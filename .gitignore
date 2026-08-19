@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+**/target/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor / IDE noise
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / runtime
+*.log

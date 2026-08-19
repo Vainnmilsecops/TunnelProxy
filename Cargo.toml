@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/protocol",
+    "crates/agent",
+    "crates/edge",
+    "crates/control-plane",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Treat warnings as errors during the foundation phase so the workspace stays clean.
+# Per-crate opt-outs should be removed as code matures.
+all = { level = "warn" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,7 @@
+# TunnelProxy intentionally pins to a recent stable Rust toolchain so every
+# contributor and CI run uses the same compiler. The version below is a
+# conservative stable release; bump it intentionally when a need arises.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

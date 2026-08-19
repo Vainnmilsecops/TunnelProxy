@@ -1,0 +1,11 @@
+[package]
+name = "tunnelproxy-control-plane"
+description = "TunnelProxy durable tunnel/account configuration and APIs (placeholder)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
