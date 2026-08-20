@@ -2,6 +2,12 @@
 /target/
 **/target/
 
+# Dependency lock for libraries that have not been released yet.
+# TunnelProxy ships binaries (see DEBT-003), so this will be removed
+# before the first release. Until then we keep `Cargo.lock` local to
+# avoid committing a file we plan to change policy on.
+Cargo.lock
+
 # Local environment
 .env
 .env.*

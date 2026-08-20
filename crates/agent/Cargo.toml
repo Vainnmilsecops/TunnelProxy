@@ -1,6 +1,6 @@
 [package]
 name = "tunnelproxy-agent"
-description = "TunnelProxy local agent / CLI runtime (placeholder)."
+description = "TunnelProxy local agent / CLI runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,13 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Used only by the in-crate integration tests that drive the edge
+# listener and the agent client together.
+tunnelproxy-edge = { path = "../edge" }

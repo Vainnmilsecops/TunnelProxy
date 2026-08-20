@@ -15,6 +15,28 @@ rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[workspace.dependencies]
+# Async runtime. ADR-002 makes Tokio the intended runtime for all
+# networking code; crate-level deps re-export these via `<name>.workspace = true`.
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
+# Structured logging per INV-003 (avoid leaking payloads; logs use spans/events only).
+tracing = "0.1"
+
+# Concrete dependency versions used by individual crates that need them.
+# Listed here so every crate resolves the same version.
+tokio-stream = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
