@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bidirectional TCP Streaming / TCP Relay** (Session 03).
+**TCP Relay Lifecycle Hardening / Local Port Forwarding** (Session 04).
 
 ## Completed
 
@@ -57,18 +57,51 @@
 - Connection-level isolation: an upstream connect failure closes only
   that downstream connection and is logged; the listener keeps
   accepting new connections.
-- Development binary surface: `edge_dev` now defaults to running as a
-  relay (`127.0.0.1:7000` → `127.0.0.1:8000`); a new
-  `upstream_echo_dev` example is provided for manual smoke tests.
-  `agent_dev` is unchanged; it just connects to the relay and
-  verifies the byte-exact echo through it.
-- Real TCP integration tests for the relay (7 tests in
-  `crates/edge/tests/relay_tcp.rs`): basic round-trip, 256 KiB
-  binary-safe payload, half-close preservation, listener survives an
-  unreachable upstream, byte-counts assertion on
-  `relay_bidirectional` directly, `UpstreamConnect` error surfaced
-  when upstream is unreachable, and a smoke test for
-  `run_relay_listener` itself. All use ephemeral ports.
+- **Local TCP forwarder** in `tunnelproxy-edge`
+  (`ForwardConfig`, `ForwardConfigError`, `Forwarder`, `ForwardError`,
+  `ConnectionId`, `ConnectionIdAllocator`, `ConnectionLifecycle`,
+  `ConnectionOutcome`, `forward_handle_connection`,
+  `DEFAULT_MAX_CONNECTIONS = 100`,
+  `DEFAULT_CONNECT_TIMEOUT = 5 s`). The forwarder is the
+  Session 04 hardening of the Session 03 relay:
+    - explicit, validated forwarding configuration
+      (`ForwardConfig::validate` rejects zero `max_connections` and
+      zero `connect_timeout`);
+    - a process-local [`ConnectionId`] is allocated at accept time
+      and appears on every lifecycle log line;
+    - structured lifecycle phases
+      ([`ConnectionLifecycle`]: `Accepted`, `CapacityRejected`,
+      `ConnectingUpstream`, `UpstreamConnectFailed`,
+      `UpstreamConnectTimeout`, `Relaying`, `RelayIoFailed`,
+      `Closed`);
+    - the upstream TCP connect is wrapped in
+      `tokio::time::timeout` so a blackholed upstream cannot pin a
+      task;
+    - bounded concurrent admission via
+      `tokio::sync::Semaphore` (`max_connections`); accepted
+      connections with no available permit are rejected cleanly
+      (downstream shut down) and the listener keeps running;
+    - per-connection resources (`downstream TcpStream`, `upstream
+      TcpStream`, semaphore permit) are owned by the per-connection
+      task so dropping the task drops everything;
+    - per-connection outcome (`bytes_downstream_to_upstream`,
+      `bytes_upstream_to_downstream`, `duration`, lifecycle phase,
+      structured error category) is exposed for tests and runtime
+      observability.
+- Development binary surface: `edge_dev` is now a CLI-driven
+  forwarder (`--listen`, `--upstream`, `--max-connections`,
+  `--connect-timeout-ms`, `--help`). `upstream_echo_dev` and
+  `agent_dev` are unchanged. The CLI is intentionally narrow.
+- Real TCP integration tests for the forwarder (9 tests in
+  `crates/edge/tests/forwarder.rs`): golden-path round-trip,
+  capacity-limit (1-permit reject then release), half-close
+  preservation, 256 KiB binary-safe payload, unreachable upstream
+  surfaced as `UpstreamConnect` / `UpstreamConnectTimeout`,
+  recoverable failure does not kill the listener, config validation,
+  failure-isolation-then-recovery across a forwarder restart, and
+  `ConnectionIdAllocator` monotonicity. All use ephemeral ports.
+- All Session 02 echo tests (`tests/edge_tcp.rs`) and Session 03
+  relay tests (`tests/relay_tcp.rs`) continue to pass unchanged.
 
 ## Not implemented
 
@@ -90,23 +123,26 @@
   own upstream connection.
 - Per-connection idle read timeout on the relay path (DEBT-006
   carries over from Session 02 and remains open).
+- Process-wide graceful shutdown / SIGTERM-driven draining of
+  in-flight relays (DEBT-005 remains open; see TECH_DEBT).
 
-Any of the above is out of scope for Session 03 and must not appear
-in the Session 03 commit.
+Any of the above is out of scope for Session 04 and must not appear
+in the Session 04 commit.
 
 ## Next planned session
 
-**Session 04 — Local TCP Forwarding / Relay Lifecycle Hardening.**
+**Session 05 — Tunnel Protocol v1 Design / Framing Foundation.**
 
-Goals (subject to refinement when Session 04 begins):
+Goals (subject to refinement when Session 05 begins):
 
-- Add a configurable per-connection idle deadline on the relay path
-  (resolve DEBT-006).
-- Add a graceful-shutdown channel to `run_relay_listener` so SIGTERM
-  in the dev binary drains in-flight relay connections (resolve
-  DEBT-005).
-- Decide and document whether to introduce an upstream-connection
-  pool, or to keep the one-downstream-one-upstream mapping.
-- Extend integration tests for: idle timeouts, graceful shutdown,
-  large concurrent fan-out, and a second upstream peer to confirm
-  isolation.
+- Design the on-wire frame layout for the Agent ↔ Edge tunnel
+  (length-prefixed, version-tagged) — no implementation yet, just
+  the framing primitives in `tunnelproxy-protocol`.
+- Bump `PROTOCOL_VERSION` to a draft value in the protocol crate
+  once the framing is agreed.
+- Decide on the initial message set (HELLO / OPEN_TUNNEL / OPEN_STREAM
+  / DATA / CLOSE / HEARTBEAT / ERROR) and document it.
+- Lay out per-stream isolation as a protocol-level concept that the
+  edge / agent runtime will respect.
+- Do **not** yet implement a real Agent → Edge persistent tunnel;
+  this session only ships the framing foundation.

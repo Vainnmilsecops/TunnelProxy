@@ -121,6 +121,62 @@ logging) and isolates per-connection failures so the listener keeps
 running. The relay exists to validate the byte-stream pipeline that
 later sessions will reuse for the actual agent ↔ edge tunnel.
 
+### 2.6.1 Local TCP forwarder (Session 04)
+
+Session 04 hardens the Session 03 relay into a small,
+lifecycle-aware **local TCP forwarder** that lives next to the
+relay primitives inside `tunnelproxy-edge`. The forwarder keeps the
+same byte-stream contract but adds:
+
+```
+            ForwardConfig
+   listen_addr:  SocketAddr
+   upstream_addr: SocketAddr
+   max_connections: usize           # bounded concurrent admission
+   connect_timeout:  Duration       # upstream TCP connect deadline
+```
+
+- **Connection identity.** Every accepted downstream connection is
+  tagged with a process-local `ConnectionId(u64)` allocated from a
+  shared `Arc<ConnectionIdAllocator>`. The id appears on every
+  structured lifecycle log line.
+- **Connection lifecycle.** Each connection progresses through
+  observable phases
+  ([`ConnectionLifecycle::Accepted`], `ConnectingUpstream`,
+  `Relaying`, `Closed`, plus the failure phases
+  `CapacityRejected`, `UpstreamConnectFailed`,
+  `UpstreamConnectTimeout`, `RelayIoFailed`).
+- **Bounded admission.** A `tokio::sync::Semaphore` of size
+  `max_connections` is acquired *before* dialing the upstream.
+  Accepted connections with no available permit are rejected
+  cleanly (downstream shut down) and the listener keeps running.
+  The permit is owned by the per-connection task via RAII
+  (`OwnedSemaphorePermit`), so the permit is always released when
+  the connection ends — by success or by failure.
+- **Bounded upstream connect.** The upstream dial is wrapped in
+  `tokio::time::timeout(config.connect_timeout, TcpStream::connect(...))`.
+  A timed-out connect is categorised as
+  `ForwardError::UpstreamConnectTimeout`; an I/O error is
+  `ForwardError::UpstreamConnect`. The two are deliberately distinct
+  so dashboards can tell "host unreachable" from "host slow".
+- **Resource lifetime.** Every per-connection resource — the
+  downstream `TcpStream`, the upstream `TcpStream`, and the
+  semaphore permit — is owned by the per-connection task. Dropping
+  the task drops all of them. There are no detached child tasks.
+- **Statistics.** Each connection surfaces a `ConnectionOutcome`
+  carrying `RelayStats` (bytes each direction) and a `Duration`,
+  usable for runtime observability and for tests.
+- **Forwarder API.** `Forwarder::new(ForwardConfig)` validates the
+  config; `forwarder.run()` binds the listener and runs the
+  lifecycle loop until `accept` itself fails.
+
+The forwarder is **not** the reverse tunnel either. It is the
+production-quality local-TCP forwarder that the agent ↔ edge
+tunnel will eventually be layered on top of. The Session 03 relay
+primitives remain in the public API for regression coverage and
+for tests that want a minimal surface; new code should use the
+forwarder.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
