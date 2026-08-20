@@ -92,11 +92,48 @@
   peer opens a TCP connection and never sends bytes or EOF. The agent
   enforces a deadline on its outbound operations, but the edge has
   no equivalent for the inbound side. INV-005 explicitly requires
-  timeouts on long-running network operations.
+  timeouts on long-running network operations. Session 03 inherits
+  this debt and adds an additional variant on the relay path.
 - **Exit plan:** Wrap `stream.read(...)` in a `tokio::time::timeout`
   with a configurable idle deadline. Document the default in
+  `docs/DEVELOPMENT.md`. Resolve in Session 04 together with the
+  relay-path deadline (DEBT-007).
+- **Tracking:** Session 04 plan.
+
+### DEBT-007 — No relay-path idle timeout / upstream connect deadline
+
+- **Introduced in:** Session 03
+- **Category:** correctness
+- **Impact:** medium
+- **Rationale:** `relay_connection` calls `TcpStream::connect` without
+  any timeout: if the upstream is blackholed, the connect can hang
+  for the OS-default TCP timeout (often tens of seconds). Likewise,
+  `relay_bidirectional` uses `tokio::io::copy_bidirectional` directly,
+  so a half-open peer can pin a relay task indefinitely. INV-005
+  explicitly requires deadlines on long-running network operations.
+- **Exit plan:** Wrap `TcpStream::connect` in `tokio::time::timeout`
+  with a configurable connect deadline; wrap each copy direction in
+  a deadline shared with DEBT-006; surface a `RelayError` variant
+  for the timed-out cases. Document defaults in
   `docs/DEVELOPMENT.md`.
-- **Tracking:** Session 03+ plan.
+- **Tracking:** Session 04 plan.
+
+### DEBT-008 — No upstream connection pool
+
+- **Introduced in:** Session 03
+- **Category:** correctness
+- **Impact:** low
+- **Rationale:** `relay_connection` opens exactly one upstream TCP
+  connection per downstream connection. This is deliberate for the
+  byte-relay baseline: it keeps the failure mode local, the lifecycle
+  obvious, and the tests simple. It is **not** a performance
+  optimisation and it makes the relay more expensive under heavy
+  fan-in than a pooled design would be.
+- **Exit plan:** If a future session shows a real fan-in workload,
+  introduce an upstream-connection pool with its own admission
+  control. Until then, keep the one-downstream-one-upstream mapping
+  and document the cost in `docs/DEVELOPMENT.md`.
+- **Tracking:** open.
 
 ## Resolved items
 

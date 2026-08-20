@@ -95,6 +95,32 @@ Anyone making an HTTPS request to a tunnel URL. Could be a browser, a
 mobile app, a CLI, a SaaS webhook. Treated as untrusted input. Edge
 never trusts client-supplied headers verbatim (INV-009).
 
+### 2.6 Layer-4 TCP relay (Session 03)
+
+Session 03 introduces a small **layer-4 TCP relay** inside
+`tunnelproxy-edge`, separate from the agent ↔ edge tunnel of the
+golden path:
+
+```
+Downstream TCP Client
+    |
+    v
+TunnelProxy Edge (relay)
+    |
+    v
+Configured TCP Upstream
+```
+
+This is **not** the reverse tunnel. It is a generic byte-oriented
+TCP relay: for every accepted downstream connection, the relay dials
+a fresh upstream TCP connection and forwards bytes concurrently in
+both directions using
+[`tokio::io::copy_bidirectional`], which honors TCP half-close. The
+relay preserves bounded buffers (no `read_to_end`, no payload
+logging) and isolates per-connection failures so the listener keeps
+running. The relay exists to validate the byte-stream pipeline that
+later sessions will reuse for the actual agent ↔ edge tunnel.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
