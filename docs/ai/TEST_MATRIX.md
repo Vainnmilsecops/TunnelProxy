@@ -12,7 +12,7 @@
 
 | Capability                                | Unit | Integration | E2E | Notes                                                                                                                       |
 | ----------------------------------------- | ---- | ----------- | --- | --------------------------------------------------------------------------------------------------------------------------- |
-| Workspace compiles and lints              | ✅   | —           | —   | Foundation checks; Session 03 keeps networking deps and lint-clean code.                                                     |
+| Workspace compiles and lints              | ✅   | —           | —   | Foundation checks; Session 04 keeps networking deps and lint-clean code.                                                    |
 | Per-crate placeholder unit tests          | ✅   | —           | —   | Identifiers / status enums.                                                                                                 |
 | Edge: bind async TCP listener (echo)      | ✅   | ✅          | —   | `run_listener`; integration test binds via `127.0.0.1:0`, asserts `TcpStream::connect` succeeds.                             |
 | Edge: accept connections                  | ✅   | ✅          | —   | Each connection is spawned via `tokio::spawn`.                                                                              |
@@ -31,8 +31,20 @@
 | Edge: TCP relay byte counts (`RelayStats`)| ✅   | ✅          | —   | `relay_bidirectional_returns_byte_counts`; asserted via `RelayStats`.                                                        |
 | Edge: TCP relay `UpstreamConnect` error   | ✅   | ✅          | —   | `relay_connection_reports_upstream_connect_failure` surfaces `RelayError::UpstreamConnect`.                                  |
 | Bidirectional streaming                   | ✅   | ✅          | —   | Session 03 deliverables.                                                                                                    |
+| Forwarder: explicit forwarding config     | ✅   | ✅          | —   | `ForwardConfig::validate` rejects zero-capacity / zero-timeout; `Forwarder::new` returns `ForwardConfigError`; covered in lib and in `forwarder_new_rejects_invalid_config`. |
+| Forwarder: per-connection `ConnectionId`  | ✅   | ✅          | —   | `ConnectionIdAllocator` is monotonic and process-local; allocator unit test + `connection_id_allocator_yields_unique_ids` integration. |
+| Forwarder: lifecycle phases               | ✅   | ✅          | —   | `ConnectionLifecycle` + `ForwardError::phase` cover all observed phases; `forwarder_golden_path_round_trip` asserts `Closed`. |
+| Forwarder: bounded concurrency            | ✅   | ✅          | —   | `Forwarder::available_permits` exposes live permit count; `forwarder_capacity_limit_one_rejects_then_releases` exercises the deterministic capacity-exhaustion policy (accept / permit / write / hold / second-client-rejected / release / third-client-succeeds). |
+| Forwarder: upstream connect timeout       | ✅   | ✅          | —   | `ForwardError::UpstreamConnectTimeout` is distinct from `ForwardError::UpstreamConnect`; covered in `forwarder_unreachable_upstream_surfaces_upstream_connect_failure` (loopback closed port can surface as either on Windows). |
+| Forwarder: failure isolation              | —    | ✅          | —   | `forwarder_recoverable_failure_does_not_kill_listener` proves two consecutive failed connections do not stop the listener. |
+| Forwarder: failure → recovery             | —    | ✅          | —   | `forwarder_failure_then_recovery_via_restart` simulates upstream restart and verifies a later connection succeeds.          |
+| Forwarder: byte / duration observability  | ✅   | ✅          | —   | `ConnectionOutcome` carries `RelayStats` + `duration`; covered by `forwarder_golden_path_round_trip` and `forwarder_large_payload_round_trip`. |
+| Forwarder: large (256 KiB) payload        | ✅   | ✅          | —   | `forwarder_large_payload_round_trip`; same byte-exact assertion as Session 03.                                              |
+| Forwarder: half-close preserved           | —    | ✅          | —   | `forwarder_preserves_half_close`.                                                                                           |
+| Forwarder: structured error categories    | ✅   | ✅          | —   | `ForwardError::category()` returns `"capacity_exhausted"`, `"upstream_connect_failed"`, `"upstream_connect_timeout"`, `"relay_io_failed"`; logged as `error_category`. |
+| Edge: TCP forwarder CLI                   | —    | —           | —   | `edge_dev` accepts `--listen`, `--upstream`, `--max-connections`, `--connect-timeout-ms`, `--help`; manually smoke-tested.   |
 | HTTP reverse proxy                        | —    | —           | —   | Planned after Session 04.                                                                                                   |
-| Tunnel protocol framing                   | —    | —           | —   | Planned with the multiplexed tunnel (ADR-005).                                                                              |
+| Tunnel protocol framing                   | —    | —           | —   | Planned with the multiplexed tunnel (ADR-005); Session 05 design.                                                          |
 | Agent ↔ Edge protocol handshake           | —    | —           | —   | Out of scope until framing exists.                                                                                          |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
 | Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |

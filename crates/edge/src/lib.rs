@@ -2,37 +2,52 @@
 //!
 //! Public ingress and live tunnel routing for TunnelProxy.
 //!
-//! This crate contains two distinct but coexisting TCP primitives:
+//! This crate contains three distinct but coexisting TCP primitives:
 //!
 //! - The **echo baseline** from Session 02 (`run_listener`,
-//!   `handle_connection`). It binds a TCP listener and echoes every
-//!   byte back to the client. Kept for regression coverage and as the
+//!   `handle_connection`). Binds a TCP listener and echoes every byte
+//!   back to the client. Kept for regression coverage and as the
 //!   simplest possible networking smoke test.
 //!
 //! - The **bidirectional TCP relay** from Session 03
 //!   (`run_relay_listener`, `relay_connection`, `relay_bidirectional`,
-//!   [`RelayStats`], [`RelayError`]). It binds a TCP listener; for
-//!   every accepted downstream connection it opens a fresh upstream
-//!   TCP connection to a configured address and forwards raw bytes
-//!   concurrently in both directions using
+//!   [`RelayStats`], [`RelayError`], [`RelayDirection`]). Binds a TCP
+//!   listener; for every accepted downstream connection it opens a
+//!   fresh upstream TCP connection to a configured address and
+//!   forwards raw bytes concurrently in both directions using
 //!   [`tokio::io::copy_bidirectional`]. The relay preserves TCP
 //!   half-close semantics so that EOF in one direction does not kill
 //!   traffic in the other.
 //!
+//! - The **local TCP forwarder** from Session 04
+//!   ([`ForwardConfig`], [`ForwardError`], [`Forwarder`],
+//!   [`ConnectionId`], [`ConnectionLifecycle`], [`ConnectionOutcome`]).
+//!   It is the hardened, configurable, lifecycle-aware foundation of
+//!   the relay: explicit forwarding configuration, per-connection
+//!   identity, structured lifecycle phases, bounded upstream connect
+//!   timeouts, explicit max-concurrent-connections policy, and
+//!   RAII-managed resource cleanup. The forwarder is built on top of
+//!   the same byte-stream primitive as the Session 03 relay, so the
+//!   underlying full-duplex and half-close semantics are preserved by
+//!   construction.
+//!
 //! Neither primitive implements the TunnelProxy reverse-tunnel
-//! protocol. The relay is a **layer-4 TCP relay primitive**: it does
-//! not understand HTTP, framing, sessions, multiplexing, or
-//! authentication. It exists to validate the byte-stream pipeline that
-//! later sessions will reuse for the agent ↔ edge tunnel. See
-//! `docs/ai/DECISIONS.md` (ADR-002, ADR-005) and `docs/TECH_DEBT.md`
-//! for the deliberate limitations.
+//! protocol. They are **layer-4 TCP** primitives that exist to
+//! validate the byte-stream pipeline, lifecycle, and resource
+//! discipline that later sessions will reuse for the agent ↔ edge
+//! tunnel. See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006) and
+//! `docs/TECH_DEBT.md` for the deliberate limitations.
 
 #![deny(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{debug, error, info, trace, warn};
 
 /// Default development bind address for the edge listener.
@@ -43,11 +58,27 @@ use tracing::{debug, error, info, trace, warn};
 /// outbound tunnels).
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7000";
 
-/// Default upstream address for the relay development binary.
+/// Default upstream address for the relay/forwarder development
+/// binary.
 ///
-/// Pairs with [`DEFAULT_BIND_ADDR`]: a relay running on `127.0.0.1:7000`
-/// will forward to `127.0.0.1:8000` by default.
+/// Pairs with [`DEFAULT_BIND_ADDR`]: a forwarder listening on
+/// `127.0.0.1:7000` will forward to `127.0.0.1:8000` by default.
 pub const DEFAULT_UPSTREAM_ADDR: &str = "127.0.0.1:8000";
+
+/// Default maximum concurrent connections for the forwarder.
+///
+/// Bounds the total in-flight relays. New connections that arrive
+/// while this many relays are already active are rejected cleanly
+/// (the downstream socket is shut down and the connection is logged
+/// with [`ConnectionLifecycle::CapacityRejected`]).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+/// Default upstream TCP connect timeout.
+///
+/// Bound the time a single downstream connection spends waiting to
+/// dial the upstream. Distinct from the smaller read deadlines
+/// enforced inside the relay.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Size of the per-connection read buffer used by the Session 02 echo
 /// baseline.
@@ -55,10 +86,14 @@ pub const DEFAULT_UPSTREAM_ADDR: &str = "127.0.0.1:8000";
 /// 8 KiB is a reasonable default for the byte-stream baseline. The
 /// invariant in INV-002 (no unbounded buffering) is satisfied because
 /// the buffer is a fixed allocation and is reused across reads; we
-/// never call `read_to_end` on a live socket. The relay does not use
-/// this constant directly — `tokio::io::copy_bidirectional` allocates
-/// its own fixed-size intermediate buffer (default 8 KiB).
+/// never call `read_to_end` on a live socket. The relay / forwarder
+/// does not use this constant directly — `tokio::io::copy_bidirectional`
+/// allocates its own fixed-size intermediate buffer (default 8 KiB).
 pub const READ_BUFFER_SIZE: usize = 8 * 1024;
+
+// ---------------------------------------------------------------------------
+// Session 02 — TCP echo baseline (preserved unchanged)
+// ---------------------------------------------------------------------------
 
 /// Bind a TCP listener and serve connections forever, echoing every
 /// byte received from each client back to that client until EOF or
@@ -66,10 +101,11 @@ pub const READ_BUFFER_SIZE: usize = 8 * 1024;
 ///
 /// This is the Session 02 baseline. Kept for regression coverage and
 /// as the simplest possible networking smoke test. New code should
-/// prefer the relay primitives below for any non-trivial workload.
+/// prefer the forwarder / relay primitives below for any non-trivial
+/// workload.
 ///
-/// `bind_addr` is resolved by the caller. Use [`DEFAULT_BIND_ADDR`] for
-/// the development binary.
+/// `bind_addr` is resolved by the caller. Use [`DEFAULT_BIND_ADDR`]
+/// for the development binary.
 ///
 /// Each accepted connection is handled by [`handle_connection`],
 /// spawned as an independent Tokio task so that one connection's
@@ -79,8 +115,8 @@ pub const READ_BUFFER_SIZE: usize = 8 * 1024;
 ///
 /// The function returns `Ok(())` only when [`TcpListener::accept`]
 /// itself fails — for example when the bound socket is closed by the
-/// process supervisor. Normal per-connection closes are not propagated
-/// upward.
+/// process supervisor. Normal per-connection closes are not
+/// propagated upward.
 pub async fn run_listener(bind_addr: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
@@ -160,11 +196,11 @@ pub async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) {
 }
 
 // ---------------------------------------------------------------------------
-// Session 03 — bidirectional TCP relay
+// Session 03 — bidirectional TCP relay (preserved unchanged)
 // ---------------------------------------------------------------------------
 
-/// Summary of bytes forwarded in both directions during a single relay
-/// connection.
+/// Summary of bytes forwarded in both directions during a single
+/// relay connection.
 ///
 /// Returned by [`relay_bidirectional`] and surfaced through
 /// [`relay_connection`] so callers and tests can assert that traffic
@@ -174,17 +210,18 @@ pub struct RelayStats {
     /// Bytes forwarded from the downstream client to the upstream
     /// server.
     pub bytes_downstream_to_upstream: u64,
-    /// Bytes forwarded from the upstream server back to the downstream
-    /// client.
+    /// Bytes forwarded from the upstream server back to the
+    /// downstream client.
     pub bytes_upstream_to_downstream: u64,
 }
 
-/// Errors that can occur during a single relay connection.
+/// Errors that can occur during a single Session 03 relay connection.
 ///
-/// These deliberately stay coarse-grained: the relay is a TCP primitive,
-/// not a diagnostic tool. Tests and the dev binary use the variants
-/// only to distinguish "could not even open the upstream" from
-/// "upstream opened but I/O failed while relaying".
+/// Coarse-grained on purpose: the relay is a TCP primitive, not a
+/// diagnostic tool. Tests and the dev binary use the variants only to
+/// distinguish "could not even open the upstream" from "upstream
+/// opened but I/O failed while relaying". Session 04 introduces
+/// [`ForwardError`] for the lifecycle-aware forwarder.
 #[derive(Debug)]
 pub enum RelayError {
     /// Opening the upstream TCP connection failed for a specific
@@ -205,10 +242,6 @@ pub enum RelayError {
 }
 
 /// Identifies which side of the relay a byte copy involves.
-///
-/// `Downstream` is the client that connected to the edge relay.
-/// `Upstream` is the TCP service the relay dialed on behalf of that
-/// client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayDirection {
     Downstream,
@@ -257,9 +290,7 @@ impl std::error::Error for RelayError {
 /// write half on the other side is shut down so the remote peer
 /// observes EOF.
 ///
-/// Returns the total byte counts forwarded in each direction. The
-/// byte counts reflect successful copies only — bytes that could not
-/// be delivered because the connection failed are not included.
+/// Returns the total byte counts forwarded in each direction.
 ///
 /// INV-002 (no unbounded buffering) is structurally satisfied because
 /// `copy_bidirectional` allocates its own fixed-size intermediate
@@ -285,15 +316,6 @@ pub async fn relay_bidirectional(
 /// Accept a downstream `TcpStream`, open a fresh upstream connection
 /// to `upstream_addr`, and forward bytes bidirectionally between the
 /// two until either side closes.
-///
-/// On a successful upstream connect, this returns the byte counts from
-/// [`relay_bidirectional`]. If the upstream connect fails, the
-/// downstream socket is closed and [`RelayError::UpstreamConnect`] is
-/// returned.
-///
-/// This function is the per-connection workhorse used by
-/// [`run_relay_listener`]. It is exposed publicly so integration tests
-/// can drive the full relay lifecycle without owning a listener.
 pub async fn relay_connection(
     mut downstream: TcpStream,
     peer: SocketAddr,
@@ -324,9 +346,6 @@ pub async fn relay_connection(
                 error = %source,
                 "relay: upstream connect failed; closing downstream only"
             );
-            // Explicitly close the downstream side. Dropping it would
-            // also work, but a graceful shutdown is clearer in the
-            // logs.
             let _ = downstream.shutdown().await;
             return Err(RelayError::UpstreamConnect {
                 upstream: upstream_addr,
@@ -369,11 +388,9 @@ pub async fn relay_connection(
 /// connection, open a fresh upstream TCP connection to `upstream_addr`
 /// and forward bytes bidirectionally until either side closes.
 ///
-/// Connection-level failures (upstream refused, downstream reset,
-/// I/O errors) are logged and isolated to that connection; the
-/// listener loop continues to accept new connections.
-///
-/// Returns `Ok(())` only when [`TcpListener::accept`] itself fails.
+/// Session 03 kept admission unbounded. Session 04 supersedes this
+/// default with [`Forwarder`] (bounded concurrency, connect timeout,
+/// structured lifecycle). For new code prefer the [`Forwarder`].
 pub async fn run_relay_listener(
     bind_addr: SocketAddr,
     upstream_addr: SocketAddr,
@@ -402,13 +419,695 @@ pub async fn run_relay_listener(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session 04 — TCP forwarder: connection identity, lifecycle, bounded
+// concurrency, bounded upstream-connect timeout, RAII resource cleanup.
+// ---------------------------------------------------------------------------
+
+/// Process-local allocator for [`ConnectionId`].
+///
+/// Wraps a [`AtomicU64`] counter; allocating a new ID is a single
+/// `fetch_add`. IDs are 1-indexed and never reused for the lifetime
+/// of the process.
+#[derive(Debug, Default)]
+pub struct ConnectionIdAllocator {
+    next: AtomicU64,
+}
+
+impl ConnectionIdAllocator {
+    /// Create a new allocator starting at 0 (next issued ID is 1).
+    pub fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// Allocate and return the next [`ConnectionId`].
+    ///
+    /// This is `&self` (not `&mut self`) so the allocator can live
+    /// behind an `Arc` and be shared across spawned tasks / test
+    /// harnesses.
+    pub fn next_id(&self) -> ConnectionId {
+        let raw = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        ConnectionId(raw)
+    }
+}
+
+/// Strongly typed connection identity for the forwarder.
+///
+/// A `ConnectionId` is allocated by [`ConnectionIdAllocator::next_id`]
+/// at the moment a downstream connection is accepted, and is then
+/// attached to every log event and `ConnectionOutcome` for that
+/// connection's lifetime. IDs are process-local and are not
+/// persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionId(pub u64);
+
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conn#{}", self.0)
+    }
+}
+
+/// Configuration for a [`Forwarder`].
+///
+/// Values are validated by [`ForwardConfig::validate`] before the
+/// forwarder is constructed. The defaults used by the development
+/// binary are documented on each field.
+#[derive(Debug, Clone)]
+pub struct ForwardConfig {
+    /// Downstream listen address (what clients connect to).
+    pub listen_addr: SocketAddr,
+    /// Upstream service address (what the forwarder dials).
+    pub upstream_addr: SocketAddr,
+    /// Maximum concurrent in-flight relays. Must be `> 0`.
+    pub max_connections: usize,
+    /// Per-connection timeout for `TcpStream::connect(upstream_addr)`.
+    /// Must be non-zero.
+    pub connect_timeout: Duration,
+}
+
+impl ForwardConfig {
+    /// Local-development defaults: `127.0.0.1:7000` →
+    /// `127.0.0.1:8000`, 100 concurrent connections, 5 s connect
+    /// timeout.
+    pub fn dev_defaults() -> Self {
+        Self {
+            listen_addr: DEFAULT_BIND_ADDR
+                .parse()
+                .expect("hardcoded default bind address is valid"),
+            upstream_addr: DEFAULT_UPSTREAM_ADDR
+                .parse()
+                .expect("hardcoded default upstream address is valid"),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    /// Validate `self`; return a structured error if any field is
+    /// unusable.
+    pub fn validate(&self) -> Result<(), ForwardConfigError> {
+        if self.max_connections == 0 {
+            return Err(ForwardConfigError::ZeroMaxConnections);
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(ForwardConfigError::ZeroConnectTimeout);
+        }
+        Ok(())
+    }
+}
+
+/// Errors produced by [`ForwardConfig::validate`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ForwardConfigError {
+    /// `max_connections` must be strictly greater than zero.
+    ZeroMaxConnections,
+    /// `connect_timeout` must be a positive [`Duration`].
+    ZeroConnectTimeout,
+}
+
+impl std::fmt::Display for ForwardConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForwardConfigError::ZeroMaxConnections => {
+                f.write_str("max_connections must be greater than zero")
+            }
+            ForwardConfigError::ZeroConnectTimeout => {
+                f.write_str("connect_timeout must be greater than zero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForwardConfigError {}
+
+/// Connection lifecycle phase observed by the forwarder.
+///
+/// The forwarder logs one or more of these per connection. They are
+/// also embedded in [`ConnectionOutcome`] so tests can assert the
+/// observed path without parsing log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLifecycle {
+    /// The downstream TCP connection was accepted. Capacity was
+    /// available; the per-connection task is now driving the relay.
+    Accepted,
+    /// The downstream TCP connection was accepted but rejected
+    /// immediately because no concurrency permit was available. The
+    /// downstream socket was shut down and the listener kept
+    /// accepting.
+    CapacityRejected,
+    /// The downstream connection was accepted but the upstream TCP
+    /// connect is in progress.
+    ConnectingUpstream,
+    /// The upstream TCP connect returned an I/O error (refused,
+    /// timeout, unreachable, …). The downstream socket was shut down
+    /// and the listener kept accepting.
+    UpstreamConnectFailed,
+    /// The upstream TCP connect did not complete within
+    /// [`ForwardConfig::connect_timeout`]. The downstream socket was
+    /// shut down and the listener kept accepting.
+    UpstreamConnectTimeout,
+    /// Both sockets are open and [`copy_bidirectional`] is running.
+    Relaying,
+    /// `copy_bidirectional` returned an I/O error before either side
+    /// cleanly closed.
+    RelayIoFailed,
+    /// Either side closed cleanly and the relay returned
+    /// [`RelayStats`].
+    Closed,
+}
+
+impl ConnectionLifecycle {
+    /// Short identifier used as the `phase` field in log events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectionLifecycle::Accepted => "accepted",
+            ConnectionLifecycle::CapacityRejected => "capacity_rejected",
+            ConnectionLifecycle::ConnectingUpstream => "connecting_upstream",
+            ConnectionLifecycle::UpstreamConnectFailed => "upstream_connect_failed",
+            ConnectionLifecycle::UpstreamConnectTimeout => "upstream_connect_timeout",
+            ConnectionLifecycle::Relaying => "relaying",
+            ConnectionLifecycle::RelayIoFailed => "relay_io_failed",
+            ConnectionLifecycle::Closed => "closed",
+        }
+    }
+}
+
+/// Per-connection failure categorized for logging and tests.
+///
+/// `ConnectionOutcome::Failure` carries one of these so callers can
+/// distinguish "we never reached the upstream" from "the upstream
+/// was unreachable" from "the upstream timed out" from "the relay
+/// itself failed".
+#[derive(Debug)]
+pub enum ForwardError {
+    /// No concurrency permit was available; the downstream socket
+    /// was rejected before any upstream dial.
+    CapacityExhausted,
+    /// The upstream TCP connect returned an I/O error (refused,
+    /// network unreachable, …). The downstream was shut down.
+    UpstreamConnect { source: std::io::Error },
+    /// The upstream TCP connect did not complete within
+    /// `ForwardConfig::connect_timeout`. The downstream was shut
+    /// down.
+    UpstreamConnectTimeout,
+    /// `copy_bidirectional` returned an I/O error after both sockets
+    /// were established.
+    RelayIo {
+        from: RelayDirection,
+        to: RelayDirection,
+        source: std::io::Error,
+    },
+}
+
+impl ForwardError {
+    /// Stable category identifier used as the `error_category` field
+    /// in log events.
+    pub fn category(&self) -> &'static str {
+        match self {
+            ForwardError::CapacityExhausted => "capacity_exhausted",
+            ForwardError::UpstreamConnect { .. } => "upstream_connect_failed",
+            ForwardError::UpstreamConnectTimeout => "upstream_connect_timeout",
+            ForwardError::RelayIo { .. } => "relay_io_failed",
+        }
+    }
+
+    /// Last lifecycle phase the connection reached before the error.
+    pub fn phase(&self) -> ConnectionLifecycle {
+        match self {
+            ForwardError::CapacityExhausted => ConnectionLifecycle::CapacityRejected,
+            ForwardError::UpstreamConnect { .. } => ConnectionLifecycle::UpstreamConnectFailed,
+            ForwardError::UpstreamConnectTimeout => ConnectionLifecycle::UpstreamConnectTimeout,
+            ForwardError::RelayIo { .. } => ConnectionLifecycle::RelayIoFailed,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForwardError::CapacityExhausted => {
+                f.write_str("forwarder at max_connections; connection rejected")
+            }
+            ForwardError::UpstreamConnect { source } => {
+                write!(f, "upstream connect failed: {source}")
+            }
+            ForwardError::UpstreamConnectTimeout => f.write_str("upstream connect timed out"),
+            ForwardError::RelayIo { from, to, source } => {
+                write!(f, "relay I/O failed ({from} -> {to}): {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForwardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ForwardError::CapacityExhausted => None,
+            ForwardError::UpstreamConnect { source } => Some(source),
+            ForwardError::UpstreamConnectTimeout => None,
+            ForwardError::RelayIo { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Per-connection result returned by
+/// [`Forwarder::handle_connection`].
+///
+/// Tests use this to assert that a connection reached a particular
+/// phase, forwarded a specific number of bytes in each direction,
+/// and lasted a measurable amount of time. Production code can
+/// ignore it; it is logged via the lifecycle struct.
+#[derive(Debug)]
+pub struct ConnectionOutcome {
+    pub connection_id: ConnectionId,
+    pub peer: SocketAddr,
+    pub upstream: SocketAddr,
+    pub outcome: Result<RelayStats, ForwardError>,
+    pub duration: Duration,
+}
+
+impl ConnectionOutcome {
+    /// The last lifecycle phase the connection reached. This is the
+    /// success phase (`Closed`) on success, or the failure phase from
+    /// [`ForwardError::phase`] on failure. Useful for tests that do
+    /// not want to pattern-match on `Result`.
+    pub fn final_phase(&self) -> ConnectionLifecycle {
+        match &self.outcome {
+            Ok(_) => ConnectionLifecycle::Closed,
+            Err(err) => err.phase(),
+        }
+    }
+}
+
+/// Bounded, lifecycle-aware local TCP forwarder.
+///
+/// The forwarder binds a `TcpListener` on `config.listen_addr`. For
+/// every accepted downstream connection:
+///
+/// 1. allocate a [`ConnectionId`];
+/// 2. try to acquire a permit from an [`Arc<Semaphore>`] sized to
+///    `config.max_connections`. If no permit is available the
+///    downstream is shut down and the listener continues. This is
+///    the documented capacity-exhaustion policy;
+/// 3. dial the upstream under `config.connect_timeout`. Timeouts and
+///    I/O errors are distinguished and surface as
+///    [`ForwardError::UpstreamConnectTimeout`] or
+///    [`ForwardError::UpstreamConnect`];
+/// 4. forward raw bytes in both directions via
+///    [`tokio::io::copy_bidirectional`];
+/// 5. release the semaphore permit (RAII via
+///    [`OwnedSemaphorePermit`]).
+///
+/// Per-connection resources (`TcpStream`s, permit) are owned by the
+/// per-connection task so dropping the task drops everything. There
+/// are no detached child tasks.
+pub struct Forwarder {
+    config: ForwardConfig,
+    semaphore: Arc<Semaphore>,
+    ids: Arc<ConnectionIdAllocator>,
+}
+
+impl Forwarder {
+    /// Construct a forwarder. Returns an error if `config` is not
+    /// valid; the listener is not yet bound.
+    pub fn new(config: ForwardConfig) -> Result<Self, ForwardConfigError> {
+        config.validate()?;
+        Ok(Self {
+            semaphore: Arc::new(Semaphore::new(config.max_connections)),
+            ids: Arc::new(ConnectionIdAllocator::new()),
+            config,
+        })
+    }
+
+    /// Effective forwarder config (after defaults / validation).
+    pub fn config(&self) -> &ForwardConfig {
+        &self.config
+    }
+
+    /// Number of currently-available permits. Useful for tests and
+    /// for the dev binary to log capacity headroom.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Bind the listener and run the forwarder until
+    /// [`TcpListener::accept`] itself fails.
+    pub async fn run(self) -> std::io::Result<()> {
+        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        let local = listener.local_addr()?;
+        info!(
+            addr = %local,
+            upstream = %self.config.upstream_addr,
+            max_connections = self.config.max_connections,
+            connect_timeout_ms = self.config.connect_timeout.as_millis() as u64,
+            event = "forwarder_started",
+            "forwarder bound"
+        );
+
+        let semaphore = self.semaphore;
+        let ids = self.ids;
+        let upstream_addr = self.config.upstream_addr;
+        let connect_timeout = self.config.connect_timeout;
+
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, peer)) => {
+                    let semaphore = Arc::clone(&semaphore);
+                    let ids = Arc::clone(&ids);
+                    tokio::spawn(async move {
+                        let id = ids.next_id();
+                        info!(
+                            connection_id = %id,
+                            peer = %peer,
+                            upstream = %upstream_addr,
+                            event = "connection_accepted",
+                            "downstream connection accepted"
+                        );
+                        let permit = match semaphore.try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(TryAcquireError::NoPermits) => {
+                                let _ = stream.shutdown().await;
+                                error!(
+                                    connection_id = %id,
+                                    peer = %peer,
+                                    upstream = %upstream_addr,
+                                    event = "connection_rejected_capacity",
+                                    "no capacity permit available; downstream closed"
+                                );
+                                return;
+                            }
+                            Err(TryAcquireError::Closed) => {
+                                let _ = stream.shutdown().await;
+                                error!(
+                                    connection_id = %id,
+                                    peer = %peer,
+                                    upstream = %upstream_addr,
+                                    event = "connection_rejected_capacity",
+                                    "semaphore closed; downstream closed"
+                                );
+                                return;
+                            }
+                        };
+                        // Hand ownership of `permit` and `stream` into
+                        // the per-connection handler. Drop at the end
+                        // of the handler releases both resources.
+                        let outcome = forward_handle_connection(
+                            id,
+                            stream,
+                            peer,
+                            upstream_addr,
+                            connect_timeout,
+                            permit,
+                        )
+                        .await;
+                        log_outcome(&outcome, upstream_addr);
+                    });
+                }
+                Err(err) => {
+                    error!(error = %err, event = "forwarder_accept_error", "accept failed");
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// Drive a single accepted downstream connection through the full
+/// lifecycle on behalf of [`Forwarder`].
+///
+/// Exposed publicly so integration tests can drive the full lifecycle
+/// without owning a listener. The function takes ownership of the
+/// `permit`: dropping the function releases it.
+pub async fn forward_handle_connection(
+    connection_id: ConnectionId,
+    mut downstream: TcpStream,
+    peer: SocketAddr,
+    upstream_addr: SocketAddr,
+    connect_timeout: Duration,
+    permit: OwnedSemaphorePermit,
+) -> ConnectionOutcome {
+    let started = Instant::now();
+
+    info!(
+        connection_id = %connection_id,
+        peer = %peer,
+        upstream = %upstream_addr,
+        event = "upstream_connecting",
+        "dialing upstream"
+    );
+
+    let upstream =
+        match tokio::time::timeout(connect_timeout, TcpStream::connect(upstream_addr)).await {
+            Ok(Ok(stream)) => {
+                info!(
+                    connection_id = %connection_id,
+                    peer = %peer,
+                    upstream = %upstream_addr,
+                    event = "upstream_connected",
+                    "upstream TCP connection established"
+                );
+                stream
+            }
+            Ok(Err(source)) => {
+                error!(
+                    connection_id = %connection_id,
+                    peer = %peer,
+                    upstream = %upstream_addr,
+                    error = %source,
+                    error_category = "upstream_connect_failed",
+                    event = "upstream_connect_failed",
+                    "upstream connect failed; shutting down downstream only"
+                );
+                let _ = downstream.shutdown().await;
+                drop(permit);
+                return ConnectionOutcome {
+                    connection_id,
+                    peer,
+                    upstream: upstream_addr,
+                    outcome: Err(ForwardError::UpstreamConnect { source }),
+                    duration: started.elapsed(),
+                };
+            }
+            Err(_elapsed) => {
+                error!(
+                    connection_id = %connection_id,
+                    peer = %peer,
+                    upstream = %upstream_addr,
+                    error_category = "upstream_connect_timeout",
+                    event = "upstream_connect_timeout",
+                    "upstream connect timed out; shutting down downstream only"
+                );
+                let _ = downstream.shutdown().await;
+                drop(permit);
+                return ConnectionOutcome {
+                    connection_id,
+                    peer,
+                    upstream: upstream_addr,
+                    outcome: Err(ForwardError::UpstreamConnectTimeout),
+                    duration: started.elapsed(),
+                };
+            }
+        };
+
+    info!(
+        connection_id = %connection_id,
+        peer = %peer,
+        upstream = %upstream_addr,
+        event = "relay_started",
+        "starting bidirectional copy"
+    );
+
+    let relay_result = relay_bidirectional_with_id(connection_id, downstream, upstream).await;
+    let outcome = match relay_result {
+        Ok(stats) => {
+            info!(
+                connection_id = %connection_id,
+                peer = %peer,
+                upstream = %upstream_addr,
+                bytes_downstream_to_upstream = stats.bytes_downstream_to_upstream,
+                bytes_upstream_to_downstream = stats.bytes_upstream_to_downstream,
+                event = "relay_completed",
+                "relay completed"
+            );
+            Ok(stats)
+        }
+        Err(err) => {
+            warn!(
+                connection_id = %connection_id,
+                peer = %peer,
+                upstream = %upstream_addr,
+                error = %err,
+                event = "relay_failed",
+                "relay copy failed"
+            );
+            Err(forward_from_relay(err))
+        }
+    };
+
+    drop(permit);
+
+    ConnectionOutcome {
+        connection_id,
+        peer,
+        upstream: upstream_addr,
+        outcome,
+        duration: started.elapsed(),
+    }
+}
+
+/// Same body as [`relay_bidirectional`] but logs progress with the
+/// connection ID, then maps a [`RelayError::Copy`] into the matching
+/// [`ForwardError::RelayIo`].
+async fn relay_bidirectional_with_id(
+    connection_id: ConnectionId,
+    mut downstream: TcpStream,
+    mut upstream: TcpStream,
+) -> Result<RelayStats, RelayError> {
+    let res = copy_bidirectional(&mut downstream, &mut upstream).await;
+    match res {
+        Ok((dn_to_up, up_to_dn)) => Ok(RelayStats {
+            bytes_downstream_to_upstream: dn_to_up,
+            bytes_upstream_to_downstream: up_to_dn,
+        }),
+        Err(source) => {
+            trace!(
+                connection_id = %connection_id,
+                error = %source,
+                event = "relay_io_error",
+                "copy_bidirectional returned an I/O error"
+            );
+            Err(RelayError::Copy {
+                from: RelayDirection::Downstream,
+                to: RelayDirection::Upstream,
+                source,
+            })
+        }
+    }
+}
+
+/// Map a [`RelayError`] into the matching [`ForwardError`].
+fn forward_from_relay(err: RelayError) -> ForwardError {
+    match err {
+        RelayError::UpstreamConnect { source, .. } => ForwardError::UpstreamConnect { source },
+        RelayError::Copy { from, to, source } => ForwardError::RelayIo { from, to, source },
+    }
+}
+
+/// Log a structured summary of a finished connection outcome.
+///
+/// This is a free function (rather than a method on
+/// `ConnectionOutcome`) so it can be called from the listener task
+/// after `handle_connection` returns, while still keeping the
+/// `Display` / `error_category` formatting close to the data.
+fn log_outcome(outcome: &ConnectionOutcome, _upstream: SocketAddr) {
+    let duration_ms = outcome.duration.as_millis() as u64;
+    match &outcome.outcome {
+        Ok(stats) => {
+            info!(
+                connection_id = %outcome.connection_id,
+                peer = %outcome.peer,
+                upstream = %outcome.upstream,
+                phase = outcome.final_phase().as_str(),
+                bytes_downstream_to_upstream = stats.bytes_downstream_to_upstream,
+                bytes_upstream_to_downstream = stats.bytes_upstream_to_downstream,
+                duration_ms,
+                event = "connection_closed",
+                "connection completed"
+            );
+        }
+        Err(err) => {
+            warn!(
+                connection_id = %outcome.connection_id,
+                peer = %outcome.peer,
+                upstream = %outcome.upstream,
+                phase = outcome.final_phase().as_str(),
+                error_category = err.category(),
+                error = %err,
+                duration_ms,
+                event = "connection_closed",
+                "connection closed with failure"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Smoke test for `RelayStats`: it round-trips through serde-like
-    /// derivations without losing the byte counts. This guards against
-    /// an accidental field rename breaking observability.
+    /// Smoke test for `ConnectionId`: allocator yields unique
+    /// monotonic IDs.
+    #[test]
+    fn connection_id_allocator_is_monotonic() {
+        let alloc = ConnectionIdAllocator::new();
+        let a = alloc.next_id();
+        let b = alloc.next_id();
+        let c = alloc.next_id();
+        assert_eq!(a, ConnectionId(1));
+        assert_eq!(b, ConnectionId(2));
+        assert_eq!(c, ConnectionId(3));
+        assert_eq!(a.to_string(), "conn#1");
+    }
+
+    /// `ForwardConfig::dev_defaults()` is valid.
+    #[test]
+    fn dev_defaults_validate() {
+        ForwardConfig::dev_defaults()
+            .validate()
+            .expect("dev defaults must be valid");
+    }
+
+    /// `ForwardConfig::validate` rejects a zero-capacity forwarder.
+    #[test]
+    fn validate_rejects_zero_max_connections() {
+        let cfg = ForwardConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream_addr: "127.0.0.1:1".parse().unwrap(),
+            max_connections: 0,
+            connect_timeout: Duration::from_secs(5),
+        };
+        assert_eq!(cfg.validate(), Err(ForwardConfigError::ZeroMaxConnections));
+    }
+
+    /// `ForwardConfig::validate` rejects a zero connect timeout.
+    #[test]
+    fn validate_rejects_zero_connect_timeout() {
+        let cfg = ForwardConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream_addr: "127.0.0.1:1".parse().unwrap(),
+            max_connections: 16,
+            connect_timeout: Duration::ZERO,
+        };
+        assert_eq!(cfg.validate(), Err(ForwardConfigError::ZeroConnectTimeout));
+    }
+
+    /// `ForwardError::category` and `phase` cover all variants.
+    #[test]
+    fn forward_error_categories_and_phases_are_stable() {
+        let cap = ForwardError::CapacityExhausted;
+        assert_eq!(cap.category(), "capacity_exhausted");
+        assert_eq!(cap.phase(), ConnectionLifecycle::CapacityRejected);
+
+        let io = std::io::Error::other("x");
+        let up = ForwardError::UpstreamConnect { source: io };
+        assert_eq!(up.category(), "upstream_connect_failed");
+        assert_eq!(up.phase(), ConnectionLifecycle::UpstreamConnectFailed);
+
+        let to = ForwardError::UpstreamConnectTimeout;
+        assert_eq!(to.category(), "upstream_connect_timeout");
+        assert_eq!(to.phase(), ConnectionLifecycle::UpstreamConnectTimeout);
+
+        let relay = ForwardError::RelayIo {
+            from: RelayDirection::Downstream,
+            to: RelayDirection::Upstream,
+            source: std::io::Error::other("x"),
+        };
+        assert_eq!(relay.category(), "relay_io_failed");
+        assert_eq!(relay.phase(), ConnectionLifecycle::RelayIoFailed);
+    }
+
+    /// Session 03 `RelayStats` default is still zero.
     #[test]
     fn relay_stats_default_is_zero() {
         let stats = RelayStats::default();
@@ -416,6 +1115,8 @@ mod tests {
         assert_eq!(stats.bytes_upstream_to_downstream, 0);
     }
 
+    /// Session 03 `RelayError` display keeps the address out of
+    /// payload content.
     #[test]
     fn relay_error_display_does_not_leak_payloads() {
         let err = RelayError::UpstreamConnect {
@@ -423,9 +1124,6 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
         };
         let rendered = err.to_string();
-        // We deliberately do not assert exact wording — only that
-        // neither the address is logged with secret-shaped content
-        // nor the upstream service name leaks.
         assert!(rendered.contains("upstream"));
         assert!(rendered.contains("refused"));
     }
