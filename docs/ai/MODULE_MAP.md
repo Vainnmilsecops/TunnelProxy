@@ -22,6 +22,9 @@
 
 ## `tunnelproxy-protocol`
 
+**Current implementation:** Version 1 framing, handshake, heartbeat, and
+single-stream lifecycle payload types/codecs.
+
 **Responsibility (future)**
 
 - Protocol versioning (`PROTOCOL_VERSION`).
@@ -39,6 +42,9 @@
 
 ## `tunnelproxy-agent`
 
+**Current implementation:** Outbound handshake/heartbeat plus a one-active-
+stream bridge to one configured local TCP service.
+
 **Responsibility (future)**
 
 - Initiate outbound tunnel to Edge (INV-001).
@@ -54,6 +60,9 @@
 - Persisting user data beyond what the runtime strictly needs.
 
 ## `tunnelproxy-edge`
+
+**Current implementation:** TCP baselines, bounded forwarder, Agent transport,
+and loopback-only one-active-stream raw TCP ingress.
 
 **Responsibility (future)**
 

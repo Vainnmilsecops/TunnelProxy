@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Heartbeat, Liveness & Dead-Session Detection** (Session 07).
+**Single-Stream Reverse Data Path** (Session 08).
 
 ## Completed
 
@@ -32,20 +32,39 @@
   released through RAII on every close/failure path.
 - Structured heartbeat tracing includes session ID, peer, sequence, RTT, and
   close reason without logging payload bytes.
+- Protocol stream lifecycle: Edge OPEN_STREAM request, Agent OPEN_STREAM
+  acknowledgment, binary DATA, directional END_STREAM, and typed RESET_STREAM.
+- `SingleStreamEdgeRuntime` binds separate loopback Agent and raw-TCP ingress
+  listeners and supports exactly one active stream.
+- Agent `run_with_local_target` connects an opened stream to one configured
+  local TCP service under a deadline.
+- Fixed 16 KiB reads, 64 KiB protocol frame ceiling, sequential writes, and no
+  unbounded application queues.
+- Stream IDs start at 1, increase without reuse/wrap, and support sequential
+  stream reuse on one Agent session.
+- TCP half-close is preserved independently in both directions.
+- Stream-open timeout (5 s default), local-connect timeout supplied by Agent,
+  and active-stream idle timeout (60 s default).
+- Heartbeat remains live while DATA frames are flowing or a local service is
+  slow. Stream failure/reset cleans up only that stream.
+- 10 real-TCP Session 08 integration tests cover golden path, 256 KiB binary
+  traffic, half-close, sequential reuse, monotonic IDs, busy admission,
+  heartbeat interleaving, idle timeout, local-connect failure, and lifecycle
+  violations.
 - 20 Agent transport integration tests cover the handshake and heartbeat paths.
-- 94 explicit workspace tests are present (80 through Session 06 plus 14 for
-  Session 07).
-- Prior Session 01–06 capabilities and tests are preserved.
+- 112 explicit workspace tests are present (94 through Session 07 plus 18 for
+  Session 08).
+- Prior Session 01–07 capabilities and tests are preserved.
 
 ## Not implemented
 
 - TLS / encryption.
 - Agent authentication.
 - Reconnect logic.
-- Stream multiplexing (`OPEN_STREAM` / `DATA` frames have no runtime yet).
+- Concurrent stream multiplexing and flow-control windows.
 - Tunnel registration (REGISTER is ephemeral transport registration only).
 - Public tunnel endpoints / hostname allocation.
-- Traffic forwarding / reverse tunneling.
+- Public HTTP/TLS reverse proxy and raw public ingress.
 - Durable Agent identity (`TunnelId`, `AgentId`).
 - Upstream connection pool (DEBT-008 open).
 - Graceful shutdown channel on listeners (DEBT-005 / DEBT-012 open).
@@ -55,11 +74,12 @@
 
 ## Next planned session
 
-**Session 08 — Single-Stream Reverse Data Path.**
+**Session 09 — Bounded Stream Multiplexing & Session Routing.**
 
 Goals:
 
-- Implement one `OPEN_STREAM` / `DATA` / `END_STREAM` flow without multiplexing.
-- Forward one Edge-side TCP connection through the Agent to one local port.
-- Preserve half-close, bounded buffers, cancellation, and per-stream cleanup.
-- Keep multiplexing, public HTTP ingress, TLS, and reconnect out of scope.
+- Replace the single-active-stream state with a bounded concurrent stream map.
+- Introduce one reader task and one bounded writer queue per Agent transport.
+- Add per-stream cancellation, capacity admission, and fair dispatch.
+- Keep public HTTP/TLS ingress, durable routing, authentication, and reconnect
+  out of scope until multiplexing is proven over raw TCP.

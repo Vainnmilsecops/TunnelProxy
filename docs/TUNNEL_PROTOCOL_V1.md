@@ -74,33 +74,30 @@ streams over a single TCP connection.
 stream-scoped frame with `stream_id == 0`, or a control-scoped frame with
 `stream_id > 0`, is a protocol error.
 
-> **Note:** Stream multiplexing is **not implemented** in Session 05.
-> The stream ID field and scope rules exist now so that the protocol
-> foundation is correct before the multiplexing runtime is added.
+> **Note:** Session 08 activates the stream lifecycle for one active stream.
+> Concurrent stream multiplexing is still not implemented.
 
 ## Frame Types
 
 | Value   | Name           | Scope      | Payload semantics |
 |---------|----------------|------------|-------------------|
-| `0x01`  | `HELLO`        | Control    | Not yet defined.  |
-| `0x02`  | `REGISTER`     | Control    | Not yet defined.  |
-| `0x03`  | `REGISTERED`   | Control    | Not yet defined.  |
-| `0x10`  | `OPEN_STREAM`  | Stream     | Not yet defined.  |
-| `0x11`  | `DATA`         | Stream     | Not yet defined.  |
-| `0x12`  | `END_STREAM`   | Stream     | Not yet defined.  |
-| `0x13`  | `RESET_STREAM` | Stream     | Not yet defined.  |
+| `0x01`  | `HELLO`        | Control    | 1-byte role. |
+| `0x02`  | `REGISTER`     | Control    | Empty in v1. |
+| `0x03`  | `REGISTERED`   | Control    | 8-byte non-zero session ID. |
+| `0x10`  | `OPEN_STREAM`  | Stream     | Empty request/acknowledgment payload. |
+| `0x11`  | `DATA`         | Stream     | Non-empty binary bytes, maximum 64 KiB. |
+| `0x12`  | `END_STREAM`   | Stream     | Empty directional half-close. |
+| `0x13`  | `RESET_STREAM` | Stream     | 2-byte big-endian reset code. |
 | `0x20`  | `PING`         | Control    | 8-byte non-zero heartbeat sequence. |
 | `0x21`  | `PONG`         | Control    | Echoes the matching PING sequence. |
-| `0xFF`  | `ERROR`        | Control    | Not yet defined.  |
+| `0xFF`  | `ERROR`        | Control    | 2-byte state-dependent error code. |
 
 Frame types are defined as stable numeric constants. Unknown frame type
 bytes are rejected with `ProtocolError::UnknownFrameType` — they are not
 silently mapped to a default variant.
 
-**Payload schemas for each frame type are not yet defined.** The payload
-field is opaque binary bytes in Session 05. Future sessions will introduce
-typed payload structures (e.g. JSON, protobuf, or a custom binary schema)
-as the Agent ↔ Edge handshake is designed.
+Payload interpretation is state-dependent, but every currently implemented
+frame type has a fixed schema described below.
 
 ### Session 06 Payload Schemas
 
@@ -113,8 +110,6 @@ Session 06 defines the payload schemas for the handshake frame types:
 | `0x03` | `REGISTERED` | Control | 8 bytes big-endian: `TransportSessionId` (non-zero). |
 | `0xFF` | `ERROR`      | Control | 2 bytes big-endian: error code (see below). |
 
-All other frame type payloads remain undefined in Session 06.
-
 ### Session 07 Heartbeat Payloads
 
 PING and PONG both carry exactly 8 bytes: a non-zero `u64` heartbeat
@@ -122,6 +117,23 @@ sequence encoded in big-endian order. Edge initiates PING and permits only
 one outstanding sequence. Agent responds with PONG carrying the identical
 payload. Zero, malformed lengths, mismatched PONG, unsolicited PONG, and
 Agent-initiated PING are protocol violations that close the session.
+
+### Session 08 Stream Payloads
+
+Edge alone allocates monotonically increasing non-zero stream IDs and sends an
+empty `OPEN_STREAM`. After connecting to its configured local service, Agent
+echoes an empty `OPEN_STREAM` with the same ID as acknowledgment. Edge does not
+forward ingress bytes before this acknowledgment.
+
+`DATA` carries arbitrary non-empty binary bytes. Runtime producers use a fixed
+16 KiB read buffer, while the protocol-wide 64 KiB maximum remains enforced by
+the codec. `END_STREAM` has an empty payload and closes only the sender's data
+direction; the opposite direction remains usable until it also sends
+`END_STREAM`. `RESET_STREAM` carries exactly one known two-byte reset code and
+aborts only that logical stream.
+
+Session 08 permits one active stream per Agent transport and allows sequential
+reuse after cleanup. Heartbeat frames remain valid while a stream is active.
 
 ## Payload Maximum
 
@@ -235,7 +247,21 @@ registry. Decoding is state-dependent because the payload remains a compact
 | 3 | `UnsolicitedPong` | PONG arrived while no PING was outstanding. |
 | 4 | `AgentPingNotSupported` | Agent initiated PING in the Edge-initiated v1 model. |
 | 5 | `InvalidHeartbeatPayload` | PING/PONG payload is not one non-zero 8-byte sequence. |
-| 6 | `UnexpectedFrame` | A non-heartbeat frame arrived before traffic streams are supported. |
+| 6 | `UnexpectedFrame` | A frame arrived in a control-session state where it is not permitted. |
+
+### Stream Reset Codes
+
+RESET_STREAM uses a state-independent two-byte big-endian code:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | `LocalConnectFailed` | Agent could not connect to the configured local service. |
+| 2 | `LocalConnectTimeout` | Agent's local connect deadline expired. |
+| 3 | `IoFailure` | Local or ingress stream I/O failed. |
+| 4 | `ProtocolViolation` | Stream lifecycle, ID, or payload was invalid. |
+| 5 | `StreamBusy` | A second open was attempted while one stream was active. |
+| 6 | `OpenTimeout` | Edge did not receive Agent's open acknowledgment. |
+| 7 | `IdleTimeout` | The active stream made no application-data progress. |
 
 ## Security Considerations
 
@@ -255,14 +281,11 @@ Protocol v1 framing does **not** include:
 
 - TLS or encryption.
 - Agent authentication or credentials.
-- Stream multiplexing runtime (stream IDs exist as a concept but the
-  demultiplexing logic is not implemented).
+- Concurrent stream multiplexing and flow-control windows.
 - Reconnect logic.
 - HTTP, WebSocket, or any higher-layer protocol.
-- Payload schemas for frame types other than HELLO, REGISTER, REGISTERED,
-  PING, PONG, and ERROR.
 - Tunnel registration, hostname allocation, or durable identity.
-- Traffic forwarding / reverse tunneling.
+- Public HTTP/TLS traffic routing; Session 08 is raw TCP loopback only.
 
 ## Dependencies
 

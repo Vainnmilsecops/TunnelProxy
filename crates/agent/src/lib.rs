@@ -16,8 +16,10 @@
 //! The agent NEVER accepts inbound connections from the public internet
 //! (INV-001). All sockets in this crate are outbound.
 //!
-//! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Reconnect,
-//! stream multiplexing, and local forwarding remain unimplemented. See
+//! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Session 08
+//! adds a loopback-tested single-stream local TCP bridge through
+//! `AgentSession::run_with_local_target`; concurrent multiplexing remains out
+//! of scope, as do reconnect and the final CLI. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]

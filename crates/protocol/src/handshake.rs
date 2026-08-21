@@ -285,7 +285,7 @@ pub enum HeartbeatErrorCode {
     AgentPingNotSupported = 4,
     /// PING or PONG payload was not exactly one non-zero 8-byte sequence.
     InvalidHeartbeatPayload = 5,
-    /// A non-heartbeat frame was received before stream traffic is supported.
+    /// A frame was received in a control-session state where it is not allowed.
     UnexpectedFrame = 6,
 }
 

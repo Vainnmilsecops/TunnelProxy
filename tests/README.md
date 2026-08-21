@@ -30,6 +30,6 @@ cargo test --test edge_tcp -p tunnelproxy-edge
 ## What these tests are not
 
 The per-crate integration suites now exercise TCP echo/relay/forwarding,
-Tunnel Protocol framing, Agent ↔ Edge handshake, and heartbeat liveness.
-They still do **not** exercise a reverse traffic stream, public HTTP ingress,
-TLS, authentication, durable tunnel registration, or multiplexing.
+Tunnel Protocol framing, Agent ↔ Edge handshake, heartbeat liveness, and the
+single-stream reverse TCP data path. They still do **not** exercise public HTTP
+ingress, TLS, authentication, durable tunnel registration, or multiplexing.

@@ -36,7 +36,7 @@ pub enum FrameType {
     Registered = 0x03,
 
     // --- Stream lifecycle (stream, stream_id > 0) ---
-    /// Initiates a new logical stream on an established connection.
+    /// Opens or acknowledges a logical stream on an established connection.
     ///
     /// Scope: stream (`stream_id > 0`).
     OpenStream = 0x10,
@@ -46,7 +46,7 @@ pub enum FrameType {
     /// Scope: stream (`stream_id > 0`).
     Data = 0x11,
 
-    /// Graceful end of a stream; no more data will be sent.
+    /// Graceful directional end; the sender will emit no more DATA.
     ///
     /// Scope: stream (`stream_id > 0`).
     EndStream = 0x12,

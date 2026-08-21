@@ -3,20 +3,25 @@
 //! This module implements the Agent runtime for connecting to Edge,
 //! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
 //! and maintaining the established session by answering Edge-initiated
-//! heartbeat PING frames with matching PONG frames.
+//! heartbeat PING frames with matching PONG frames. Session 08 also bridges one
+//! active framed stream to a configured local TCP service.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatErrorCode, HeartbeatSequence,
-    ProtocolError, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE, REGISTERED_PAYLOAD_SIZE, ROLE_AGENT,
+    ProtocolError, StreamId, StreamResetCode, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE,
+    REGISTERED_PAYLOAD_SIZE, ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
 };
+
+/// Fixed application-data read buffer used by the single-stream bridge.
+pub const STREAM_IO_BUFFER_SIZE: usize = 16 * 1024;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -179,6 +184,64 @@ impl AgentSession {
         }
     }
 
+    /// Runs heartbeat plus the Session 08 single-stream reverse data path.
+    ///
+    /// Edge may open one stream at a time. For each accepted `OPEN_STREAM`, the
+    /// Agent connects to `local_addr`, echoes `OPEN_STREAM` as acknowledgment,
+    /// then relays bounded `DATA` frames until both directions send
+    /// `END_STREAM` or either side resets the stream. The transport returns to
+    /// idle after cleanup, allowing another stream to be opened sequentially.
+    pub async fn run_with_local_target(
+        &mut self,
+        local_addr: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<AgentSessionCloseReason, AgentError> {
+        if connect_timeout.is_zero() {
+            return Err(AgentError::ProtocolViolation {
+                reason: "local connect timeout must be greater than zero",
+            });
+        }
+
+        let mut decoder = FrameDecoder::new();
+        loop {
+            let frame = match decoder
+                .decode(&mut self.socket)
+                .await
+                .map_err(AgentError::ProtocolDecode)?
+            {
+                Some(frame) => frame,
+                None => return Ok(AgentSessionCloseReason::PeerClosed),
+            };
+
+            match frame.frame_type {
+                FrameType::Ping => self.respond_to_ping(frame).await?,
+                FrameType::OpenStream => {
+                    if !frame.payload.is_empty() {
+                        self.send_stream_reset(frame.stream_id, StreamResetCode::ProtocolViolation)
+                            .await?;
+                        continue;
+                    }
+                    self.drive_local_stream(
+                        &mut decoder,
+                        frame.stream_id,
+                        local_addr,
+                        connect_timeout,
+                    )
+                    .await?;
+                }
+                FrameType::Error => {
+                    let error = decode_heartbeat_error(&frame);
+                    let _ = self.socket.shutdown().await;
+                    return Err(error);
+                }
+                frame_type => {
+                    let _ = self.socket.shutdown().await;
+                    return Err(AgentError::UnexpectedFrame { frame_type });
+                }
+            }
+        }
+    }
+
     /// Gracefully closes the Agent's TCP write side.
     pub async fn close(&mut self) -> Result<AgentSessionCloseReason, AgentError> {
         self.socket
@@ -238,6 +301,194 @@ impl AgentSession {
         );
         Ok(())
     }
+
+    async fn drive_local_stream(
+        &mut self,
+        decoder: &mut FrameDecoder,
+        stream_id: StreamId,
+        local_addr: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<(), AgentError> {
+        info!(
+            edge = %self.edge_addr,
+            session_id = %self.session_id,
+            stream_id = stream_id.get(),
+            local = %local_addr,
+            event = "stream_open_received",
+            "single-stream open request received"
+        );
+
+        let mut local = match timeout(connect_timeout, TcpStream::connect(local_addr)).await {
+            Ok(Ok(socket)) => socket,
+            Ok(Err(error)) => {
+                warn!(
+                    edge = %self.edge_addr,
+                    session_id = %self.session_id,
+                    stream_id = stream_id.get(),
+                    error = %error,
+                    event = "stream_local_connect_failed",
+                    "local service connection failed"
+                );
+                self.send_stream_reset(stream_id, StreamResetCode::LocalConnectFailed)
+                    .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    edge = %self.edge_addr,
+                    session_id = %self.session_id,
+                    stream_id = stream_id.get(),
+                    event = "stream_local_connect_timeout",
+                    "local service connection timed out"
+                );
+                self.send_stream_reset(stream_id, StreamResetCode::LocalConnectTimeout)
+                    .await?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = local.set_nodelay(true) {
+            warn!(error = %error, stream_id = stream_id.get(), "failed to set local TCP_NODELAY");
+        }
+
+        self.send_stream_frame(stream_id, FrameType::OpenStream, Vec::new())
+            .await?;
+        info!(
+            edge = %self.edge_addr,
+            session_id = %self.session_id,
+            stream_id = stream_id.get(),
+            local = %local_addr,
+            event = "stream_local_connected",
+            "local service connected and stream acknowledged"
+        );
+
+        let mut buffer = [0_u8; STREAM_IO_BUFFER_SIZE];
+        let mut edge_to_local_open = true;
+        let mut local_to_edge_open = true;
+        let mut bytes_edge_to_local = 0_u64;
+        let mut bytes_local_to_edge = 0_u64;
+
+        while edge_to_local_open || local_to_edge_open {
+            tokio::select! {
+                incoming = decoder.decode(&mut self.socket) => {
+                    let frame = match incoming.map_err(AgentError::ProtocolDecode)? {
+                        Some(frame) => frame,
+                        None => return Err(AgentError::ConnectionClosed),
+                    };
+                    match frame.frame_type {
+                        FrameType::Ping => self.respond_to_ping(frame).await?,
+                        FrameType::Data => {
+                            if frame.stream_id != stream_id || frame.payload.is_empty() || !edge_to_local_open {
+                                self.send_stream_reset(frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                                return Err(AgentError::ProtocolViolation {
+                                    reason: "invalid DATA frame for active stream",
+                                });
+                            }
+                            if let Err(error) = local.write_all(&frame.payload).await {
+                                warn!(stream_id = stream_id.get(), error = %error, event = "stream_local_io_failed", "local stream write failed");
+                                self.send_stream_reset(stream_id, StreamResetCode::IoFailure).await?;
+                                return Ok(());
+                            }
+                            bytes_edge_to_local = bytes_edge_to_local.saturating_add(frame.payload.len() as u64);
+                        }
+                        FrameType::EndStream => {
+                            if frame.stream_id != stream_id || !frame.payload.is_empty() || !edge_to_local_open {
+                                self.send_stream_reset(frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                                return Err(AgentError::ProtocolViolation {
+                                    reason: "invalid END_STREAM frame for active stream",
+                                });
+                            }
+                            if let Err(error) = local.shutdown().await {
+                                warn!(stream_id = stream_id.get(), error = %error, event = "stream_local_io_failed", "local stream half-close failed");
+                                self.send_stream_reset(stream_id, StreamResetCode::IoFailure).await?;
+                                return Ok(());
+                            }
+                            edge_to_local_open = false;
+                            info!(stream_id = stream_id.get(), event = "stream_half_closed", direction = "edge_to_local", "stream direction closed");
+                        }
+                        FrameType::ResetStream => {
+                            if frame.stream_id != stream_id {
+                                self.send_stream_reset(frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                                return Err(AgentError::ProtocolViolation {
+                                    reason: "RESET_STREAM used the wrong stream ID",
+                                });
+                            }
+                            let Some(code) = decode_stream_reset(&frame) else {
+                                self.send_stream_reset(stream_id, StreamResetCode::ProtocolViolation).await?;
+                                return Err(AgentError::ProtocolViolation {
+                                    reason: "RESET_STREAM payload must be a known two-byte code",
+                                });
+                            };
+                            info!(stream_id = stream_id.get(), reset_code = ?code, event = "stream_reset_received", "stream reset by Edge");
+                            return Ok(());
+                        }
+                        FrameType::OpenStream => {
+                            self.send_stream_reset(frame.stream_id, StreamResetCode::StreamBusy).await?;
+                        }
+                        frame_type => {
+                            self.send_stream_reset(stream_id, StreamResetCode::ProtocolViolation).await?;
+                            return Err(AgentError::UnexpectedFrame { frame_type });
+                        }
+                    }
+                }
+                read = local.read(&mut buffer), if local_to_edge_open => {
+                    match read {
+                        Ok(0) => {
+                            self.send_stream_frame(stream_id, FrameType::EndStream, Vec::new()).await?;
+                            local_to_edge_open = false;
+                            info!(stream_id = stream_id.get(), event = "stream_half_closed", direction = "local_to_edge", "stream direction closed");
+                        }
+                        Ok(read) => {
+                            self.send_stream_frame(stream_id, FrameType::Data, buffer[..read].to_vec()).await?;
+                            bytes_local_to_edge = bytes_local_to_edge.saturating_add(read as u64);
+                        }
+                        Err(error) => {
+                            warn!(stream_id = stream_id.get(), error = %error, event = "stream_local_io_failed", "local stream read failed");
+                            self.send_stream_reset(stream_id, StreamResetCode::IoFailure).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            edge = %self.edge_addr,
+            session_id = %self.session_id,
+            stream_id = stream_id.get(),
+            bytes_edge_to_local,
+            bytes_local_to_edge,
+            event = "stream_closed",
+            "single stream completed"
+        );
+        Ok(())
+    }
+
+    async fn send_stream_frame(
+        &mut self,
+        stream_id: StreamId,
+        frame_type: FrameType,
+        payload: Vec<u8>,
+    ) -> Result<(), AgentError> {
+        let frame =
+            Frame::stream(stream_id, frame_type, payload).map_err(AgentError::ProtocolDecode)?;
+        FrameEncoder::encode(&mut self.socket, &frame)
+            .await
+            .map(|_| ())
+            .map_err(AgentError::ProtocolDecode)
+    }
+
+    async fn send_stream_reset(
+        &mut self,
+        stream_id: StreamId,
+        code: StreamResetCode,
+    ) -> Result<(), AgentError> {
+        self.send_stream_frame(
+            stream_id,
+            FrameType::ResetStream,
+            code.to_be_bytes().to_vec(),
+        )
+        .await
+    }
 }
 
 fn decode_heartbeat_error(frame: &Frame) -> AgentError {
@@ -248,6 +499,13 @@ fn decode_heartbeat_error(frame: &Frame) -> AgentError {
         None
     };
     AgentError::HeartbeatRejected { code }
+}
+
+fn decode_stream_reset(frame: &Frame) -> Option<StreamResetCode> {
+    if frame.payload.len() as u32 != STREAM_RESET_PAYLOAD_SIZE {
+        return None;
+    }
+    StreamResetCode::from_be_bytes([frame.payload[0], frame.payload[1]])
 }
 
 // ---------------------------------------------------------------------------

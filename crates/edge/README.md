@@ -22,5 +22,7 @@ Future TunnelProxy public ingress and live tunnel routing.
 The crate contains tested TCP echo/relay primitives, a bounded local forwarder,
 and the protocol-aware Agent transport listener. The listener performs the v1
 handshake, bounds concurrent sessions, and uses Edge-initiated PING/PONG to
-remove dead sessions. Public HTTP ingress, TLS, authentication, durable routing,
-and reverse traffic streams are not implemented yet.
+remove dead sessions. Session 08 adds a loopback-only `SingleStreamEdgeRuntime`
+that forwards one active raw TCP ingress through an Agent while allowing
+sequential stream reuse. Public HTTP ingress, TLS, authentication, durable
+routing, and concurrent stream multiplexing are not implemented yet.

@@ -301,3 +301,40 @@ Out of scope:
 - Reverse traffic forwarding and public HTTP ingress.
 - TLS, Agent authentication, durable tunnel registration, and hostnames.
 - Listener graceful shutdown and relay-path idle timeout.
+
+## Session 08 — Single-Stream Reverse Data Path — complete
+
+Scope delivered:
+
+- Activated Protocol v1 stream semantics without changing the reserved frame
+  numbers or 16-byte header: empty OPEN_STREAM request/acknowledgment,
+  non-empty binary DATA, empty directional END_STREAM, and two-byte typed
+  RESET_STREAM.
+- Added seven reset categories: local connect failure/timeout, I/O failure,
+  protocol violation, stream busy, open timeout, and idle timeout.
+- Added Agent `run_with_local_target(local_addr, connect_timeout)`, which
+  connects one opened stream to a configured local TCP service and returns to
+  idle after stream cleanup.
+- Added loopback-only `SingleStreamEdgeRuntime` with separate Agent and raw TCP
+  ingress listeners. Exactly one Agent and one active stream are permitted.
+- Edge allocates monotonic non-zero stream IDs. A transport can serve multiple
+  streams sequentially without ID reuse.
+- Preserved directional TCP half-close and kept Edge heartbeat live while a
+  stream is active.
+- Bounded application reads at 16 KiB, retained the 64 KiB codec ceiling, used
+  sequential writes, and introduced no unbounded queues.
+- Added stream-open and stream-idle deadlines plus the existing Agent local
+  connect deadline. Failures reset only the affected stream when the transport
+  remains valid.
+- Added 18 tests: 2 protocol unit tests, 6 Edge configuration tests, and 10
+  real-TCP integration tests. The workspace contains 112 explicit tests.
+- Updated protocol, architecture, transport, current-state, decision,
+  test-matrix, technical-debt, and crate documentation.
+
+Out of scope:
+
+- Concurrent stream multiplexing and flow-control windows.
+- Public HTTP/HTTPS ingress, TLS termination, hostname allocation, and routing.
+- Agent authentication, durable registration/identity, and control-plane state.
+- Reconnect and exponential backoff.
+- Production CLI wiring, graceful process shutdown, and multi-edge operation.

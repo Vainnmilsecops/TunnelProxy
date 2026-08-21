@@ -94,7 +94,9 @@
   never sends bytes or EOF. INV-005 explicitly requires timeouts
   on long-running network operations. Session 04 added the
   upstream-connect timeout (closes DEBT-007) but did not add an
-  idle read deadline.
+  idle read deadline. Session 08's new single-stream path does have a
+  configurable application-data idle deadline; this debt remains for the
+  legacy echo/forwarder paths only.
 - **Exit plan:** Wrap `copy_bidirectional` (or its driving
   half-copies) in a configurable idle deadline that aborts the
   relay without leaking sockets or the semaphore permit. Document
@@ -151,22 +153,36 @@
   there are real production workloads to measure.
 - **Tracking:** open.
 
-### DEBT-012 — No graceful shutdown for Agent transport listener
+### DEBT-012 — No graceful shutdown for Agent transport runtimes
 
 - **Introduced in:** Session 06
 - **Category:** ops
 - **Impact:** medium
-- **Rationale:** `AgentTransportListener::run` executes an infinite
-  accept loop and only returns when `accept` itself errors. There is
-  no signal-driven graceful-shutdown path and no cancellation token
-  passed to spawned session tasks. In production we need clean draining
-  of in-flight connections on SIGTERM.
+- **Rationale:** `AgentTransportListener::run` executes an infinite accept loop
+  and `SingleStreamEdgeRuntime::run` owns long-lived listeners/session state.
+  Neither has a signal-driven graceful-shutdown path or cancellation token. In
+  production we need clean draining of in-flight connections on SIGTERM.
 - **Exit plan:** Add a `tokio::sync::watch` or `CancellationToken`
   channel that `AgentTransportListener::run` selects on alongside
   `accept`, and that in-flight `agent_session_task` tasks also
   observe to abort their copies cleanly. DEBT-005 applies the same
   fix to `Forwarder::run`.
 - **Tracking:** Session 07+ plan, `docs/ai/SESSION_INDEX.md`.
+
+### DEBT-013 — Single-stream runtime rejects concurrent ingress
+
+- **Introduced in:** Session 08
+- **Category:** correctness
+- **Impact:** high for production, low for the bounded vertical slice
+- **Rationale:** `SingleStreamEdgeRuntime` deliberately permits one connected
+  Agent and one active logical stream. A second ingress is closed immediately.
+  This isolates frame lifecycle, half-close, heartbeat interleaving, and
+  backpressure before introducing concurrent socket ownership.
+- **Exit plan:** Replace the single active state with a bounded per-session
+  stream registry, one reader task, one bounded writer queue, per-stream
+  cancellation, and explicit capacity/fairness policy. Preserve the Session 08
+  wire payloads.
+- **Tracking:** Session 09 plan, `docs/ai/SESSION_INDEX.md`.
 
 ## Resolved items
 
