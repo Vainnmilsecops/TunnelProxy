@@ -18,7 +18,7 @@
 //! AWAIT_REGISTER  --timeout/EOF/wrong_frame --> CLOSED
 //!     |
 //!     v  (valid REGISTER received)
-//! ESTABLISHED  --EOF/error--> CLOSED
+//! ESTABLISHED  --heartbeat timeout/violation/EOF/error--> CLOSED
 //! ```
 //!
 //! The permit from the capacity semaphore is held for the entire lifetime
@@ -30,14 +30,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use tunnelproxy_protocol::{
-    Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, ProtocolError,
-    TransportSessionId, HELLO_PAYLOAD_SIZE, ROLE_AGENT,
+    Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, HeartbeatErrorCode,
+    HeartbeatSequence, ProtocolError, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE,
+    HELLO_PAYLOAD_SIZE, ROLE_AGENT,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,12 @@ pub const DEFAULT_MAX_AGENT_SESSIONS: usize = 50;
 /// Default handshake timeout (how long Edge waits for a complete handshake).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default delay between successful heartbeat exchanges.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Default maximum time Edge waits for the matching PONG.
+pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration for an [`AgentTransportListener`].
 #[derive(Debug, Clone)]
 pub struct AgentListenerConfig {
@@ -68,15 +75,22 @@ pub struct AgentListenerConfig {
     /// Maximum time to wait for a complete handshake after TCP acceptance.
     /// Does not limit established session lifetime.
     pub handshake_timeout: Duration,
+    /// Delay before the first PING and after each valid PONG.
+    pub heartbeat_interval: Duration,
+    /// Maximum time to wait for the PONG matching an outstanding PING.
+    pub pong_timeout: Duration,
 }
 
 impl AgentListenerConfig {
-    /// Development defaults: bind `127.0.0.1:0` (ephemeral port), 50 sessions, 10 s handshake.
+    /// Development defaults: bind `127.0.0.1:0` (ephemeral port), 50 sessions,
+    /// 10 s handshake timeout, 15 s heartbeat interval, and 10 s PONG timeout.
     pub fn dev_defaults() -> Self {
         Self {
             listen_addr: "127.0.0.1:0".parse().expect("hardcoded default is valid"),
             max_agent_sessions: DEFAULT_MAX_AGENT_SESSIONS,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            pong_timeout: DEFAULT_PONG_TIMEOUT,
         }
     }
 
@@ -87,6 +101,12 @@ impl AgentListenerConfig {
         }
         if self.handshake_timeout.is_zero() {
             return Err(AgentListenerConfigError::ZeroHandshakeTimeout);
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(AgentListenerConfigError::ZeroHeartbeatInterval);
+        }
+        if self.pong_timeout.is_zero() {
+            return Err(AgentListenerConfigError::ZeroPongTimeout);
         }
         Ok(())
     }
@@ -99,6 +119,10 @@ pub enum AgentListenerConfigError {
     ZeroMaxSessions,
     /// `handshake_timeout` must be a positive duration.
     ZeroHandshakeTimeout,
+    /// `heartbeat_interval` must be a positive duration.
+    ZeroHeartbeatInterval,
+    /// `pong_timeout` must be a positive duration.
+    ZeroPongTimeout,
 }
 
 impl std::fmt::Display for AgentListenerConfigError {
@@ -108,6 +132,10 @@ impl std::fmt::Display for AgentListenerConfigError {
             Self::ZeroHandshakeTimeout => {
                 f.write_str("handshake_timeout must be greater than zero")
             }
+            Self::ZeroHeartbeatInterval => {
+                f.write_str("heartbeat_interval must be greater than zero")
+            }
+            Self::ZeroPongTimeout => f.write_str("pong_timeout must be greater than zero"),
         }
     }
 }
@@ -120,11 +148,10 @@ impl std::error::Error for AgentListenerConfigError {}
 
 /// Process-local allocator for [`TransportSessionId`].
 ///
-/// Wraps an `AtomicU64` counter starting at 0; allocating returns
-/// `fetch_add(1) + 1`, so the first issued ID is 1. Zero is reserved
-/// as invalid. If wraparound ever returns zero (after 2^64 allocations),
-/// the allocator retries once. If the retry also returns zero, `None`
-/// is returned — a safe failure rather than a silent zero-ID session.
+/// Wraps an `AtomicU64` counter starting at 0; checked allocation makes the
+/// first issued ID 1. Zero is reserved
+/// as invalid. The atomic update uses checked addition, so exhaustion at
+/// `u64::MAX` returns `None` instead of wrapping or reusing an ID.
 #[derive(Debug, Default)]
 pub struct TransportSessionIdAllocator {
     counter: AtomicU64,
@@ -140,14 +167,15 @@ impl TransportSessionIdAllocator {
 
     /// Allocates and returns the next [`TransportSessionId`].
     ///
-    /// Returns `None` if the allocator would return zero (wraparound edge
-    /// case after 2^64 allocations — safe failure, not a silent zero-ID).
+    /// Returns `None` when the sequence space is exhausted.
     pub fn next_id(&self) -> Option<TransportSessionId> {
-        let raw = self
+        let previous = self
             .counter
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        TransportSessionId::new(raw)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()?;
+        previous.checked_add(1).and_then(TransportSessionId::new)
     }
 }
 
@@ -195,6 +223,17 @@ pub enum AgentTransportError {
     UnexpectedEof { state: HandshakeState },
     /// I/O error during the established session (post-handshake).
     SessionIo(std::io::Error),
+    /// The Agent did not return the matching PONG before the deadline.
+    HeartbeatTimeout { sequence: HeartbeatSequence },
+    /// The Agent returned a PONG for a different sequence.
+    HeartbeatSequenceMismatch {
+        expected: HeartbeatSequence,
+        got: HeartbeatSequence,
+    },
+    /// PING or PONG payload was not exactly one non-zero sequence.
+    InvalidHeartbeatPayload { frame_type: FrameType },
+    /// Sequence space was exhausted instead of wrapping to zero.
+    HeartbeatSequenceExhausted,
 }
 
 impl std::fmt::Display for AgentTransportError {
@@ -207,6 +246,19 @@ impl std::fmt::Display for AgentTransportError {
             Self::ProtocolDecode(e) => write!(f, "protocol decode error: {e}"),
             Self::UnexpectedEof { state } => write!(f, "unexpected EOF in state {:?}", state),
             Self::SessionIo(e) => write!(f, "session I/O error: {e}"),
+            Self::HeartbeatTimeout { sequence } => {
+                write!(f, "heartbeat timed out waiting for {sequence}")
+            }
+            Self::HeartbeatSequenceMismatch { expected, got } => {
+                write!(
+                    f,
+                    "heartbeat sequence mismatch: expected {expected}, got {got}"
+                )
+            }
+            Self::InvalidHeartbeatPayload { frame_type } => {
+                write!(f, "invalid {frame_type:?} heartbeat payload")
+            }
+            Self::HeartbeatSequenceExhausted => f.write_str("heartbeat sequence exhausted"),
         }
     }
 }
@@ -219,8 +271,19 @@ impl std::error::Error for AgentTransportError {
             Self::ProtocolDecode(e) => Some(e),
             Self::UnexpectedEof { .. } => None,
             Self::SessionIo(e) => Some(e),
+            Self::HeartbeatTimeout { .. }
+            | Self::HeartbeatSequenceMismatch { .. }
+            | Self::InvalidHeartbeatPayload { .. }
+            | Self::HeartbeatSequenceExhausted => None,
         }
     }
+}
+
+/// Why an established Agent session stopped without an internal error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCloseReason {
+    /// Agent closed the TCP connection cleanly.
+    PeerClosed,
 }
 
 /// Established Agent transport session.
@@ -250,6 +313,14 @@ async fn send_error_and_close(socket: &mut TcpStream, code: HandshakeErrorCode) 
     };
     if FrameEncoder::encode(socket, &frame).await.is_err() {
         // Silently ignore encoding/sending errors — we're closing anyway.
+    }
+    let _ = socket.shutdown().await;
+}
+
+/// Best-effort heartbeat ERROR response followed by TCP write shutdown.
+async fn send_heartbeat_error_and_close(socket: &mut TcpStream, code: HeartbeatErrorCode) {
+    if let Ok(frame) = Frame::control(FrameType::Error, code.to_be_bytes().to_vec()) {
+        let _ = FrameEncoder::encode(socket, &frame).await;
     }
     let _ = socket.shutdown().await;
 }
@@ -290,6 +361,8 @@ impl AgentTransportListener {
             addr = %local,
             max_sessions = config.max_agent_sessions,
             handshake_timeout_ms = config.handshake_timeout.as_millis() as u64,
+            heartbeat_interval_ms = config.heartbeat_interval.as_millis() as u64,
+            pong_timeout_ms = config.pong_timeout.as_millis() as u64,
             event = "agent_transport_listener_started",
             "agent transport listener bound"
         );
@@ -320,6 +393,8 @@ impl AgentTransportListener {
         let semaphore = Arc::clone(&self.semaphore);
         let session_ids = Arc::clone(&self.session_ids);
         let handshake_timeout = self.config.handshake_timeout;
+        let heartbeat_interval = self.config.heartbeat_interval;
+        let pong_timeout = self.config.pong_timeout;
 
         loop {
             match listener.accept().await {
@@ -339,8 +414,16 @@ impl AgentTransportListener {
                                 return;
                             }
                         };
-                        agent_session_task(stream, peer, session_ids, handshake_timeout, permit)
-                            .await;
+                        agent_session_task(
+                            stream,
+                            peer,
+                            session_ids,
+                            handshake_timeout,
+                            heartbeat_interval,
+                            pong_timeout,
+                            permit,
+                        )
+                        .await;
                     });
                 }
                 Err(err) => {
@@ -362,6 +445,8 @@ async fn agent_session_task(
     peer: SocketAddr,
     session_ids: Arc<TransportSessionIdAllocator>,
     handshake_timeout: Duration,
+    heartbeat_interval: Duration,
+    pong_timeout: Duration,
     _permit: OwnedSemaphorePermit,
 ) {
     info!(peer = %peer, event = "agent_connection_accepted", "agent connection accepted");
@@ -384,26 +469,26 @@ async fn agent_session_task(
                 "agent transport session established"
             );
 
-            // For Session 06: wait for EOF or error on the established session.
-            // No traffic streams are implemented yet.
-            match socket.read_u8().await {
-                Ok(_) => {
-                    // Any frame received on an established session is unsupported in v1.
-                    warn!(
-                        peer = %peer,
-                        session_id = %session.session_id,
-                        event = "agent_session_unsupported_frame",
-                        "received unexpected frame on established session; closing"
-                    );
-                }
-                Err(e) => {
-                    // EOF or error — clean close.
+            match run_established_session(&mut socket, &session, heartbeat_interval, pong_timeout)
+                .await
+            {
+                Ok(SessionCloseReason::PeerClosed) => {
                     debug!(
                         peer = %peer,
                         session_id = %session.session_id,
-                        error = %e,
+                        close_reason = "peer_closed",
                         event = "agent_session_closed",
-                        "agent session closed"
+                        "agent session peer closed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        peer = %peer,
+                        session_id = %session.session_id,
+                        error = %e,
+                        close_reason = "heartbeat_or_protocol_failure",
+                        event = "agent_session_closed_with_failure",
+                        "agent session heartbeat or protocol failure"
                     );
                 }
             }
@@ -459,6 +544,169 @@ async fn agent_session_task(
             );
         }
     }
+}
+
+/// Runs Edge's established-session heartbeat state machine.
+async fn run_established_session(
+    socket: &mut TcpStream,
+    session: &AgentSession,
+    heartbeat_interval: Duration,
+    pong_timeout: Duration,
+) -> Result<SessionCloseReason, AgentTransportError> {
+    let mut decoder = FrameDecoder::new();
+    let mut sequence = HeartbeatSequence::FIRST;
+
+    loop {
+        let interval = tokio::time::sleep(heartbeat_interval);
+        tokio::pin!(interval);
+
+        tokio::select! {
+            incoming = decoder.decode(socket) => {
+                let frame = match incoming {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return Ok(SessionCloseReason::PeerClosed),
+                    Err(error) => return Err(AgentTransportError::ProtocolDecode(error)),
+                };
+                return reject_unsolicited_frame(socket, session, frame).await;
+            }
+            () = &mut interval => {}
+        }
+
+        let ping = Frame::control(FrameType::Ping, sequence.to_be_bytes().to_vec())
+            .expect("a heartbeat sequence is a valid control payload");
+        FrameEncoder::encode(socket, &ping).await.map_err(|error| {
+            AgentTransportError::SessionIo(std::io::Error::other(error.to_string()))
+        })?;
+        let ping_sent_at = Instant::now();
+        info!(
+            peer = %session.peer_addr,
+            session_id = %session.session_id,
+            heartbeat_sequence = sequence.get(),
+            event = "heartbeat_ping_sent",
+            "heartbeat PING sent"
+        );
+
+        let response = match tokio::time::timeout(pong_timeout, decoder.decode(socket)).await {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => return Ok(SessionCloseReason::PeerClosed),
+            Ok(Err(error)) => return Err(AgentTransportError::ProtocolDecode(error)),
+            Err(_) => {
+                error!(
+                    peer = %session.peer_addr,
+                    session_id = %session.session_id,
+                    heartbeat_sequence = sequence.get(),
+                    event = "heartbeat_timeout",
+                    "heartbeat PONG timed out"
+                );
+                send_heartbeat_error_and_close(socket, HeartbeatErrorCode::HeartbeatTimeout).await;
+                return Err(AgentTransportError::HeartbeatTimeout { sequence });
+            }
+        };
+
+        validate_pong(socket, session, response, sequence, ping_sent_at).await?;
+        sequence = sequence
+            .checked_next()
+            .ok_or(AgentTransportError::HeartbeatSequenceExhausted)?;
+    }
+}
+
+async fn reject_unsolicited_frame(
+    socket: &mut TcpStream,
+    session: &AgentSession,
+    frame: Frame,
+) -> Result<SessionCloseReason, AgentTransportError> {
+    let code = match frame.frame_type {
+        FrameType::Pong => HeartbeatErrorCode::UnsolicitedPong,
+        FrameType::Ping => HeartbeatErrorCode::AgentPingNotSupported,
+        _ => HeartbeatErrorCode::UnexpectedFrame,
+    };
+    warn!(
+        peer = %session.peer_addr,
+        session_id = %session.session_id,
+        frame_type = ?frame.frame_type,
+        event = "heartbeat_unsolicited_frame",
+        "unsolicited frame received while heartbeat was idle"
+    );
+    send_heartbeat_error_and_close(socket, code).await;
+    Err(AgentTransportError::ProtocolViolation {
+        reason: "unsolicited frame on established session",
+    })
+}
+
+async fn validate_pong(
+    socket: &mut TcpStream,
+    session: &AgentSession,
+    frame: Frame,
+    expected: HeartbeatSequence,
+    ping_sent_at: Instant,
+) -> Result<(), AgentTransportError> {
+    if frame.frame_type != FrameType::Pong {
+        let code = if frame.frame_type == FrameType::Ping {
+            HeartbeatErrorCode::AgentPingNotSupported
+        } else {
+            HeartbeatErrorCode::UnexpectedFrame
+        };
+        send_heartbeat_error_and_close(socket, code).await;
+        return Err(AgentTransportError::ProtocolViolation {
+            reason: "expected PONG after PING",
+        });
+    }
+
+    if frame.payload.len() as u32 != HEARTBEAT_PAYLOAD_SIZE {
+        warn!(
+            peer = %session.peer_addr,
+            session_id = %session.session_id,
+            payload_len = frame.payload.len(),
+            event = "heartbeat_invalid_payload",
+            "PONG payload length is invalid"
+        );
+        send_heartbeat_error_and_close(socket, HeartbeatErrorCode::InvalidHeartbeatPayload).await;
+        return Err(AgentTransportError::InvalidHeartbeatPayload {
+            frame_type: FrameType::Pong,
+        });
+    }
+
+    let mut bytes = [0_u8; HEARTBEAT_PAYLOAD_SIZE as usize];
+    bytes.copy_from_slice(&frame.payload);
+    let got = match HeartbeatSequence::from_be_bytes(bytes) {
+        Some(sequence) => sequence,
+        None => {
+            warn!(
+                peer = %session.peer_addr,
+                session_id = %session.session_id,
+                event = "heartbeat_invalid_payload",
+                "PONG sequence must be non-zero"
+            );
+            send_heartbeat_error_and_close(socket, HeartbeatErrorCode::InvalidHeartbeatPayload)
+                .await;
+            return Err(AgentTransportError::InvalidHeartbeatPayload {
+                frame_type: FrameType::Pong,
+            });
+        }
+    };
+
+    if got != expected {
+        warn!(
+            peer = %session.peer_addr,
+            session_id = %session.session_id,
+            expected_sequence = expected.get(),
+            received_sequence = got.get(),
+            event = "heartbeat_sequence_mismatch",
+            "heartbeat PONG sequence mismatch"
+        );
+        send_heartbeat_error_and_close(socket, HeartbeatErrorCode::HeartbeatSequenceMismatch).await;
+        return Err(AgentTransportError::HeartbeatSequenceMismatch { expected, got });
+    }
+
+    info!(
+        peer = %session.peer_addr,
+        session_id = %session.session_id,
+        heartbeat_sequence = got.get(),
+        rtt_ms = ping_sent_at.elapsed().as_millis() as u64,
+        event = "heartbeat_pong_received",
+        "matching heartbeat PONG received"
+    );
+    Ok(())
 }
 
 /// Performs the v1 handshake: HELLO → REGISTER → REGISTERED.
@@ -629,6 +877,7 @@ mod tests {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             max_agent_sessions: 0,
             handshake_timeout: Duration::from_secs(10),
+            ..AgentListenerConfig::dev_defaults()
         };
         assert_eq!(
             cfg.validate(),
@@ -642,10 +891,35 @@ mod tests {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             max_agent_sessions: 10,
             handshake_timeout: Duration::ZERO,
+            ..AgentListenerConfig::dev_defaults()
         };
         assert_eq!(
             cfg.validate(),
             Err(AgentListenerConfigError::ZeroHandshakeTimeout)
+        );
+    }
+
+    #[test]
+    fn agent_listener_config_rejects_zero_heartbeat_interval() {
+        let cfg = AgentListenerConfig {
+            heartbeat_interval: Duration::ZERO,
+            ..AgentListenerConfig::dev_defaults()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(AgentListenerConfigError::ZeroHeartbeatInterval)
+        );
+    }
+
+    #[test]
+    fn agent_listener_config_rejects_zero_pong_timeout() {
+        let cfg = AgentListenerConfig {
+            pong_timeout: Duration::ZERO,
+            ..AgentListenerConfig::dev_defaults()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(AgentListenerConfigError::ZeroPongTimeout)
         );
     }
 

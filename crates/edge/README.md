@@ -19,5 +19,8 @@ Future TunnelProxy public ingress and live tunnel routing.
 
 ## Current state
 
-Foundation-only. Today this is a library crate exposing only `EdgeId`.
-No sockets, no TLS, no HTTP.
+The crate contains tested TCP echo/relay primitives, a bounded local forwarder,
+and the protocol-aware Agent transport listener. The listener performs the v1
+handshake, bounds concurrent sessions, and uses Edge-initiated PING/PONG to
+remove dead sessions. Public HTTP ingress, TLS, authentication, durable routing,
+and reverse traffic streams are not implemented yet.

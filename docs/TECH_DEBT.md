@@ -151,21 +151,6 @@
   there are real production workloads to measure.
 - **Tracking:** open.
 
-### DEBT-011 — No heartbeat / liveness detection on established sessions
-
-- **Introduced in:** Session 06
-- **Category:** correctness
-- **Impact:** medium
-- **Rationale:** After the handshake, an established Agent ↔ Edge
-  transport session can hang indefinitely if the Agent crashes or the
-  network is partitioned. INV-005 requires timeouts on long-running
-  network operations. Session 06 intentionally does not add PING/PONG
-  timer behavior so the handshake can be stabilized first.
-- **Exit plan:** Add a configurable idle timeout on established
-  sessions (Session 07). Agent sends periodic PING; Edge responds with
-  PONG; missing PONG after configurable attempts closes the session.
-- **Tracking:** Session 07 plan, `docs/ai/SESSION_INDEX.md`.
-
 ### DEBT-012 — No graceful shutdown for Agent transport listener
 
 - **Introduced in:** Session 06
@@ -184,6 +169,19 @@
 - **Tracking:** Session 07+ plan, `docs/ai/SESSION_INDEX.md`.
 
 ## Resolved items
+
+### DEBT-011 — No heartbeat / liveness detection on established sessions
+
+- **Introduced in:** Session 06
+- **Resolved in:** Session 07
+- **Category:** correctness
+- **Impact:** medium
+- **Resolution:** Edge now initiates a PING carrying a monotonic non-zero
+  sequence after a configurable interval. Agent validates it and sends the
+  matching PONG. A configurable deadline closes silent sessions and releases
+  their capacity permit. Malformed, mismatched, unsolicited, or wrong-direction
+  heartbeat frames close only the affected session. Reconnect remains separate
+  future work.
 
 ### DEBT-001 — Foundation crates are placeholders only
 

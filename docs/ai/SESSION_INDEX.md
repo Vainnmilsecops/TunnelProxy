@@ -10,6 +10,7 @@
 | 04      | TCP Relay Lifecycle Hardening / Local Port Forwarding | complete |
 | 05      | Tunnel Protocol v1: Binary Framing & Message Design | complete |
 | 06      | Persistent Agent ↔ Edge Transport & Protocol Handshake | complete |
+| 07      | Heartbeat, Liveness & Dead-Session Detection   | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -242,7 +243,8 @@ Scope that was actually delivered:
   config validation, allocator monotonicity, handshake state.
 - New unit tests in `crates/protocol/src/handshake.rs` (4 tests):
   role roundtrip, session ID validity/bytes, error code roundtrip.
-- All 82 workspace tests pass (70 pre-existing + 12 new integration).
+- All 80 explicit workspace tests pass (58 pre-existing + 22 Session 06
+  protocol/unit/integration tests).
 - New `docs/AGENT_EDGE_TRANSPORT.md`: topology, handshake sequence diagram,
   payload schemas, TransportSessionId semantics, state machines, bounded
   admission, timeout semantics, disconnect behavior, ERROR codes, reader/writer
@@ -268,3 +270,34 @@ Out of scope (explicitly NOT delivered in Session 06):
 - Upstream connection pool (DEBT-008 still open).
 - Per-IP admission control (DEBT-009 still open).
 - Telemetry backend (DEBT-010 still open).
+
+## Session 07 — Heartbeat, Liveness & Dead-Session Detection — complete
+
+Scope delivered:
+
+- Protocol heartbeat contract: exported `HeartbeatSequence`,
+  `HeartbeatErrorCode`, and `HEARTBEAT_PAYLOAD_SIZE = 8`.
+- Edge-initiated PING and Agent PONG with an identical non-zero big-endian
+  sequence. Only one heartbeat is outstanding at a time.
+- Edge `AgentListenerConfig` now validates configurable heartbeat interval and
+  PONG timeout values (15 s / 10 s defaults).
+- Established sessions decode complete frames instead of reading one arbitrary
+  byte. Timeout, malformed PONG, sequence mismatch, unsolicited PONG,
+  Agent-initiated PING, and unsupported frames close only that session.
+- Agent `AgentSession::run()` drives the heartbeat responder and
+  `AgentSession::close()` exposes an explicit local close path.
+- Heartbeat timeout releases the session semaphore permit through RAII.
+- Structured heartbeat events include session, peer, sequence, RTT, and close
+  reason without logging network payloads.
+- Added 14 tests: 4 protocol unit tests, 2 Edge config tests, and 8 real-TCP
+  integration tests. The repository contains 94 explicit tests after Session 07.
+- Updated protocol, transport, current-state, test-matrix, decision, and
+  technical-debt documentation.
+
+Out of scope:
+
+- Reconnect and exponential backoff.
+- OPEN_STREAM / DATA runtime and multiplexing.
+- Reverse traffic forwarding and public HTTP ingress.
+- TLS, Agent authentication, durable tunnel registration, and hostnames.
+- Listener graceful shutdown and relay-path idle timeout.

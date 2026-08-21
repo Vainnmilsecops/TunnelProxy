@@ -19,5 +19,8 @@ Future local TunnelProxy agent / CLI runtime.
 
 ## Current state
 
-Foundation-only. Today this is a library crate exposing a single
-`build_identifier()` helper. No networking.
+The library opens an outbound TCP connection to Edge, performs the v1
+HELLO → REGISTER → REGISTERED handshake, and exposes an established
+`AgentSession`. Session 07 adds a heartbeat loop that validates Edge PING and
+returns the matching PONG. Reconnect, local-service forwarding, traffic
+streams, TLS, authentication, and the final CLI UX are not implemented yet.

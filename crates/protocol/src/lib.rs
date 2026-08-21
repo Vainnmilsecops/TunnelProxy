@@ -32,8 +32,11 @@ mod wire;
 pub use codec::{FrameDecoder, FrameEncoder};
 pub use error::ProtocolError;
 pub use frame::{Frame, FrameType, Scope, StreamId};
-pub use handshake::{HandshakeErrorCode, HelloRole, TransportSessionId, ROLE_AGENT};
+pub use handshake::{
+    HandshakeErrorCode, HeartbeatErrorCode, HeartbeatSequence, HelloRole, TransportSessionId,
+    ROLE_AGENT,
+};
 pub use wire::{
-    ERROR_PAYLOAD_SIZE, HEADER_SIZE, HELLO_PAYLOAD_SIZE, MAGIC, MAX_FRAME_PAYLOAD,
-    REGISTERED_PAYLOAD_SIZE, VERSION,
+    ERROR_PAYLOAD_SIZE, HEADER_SIZE, HEARTBEAT_PAYLOAD_SIZE, HELLO_PAYLOAD_SIZE, MAGIC,
+    MAX_FRAME_PAYLOAD, REGISTERED_PAYLOAD_SIZE, VERSION,
 };

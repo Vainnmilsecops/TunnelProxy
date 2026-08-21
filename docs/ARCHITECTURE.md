@@ -1,8 +1,8 @@
 # TunnelProxy — Architecture
 
-> Status: **architecture baseline only.** No networking is implemented.
-> This document fixes the conceptual shape so future sessions can grow
-> into it without restructuring.
+> Status: **pre-MVP transport foundation.** Local TCP primitives, protocol
+> framing, Agent → Edge handshake, and heartbeat are implemented. Public
+> reverse traffic forwarding, TLS, HTTP ingress, and durable routing are not.
 
 ## 1. High-level architecture
 
