@@ -1,0 +1,277 @@
+//! Agent-side transport: outbound connection, protocol handshake, and session management.
+//!
+//! This module implements the Agent runtime for connecting to Edge,
+//! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
+//! and maintaining the established session.
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tracing::{error, info, warn};
+
+use tunnelproxy_protocol::{
+    Frame, FrameDecoder, FrameEncoder, FrameType, ProtocolError, TransportSessionId,
+    REGISTERED_PAYLOAD_SIZE, ROLE_AGENT,
+};
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// Default Edge address the Agent connects to in development.
+#[allow(dead_code)]
+pub const DEFAULT_EDGE_ADDR: &str = "127.0.0.1:7100";
+
+/// Default connect timeout.
+#[allow(dead_code)]
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default handshake timeout (waiting for REGISTERED after sending REGISTER).
+#[allow(dead_code)]
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during an Agent transport session.
+#[derive(Debug)]
+pub enum AgentError {
+    /// Failed to establish the underlying TCP connection.
+    Connect(std::io::Error),
+    /// TCP connection timed out.
+    ConnectTimeout,
+    /// Handshake timed out before completion.
+    HandshakeTimeout,
+    /// Protocol violation detected.
+    ProtocolViolation { reason: &'static str },
+    /// Protocol decode error.
+    ProtocolDecode(ProtocolError),
+    /// Received a frame that was not expected.
+    UnexpectedFrame { frame_type: FrameType },
+    /// The REGISTERED payload was invalid.
+    InvalidRegisteredPayload { reason: &'static str },
+    /// I/O error during the established session.
+    SessionIo(std::io::Error),
+    /// The connection was closed by the peer.
+    ConnectionClosed,
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "connect failed: {e}"),
+            Self::ConnectTimeout => write!(f, "connect timed out"),
+            Self::HandshakeTimeout => write!(f, "handshake timed out"),
+            Self::ProtocolViolation { reason } => write!(f, "protocol violation: {reason}"),
+            Self::ProtocolDecode(e) => write!(f, "protocol decode error: {e}"),
+            Self::UnexpectedFrame { frame_type } => {
+                write!(f, "unexpected frame type: {frame_type:?}")
+            }
+            Self::InvalidRegisteredPayload { reason } => {
+                write!(f, "invalid REGISTERED payload: {reason}")
+            }
+            Self::SessionIo(e) => write!(f, "session I/O error: {e}"),
+            Self::ConnectionClosed => write!(f, "connection closed by peer"),
+        }
+    }
+}
+
+impl std::error::Error for AgentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(e) => Some(e),
+            Self::ProtocolDecode(e) => Some(e),
+            Self::SessionIo(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+/// An established Agent transport session after successful handshake.
+///
+/// The session owns the `TcpStream` and keeps it open. Dropping the
+/// session closes the connection.
+#[derive(Debug)]
+pub struct AgentSession {
+    /// Session identifier assigned by Edge (from the REGISTERED frame).
+    pub session_id: TransportSessionId,
+    /// Address of the connected Edge.
+    pub edge_addr: SocketAddr,
+    /// When the session was established.
+    pub established_at: Instant,
+    socket: TcpStream,
+}
+
+impl AgentSession {
+    /// Reads a single frame from the established session.
+    ///
+    /// Returns `Ok(None)` on clean EOF. Returns `Err` on protocol decode
+    /// error or I/O error.
+    ///
+    /// Note: for Session 06, no traffic frames are expected on an
+    /// established session. This method is provided for future sessions.
+    pub async fn read_frame(&mut self) -> Result<Option<Frame>, AgentError> {
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .decode(&mut self.socket)
+            .await
+            .map_err(AgentError::ProtocolDecode)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// Outcome of a connection and handshake attempt.
+#[derive(Debug)]
+pub enum ConnectOutcome {
+    /// Handshake succeeded; a live session was established.
+    Established(AgentSession),
+    /// Handshake failed; connection was closed.
+    Failed { reason: AgentError },
+}
+
+/// Connects to `edge_addr`, performs the v1 handshake, and returns an
+/// established session.
+///
+/// This is the primary public entry point. The session remains open
+/// after return. Drop the session to close it.
+///
+/// # Timeouts
+///
+/// - TCP connect: bounded by `connect_timeout`.
+/// - Full handshake: bounded by `handshake_timeout`.
+///
+/// Neither timeout limits the established session lifetime.
+pub async fn connect(
+    edge_addr: SocketAddr,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+) -> ConnectOutcome {
+    info!(edge = %edge_addr, event = "agent_connecting", "connecting to edge");
+
+    let socket = match timeout(connect_timeout, TcpStream::connect(edge_addr)).await {
+        Ok(Ok(s)) => {
+            info!(edge = %edge_addr, event = "agent_tcp_connected", "TCP connected");
+            s
+        }
+        Ok(Err(e)) => {
+            error!(edge = %edge_addr, error = %e, event = "agent_connect_error", "connect failed");
+            return ConnectOutcome::Failed {
+                reason: AgentError::Connect(e),
+            };
+        }
+        Err(_) => {
+            error!(edge = %edge_addr, event = "agent_connect_timeout", "connect timed out");
+            return ConnectOutcome::Failed {
+                reason: AgentError::ConnectTimeout,
+            };
+        }
+    };
+
+    let mut socket = socket;
+    if let Err(e) = socket.set_nodelay(true) {
+        warn!(error = %e, "failed to set TCP_NODELAY");
+    }
+
+    match timeout(handshake_timeout, perform_handshake(&mut socket, edge_addr)).await {
+        Ok(Ok(session_id)) => {
+            let session = AgentSession {
+                session_id,
+                edge_addr,
+                established_at: Instant::now(),
+                socket,
+            };
+            info!(
+                edge = %edge_addr,
+                session_id = %session.session_id,
+                event = "agent_session_established",
+                "agent transport session established"
+            );
+            ConnectOutcome::Established(session)
+        }
+        Ok(Err(e)) => {
+            error!(edge = %edge_addr, error = %e, event = "agent_handshake_failed", "handshake failed");
+            ConnectOutcome::Failed { reason: e }
+        }
+        Err(_) => {
+            error!(edge = %edge_addr, event = "agent_handshake_timeout", "handshake timed out");
+            ConnectOutcome::Failed {
+                reason: AgentError::HandshakeTimeout,
+            }
+        }
+    }
+}
+
+/// Performs the v1 handshake: HELLO → REGISTER → REGISTERED.
+async fn perform_handshake(
+    socket: &mut TcpStream,
+    edge_addr: SocketAddr,
+) -> Result<TransportSessionId, AgentError> {
+    info!(edge = %edge_addr, event = "agent_handshake_started", "starting handshake");
+
+    // --- Send HELLO ---
+    let hello_frame = Frame::control(FrameType::Hello, vec![ROLE_AGENT])
+        .expect("ROLE_AGENT is a valid single byte; qed");
+    FrameEncoder::encode(socket, &hello_frame)
+        .await
+        .map_err(|e| AgentError::SessionIo(std::io::Error::other(e.to_string())))?;
+    info!(edge = %edge_addr, event = "agent_hello_sent", "HELLO sent");
+
+    // --- Send REGISTER ---
+    let register_frame =
+        Frame::control(FrameType::Register, vec![]).expect("empty payload is always valid");
+    FrameEncoder::encode(socket, &register_frame)
+        .await
+        .map_err(|e| AgentError::SessionIo(std::io::Error::other(e.to_string())))?;
+    info!(edge = %edge_addr, event = "agent_register_sent", "REGISTER sent");
+
+    // --- Await REGISTERED ---
+    let mut decoder = FrameDecoder::new();
+    let registered_frame = match decoder.decode(socket).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err(AgentError::ConnectionClosed),
+        Err(e) => return Err(AgentError::ProtocolDecode(e)),
+    };
+
+    if registered_frame.frame_type != FrameType::Registered {
+        return Err(AgentError::UnexpectedFrame {
+            frame_type: registered_frame.frame_type,
+        });
+    }
+
+    // Validate REGISTERED payload: exactly 8 bytes, non-zero ID.
+    if registered_frame.payload.len() as u32 != REGISTERED_PAYLOAD_SIZE {
+        return Err(AgentError::InvalidRegisteredPayload {
+            reason: "REGISTERED payload must be exactly 8 bytes",
+        });
+    }
+
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&registered_frame.payload);
+    let session_id = match TransportSessionId::from_be_bytes(bytes) {
+        Some(id) => id,
+        None => {
+            return Err(AgentError::InvalidRegisteredPayload {
+                reason: "REGISTERED session ID must be non-zero",
+            });
+        }
+    };
+
+    info!(
+        edge = %edge_addr,
+        session_id = %session_id,
+        event = "agent_registered_received",
+        "REGISTERED received"
+    );
+
+    Ok(session_id)
+}

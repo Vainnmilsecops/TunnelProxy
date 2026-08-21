@@ -9,14 +9,22 @@
 //! yet; it exists to validate the byte-stream baseline and to give the
 //! integration tests something concrete to drive.
 //!
+//! Session 06 adds the Agent-side transport layer (`agent_transport`):
+//! outbound TCP connection to Edge, Tunnel Protocol v1 handshake
+//! (HELLO → REGISTER → REGISTERED), and established session management.
+//!
 //! The agent NEVER accepts inbound connections from the public internet
 //! (INV-001). All sockets in this crate are outbound.
 //!
-//! No reconnect, heartbeat, framing, registration, or local forwarding
-//! is implemented in this session. See `docs/ai/SESSION_INDEX.md` and
+//! No reconnect, heartbeat, stream multiplexing, or local forwarding
+//! is implemented in these sessions. See `docs/ai/SESSION_INDEX.md` and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
 #![deny(unsafe_code)]
+
+mod agent_transport;
+
+pub use agent_transport::{connect, AgentError, AgentSession, ConnectOutcome};
 
 use std::net::SocketAddr;
 use std::time::Duration;

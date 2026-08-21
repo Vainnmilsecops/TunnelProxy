@@ -13,3 +13,16 @@ pub const VERSION: u8 = 1;
 
 /// Maximum allowed payload size in bytes (64 KiB).
 pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
+
+// ---------------------------------------------------------------------------
+// Handshake payload sizes
+// ---------------------------------------------------------------------------
+
+/// Exact byte length of a [`FrameType::Hello`] payload (1 byte: role).
+pub const HELLO_PAYLOAD_SIZE: u32 = 1;
+
+/// Exact byte length of a [`FrameType::Registered`] payload (8 bytes: session ID).
+pub const REGISTERED_PAYLOAD_SIZE: u32 = 8;
+
+/// Exact byte length of an ERROR frame payload (2 bytes: error code).
+pub const ERROR_PAYLOAD_SIZE: u32 = 2;

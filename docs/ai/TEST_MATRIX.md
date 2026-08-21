@@ -50,7 +50,20 @@
 | Tunnel protocol: 64 KiB max payload       | ✅   | —           | —   | `frame::tests::frame_max_payload_is_exactly_64kib`. |
 | Tunnel protocol: EOF vs truncation        | ✅   | —           | —   | `codec::tests::clean_eof`, `codec::tests::truncated_header`, `codec::tests::truncated_payload`. |
 | Tunnel protocol: real loopback TCP        | ✅   | —           | —   | `codec::tests::real_tcp_loopback_roundtrip` binds a real `TcpListener` and exchanges frames over `TcpStream`. |
-| Agent ↔ Edge protocol handshake           | —    | —           | —   | Out of scope until framing exists.                                                                                          |
+| Agent ↔ Edge protocol handshake           | ✅   | ✅          | —   | Implemented in Session 06. See `docs/AGENT_EDGE_TRANSPORT.md`.                                         |
+| Agent ↔ Edge: valid handshake (HELLO → REGISTER → REGISTERED) | ✅ | ✅ | — | `valid_handshake_establishes_session`; 12 integration tests in `agent_transport.rs`. |
+| Agent ↔ Edge: invalid first frame (REGISTER before HELLO) | ✅ | ✅ | — | `invalid_first_frame_register_before_hello`. |
+| Agent ↔ Edge: invalid second frame (DATA before REGISTER) | ✅ | ✅ | — | `invalid_second_frame_data_instead_of_register`. |
+| Agent ↔ Edge: invalid HELLO (empty payload) | ✅ | ✅ | — | `invalid_hello_empty_payload`. |
+| Agent ↔ Edge: invalid HELLO (unknown role) | ✅ | ✅ | — | `invalid_hello_unknown_role`. |
+| Agent ↔ Edge: invalid REGISTER (non-empty payload) | ✅ | ✅ | — | `invalid_register_non_empty_payload`. |
+| Agent ↔ Edge: handshake timeout | ✅ | ✅ | — | `handshake_timeout_no_hello`. |
+| Agent ↔ Edge: timeout releases capacity permit | ✅ | ✅ | — | `timeout_releases_capacity`. |
+| Agent ↔ Edge: peer disconnect cleans up session | ✅ | ✅ | — | `peer_disconnect_cleans_up_session`. |
+| Agent ↔ Edge: session ID uniqueness | ✅ | ✅ | — | `session_id_uniqueness`. |
+| Agent ↔ Edge: session remains open after handshake | ✅ | ✅ | — | `session_remains_open_after_handshake`. |
+| Agent ↔ Edge: TransportSessionId strongly typed | ✅ | —  | — | `transport_session_id_validity`, `transport_session_id_be_bytes` (unit tests). |
+| Agent ↔ Edge: TransportSessionIdAllocator monotonic | ✅ | ✅ | — | `transport_session_id_allocator_starts_at_one`, `transport_session_id_allocator_monotonic` (unit), `transport_session_id_allocator_regression` (integration). |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
 | Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |

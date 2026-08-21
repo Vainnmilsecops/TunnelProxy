@@ -6,74 +6,56 @@
 
 ## Current milestone
 
-**Tunnel Protocol v1 Framing Foundation** (Session 05).
+**Persistent Agent ↔ Edge Transport & Protocol Handshake** (Session 06).
 
 ## Completed
 
-- Fixed 16-byte binary frame header for the Agent ↔ Edge wire protocol
-  (`MAGIC = "TPX1"`, `VERSION = 1`, `HEADER_SIZE = 16`).
-- Big-endian / network byte order for all multi-byte integer fields.
-- Stable frame type registry with explicit numeric values:
-  `HELLO (0x01)`, `REGISTER (0x02)`, `REGISTERED (0x03)`,
-  `OPEN_STREAM (0x10)`, `DATA (0x11)`, `END_STREAM (0x12)`,
-  `RESET_STREAM (0x13)`, `PING (0x20)`, `PONG (0x21)`, `ERROR (0xFF)`.
-- `StreamId` strongly-typed wrapper around `u32`; `StreamId(0)` is
-  `CONTROL`, `StreamId(N > 0)` is `STREAM`.
-- Stream scope validation: control frames require `stream_id == 0`,
-  stream frames require `stream_id > 0`; invalid combinations are rejected.
-- Bounded payloads: maximum 64 KiB per frame (`MAX_FRAME_PAYLOAD`).
-- Encoder (`FrameEncoder::encode`) and decoder (`FrameDecoder::decode`)
-  for Tokio `AsyncRead` / `AsyncWrite` streams.
-- Partial-read handling: decoder handles fragmented headers, fragmented
-  payloads, and coalesced frames correctly (never assumes one read == one
-  frame).
-- Three-way EOF distinction: clean `Ok(None)`, `TruncatedHeader`,
-  `TruncatedPayload`.
-- Typed `ProtocolError` taxonomy covering I/O, invalid magic, unsupported
-  version, unknown frame type, unsupported flags, invalid stream scope,
-  oversized frame, truncated header, truncated payload.
-- Decoder validates announced payload length **before allocating**, preventing
-  unbounded memory growth from malicious input (INV-002).
-- Payload remains opaque binary bytes; no UTF-8 assumption, no schema.
-- `tunnelproxy-protocol` crate has no dependencies on `tunnelproxy-edge`,
-  `tunnelproxy-agent`, or `tunnelproxy-control-plane`.
-- 26 deterministic codec tests pass, including a real loopback TCP test.
-- `docs/TUNNEL_PROTOCOL_V1.md` documents the wire format, frame types, scope
-  rules, EOF semantics, error taxonomy, and security rationale.
-- All prior Session 01–04 deliverables remain intact and passing.
+- Outbound Agent → Edge TCP control connection (INV-001: Agent dials Edge only).
+- Tunnel Protocol v1 handshake runtime: HELLO → REGISTER → REGISTERED.
+- HELLO payload schema: 1 byte role (`0x01` = AGENT), strictly validated.
+- REGISTER payload: empty in v1 (no durable tunnel creation).
+- REGISTERED payload: 8-byte big-endian non-zero `TransportSessionId`.
+- Strongly typed `TransportSessionId` with zero-as-invalid policy.
+- Process-local `TransportSessionIdAllocator` (atomic monotonic counter).
+- `HandshakeErrorCode` enum with 4 defined codes for ERROR frames.
+- Edge `AgentTransportListener` with bounded concurrent admission (`Semaphore`).
+- Edge handshake timeout (10 s default; affects handshake only, not established lifetime).
+- Strict handshake sequencing (HELLO first, REGISTER second; no deviations accepted).
+- Established session: connection stays open after REGISTERED; clean EOF handling.
+- Edge per-session ERROR frame response for handshake violations.
+- Agent `connect()` API with configurable timeouts.
+- Agent `AgentSession` type with `session_id`, `edge_addr`, `established_at`.
+- Structured tracing events throughout (no payload logging).
+- Agent ↔ Edge transport documentation (`docs/AGENT_EDGE_TRANSPORT.md`).
+- Protocol v1 payload schemas documented (`docs/TUNNEL_PROTOCOL_V1.md`).
+- 12 new integration tests covering all handshake scenarios.
+- 6 new unit tests for config/allocator/handshake types.
+- All 82 workspace tests pass (70 existing + 12 new).
+- Prior Session 01–05 capabilities and tests preserved unchanged.
 
 ## Not implemented
 
-- Persistent Agent ↔ Edge tunnel connection.
-- Protocol handshake behavior (HELLO / REGISTER / REGISTERED frame types
-  exist as types but carry no domain semantics yet).
-- Stream multiplexing runtime (stream IDs exist as a concept but demux
-  logic is not implemented).
-- Actual tunnel registration.
-- Heartbeat timer or keepalive behavior (PING / PONG exist as types).
-- Reconnect.
-- Payload schemas for any frame type (payload is opaque bytes for now).
-- TLS.
-- HTTP / WebSocket.
-- Authentication.
-- Persistence.
-- Request inspection, replay, dashboards, billing, or cloud deployment.
-- Upstream connection pooling (DEBT-008 open).
-- Graceful shutdown channel on the edge listener (DEBT-005 open).
+- TLS / encryption.
+- Agent authentication.
+- Heartbeat / PING-PONG liveness timers.
+- Reconnect logic.
+- Stream multiplexing (OPEN_STREAM / DATA frames have no runtime yet).
+- Tunnel registration (REGISTER in Session 06 is ephemeral transport registration only).
+- Public tunnel endpoints / hostname allocation.
+- Traffic forwarding / reverse tunneling.
+- Durable Agent identity (TunnelId, AgentId).
+- Upstream connection pool (DEBT-008 open).
+- Graceful shutdown channel on listeners (DEBT-005 open).
 - Per-connection idle read deadline (DEBT-006 open).
 - Per-IP admission control on the forwarder (DEBT-009 open).
 - Production telemetry / metrics backend (DEBT-010 open).
 
 ## Next planned session
 
-**Session 06 — Persistent Agent ↔ Edge Transport and Protocol Handshake.**
+**Session 07 — Heartbeat, Liveness & Dead-Session Detection.**
 
-Goals (subject to refinement when Session 06 begins):
-
-- Implement the persistent Agent → Edge outbound TCP connection.
-- Define HELLO / REGISTER / REGISTERED frame payload schemas.
-- Implement the protocol handshake: agent opens connection, sends HELLO,
-  edge responds with REGISTERED, tunnel is established.
-- Agent heartbeat via PING / PONG frames (timer-based).
-- Graceful connection teardown on error.
-- Update the forwarder to use the new tunnel protocol.
+Goals:
+- Implement PING / PONG frame handling in established sessions.
+- Add configurable idle timeout on established sessions.
+- Detect and clean up dead sessions (peer crash / network partition).
+- Agent sends periodic PING; Edge responds with PONG; missing PONG closes session.
