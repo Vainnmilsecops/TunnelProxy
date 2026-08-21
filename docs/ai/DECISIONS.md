@@ -234,3 +234,34 @@ outstanding. Any timeout or invalid heartbeat transition closes that session.
 - Sequential reader/writer ownership remains sufficient before multiplexing.
   A future multiplexed runtime will replace it with one reader task and one
   bounded writer queue without changing the heartbeat wire payload.
+
+---
+
+## ADR-010 — One active stream with directional half-close before multiplexing
+
+**Status:** Accepted (Session 08).
+
+**Context:** The framing, handshake, and heartbeat layers were tested, but no
+application byte could cross the persistent Agent transport. Implementing a
+full concurrent multiplexer at the same time would combine socket ownership,
+fairness, capacity, flow control, routing, and lifecycle risk in one change.
+
+**Decision:** Activate the already-reserved Protocol v1 stream frame numbers
+for exactly one active stream. Edge allocates the stream ID and sends empty
+OPEN_STREAM; Agent acknowledges with the same frame after its bounded local
+connect succeeds. DATA is binary and bounded, END_STREAM closes only the
+sender's direction, and RESET_STREAM aborts one stream with a typed code. One
+task owns each framed reader/writer state machine, and the Agent transport may
+serve later streams sequentially.
+
+**Consequences:**
+
+- The project now proves a complete raw-TCP Edge → Agent → local-service path.
+- Half-close and heartbeat behavior are exercised together before concurrency.
+- Fixed buffers, direct writes, and explicit open/connect/idle deadlines keep
+  the vertical slice bounded.
+- A second concurrent ingress is rejected; this is tracked as DEBT-013.
+- The loopback ingress is not the public product surface and provides no HTTP,
+  TLS, hostname routing, authentication, or durable registration.
+- Session 09 can replace the single active state with a bounded stream map and
+  writer queue without changing Session 08 payload semantics.

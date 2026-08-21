@@ -23,5 +23,7 @@ Wire protocol between `tunnelproxy-edge` and `tunnelproxy-agent`.
 Tunnel Protocol v1 framing is implemented: fixed 16-byte headers, binary-safe
 payloads capped at 64 KiB, strict frame/stream scope validation, typed errors,
 and async encode/decode. HELLO/REGISTER/REGISTERED handshake payloads and the
-Session 07 PING/PONG heartbeat payload are defined and tested. Stream traffic
-types exist, but their runtime semantics are not implemented yet.
+Session 07 PING/PONG heartbeat payload are defined and tested. Session 08
+defines OPEN_STREAM acknowledgment, binary DATA, directional END_STREAM, and
+typed RESET_STREAM semantics for a single active stream. Multiplexing remains
+out of scope.

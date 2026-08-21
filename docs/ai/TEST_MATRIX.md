@@ -51,7 +51,7 @@
 | Tunnel protocol: EOF vs truncation        | ✅   | —           | —   | `codec::tests::clean_eof`, `codec::tests::truncated_header`, `codec::tests::truncated_payload`. |
 | Tunnel protocol: real loopback TCP        | ✅   | —           | —   | `codec::tests::real_tcp_loopback_roundtrip` binds a real `TcpListener` and exchanges frames over `TcpStream`. |
 | Agent ↔ Edge protocol handshake           | ✅   | ✅          | —   | Implemented in Session 06. See `docs/AGENT_EDGE_TRANSPORT.md`.                                         |
-| Agent ↔ Edge: valid handshake (HELLO → REGISTER → REGISTERED) | ✅ | ✅ | — | `valid_handshake_establishes_session`; 12 integration tests in `agent_transport.rs`. |
+| Agent ↔ Edge: valid handshake (HELLO → REGISTER → REGISTERED) | ✅ | ✅ | — | `valid_handshake_establishes_session`; 20 integration tests in `agent_transport.rs`. |
 | Agent ↔ Edge: invalid first frame (REGISTER before HELLO) | ✅ | ✅ | — | `invalid_first_frame_register_before_hello`. |
 | Agent ↔ Edge: invalid second frame (DATA before REGISTER) | ✅ | ✅ | — | `invalid_second_frame_data_instead_of_register`. |
 | Agent ↔ Edge: invalid HELLO (empty payload) | ✅ | ✅ | — | `invalid_hello_empty_payload`. |
@@ -71,10 +71,19 @@
 | Agent ↔ Edge mismatched PONG | — | ✅ | — | `mismatched_pong_closes_session_with_error` verifies typed ERROR response. |
 | Agent ↔ Edge malformed heartbeat | — | ✅ | — | `malformed_pong_payload_is_rejected` and `agent_rejects_malformed_edge_ping`. |
 | Agent ↔ Edge heartbeat direction | — | ✅ | — | `unsolicited_pong_is_rejected` and `agent_ping_is_rejected_for_edge_initiated_heartbeat`. |
+| Single-stream reset-code contract | ✅ | — | — | All known `StreamResetCode` values round-trip as two big-endian bytes; unknown values are rejected. |
+| Single-stream golden path | — | ✅ | — | `single_stream_golden_path_is_byte_exact` crosses ingress → Edge → Agent → local echo and back. |
+| Single-stream bounded framing | — | ✅ | — | `large_payload_is_split_across_bounded_data_frames` round-trips 256 KiB through 16 KiB reads under the 64 KiB frame ceiling. |
+| Single-stream half-close | — | ✅ | — | `client_half_close_still_allows_local_response` verifies a response after client write shutdown. |
+| Sequential stream reuse and IDs | — | ✅ | — | `established_agent_supports_sequential_streams` and `sequential_stream_ids_are_monotonic`. |
+| Single-stream failure isolation | — | ✅ | — | Local connect failure and idle timeout reset only the stream; the Agent transport remains live. |
+| Single-stream admission | — | ✅ | — | `second_concurrent_ingress_is_rejected` proves the one-active-stream limit. |
+| Heartbeat during stream traffic | — | ✅ | — | `heartbeat_remains_live_during_active_stream` spans multiple heartbeat intervals during a slow local response. |
+| Stream lifecycle violation | — | ✅ | — | `data_before_open_is_reset_without_killing_agent_session`. |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
 | Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |
-| Backpressure                              | —    | —           | —   | INV-002 satisfied at read-buffer level; full backpressure on the future tunnel is deferred.                                 |
+| Backpressure                              | ✅   | ✅          | —   | Session 08 uses fixed 16 KiB reads, direct sequential frame writes, a 64 KiB codec ceiling, and no unbounded data queue; multiplexed fairness remains deferred. |
 | TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |
 | Authentication                            | —    | —           | —   | INV-003; deferred.                                                                                                          |
 | Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |

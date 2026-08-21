@@ -1,9 +1,9 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 07.
-> **Scope:** This document describes the Agent ↔ Edge control transport
-> layer established in Session 06. It does NOT describe tunnel traffic,
-> stream multiplexing, or any data-plane forwarding.
+> **Status:** Implemented through Session 08.
+> **Scope:** This document describes the Agent ↔ Edge control transport and the
+> Session 08 single-stream raw-TCP vertical slice. It does not describe public
+> HTTP/TLS ingress or concurrent stream multiplexing.
 
 ## Purpose
 
@@ -12,8 +12,8 @@ connection over which Agent and Edge establish an ephemeral transport
 session and exchange heartbeat frames. It is the foundation for future
 tunnel registration and stream multiplexing.
 
-This transport does **not** implement reverse tunnel traffic. Traffic
-forwarding will be layered on top in a future session.
+Session 08 carries one active raw TCP stream over this transport on loopback.
+It is not yet a public reverse-tunnel product surface.
 
 ## Topology
 
@@ -31,7 +31,7 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport is unauthenticated and unencrypted in Session 06.**
+**This transport remains unauthenticated and unencrypted through Session 08.**
 
 The development listener binds `127.0.0.1` only. In production, this
 transport requires TLS and Agent authentication before use. The README
@@ -56,7 +56,7 @@ Agent                         Edge
   |                             |
   |    [SESSION ESTABLISHED]    |
   |                             |
-  |    ... future frames ...     |
+  |<=== heartbeat + one stream ==>|
   |                             |
   |    [EOF or error]           |
   |                             |
@@ -203,8 +203,7 @@ occurs, or the heartbeat state machine detects a dead/invalid peer.
 
 ## Established Session Behavior
 
-Session 07 adds Edge-initiated heartbeat while traffic frames remain out of
-scope:
+Session 07 adds Edge-initiated heartbeat:
 
 1. Edge waits `heartbeat_interval` after establishment or a valid PONG.
 2. Edge sends `PING` with a non-zero 8-byte big-endian sequence.
@@ -218,6 +217,29 @@ sequences increase monotonically without wrapping to zero. On clean EOF the
 session closes normally. The connection's semaphore permit is held until this
 loop exits, so heartbeat timeout releases capacity through RAII.
 
+## Session 08 Single-Stream Data Path
+
+`SingleStreamEdgeRuntime` binds two loopback listeners: one for the existing
+Agent handshake and one raw TCP ingress. It supports one connected Agent and
+one active ingress stream, while allowing multiple streams sequentially on the
+same transport. Configuration validation rejects non-loopback addresses because
+this development runtime has no TLS or authentication.
+
+1. Edge accepts an ingress socket and sends empty `OPEN_STREAM` with a new
+   monotonic non-zero stream ID.
+2. Agent connects to its configured local TCP service under a deadline.
+3. Agent echoes empty `OPEN_STREAM` as acknowledgment, or sends
+   `RESET_STREAM` on failure.
+4. Both peers convert fixed-buffer TCP reads into binary `DATA` frames.
+5. TCP EOF emits empty `END_STREAM`; the other direction remains open.
+6. After both directions end, both state machines return to idle.
+
+The application read buffer is 16 KiB and the protocol codec rejects frames
+over 64 KiB before allocation. `stream_open_timeout` bounds acknowledgment and
+`stream_idle_timeout` bounds an active stream with no application-data
+progress. Heartbeat remains active during streaming. A concurrent second
+ingress connection is closed immediately; multiplexing is deferred.
+
 ## Disconnect Semantics
 
 - **Agent disconnects (EOF):** Edge observes EOF, releases the semaphore
@@ -228,6 +250,10 @@ loop exits, so heartbeat timeout releases capacity through RAII.
   closes the connection.
 - **Heartbeat timeout or violation:** Edge best-effort sends an ERROR frame,
   shuts down its write side, closes the connection, and releases capacity.
+- **Stream reset/failure:** Only the ingress/local stream is closed; a valid
+  Agent transport returns to idle for a later sequential stream.
+- **Transport disconnect during a stream:** Both stream sockets are dropped by
+  ownership cleanup.
 
 ## ERROR Frame Payload
 
@@ -255,15 +281,15 @@ error and closes without attempting an ERROR response.
 
 ## Reader/Writer Ownership
 
-Session 07 still uses a simple sequential write / sequential read model:
+Session 08 keeps exactly one decoder and one sequential writer per Agent
+transport:
 
 - The handshake is sequential; no concurrent reads/writes during handshake.
-- After establishment, Edge owns the socket in a single task that waits
-  for incoming frames.
+- After establishment, one task selects between Agent frames, bounded local or
+  ingress reads, heartbeat deadlines, and stream deadlines.
 
-Future sessions that implement multiplexing will likely need explicit
-reader/writer ownership (via `tokio::io::split` or `TcpStream::into_split`)
-to allow concurrent frame processing.
+Future multiplexing will require a dedicated reader plus a bounded writer
+queue; Session 08 deliberately avoids multiple socket owners.
 
 ## Configuration
 
@@ -279,6 +305,17 @@ AgentListenerConfig {
 }
 ```
 
+The Session 08 vertical slice additionally uses:
+
+```rust
+SingleStreamEdgeConfig {
+    agent_listener: AgentListenerConfig, // max_agent_sessions must be 1
+    ingress_listen_addr: SocketAddr,     // loopback-only development ingress
+    stream_open_timeout: Duration,       // default: 5s
+    stream_idle_timeout: Duration,       // default: 60s
+}
+```
+
 ### Agent (Client)
 
 ```rust
@@ -287,6 +324,11 @@ connect(
     connect_timeout: Duration,   // default: 5s
     handshake_timeout: Duration, // default: 10s
 ) -> ConnectOutcome
+
+AgentSession::run_with_local_target(
+    local_addr: SocketAddr,
+    connect_timeout: Duration,
+)
 ```
 
 ## What Is NOT Implemented
@@ -294,8 +336,8 @@ connect(
 - TLS / encryption
 - Agent authentication
 - Reconnect logic
-- Stream multiplexing
+- Concurrent stream multiplexing and flow-control windows
 - Tunnel registration
 - Public endpoint allocation
-- Traffic forwarding
+- Public HTTP/TLS ingress and hostname routing
 - Durable identity (TunnelId, AgentId)

@@ -15,12 +15,14 @@ correct agent, which in turn proxies them into the local service.
 - Async TCP echo, relay, and bounded local-forwarder primitives.
 - Tunnel Protocol v1 binary framing with a 64 KiB payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
-- Real loopback integration tests for framing, forwarding, lifecycle, and liveness.
+- A loopback-only, single-active-stream reverse TCP data path with bounded
+  frames, half-close, reset, open/idle deadlines, and sequential reuse.
+- Real loopback integration tests for framing, forwarding, lifecycle, liveness,
+  and the reverse data path.
 - Product, architecture, development, and AI context documentation.
 
 The following are **not yet implemented**:
 
-- Reverse traffic forwarding over the Agent transport.
 - Stream multiplexing and flow control.
 - Public HTTP reverse proxy and hostname allocation.
 - TLS and Agent authentication.
@@ -65,7 +67,7 @@ The architecture conceptually separates:
   request/response traffic.
 
 Today the control plane remains a placeholder while the data plane has a
-tested local transport foundation but no public reverse-tunnel path. See
+tested loopback raw-TCP reverse path but no public HTTP/TLS routing. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -90,9 +92,9 @@ tunnelproxy/
 │
 ├── crates/
 │   ├── common/             # shared strongly typed primitives
-│   ├── protocol/           # future Edge ↔ Agent wire protocol
-│   ├── agent/              # future local agent / CLI runtime
-│   ├── edge/               # future public ingress / live tunnel routing
+│   ├── protocol/           # Edge ↔ Agent framing and stream contracts
+│   ├── agent/              # outbound Agent transport and local TCP bridge
+│   ├── edge/               # Agent transport and loopback raw TCP ingress
 │   └── control-plane/      # future durable configuration and APIs
 │
 ├── tests/                  # cross-crate integration tests (future)
@@ -138,7 +140,8 @@ and Definition of Done.
 |---------|-------|
 | 01–06 _(complete)_ | foundation, TCP relay/forwarder, framing, Agent ↔ Edge handshake |
 | 07 _(complete)_ | Edge-initiated heartbeat, liveness timeout, dead-session cleanup |
-| 08 _(planned)_ | one bounded reverse data stream before multiplexing |
+| 08 _(complete)_ | one bounded reverse data stream before multiplexing |
+| 09 _(planned)_ | bounded concurrent stream multiplexing and session routing |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

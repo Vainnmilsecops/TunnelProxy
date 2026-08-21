@@ -27,6 +27,7 @@ mod codec;
 mod error;
 mod frame;
 mod handshake;
+mod stream;
 mod wire;
 
 pub use codec::{FrameDecoder, FrameEncoder};
@@ -36,7 +37,9 @@ pub use handshake::{
     HandshakeErrorCode, HeartbeatErrorCode, HeartbeatSequence, HelloRole, TransportSessionId,
     ROLE_AGENT,
 };
+pub use stream::StreamResetCode;
 pub use wire::{
-    ERROR_PAYLOAD_SIZE, HEADER_SIZE, HEARTBEAT_PAYLOAD_SIZE, HELLO_PAYLOAD_SIZE, MAGIC,
-    MAX_FRAME_PAYLOAD, REGISTERED_PAYLOAD_SIZE, VERSION,
+    EMPTY_STREAM_PAYLOAD_SIZE, ERROR_PAYLOAD_SIZE, HEADER_SIZE, HEARTBEAT_PAYLOAD_SIZE,
+    HELLO_PAYLOAD_SIZE, MAGIC, MAX_FRAME_PAYLOAD, REGISTERED_PAYLOAD_SIZE,
+    STREAM_RESET_PAYLOAD_SIZE, VERSION,
 };

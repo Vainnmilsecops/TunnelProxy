@@ -2,7 +2,8 @@
 //!
 //! This module implements the Edge runtime for accepting Agent connections,
 //! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
-//! and maintaining established sessions.
+//! maintaining established sessions, and driving the Session 08 loopback
+//! single-stream reverse data path.
 //!
 //! # Lifecycle
 //!
@@ -30,15 +31,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, HeartbeatErrorCode,
-    HeartbeatSequence, ProtocolError, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE,
-    HELLO_PAYLOAD_SIZE, ROLE_AGENT,
+    HeartbeatSequence, ProtocolError, StreamId, StreamResetCode, TransportSessionId,
+    HEARTBEAT_PAYLOAD_SIZE, HELLO_PAYLOAD_SIZE, ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,15 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Default maximum time Edge waits for the matching PONG.
 pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default maximum time Edge waits for Agent to acknowledge `OPEN_STREAM`.
+pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default maximum time an active stream may make no application-data progress.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fixed application-data read buffer used by the single-stream bridge.
+pub const STREAM_IO_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Configuration for an [`AgentTransportListener`].
 #[derive(Debug, Clone)]
@@ -141,6 +151,116 @@ impl std::fmt::Display for AgentListenerConfigError {
 }
 
 impl std::error::Error for AgentListenerConfigError {}
+
+/// Configuration for the Session 08 single-stream Edge runtime.
+#[derive(Debug, Clone)]
+pub struct SingleStreamEdgeConfig {
+    /// Agent control-listener settings. This runtime requires capacity one.
+    pub agent_listener: AgentListenerConfig,
+    /// Raw TCP ingress address used only for the development vertical slice.
+    pub ingress_listen_addr: SocketAddr,
+    /// Maximum time to wait for Agent's `OPEN_STREAM` acknowledgment.
+    pub stream_open_timeout: Duration,
+    /// Maximum time an active stream may make no application-data progress.
+    pub stream_idle_timeout: Duration,
+}
+
+impl SingleStreamEdgeConfig {
+    /// Loopback-only development defaults with ephemeral listener ports.
+    pub fn dev_defaults() -> Self {
+        let mut agent_listener = AgentListenerConfig::dev_defaults();
+        agent_listener.max_agent_sessions = 1;
+        Self {
+            agent_listener,
+            ingress_listen_addr: "127.0.0.1:0".parse().expect("hardcoded default is valid"),
+            stream_open_timeout: DEFAULT_STREAM_OPEN_TIMEOUT,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Validates the bounded single-Agent runtime configuration.
+    pub fn validate(&self) -> Result<(), SingleStreamEdgeConfigError> {
+        self.agent_listener
+            .validate()
+            .map_err(SingleStreamEdgeConfigError::AgentListener)?;
+        if self.agent_listener.max_agent_sessions != 1 {
+            return Err(SingleStreamEdgeConfigError::AgentCapacityMustBeOne);
+        }
+        if !self.agent_listener.listen_addr.ip().is_loopback() {
+            return Err(SingleStreamEdgeConfigError::NonLoopbackAgentListener(
+                self.agent_listener.listen_addr,
+            ));
+        }
+        if !self.ingress_listen_addr.ip().is_loopback() {
+            return Err(SingleStreamEdgeConfigError::NonLoopbackIngress(
+                self.ingress_listen_addr,
+            ));
+        }
+        if self.stream_open_timeout.is_zero() {
+            return Err(SingleStreamEdgeConfigError::ZeroStreamOpenTimeout);
+        }
+        if self.stream_idle_timeout.is_zero() {
+            return Err(SingleStreamEdgeConfigError::ZeroStreamIdleTimeout);
+        }
+        Ok(())
+    }
+}
+
+/// Errors returned by [`SingleStreamEdgeConfig::validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleStreamEdgeConfigError {
+    /// Nested Agent listener configuration is invalid.
+    AgentListener(AgentListenerConfigError),
+    /// Session 08 deliberately supports one connected Agent only.
+    AgentCapacityMustBeOne,
+    /// Unauthenticated Agent listener must remain on a loopback interface.
+    NonLoopbackAgentListener(SocketAddr),
+    /// Raw development ingress must remain on a loopback interface.
+    NonLoopbackIngress(SocketAddr),
+    /// Stream-open acknowledgment deadline must be positive.
+    ZeroStreamOpenTimeout,
+    /// Active-stream idle deadline must be positive.
+    ZeroStreamIdleTimeout,
+}
+
+impl std::fmt::Display for SingleStreamEdgeConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentListener(error) => write!(f, "invalid Agent listener config: {error}"),
+            Self::AgentCapacityMustBeOne => {
+                f.write_str("single-stream runtime requires max_agent_sessions = 1")
+            }
+            Self::NonLoopbackAgentListener(addr) => {
+                write!(f, "Agent listener must use a loopback address, got {addr}")
+            }
+            Self::NonLoopbackIngress(addr) => {
+                write!(
+                    f,
+                    "ingress listener must use a loopback address, got {addr}"
+                )
+            }
+            Self::ZeroStreamOpenTimeout => {
+                f.write_str("stream_open_timeout must be greater than zero")
+            }
+            Self::ZeroStreamIdleTimeout => {
+                f.write_str("stream_idle_timeout must be greater than zero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SingleStreamEdgeConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AgentListener(error) => Some(error),
+            Self::AgentCapacityMustBeOne
+            | Self::NonLoopbackAgentListener(_)
+            | Self::NonLoopbackIngress(_)
+            | Self::ZeroStreamOpenTimeout
+            | Self::ZeroStreamIdleTimeout => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transport session ID allocator
@@ -234,6 +354,8 @@ pub enum AgentTransportError {
     InvalidHeartbeatPayload { frame_type: FrameType },
     /// Sequence space was exhausted instead of wrapping to zero.
     HeartbeatSequenceExhausted,
+    /// Stream ID space was exhausted instead of wrapping or reusing an ID.
+    StreamIdExhausted,
 }
 
 impl std::fmt::Display for AgentTransportError {
@@ -259,6 +381,7 @@ impl std::fmt::Display for AgentTransportError {
                 write!(f, "invalid {frame_type:?} heartbeat payload")
             }
             Self::HeartbeatSequenceExhausted => f.write_str("heartbeat sequence exhausted"),
+            Self::StreamIdExhausted => f.write_str("stream ID sequence exhausted"),
         }
     }
 }
@@ -274,7 +397,8 @@ impl std::error::Error for AgentTransportError {
             Self::HeartbeatTimeout { .. }
             | Self::HeartbeatSequenceMismatch { .. }
             | Self::InvalidHeartbeatPayload { .. }
-            | Self::HeartbeatSequenceExhausted => None,
+            | Self::HeartbeatSequenceExhausted
+            | Self::StreamIdExhausted => None,
         }
     }
 }
@@ -437,6 +561,599 @@ impl AgentTransportListener {
             }
         }
     }
+}
+
+/// Session 08 development runtime: one Agent transport and one active raw TCP
+/// ingress stream at a time.
+///
+/// The runtime intentionally has no hostname routing, TLS, authentication, or
+/// Agent registry. It is the smallest complete reverse-data-path slice and can
+/// reuse the same Agent session for sequential streams.
+pub struct SingleStreamEdgeRuntime {
+    agent_listener: TcpListener,
+    ingress_listener: TcpListener,
+    config: SingleStreamEdgeConfig,
+    agent_addr: SocketAddr,
+    ingress_addr: SocketAddr,
+}
+
+impl SingleStreamEdgeRuntime {
+    /// Validates configuration and binds both loopback listeners.
+    pub async fn bind(config: SingleStreamEdgeConfig) -> std::io::Result<Self> {
+        config
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let agent_listener = TcpListener::bind(config.agent_listener.listen_addr).await?;
+        let ingress_listener = TcpListener::bind(config.ingress_listen_addr).await?;
+        let agent_addr = agent_listener.local_addr()?;
+        let ingress_addr = ingress_listener.local_addr()?;
+        info!(
+            agent_addr = %agent_addr,
+            ingress_addr = %ingress_addr,
+            stream_open_timeout_ms = config.stream_open_timeout.as_millis() as u64,
+            event = "single_stream_edge_started",
+            "single-stream Edge runtime bound"
+        );
+        Ok(Self {
+            agent_listener,
+            ingress_listener,
+            config,
+            agent_addr,
+            ingress_addr,
+        })
+    }
+
+    /// Address Agents connect to.
+    pub const fn agent_addr(&self) -> SocketAddr {
+        self.agent_addr
+    }
+
+    /// Raw TCP ingress address used by development clients and tests.
+    pub const fn ingress_addr(&self) -> SocketAddr {
+        self.ingress_addr
+    }
+
+    /// Accepts one Agent, performs the normal handshake, and serves sequential
+    /// raw TCP streams until that Agent disconnects or violates the protocol.
+    pub async fn run(self) -> Result<(), AgentTransportError> {
+        let (mut agent_socket, peer) = self
+            .agent_listener
+            .accept()
+            .await
+            .map_err(AgentTransportError::SessionIo)?;
+        if let Err(error) = agent_socket.set_nodelay(true) {
+            warn!(error = %error, peer = %peer, "failed to set Agent TCP_NODELAY");
+        }
+
+        let session_ids = TransportSessionIdAllocator::new();
+        let session = match tokio::time::timeout(
+            self.config.agent_listener.handshake_timeout,
+            perform_handshake(&mut agent_socket, peer, &session_ids),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(AgentTransportError::HandshakeTimeout {
+                    state: HandshakeState::AwaitHello,
+                });
+            }
+        };
+        info!(
+            peer = %peer,
+            session_id = %session.session_id,
+            event = "single_stream_agent_established",
+            "Agent ready for the single-stream data path"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        let mut heartbeat = EdgeHeartbeatDriver::new(self.config.agent_listener.heartbeat_interval);
+        let mut next_stream_id = 1_u32;
+
+        loop {
+            let Some((mut ingress, ingress_peer)) = wait_for_ingress(
+                &self.ingress_listener,
+                &mut agent_socket,
+                &mut decoder,
+                &session,
+                &mut heartbeat,
+                self.config.agent_listener.heartbeat_interval,
+                self.config.agent_listener.pong_timeout,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            if let Err(error) = ingress.set_nodelay(true) {
+                warn!(error = %error, peer = %ingress_peer, "failed to set ingress TCP_NODELAY");
+            }
+
+            let stream_id =
+                StreamId::new(next_stream_id).ok_or(AgentTransportError::StreamIdExhausted)?;
+            next_stream_id = next_stream_id
+                .checked_add(1)
+                .ok_or(AgentTransportError::StreamIdExhausted)?;
+
+            match open_stream(
+                &mut agent_socket,
+                &mut decoder,
+                &session,
+                &mut ingress,
+                ingress_peer,
+                stream_id,
+                self.config.stream_open_timeout,
+            )
+            .await?
+            {
+                StreamOpenOutcome::Acknowledged => {
+                    drive_edge_stream(
+                        &self.ingress_listener,
+                        &mut agent_socket,
+                        &mut decoder,
+                        &session,
+                        &mut heartbeat,
+                        &mut ingress,
+                        ingress_peer,
+                        stream_id,
+                        self.config.agent_listener.heartbeat_interval,
+                        self.config.agent_listener.pong_timeout,
+                        self.config.stream_idle_timeout,
+                    )
+                    .await?;
+                }
+                StreamOpenOutcome::Reset(code) => {
+                    info!(
+                        peer = %ingress_peer,
+                        stream_id = stream_id.get(),
+                        reset_code = ?code,
+                        event = "stream_open_rejected",
+                        "Agent rejected stream open"
+                    );
+                    let _ = ingress.shutdown().await;
+                }
+                StreamOpenOutcome::TimedOut => {
+                    warn!(
+                        peer = %ingress_peer,
+                        stream_id = stream_id.get(),
+                        event = "stream_open_timeout",
+                        "stream-open acknowledgment timed out"
+                    );
+                    let _ = ingress.shutdown().await;
+                }
+                StreamOpenOutcome::AgentClosed => return Ok(()),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingHeartbeat {
+    sequence: HeartbeatSequence,
+    sent_at: Instant,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Debug)]
+struct EdgeHeartbeatDriver {
+    next_sequence: HeartbeatSequence,
+    next_ping_at: tokio::time::Instant,
+    pending: Option<PendingHeartbeat>,
+}
+
+impl EdgeHeartbeatDriver {
+    fn new(interval: Duration) -> Self {
+        Self {
+            next_sequence: HeartbeatSequence::FIRST,
+            next_ping_at: tokio::time::Instant::now() + interval,
+            pending: None,
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.pending
+            .as_ref()
+            .map_or(self.next_ping_at, |pending| pending.deadline)
+    }
+}
+
+async fn wait_for_ingress(
+    ingress_listener: &TcpListener,
+    agent_socket: &mut TcpStream,
+    decoder: &mut FrameDecoder,
+    session: &AgentSession,
+    heartbeat: &mut EdgeHeartbeatDriver,
+    heartbeat_interval: Duration,
+    pong_timeout: Duration,
+) -> Result<Option<(TcpStream, SocketAddr)>, AgentTransportError> {
+    loop {
+        let deadline = heartbeat.deadline();
+        tokio::select! {
+            accepted = ingress_listener.accept(), if heartbeat.pending.is_none() => {
+                return accepted.map(Some).map_err(AgentTransportError::SessionIo);
+            }
+            incoming = decoder.decode(&mut *agent_socket) => {
+                let frame = match incoming {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return Ok(None),
+                    Err(error) => return Err(AgentTransportError::ProtocolDecode(error)),
+                };
+                handle_idle_heartbeat_frame(
+                    agent_socket,
+                    session,
+                    heartbeat,
+                    frame,
+                    heartbeat_interval,
+                ).await?;
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                drive_heartbeat_deadline(agent_socket, session, heartbeat, pong_timeout).await?;
+            }
+        }
+    }
+}
+
+async fn drive_heartbeat_deadline(
+    socket: &mut TcpStream,
+    session: &AgentSession,
+    heartbeat: &mut EdgeHeartbeatDriver,
+    pong_timeout: Duration,
+) -> Result<(), AgentTransportError> {
+    if let Some(pending) = heartbeat.pending.take() {
+        error!(
+            peer = %session.peer_addr,
+            session_id = %session.session_id,
+            heartbeat_sequence = pending.sequence.get(),
+            event = "heartbeat_timeout",
+            "heartbeat PONG timed out"
+        );
+        send_heartbeat_error_and_close(socket, HeartbeatErrorCode::HeartbeatTimeout).await;
+        return Err(AgentTransportError::HeartbeatTimeout {
+            sequence: pending.sequence,
+        });
+    }
+
+    let sequence = heartbeat.next_sequence;
+    let ping = Frame::control(FrameType::Ping, sequence.to_be_bytes().to_vec())
+        .expect("heartbeat payload is valid");
+    FrameEncoder::encode(socket, &ping)
+        .await
+        .map_err(AgentTransportError::ProtocolDecode)?;
+    heartbeat.pending = Some(PendingHeartbeat {
+        sequence,
+        sent_at: Instant::now(),
+        deadline: tokio::time::Instant::now() + pong_timeout,
+    });
+    info!(
+        peer = %session.peer_addr,
+        session_id = %session.session_id,
+        heartbeat_sequence = sequence.get(),
+        event = "heartbeat_ping_sent",
+        "heartbeat PING sent"
+    );
+    Ok(())
+}
+
+async fn handle_idle_heartbeat_frame(
+    socket: &mut TcpStream,
+    session: &AgentSession,
+    heartbeat: &mut EdgeHeartbeatDriver,
+    frame: Frame,
+    heartbeat_interval: Duration,
+) -> Result<(), AgentTransportError> {
+    let Some(pending) = heartbeat.pending.take() else {
+        if frame.is_stream() {
+            if frame.frame_type == FrameType::ResetStream {
+                debug!(
+                    peer = %session.peer_addr,
+                    session_id = %session.session_id,
+                    stream_id = frame.stream_id.get(),
+                    reset_code = ?decode_stream_reset(&frame),
+                    event = "idle_stream_reset_received",
+                    "ignored reset for a stream that is no longer active"
+                );
+                return Ok(());
+            }
+            warn!(
+                peer = %session.peer_addr,
+                session_id = %session.session_id,
+                stream_id = frame.stream_id.get(),
+                frame_type = ?frame.frame_type,
+                event = "idle_stream_frame_rejected",
+                "stream frame received before Edge opened a stream"
+            );
+            send_edge_stream_reset(socket, frame.stream_id, StreamResetCode::ProtocolViolation)
+                .await?;
+            return Ok(());
+        }
+        return reject_unsolicited_frame(socket, session, frame)
+            .await
+            .map(|_| ());
+    };
+    validate_pong(socket, session, frame, pending.sequence, pending.sent_at).await?;
+    heartbeat.next_sequence = pending
+        .sequence
+        .checked_next()
+        .ok_or(AgentTransportError::HeartbeatSequenceExhausted)?;
+    heartbeat.next_ping_at = tokio::time::Instant::now() + heartbeat_interval;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOpenOutcome {
+    Acknowledged,
+    Reset(StreamResetCode),
+    TimedOut,
+    AgentClosed,
+}
+
+async fn open_stream(
+    agent_socket: &mut TcpStream,
+    decoder: &mut FrameDecoder,
+    session: &AgentSession,
+    ingress: &mut TcpStream,
+    ingress_peer: SocketAddr,
+    stream_id: StreamId,
+    open_timeout: Duration,
+) -> Result<StreamOpenOutcome, AgentTransportError> {
+    send_edge_stream_frame(agent_socket, stream_id, FrameType::OpenStream, Vec::new()).await?;
+    info!(
+        peer = %ingress_peer,
+        session_id = %session.session_id,
+        stream_id = stream_id.get(),
+        event = "stream_open_requested",
+        "requested Agent local stream"
+    );
+
+    let response = match tokio::time::timeout(open_timeout, decoder.decode(&mut *agent_socket))
+        .await
+    {
+        Ok(Ok(Some(frame))) => frame,
+        Ok(Ok(None)) => return Ok(StreamOpenOutcome::AgentClosed),
+        Ok(Err(error)) => return Err(AgentTransportError::ProtocolDecode(error)),
+        Err(_) => {
+            send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::OpenTimeout).await?;
+            let _ = ingress.shutdown().await;
+            return Ok(StreamOpenOutcome::TimedOut);
+        }
+    };
+
+    if response.stream_id != stream_id {
+        send_edge_stream_reset(
+            agent_socket,
+            response.stream_id,
+            StreamResetCode::ProtocolViolation,
+        )
+        .await?;
+        return Err(AgentTransportError::ProtocolViolation {
+            reason: "stream-open response used the wrong stream ID",
+        });
+    }
+    match response.frame_type {
+        FrameType::OpenStream if response.payload.is_empty() => {
+            info!(
+                peer = %ingress_peer,
+                session_id = %session.session_id,
+                stream_id = stream_id.get(),
+                event = "stream_opened",
+                "Agent acknowledged stream open"
+            );
+            Ok(StreamOpenOutcome::Acknowledged)
+        }
+        FrameType::ResetStream => {
+            let Some(code) = decode_stream_reset(&response) else {
+                send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::ProtocolViolation)
+                    .await?;
+                return Err(AgentTransportError::ProtocolViolation {
+                    reason: "RESET_STREAM payload must be a known two-byte code",
+                });
+            };
+            Ok(StreamOpenOutcome::Reset(code))
+        }
+        _ => {
+            send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::ProtocolViolation)
+                .await?;
+            Err(AgentTransportError::ProtocolViolation {
+                reason: "expected OPEN_STREAM acknowledgment or RESET_STREAM",
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_edge_stream(
+    ingress_listener: &TcpListener,
+    agent_socket: &mut TcpStream,
+    decoder: &mut FrameDecoder,
+    session: &AgentSession,
+    heartbeat: &mut EdgeHeartbeatDriver,
+    ingress: &mut TcpStream,
+    ingress_peer: SocketAddr,
+    stream_id: StreamId,
+    heartbeat_interval: Duration,
+    pong_timeout: Duration,
+    stream_idle_timeout: Duration,
+) -> Result<(), AgentTransportError> {
+    let mut buffer = [0_u8; STREAM_IO_BUFFER_SIZE];
+    let mut ingress_to_agent_open = true;
+    let mut agent_to_ingress_open = true;
+    let mut bytes_ingress_to_agent = 0_u64;
+    let mut bytes_agent_to_ingress = 0_u64;
+    let mut stream_idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
+
+    while ingress_to_agent_open || agent_to_ingress_open {
+        let deadline = heartbeat.deadline();
+        tokio::select! {
+            incoming = decoder.decode(&mut *agent_socket) => {
+                let frame = match incoming {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(AgentTransportError::ProtocolDecode(error)),
+                };
+
+                if frame.frame_type == FrameType::Pong {
+                    handle_idle_heartbeat_frame(
+                        agent_socket,
+                        session,
+                        heartbeat,
+                        frame,
+                        heartbeat_interval,
+                    ).await?;
+                    continue;
+                }
+
+                match frame.frame_type {
+                    FrameType::Data => {
+                        if frame.stream_id != stream_id || frame.payload.is_empty() || !agent_to_ingress_open {
+                            send_edge_stream_reset(agent_socket, frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                            return Err(AgentTransportError::ProtocolViolation {
+                                reason: "invalid DATA frame for active stream",
+                            });
+                        }
+                        if let Err(error) = ingress.write_all(&frame.payload).await {
+                            warn!(stream_id = stream_id.get(), error = %error, event = "stream_ingress_io_failed", "ingress write failed");
+                            send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::IoFailure).await?;
+                            return Ok(());
+                        }
+                        bytes_agent_to_ingress = bytes_agent_to_ingress.saturating_add(frame.payload.len() as u64);
+                        stream_idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
+                    }
+                    FrameType::EndStream => {
+                        if frame.stream_id != stream_id || !frame.payload.is_empty() || !agent_to_ingress_open {
+                            send_edge_stream_reset(agent_socket, frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                            return Err(AgentTransportError::ProtocolViolation {
+                                reason: "invalid END_STREAM frame for active stream",
+                            });
+                        }
+                        ingress.shutdown().await.map_err(AgentTransportError::SessionIo)?;
+                        agent_to_ingress_open = false;
+                        info!(stream_id = stream_id.get(), direction = "agent_to_ingress", event = "stream_half_closed", "stream direction closed");
+                    }
+                    FrameType::ResetStream => {
+                        if frame.stream_id != stream_id {
+                            send_edge_stream_reset(agent_socket, frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                            return Err(AgentTransportError::ProtocolViolation {
+                                reason: "RESET_STREAM used the wrong stream ID",
+                            });
+                        }
+                        let Some(code) = decode_stream_reset(&frame) else {
+                            send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::ProtocolViolation).await?;
+                            return Err(AgentTransportError::ProtocolViolation {
+                                reason: "RESET_STREAM payload must be a known two-byte code",
+                            });
+                        };
+                        info!(stream_id = stream_id.get(), reset_code = ?code, event = "stream_reset_received", "stream reset by Agent");
+                        let _ = ingress.shutdown().await;
+                        return Ok(());
+                    }
+                    FrameType::OpenStream => {
+                        send_edge_stream_reset(agent_socket, frame.stream_id, StreamResetCode::ProtocolViolation).await?;
+                        return Err(AgentTransportError::ProtocolViolation {
+                            reason: "unexpected OPEN_STREAM while stream is active",
+                        });
+                    }
+                    FrameType::Ping => {
+                        send_heartbeat_error_and_close(agent_socket, HeartbeatErrorCode::AgentPingNotSupported).await;
+                        return Err(AgentTransportError::ProtocolViolation {
+                            reason: "Agent initiated PING while stream is active",
+                        });
+                    }
+                    frame_type => {
+                        return Err(AgentTransportError::ProtocolViolation {
+                            reason: match frame_type {
+                                FrameType::Error => "Agent sent ERROR while stream is active",
+                                _ => "unexpected control frame while stream is active",
+                            },
+                        });
+                    }
+                }
+            }
+            read = ingress.read(&mut buffer), if ingress_to_agent_open => {
+                match read {
+                    Ok(0) => {
+                        send_edge_stream_frame(agent_socket, stream_id, FrameType::EndStream, Vec::new()).await?;
+                        ingress_to_agent_open = false;
+                        info!(stream_id = stream_id.get(), direction = "ingress_to_agent", event = "stream_half_closed", "stream direction closed");
+                    }
+                    Ok(read) => {
+                        send_edge_stream_frame(agent_socket, stream_id, FrameType::Data, buffer[..read].to_vec()).await?;
+                        bytes_ingress_to_agent = bytes_ingress_to_agent.saturating_add(read as u64);
+                        stream_idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
+                    }
+                    Err(error) => {
+                        warn!(stream_id = stream_id.get(), error = %error, event = "stream_ingress_io_failed", "ingress read failed");
+                        send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::IoFailure).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            extra = ingress_listener.accept() => {
+                let (mut rejected, rejected_peer) = extra.map_err(AgentTransportError::SessionIo)?;
+                let _ = rejected.shutdown().await;
+                warn!(peer = %rejected_peer, active_stream_id = stream_id.get(), event = "stream_ingress_rejected_busy", "single-stream runtime is busy");
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                drive_heartbeat_deadline(agent_socket, session, heartbeat, pong_timeout).await?;
+            }
+            () = tokio::time::sleep_until(stream_idle_deadline) => {
+                warn!(
+                    peer = %ingress_peer,
+                    session_id = %session.session_id,
+                    stream_id = stream_id.get(),
+                    event = "stream_idle_timeout",
+                    "active stream made no application-data progress"
+                );
+                send_edge_stream_reset(agent_socket, stream_id, StreamResetCode::IdleTimeout).await?;
+                let _ = ingress.shutdown().await;
+                return Ok(());
+            }
+        }
+    }
+
+    info!(
+        peer = %ingress_peer,
+        session_id = %session.session_id,
+        stream_id = stream_id.get(),
+        bytes_ingress_to_agent,
+        bytes_agent_to_ingress,
+        event = "stream_closed",
+        "single stream completed"
+    );
+    Ok(())
+}
+
+async fn send_edge_stream_frame(
+    socket: &mut TcpStream,
+    stream_id: StreamId,
+    frame_type: FrameType,
+    payload: Vec<u8>,
+) -> Result<(), AgentTransportError> {
+    let frame = Frame::stream(stream_id, frame_type, payload)
+        .map_err(AgentTransportError::ProtocolDecode)?;
+    FrameEncoder::encode(socket, &frame)
+        .await
+        .map(|_| ())
+        .map_err(AgentTransportError::ProtocolDecode)
+}
+
+async fn send_edge_stream_reset(
+    socket: &mut TcpStream,
+    stream_id: StreamId,
+    code: StreamResetCode,
+) -> Result<(), AgentTransportError> {
+    send_edge_stream_frame(
+        socket,
+        stream_id,
+        FrameType::ResetStream,
+        code.to_be_bytes().to_vec(),
+    )
+    .await
+}
+
+fn decode_stream_reset(frame: &Frame) -> Option<StreamResetCode> {
+    if frame.payload.len() as u32 != STREAM_RESET_PAYLOAD_SIZE {
+        return None;
+    }
+    StreamResetCode::from_be_bytes([frame.payload[0], frame.payload[1]])
 }
 
 /// Drives a single Agent connection through the handshake state machine.
@@ -921,6 +1638,67 @@ mod tests {
             cfg.validate(),
             Err(AgentListenerConfigError::ZeroPongTimeout)
         );
+    }
+
+    #[test]
+    fn single_stream_edge_config_dev_defaults_valid() {
+        assert!(SingleStreamEdgeConfig::dev_defaults().validate().is_ok());
+    }
+
+    #[test]
+    fn single_stream_edge_config_requires_one_agent() {
+        let mut cfg = SingleStreamEdgeConfig::dev_defaults();
+        cfg.agent_listener.max_agent_sessions = 2;
+        assert_eq!(
+            cfg.validate(),
+            Err(SingleStreamEdgeConfigError::AgentCapacityMustBeOne)
+        );
+    }
+
+    #[test]
+    fn single_stream_edge_config_rejects_zero_open_timeout() {
+        let cfg = SingleStreamEdgeConfig {
+            stream_open_timeout: Duration::ZERO,
+            ..SingleStreamEdgeConfig::dev_defaults()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(SingleStreamEdgeConfigError::ZeroStreamOpenTimeout)
+        );
+    }
+
+    #[test]
+    fn single_stream_edge_config_rejects_zero_idle_timeout() {
+        let cfg = SingleStreamEdgeConfig {
+            stream_idle_timeout: Duration::ZERO,
+            ..SingleStreamEdgeConfig::dev_defaults()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(SingleStreamEdgeConfigError::ZeroStreamIdleTimeout)
+        );
+    }
+
+    #[test]
+    fn single_stream_edge_config_rejects_public_agent_listener() {
+        let mut cfg = SingleStreamEdgeConfig::dev_defaults();
+        cfg.agent_listener.listen_addr = "0.0.0.0:7100".parse().unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(SingleStreamEdgeConfigError::NonLoopbackAgentListener(_))
+        ));
+    }
+
+    #[test]
+    fn single_stream_edge_config_rejects_public_ingress() {
+        let cfg = SingleStreamEdgeConfig {
+            ingress_listen_addr: "0.0.0.0:7000".parse().unwrap(),
+            ..SingleStreamEdgeConfig::dev_defaults()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(SingleStreamEdgeConfigError::NonLoopbackIngress(_))
+        ));
     }
 
     #[test]

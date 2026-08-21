@@ -29,3 +29,9 @@ pub const ERROR_PAYLOAD_SIZE: u32 = 2;
 
 /// Exact byte length of a PING or PONG payload (8 bytes: heartbeat sequence).
 pub const HEARTBEAT_PAYLOAD_SIZE: u32 = 8;
+
+/// Exact byte length of OPEN_STREAM and END_STREAM payloads.
+pub const EMPTY_STREAM_PAYLOAD_SIZE: u32 = 0;
+
+/// Exact byte length of a RESET_STREAM payload (2 bytes: reset code).
+pub const STREAM_RESET_PAYLOAD_SIZE: u32 = 2;

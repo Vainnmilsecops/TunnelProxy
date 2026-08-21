@@ -1,8 +1,9 @@
 # TunnelProxy — Architecture
 
-> Status: **pre-MVP transport foundation.** Local TCP primitives, protocol
-> framing, Agent → Edge handshake, and heartbeat are implemented. Public
-> reverse traffic forwarding, TLS, HTTP ingress, and durable routing are not.
+> Status: **pre-MVP data-path foundation.** Local TCP primitives, protocol
+> framing, Agent → Edge handshake, heartbeat, and one loopback raw-TCP reverse
+> stream are implemented. Public TLS/HTTP ingress, multiplexing, and durable
+> routing are not.
 
 ## 1. High-level architecture
 
@@ -176,6 +177,24 @@ tunnel will eventually be layered on top of. The Session 03 relay
 primitives remain in the public API for regression coverage and
 for tests that want a minimal surface; new code should use the
 forwarder.
+
+### 2.7 Single-stream reverse data path (Session 08)
+
+Session 08 connects the previously separate foundations into one vertical
+slice. `SingleStreamEdgeRuntime` accepts one loopback raw TCP ingress, opens a
+framed stream over the established Agent transport, and the Agent connects that
+stream to one configured local TCP service.
+
+Only one stream is active at a time. Stream IDs increase monotonically and the
+same Agent connection can serve later streams sequentially. Fixed 16 KiB reads,
+the protocol's 64 KiB frame ceiling, direct sequential writes, open/connect/idle
+deadlines, and per-stream reset keep resource use bounded. Directional
+`END_STREAM` preserves TCP half-close, while PING/PONG remains active during
+data transfer.
+
+The ingress is deliberately loopback raw TCP. There is no public listener,
+hostname resolution, HTTP parsing, TLS, authentication, durable registration,
+or concurrent multiplexing in this runtime.
 
 ## 3. Control plane vs data plane
 
