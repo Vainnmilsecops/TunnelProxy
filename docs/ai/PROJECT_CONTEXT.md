@@ -33,7 +33,7 @@ localhost:<port>
 ## Major components
 
 - `tunnelproxy-common` — shared strongly-typed primitives.
-- `tunnelproxy-protocol` — future Edge � Agent wire protocol.
+- `tunnelproxy-protocol` — Edge ↔ Agent wire framing and control types.
 - `tunnelproxy-agent` — local CLI / runtime that opens the tunnel.
 - `tunnelproxy-edge` — public ingress and live tunnel routing.
 - `tunnelproxy-control-plane` — durable users, agents, tunnels, auth,
@@ -71,7 +71,7 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-TCP networking, HTTP reverse proxying, TLS, auth, persistence, custom
-domains, dashboard, billing, rate limiting, request inspection, replay,
-and cloud deployment are explicitly **not implemented** in this phase.
+Reverse traffic streams, HTTP reverse proxying, TLS, auth, persistence,
+custom domains, dashboard, billing, rate limiting, request inspection,
+replay, and cloud deployment are explicitly **not implemented** in this phase.
 Any change that pretends one of these exists is a bug.

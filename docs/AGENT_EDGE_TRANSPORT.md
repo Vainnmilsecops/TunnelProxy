@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented (Session 06).
+> **Status:** Implemented through Session 07.
 > **Scope:** This document describes the Agent ↔ Edge control transport
 > layer established in Session 06. It does NOT describe tunnel traffic,
 > stream multiplexing, or any data-plane forwarding.
@@ -9,8 +9,8 @@
 
 The Agent ↔ Edge transport is a persistent, protocol-aware TCP control
 connection over which Agent and Edge establish an ephemeral transport
-session. It is the foundation for all future Agent ↔ Edge communication,
-including tunnel registration, stream multiplexing, and heartbeat.
+session and exchange heartbeat frames. It is the foundation for future
+tunnel registration and stream multiplexing.
 
 This transport does **not** implement reverse tunnel traffic. Traffic
 forwarding will be layered on top in a future session.
@@ -198,24 +198,25 @@ when REGISTERED is successfully sent.
 
 **The handshake timeout does NOT limit the established session lifetime.**
 
-Established sessions remain open until:
-- The Agent disconnects (EOF).
-- An I/O error occurs.
-- A future session adds idle/liveness timeouts.
+Established sessions remain open until the Agent disconnects, an I/O error
+occurs, or the heartbeat state machine detects a dead/invalid peer.
 
 ## Established Session Behavior
 
-In Session 06, no traffic frames are implemented. After the handshake:
+Session 07 adds Edge-initiated heartbeat while traffic frames remain out of
+scope:
 
-- Edge waits for any incoming byte or EOF.
-- If any frame is received (e.g. DATA), it is logged as an unsupported
-  frame and the session closes.
-- If EOF is received, the session closes cleanly.
+1. Edge waits `heartbeat_interval` after establishment or a valid PONG.
+2. Edge sends `PING` with a non-zero 8-byte big-endian sequence.
+3. Agent validates the payload and returns `PONG` with the same sequence.
+4. Edge requires the matching PONG within `pong_timeout`.
+5. Timeout, malformed payload, mismatched sequence, unsolicited PONG, Agent-
+   initiated PING, or any unsupported frame closes the session.
 
-Future sessions will:
-- Implement PING/PONG heartbeat.
-- Implement OPEN_STREAM / DATA frames.
-- Implement stream multiplexing.
+Only one PING may be outstanding. The first sequence is 1 and subsequent
+sequences increase monotonically without wrapping to zero. On clean EOF the
+session closes normally. The connection's semaphore permit is held until this
+loop exits, so heartbeat timeout releases capacity through RAII.
 
 ## Disconnect Semantics
 
@@ -225,6 +226,8 @@ Future sessions will:
   or an I/O error.
 - **Handshake violation:** Edge best-effort sends an ERROR frame, then
   closes the connection.
+- **Heartbeat timeout or violation:** Edge best-effort sends an ERROR frame,
+  shuts down its write side, closes the connection, and releases capacity.
 
 ## ERROR Frame Payload
 
@@ -242,12 +245,17 @@ bytes 0-1:  error code
               4 = ProtocolViolation
 ```
 
+During an established session, the same 2-byte ERROR payload carries a
+state-dependent `HeartbeatErrorCode`: timeout (1), sequence mismatch (2),
+unsolicited PONG (3), Agent PING not supported (4), invalid heartbeat payload
+(5), or unexpected frame (6).
+
 For malformed protocol input (bad magic, version, etc.), Edge logs the
 error and closes without attempting an ERROR response.
 
 ## Reader/Writer Ownership
 
-Session 06 uses a simple sequential write / sequential read model:
+Session 07 still uses a simple sequential write / sequential read model:
 
 - The handshake is sequential; no concurrent reads/writes during handshake.
 - After establishment, Edge owns the socket in a single task that waits
@@ -266,6 +274,8 @@ AgentListenerConfig {
     listen_addr: SocketAddr,      // default: 127.0.0.1:7100
     max_agent_sessions: usize,   // default: 50
     handshake_timeout: Duration,  // default: 10s
+    heartbeat_interval: Duration, // default: 15s
+    pong_timeout: Duration,       // default: 10s
 }
 ```
 
@@ -283,7 +293,6 @@ connect(
 
 - TLS / encryption
 - Agent authentication
-- Heartbeat / PING-PONG timers
 - Reconnect logic
 - Stream multiplexing
 - Tunnel registration

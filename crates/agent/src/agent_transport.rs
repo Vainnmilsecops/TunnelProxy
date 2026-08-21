@@ -2,18 +2,20 @@
 //!
 //! This module implements the Agent runtime for connecting to Edge,
 //! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
-//! and maintaining the established session.
+//! and maintaining the established session by answering Edge-initiated
+//! heartbeat PING frames with matching PONG frames.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use tunnelproxy_protocol::{
-    Frame, FrameDecoder, FrameEncoder, FrameType, ProtocolError, TransportSessionId,
-    REGISTERED_PAYLOAD_SIZE, ROLE_AGENT,
+    Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatErrorCode, HeartbeatSequence,
+    ProtocolError, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE, REGISTERED_PAYLOAD_SIZE, ROLE_AGENT,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +59,10 @@ pub enum AgentError {
     SessionIo(std::io::Error),
     /// The connection was closed by the peer.
     ConnectionClosed,
+    /// A heartbeat frame had an invalid payload.
+    InvalidHeartbeatPayload { frame_type: FrameType },
+    /// Edge rejected or terminated the established heartbeat session.
+    HeartbeatRejected { code: Option<HeartbeatErrorCode> },
 }
 
 impl std::fmt::Display for AgentError {
@@ -75,6 +81,15 @@ impl std::fmt::Display for AgentError {
             }
             Self::SessionIo(e) => write!(f, "session I/O error: {e}"),
             Self::ConnectionClosed => write!(f, "connection closed by peer"),
+            Self::InvalidHeartbeatPayload { frame_type } => {
+                write!(f, "invalid {frame_type:?} heartbeat payload")
+            }
+            Self::HeartbeatRejected { code: Some(code) } => {
+                write!(f, "heartbeat rejected by Edge: {code:?}")
+            }
+            Self::HeartbeatRejected { code: None } => {
+                write!(f, "heartbeat rejected by Edge with an unknown error")
+            }
         }
     }
 }
@@ -109,14 +124,24 @@ pub struct AgentSession {
     socket: TcpStream,
 }
 
+/// Normal reason the Agent session loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionCloseReason {
+    /// Edge closed the TCP connection cleanly.
+    PeerClosed,
+    /// The Agent explicitly shut down its write side.
+    LocalShutdown,
+}
+
 impl AgentSession {
     /// Reads a single frame from the established session.
     ///
     /// Returns `Ok(None)` on clean EOF. Returns `Err` on protocol decode
     /// error or I/O error.
     ///
-    /// Note: for Session 06, no traffic frames are expected on an
-    /// established session. This method is provided for future sessions.
+    /// Callers that want automatic heartbeat responses should use [`run`](Self::run).
+    /// This lower-level method remains available for protocol tests and future
+    /// stream dispatch.
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, AgentError> {
         let mut decoder = FrameDecoder::new();
         decoder
@@ -124,6 +149,105 @@ impl AgentSession {
             .await
             .map_err(AgentError::ProtocolDecode)
     }
+
+    /// Drives the established heartbeat loop until Edge closes the session or
+    /// a protocol/I/O failure occurs.
+    pub async fn run(&mut self) -> Result<AgentSessionCloseReason, AgentError> {
+        loop {
+            let frame = match self.read_frame().await? {
+                Some(frame) => frame,
+                None => return Ok(AgentSessionCloseReason::PeerClosed),
+            };
+
+            match frame.frame_type {
+                FrameType::Ping => {
+                    if let Err(error) = self.respond_to_ping(frame).await {
+                        let _ = self.socket.shutdown().await;
+                        return Err(error);
+                    }
+                }
+                FrameType::Error => {
+                    let error = decode_heartbeat_error(&frame);
+                    let _ = self.socket.shutdown().await;
+                    return Err(error);
+                }
+                frame_type => {
+                    let _ = self.socket.shutdown().await;
+                    return Err(AgentError::UnexpectedFrame { frame_type });
+                }
+            }
+        }
+    }
+
+    /// Gracefully closes the Agent's TCP write side.
+    pub async fn close(&mut self) -> Result<AgentSessionCloseReason, AgentError> {
+        self.socket
+            .shutdown()
+            .await
+            .map_err(AgentError::SessionIo)?;
+        Ok(AgentSessionCloseReason::LocalShutdown)
+    }
+
+    async fn respond_to_ping(&mut self, frame: Frame) -> Result<(), AgentError> {
+        if frame.payload.len() as u32 != HEARTBEAT_PAYLOAD_SIZE {
+            warn!(
+                edge = %self.edge_addr,
+                session_id = %self.session_id,
+                payload_len = frame.payload.len(),
+                event = "heartbeat_invalid_payload",
+                "PING payload length is invalid"
+            );
+            return Err(AgentError::InvalidHeartbeatPayload {
+                frame_type: FrameType::Ping,
+            });
+        }
+
+        let mut bytes = [0_u8; HEARTBEAT_PAYLOAD_SIZE as usize];
+        bytes.copy_from_slice(&frame.payload);
+        let sequence = HeartbeatSequence::from_be_bytes(bytes).ok_or_else(|| {
+            warn!(
+                edge = %self.edge_addr,
+                session_id = %self.session_id,
+                event = "heartbeat_invalid_payload",
+                "PING sequence must be non-zero"
+            );
+            AgentError::InvalidHeartbeatPayload {
+                frame_type: FrameType::Ping,
+            }
+        })?;
+
+        info!(
+            edge = %self.edge_addr,
+            session_id = %self.session_id,
+            heartbeat_sequence = sequence.get(),
+            event = "heartbeat_ping_received",
+            "heartbeat PING received"
+        );
+
+        let pong = Frame::control(FrameType::Pong, sequence.to_be_bytes().to_vec())
+            .expect("a heartbeat sequence is a valid control payload");
+        FrameEncoder::encode(&mut self.socket, &pong)
+            .await
+            .map_err(|error| AgentError::SessionIo(std::io::Error::other(error.to_string())))?;
+        info!(
+            edge = %self.edge_addr,
+            session_id = %self.session_id,
+            heartbeat_sequence = sequence.get(),
+            event = "heartbeat_pong_sent",
+            "heartbeat PONG sent"
+        );
+        Ok(())
+    }
+}
+
+fn decode_heartbeat_error(frame: &Frame) -> AgentError {
+    let code = if frame.payload.len() == 2 {
+        let bytes = [frame.payload[0], frame.payload[1]];
+        HeartbeatErrorCode::from_be_bytes(bytes)
+    } else {
+        None
+    };
+    AgentError::HeartbeatRejected { code }
 }
 
 // ---------------------------------------------------------------------------

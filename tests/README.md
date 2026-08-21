@@ -29,7 +29,7 @@ cargo test --test edge_tcp -p tunnelproxy-edge
 
 ## What these tests are not
 
-These tests do **not** exercise the TunnelProxy reverse-tunnel
-protocol, the Agent ↔ Edge handshake, registration, heartbeat, or any
-forwarding logic. Those belong to future sessions. Anything beyond a
-byte-oriented echo over TCP is out of scope here.
+The per-crate integration suites now exercise TCP echo/relay/forwarding,
+Tunnel Protocol framing, Agent ↔ Edge handshake, and heartbeat liveness.
+They still do **not** exercise a reverse traffic stream, public HTTP ingress,
+TLS, authentication, durable tunnel registration, or multiplexing.

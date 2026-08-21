@@ -57,9 +57,8 @@ impl TryFrom<u8> for HelloRole {
 /// Properties:
 /// - Zero is reserved / invalid.
 /// - IDs are monotonically increasing (via `AtomicU64` on Edge).
-/// - Wraparound: if the allocator returns zero, it retries once.
-///   If the retry also returns zero, `next()` returns `None` — this
-///   is a safe failure rather than a silent zero-ID session.
+/// - Edge allocates IDs with checked atomic addition and returns `None` on
+///   exhaustion rather than wrapping or silently reusing an ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransportSessionId(u64);
 
@@ -194,13 +193,6 @@ impl TryFrom<u16> for HandshakeErrorCode {
 // HeartbeatSequence
 // ---------------------------------------------------------------------------
 
-/// Error returned when constructing an invalid `HeartbeatSequence`.
-#[derive(Debug)]
-pub enum InvalidHeartbeatSequence {
-    /// The raw value was zero; zero is reserved as invalid.
-    Zero,
-}
-
 /// A strictly positive sequence number used in PING/PONG heartbeat frames.
 ///
 /// `HeartbeatSequence` is encoded as an 8-byte big-endian unsigned integer
@@ -208,8 +200,8 @@ pub enum InvalidHeartbeatSequence {
 ///
 /// Properties:
 /// - Zero is reserved / invalid.
-/// - Wraparound: if the allocator returns zero, it retries once.
-///   If the retry also returns zero, `next()` returns `None`.
+/// - [`checked_next`](Self::checked_next) returns `None` rather than wrapping
+///   to zero after `u64::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HeartbeatSequence(u64);
 
@@ -258,6 +250,12 @@ impl HeartbeatSequence {
         let seq = u64::from_be_bytes(bytes);
         Self::new(seq)
     }
+
+    /// Returns the next sequence, or `None` instead of wrapping at `u64::MAX`.
+    #[inline]
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).and_then(Self::new)
+    }
 }
 
 impl fmt::Display for HeartbeatSequence {
@@ -285,6 +283,10 @@ pub enum HeartbeatErrorCode {
     UnsolicitedPong = 3,
     /// Received a PING from the Agent (not supported in Session 07).
     AgentPingNotSupported = 4,
+    /// PING or PONG payload was not exactly one non-zero 8-byte sequence.
+    InvalidHeartbeatPayload = 5,
+    /// A non-heartbeat frame was received before stream traffic is supported.
+    UnexpectedFrame = 6,
 }
 
 impl HeartbeatErrorCode {
@@ -304,6 +306,8 @@ impl HeartbeatErrorCode {
             2 => Some(Self::HeartbeatSequenceMismatch),
             3 => Some(Self::UnsolicitedPong),
             4 => Some(Self::AgentPingNotSupported),
+            5 => Some(Self::InvalidHeartbeatPayload),
+            6 => Some(Self::UnexpectedFrame),
             _ => None,
         }
     }
@@ -323,6 +327,8 @@ impl TryFrom<u16> for HeartbeatErrorCode {
             2 => Ok(Self::HeartbeatSequenceMismatch),
             3 => Ok(Self::UnsolicitedPong),
             4 => Ok(Self::AgentPingNotSupported),
+            5 => Ok(Self::InvalidHeartbeatPayload),
+            6 => Ok(Self::UnexpectedFrame),
             _ => Err(()),
         }
     }
@@ -378,5 +384,58 @@ mod tests {
 
         // Unknown code.
         assert!(HandshakeErrorCode::from_be_bytes([0x00, 0x99]).is_none());
+    }
+
+    #[test]
+    fn heartbeat_sequence_rejects_zero() {
+        assert!(HeartbeatSequence::INVALID.is_invalid());
+        assert!(HeartbeatSequence::new(0).is_none());
+        assert!(HeartbeatSequence::from_be_bytes([0; 8]).is_none());
+        assert_eq!(HeartbeatSequence::FIRST.get(), 1);
+    }
+
+    #[test]
+    fn heartbeat_sequence_roundtrips_big_endian() {
+        let sequence = HeartbeatSequence::new(0x01_02_03_04_05_06_07_08).unwrap();
+        assert_eq!(
+            sequence.to_be_bytes(),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        assert_eq!(
+            HeartbeatSequence::from_be_bytes(sequence.to_be_bytes()),
+            Some(sequence)
+        );
+        assert_eq!(sequence.to_string(), "seq#72623859790382856");
+    }
+
+    #[test]
+    fn heartbeat_sequence_checked_next_does_not_wrap() {
+        assert_eq!(
+            HeartbeatSequence::FIRST.checked_next(),
+            HeartbeatSequence::new(2)
+        );
+        assert!(HeartbeatSequence::new(u64::MAX)
+            .unwrap()
+            .checked_next()
+            .is_none());
+    }
+
+    #[test]
+    fn heartbeat_error_code_roundtrip() {
+        for code in [
+            HeartbeatErrorCode::HeartbeatTimeout,
+            HeartbeatErrorCode::HeartbeatSequenceMismatch,
+            HeartbeatErrorCode::UnsolicitedPong,
+            HeartbeatErrorCode::AgentPingNotSupported,
+            HeartbeatErrorCode::InvalidHeartbeatPayload,
+            HeartbeatErrorCode::UnexpectedFrame,
+        ] {
+            assert_eq!(
+                HeartbeatErrorCode::from_be_bytes(code.to_be_bytes()),
+                Some(code)
+            );
+            assert_eq!(HeartbeatErrorCode::try_from(code.as_u16()), Ok(code));
+        }
+        assert!(HeartbeatErrorCode::from_be_bytes([0x00, 0x99]).is_none());
     }
 }

@@ -205,3 +205,32 @@ ERROR frame and immediate connection close.
 - No database or external state is required for the ID itself.
 - Future sessions may layer additional authentication (TLS client certs, shared secrets)
   on top of this foundation without changing the ID semantics.
+
+---
+
+## ADR-009 — Edge-initiated heartbeat with one outstanding sequence
+
+**Status:** Accepted (Session 07).
+
+**Context:** After Session 06, Edge retained a semaphore permit for every
+established Agent TCP connection but could not distinguish an idle healthy
+Agent from a crashed process or partitioned network. Edge is the authority that
+owns live routing/session capacity, so it must be able to make this decision
+without depending on Agent timers.
+
+**Decision:** Edge initiates heartbeat after a configurable interval. Every
+PING contains an 8-byte big-endian non-zero sequence. Agent returns a PONG with
+the identical sequence before a configurable deadline. Only one PING may be
+outstanding. Any timeout or invalid heartbeat transition closes that session.
+
+**Consequences:**
+
+- Edge has a deterministic upper bound for retaining a silent Agent session.
+- The semaphore permit is released by the same task/RAII path used by all other
+  session exits.
+- PING/PONG direction is fixed in v1: Agent-initiated PING is rejected.
+- Heartbeat does not implement reconnect; Agent recovery remains a separate
+  state machine.
+- Sequential reader/writer ownership remains sufficient before multiplexing.
+  A future multiplexed runtime will replace it with one reader task and one
+  bounded writer queue without changing the heartbeat wire payload.

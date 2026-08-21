@@ -89,8 +89,8 @@ stream-scoped frame with `stream_id == 0`, or a control-scoped frame with
 | `0x11`  | `DATA`         | Stream     | Not yet defined.  |
 | `0x12`  | `END_STREAM`   | Stream     | Not yet defined.  |
 | `0x13`  | `RESET_STREAM` | Stream     | Not yet defined.  |
-| `0x20`  | `PING`         | Control    | Not yet defined.  |
-| `0x21`  | `PONG`         | Control    | Not yet defined.  |
+| `0x20`  | `PING`         | Control    | 8-byte non-zero heartbeat sequence. |
+| `0x21`  | `PONG`         | Control    | Echoes the matching PING sequence. |
 | `0xFF`  | `ERROR`        | Control    | Not yet defined.  |
 
 Frame types are defined as stable numeric constants. Unknown frame type
@@ -114,6 +114,14 @@ Session 06 defines the payload schemas for the handshake frame types:
 | `0xFF` | `ERROR`      | Control | 2 bytes big-endian: error code (see below). |
 
 All other frame type payloads remain undefined in Session 06.
+
+### Session 07 Heartbeat Payloads
+
+PING and PONG both carry exactly 8 bytes: a non-zero `u64` heartbeat
+sequence encoded in big-endian order. Edge initiates PING and permits only
+one outstanding sequence. Agent responds with PONG carrying the identical
+payload. Zero, malformed lengths, mismatched PONG, unsolicited PONG, and
+Agent-initiated PING are protocol violations that close the session.
 
 ## Payload Maximum
 
@@ -214,6 +222,21 @@ in ERROR frame payloads:
 | 3 | `InvalidRegister` | REGISTER frame had a non-empty payload. |
 | 4 | `ProtocolViolation` | General protocol violation. |
 
+### Heartbeat Error Codes
+
+After REGISTERED, ERROR payloads use the established-session heartbeat code
+registry. Decoding is state-dependent because the payload remains a compact
+2-byte big-endian value:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | `HeartbeatTimeout` | Matching PONG was not received before the deadline. |
+| 2 | `HeartbeatSequenceMismatch` | PONG sequence differs from the outstanding PING. |
+| 3 | `UnsolicitedPong` | PONG arrived while no PING was outstanding. |
+| 4 | `AgentPingNotSupported` | Agent initiated PING in the Edge-initiated v1 model. |
+| 5 | `InvalidHeartbeatPayload` | PING/PONG payload is not one non-zero 8-byte sequence. |
+| 6 | `UnexpectedFrame` | A non-heartbeat frame arrived before traffic streams are supported. |
+
 ## Security Considerations
 
 - All validated untrusted input. Every byte of every incoming frame is
@@ -234,12 +257,10 @@ Protocol v1 framing does **not** include:
 - Agent authentication or credentials.
 - Stream multiplexing runtime (stream IDs exist as a concept but the
   demultiplexing logic is not implemented).
-- Heartbeat timer or keepalive behavior (PING / PONG frame types exist
-  as types but the behavior is not implemented).
 - Reconnect logic.
 - HTTP, WebSocket, or any higher-layer protocol.
 - Payload schemas for frame types other than HELLO, REGISTER, REGISTERED,
-  and ERROR (defined in Session 06).
+  PING, PONG, and ERROR.
 - Tunnel registration, hostname allocation, or durable identity.
 - Traffic forwarding / reverse tunneling.
 

@@ -26,3 +26,6 @@ pub const REGISTERED_PAYLOAD_SIZE: u32 = 8;
 
 /// Exact byte length of an ERROR frame payload (2 bytes: error code).
 pub const ERROR_PAYLOAD_SIZE: u32 = 2;
+
+/// Exact byte length of a PING or PONG payload (8 bytes: heartbeat sequence).
+pub const HEARTBEAT_PAYLOAD_SIZE: u32 = 8;

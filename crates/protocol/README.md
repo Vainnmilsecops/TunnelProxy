@@ -2,7 +2,7 @@
 
 Wire protocol between `tunnelproxy-edge` and `tunnelproxy-agent`.
 
-## Responsibility (future)
+## Responsibility
 
 - Protocol versioning.
 - Frame layout.
@@ -20,5 +20,8 @@ Wire protocol between `tunnelproxy-edge` and `tunnelproxy-agent`.
 
 ## Current state
 
-Foundation-only. The only export today is `PROTOCOL_VERSION = 1` so that
-later sessions can wire up version negotiation without a phantom API.
+Tunnel Protocol v1 framing is implemented: fixed 16-byte headers, binary-safe
+payloads capped at 64 KiB, strict frame/stream scope validation, typed errors,
+and async encode/decode. HELLO/REGISTER/REGISTERED handshake payloads and the
+Session 07 PING/PONG heartbeat payload are defined and tested. Stream traffic
+types exist, but their runtime semantics are not implemented yet.

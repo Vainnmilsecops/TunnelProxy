@@ -16,15 +16,17 @@
 //! The agent NEVER accepts inbound connections from the public internet
 //! (INV-001). All sockets in this crate are outbound.
 //!
-//! No reconnect, heartbeat, stream multiplexing, or local forwarding
-//! is implemented in these sessions. See `docs/ai/SESSION_INDEX.md` and
-//! `docs/TECH_DEBT.md` for the deliberate limitations.
+//! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Reconnect,
+//! stream multiplexing, and local forwarding remain unimplemented. See
+//! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]
 
 mod agent_transport;
 
-pub use agent_transport::{connect, AgentError, AgentSession, ConnectOutcome};
+pub use agent_transport::{
+    connect, AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
+};
 
 use std::net::SocketAddr;
 use std::time::Duration;

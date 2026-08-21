@@ -64,6 +64,13 @@
 | Agent ↔ Edge: session remains open after handshake | ✅ | ✅ | — | `session_remains_open_after_handshake`. |
 | Agent ↔ Edge: TransportSessionId strongly typed | ✅ | —  | — | `transport_session_id_validity`, `transport_session_id_be_bytes` (unit tests). |
 | Agent ↔ Edge: TransportSessionIdAllocator monotonic | ✅ | ✅ | — | `transport_session_id_allocator_starts_at_one`, `transport_session_id_allocator_monotonic` (unit), `transport_session_id_allocator_regression` (integration). |
+| Agent ↔ Edge heartbeat payload types | ✅ | — | — | `HeartbeatSequence` rejects zero, round-trips big-endian, increments without wrapping; heartbeat error codes round-trip. |
+| Agent ↔ Edge heartbeat golden path | — | ✅ | — | `heartbeat_ping_pong_keeps_session_alive`; Agent `run()` answers Edge PING with matching PONG. |
+| Agent ↔ Edge heartbeat sequence | ✅ | ✅ | — | `edge_heartbeat_sequence_is_monotonic` observes sequences 1, 2, and 3 over real TCP. |
+| Agent ↔ Edge dead-session detection | — | ✅ | — | `heartbeat_timeout_releases_capacity` proves a silent established Agent is closed and its only permit is reusable. |
+| Agent ↔ Edge mismatched PONG | — | ✅ | — | `mismatched_pong_closes_session_with_error` verifies typed ERROR response. |
+| Agent ↔ Edge malformed heartbeat | — | ✅ | — | `malformed_pong_payload_is_rejected` and `agent_rejects_malformed_edge_ping`. |
+| Agent ↔ Edge heartbeat direction | — | ✅ | — | `unsolicited_pong_is_rejected` and `agent_ping_is_rejected_for_edge_initiated_heartbeat`. |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
 | Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |

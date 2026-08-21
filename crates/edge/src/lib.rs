@@ -31,13 +31,14 @@
 //!   underlying full-duplex and half-close semantics are preserved by
 //!   construction.
 //!
-//! - The **Agent control transport** from Session 06
+//! - The **Agent control transport** from Sessions 06–07
 //!   (`AgentTransportListener`, `AgentListenerConfig`,
 //!   `TransportSessionId`, `AgentSession`, `HandshakeState`).
 //!   A protocol-aware TCP listener that accepts Agent connections,
 //!   performs the v1 handshake (HELLO → REGISTER → REGISTERED),
 //!   and maintains established transport sessions. Bounded concurrent
-//!   admission via semaphore; bounded handshake via timeout.
+//!   admission via semaphore; bounded handshake and Edge-initiated heartbeat
+//!   liveness via configurable timeouts.
 //!
 //! The echo baseline and relay primitives are **layer-4 TCP** primitives
 //! that exist to validate the byte-stream pipeline, lifecycle, and

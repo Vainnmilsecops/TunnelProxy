@@ -9,22 +9,24 @@ correct agent, which in turn proxies them into the local service.
 
 ## Current development status
 
-**Early-stage / pre-MVP foundation.** This repository currently contains:
+**Early-stage / pre-MVP transport foundation.** This repository currently contains:
 
 - The Cargo workspace layout and component boundaries.
-- Minimal, non-functional crate skeletons for the long-term components.
+- Async TCP echo, relay, and bounded local-forwarder primitives.
+- Tunnel Protocol v1 binary framing with a 64 KiB payload limit.
+- Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
+- Real loopback integration tests for framing, forwarding, lifecycle, and liveness.
 - Product, architecture, development, and AI context documentation.
 
 The following are **not yet implemented**:
 
-- TCP listener / TCP tunnel
-- HTTP reverse proxy
-- Custom tunnel framing
-- TLS
-- Authentication
-- Persistence
-- Request inspection, replay, webhook debugging
-- Multi-tenant or multi-edge runtime
+- Reverse traffic forwarding over the Agent transport.
+- Stream multiplexing and flow control.
+- Public HTTP reverse proxy and hostname allocation.
+- TLS and Agent authentication.
+- Persistence and durable tunnel identity.
+- Request inspection, replay, and webhook debugging.
+- Multi-tenant or multi-edge runtime.
 
 Any README, comment, or doc that suggests these features work today is a bug.
 See [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) and
@@ -62,7 +64,8 @@ The architecture conceptually separates:
 - **Data Plane** — live agent connections, public ingress, tunnel routing,
   request/response traffic.
 
-Today both planes are empty placeholders. See
+Today the control plane remains a placeholder while the data plane has a
+tested local transport foundation but no public reverse-tunnel path. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -133,8 +136,9 @@ and Definition of Done.
 
 | Session | Focus |
 |---------|-------|
-| 01 — Foundation _(current)_ | workspace, component boundaries, docs, AI context layer |
-| 02 — TCP Networking Foundation _(planned)_ | outbound agent connection, TCP forwarding primitives |
+| 01–06 _(complete)_ | foundation, TCP relay/forwarder, framing, Agent ↔ Edge handshake |
+| 07 _(complete)_ | Edge-initiated heartbeat, liveness timeout, dead-session cleanup |
+| 08 _(planned)_ | one bounded reverse data stream before multiplexing |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
