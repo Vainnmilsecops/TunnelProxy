@@ -190,6 +190,144 @@ impl TryFrom<u16> for HandshakeErrorCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HeartbeatSequence
+// ---------------------------------------------------------------------------
+
+/// Error returned when constructing an invalid `HeartbeatSequence`.
+#[derive(Debug)]
+pub enum InvalidHeartbeatSequence {
+    /// The raw value was zero; zero is reserved as invalid.
+    Zero,
+}
+
+/// A strictly positive sequence number used in PING/PONG heartbeat frames.
+///
+/// `HeartbeatSequence` is encoded as an 8-byte big-endian unsigned integer
+/// in the PING and PONG frame payloads.
+///
+/// Properties:
+/// - Zero is reserved / invalid.
+/// - Wraparound: if the allocator returns zero, it retries once.
+///   If the retry also returns zero, `next()` returns `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeartbeatSequence(u64);
+
+impl HeartbeatSequence {
+    /// The zero / invalid sequence. No valid heartbeat has this value.
+    pub const INVALID: Self = Self(0);
+
+    /// The first valid sequence number.
+    pub const FIRST: Self = Self(1);
+
+    /// Attempts to construct a `HeartbeatSequence` from a raw `u64`.
+    ///
+    /// Returns `None` if the value is zero.
+    #[inline]
+    pub fn new(seq: u64) -> Option<Self> {
+        if seq == 0 {
+            None
+        } else {
+            Some(Self(seq))
+        }
+    }
+
+    /// Returns `true` if this is the invalid / zero sequence.
+    #[inline]
+    pub const fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns the raw `u64` value.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Encodes the sequence as 8 big-endian bytes.
+    #[inline]
+    pub fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    /// Decodes 8 big-endian bytes into a `HeartbeatSequence`.
+    ///
+    /// Returns `None` if the bytes decode to zero.
+    #[inline]
+    pub fn from_be_bytes(bytes: [u8; 8]) -> Option<Self> {
+        let seq = u64::from_be_bytes(bytes);
+        Self::new(seq)
+    }
+}
+
+impl fmt::Display for HeartbeatSequence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seq#{}", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat error codes
+// ---------------------------------------------------------------------------
+
+/// Error codes transmitted in ERROR frame payloads during established-session
+/// heartbeat violations.
+///
+/// Distinct from `HandshakeErrorCode` — these apply after REGISTERED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum HeartbeatErrorCode {
+    /// No PONG was received before the heartbeat deadline expired.
+    HeartbeatTimeout = 1,
+    /// Received a PONG with a sequence that does not match the outstanding PING.
+    HeartbeatSequenceMismatch = 2,
+    /// Received a PONG when no PING was outstanding.
+    UnsolicitedPong = 3,
+    /// Received a PING from the Agent (not supported in Session 07).
+    AgentPingNotSupported = 4,
+}
+
+impl HeartbeatErrorCode {
+    /// Encodes the error code as 2 big-endian bytes.
+    #[inline]
+    pub fn to_be_bytes(self) -> [u8; 2] {
+        (self as u16).to_be_bytes()
+    }
+
+    /// Decodes a 2-byte big-endian ERROR payload into a `HeartbeatErrorCode`.
+    ///
+    /// Returns `None` if the code is not a defined variant.
+    pub fn from_be_bytes(bytes: [u8; 2]) -> Option<Self> {
+        let code = u16::from_be_bytes(bytes);
+        match code {
+            1 => Some(Self::HeartbeatTimeout),
+            2 => Some(Self::HeartbeatSequenceMismatch),
+            3 => Some(Self::UnsolicitedPong),
+            4 => Some(Self::AgentPingNotSupported),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw `u16` value.
+    #[inline]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for HeartbeatErrorCode {
+    type Error = ();
+    fn try_from(code: u16) -> Result<Self, Self::Error> {
+        match code {
+            1 => Ok(Self::HeartbeatTimeout),
+            2 => Ok(Self::HeartbeatSequenceMismatch),
+            3 => Ok(Self::UnsolicitedPong),
+            4 => Ok(Self::AgentPingNotSupported),
+            _ => Err(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

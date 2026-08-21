@@ -1,0 +1,52 @@
+feat(transport): establish Agent Edge protocol handshake
+
+Implement the persistent Agent ↔ Edge control transport and Tunnel Protocol v1
+handshake (HELLO → REGISTER → REGISTERED) as Session 06.
+
+Protocol extensions (tunnelproxy-protocol):
+- New `handshake.rs` module: `HelloRole`, `TransportSessionId`,
+  `TransportSessionIdAllocator`, `HandshakeErrorCode`.
+- Wire constants: `HELLO_PAYLOAD_SIZE`, `REGISTERED_PAYLOAD_SIZE`,
+  `ERROR_PAYLOAD_SIZE`.
+- `ROLE_AGENT = 0x01` for the HELLO role byte.
+- `TransportSessionId`: strongly typed u64, zero-is-invalid, big-endian
+  8-byte encoding for REGISTERED payload.
+- `HandshakeErrorCode`: 4 defined codes (UnexpectedFrame, InvalidHello,
+  InvalidRegister, ProtocolViolation) for ERROR frame payloads.
+
+Edge runtime (tunnelproxy-edge):
+- New `agent_transport.rs` module: `AgentListenerConfig`,
+  `AgentTransportListener`, `TransportSessionIdAllocator`,
+  `HandshakeState`, `AgentTransportError`, `AgentSession`.
+- Bounded concurrent admission via `tokio::sync::Semaphore` (permit held
+  for full connection lifetime).
+- Bounded handshake timeout (10 s default; affects handshake only).
+- Strict state machine: TCP_ACCEPTED → AWAIT_HELLO → AWAIT_REGISTER
+  → ESTABLISHED → CLOSED.
+- ERROR frame sent for handshake violations.
+- Established session waits for incoming bytes / EOF (no traffic frames yet).
+- Added `tunnelproxy-protocol` as a dependency.
+
+Agent runtime (tunnelproxy-agent):
+- New `agent_transport.rs` module: `AgentError`, `AgentSession`,
+  `ConnectOutcome`, `connect()`.
+- Performs HELLO → REGISTER → REGISTERED handshake.
+- `AgentSession` owns the socket with `session_id`, `edge_addr`,
+  `established_at`, and `read_frame()` for future use.
+- Added `tunnelproxy-protocol` as a dependency.
+
+Integration tests (crates/edge/tests/agent_transport.rs):
+- 12 tests covering: valid handshake, invalid frame sequences,
+  invalid payloads, handshake timeout, capacity release, peer disconnect,
+  session ID uniqueness, session remains open.
+
+Documentation:
+- `docs/AGENT_EDGE_TRANSPORT.md`: topology, handshake sequence,
+  payload schemas, state machines, bounded admission, ERROR codes,
+  reader/writer ownership notes.
+- `docs/TUNNEL_PROTOCOL_V1.md`: updated with Session 06 schemas.
+- `docs/ai/CURRENT_STATE.md`, `docs/ai/TEST_MATRIX.md`,
+  `docs/ai/SESSION_INDEX.md`, `docs/ai/DECISIONS.md` (ADR-008),
+  `docs/TECH_DEBT.md` (DEBT-011, DEBT-012).
+
+All 82 workspace tests pass. No previous capabilities broken.
