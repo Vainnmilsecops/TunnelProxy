@@ -176,3 +176,32 @@ All multi-byte integers use big-endian / network byte order.
   between incompatible peers.
 - Switching to HTTP/2 or QUIC later remains possible; the protocol
   crate boundary is the single point of change.
+
+---
+
+## ADR-008 — Ephemeral process-local TransportSessionId with strict handshake sequencing
+
+**Status:** Accepted (Session 06).
+
+**Context:** Before the Agent ↔ Edge transport can be established, both peers need a shared
+notion of "which session is this?" for observability and debugging. We also need
+to validate that the Agent is who it claims to be (no auth yet) and that the
+handshake order is correct (no frame substitution or replay).
+
+**Decision:** Edge allocates a monotonically increasing `TransportSessionId` (u64)
+per accepted TCP connection using a process-local `AtomicU64`. The ID is sent to the
+Agent in a REGISTERED frame. Zero is reserved as invalid. The handshake is strictly
+sequenced: HELLO must be first, REGISTER must be second. Any deviation triggers an
+ERROR frame and immediate connection close.
+
+**Consequences:**
+
+- The ID is ephemeral: it exists for the TCP connection's lifetime only.
+- The ID is process-local: it has no meaning outside the Edge process.
+- The ID is not a durable identity: it is not a `TunnelId`, `AgentId`, or `UserId`.
+- Wraparound after 2^64 allocations returns `None` (safe failure rather than a
+  silent zero-ID session).
+- Strict sequencing prevents replay or substitution attacks during the handshake.
+- No database or external state is required for the ID itself.
+- Future sessions may layer additional authentication (TLS client certs, shared secrets)
+  on top of this foundation without changing the ID semantics.

@@ -102,6 +102,19 @@ field is opaque binary bytes in Session 05. Future sessions will introduce
 typed payload structures (e.g. JSON, protobuf, or a custom binary schema)
 as the Agent ↔ Edge handshake is designed.
 
+### Session 06 Payload Schemas
+
+Session 06 defines the payload schemas for the handshake frame types:
+
+| Value   | Name         | Scope   | Payload schema |
+|---------|--------------|---------|---------------|
+| `0x01` | `HELLO`      | Control | 1 byte: role (`0x01` = AGENT). Exactly 1 byte. |
+| `0x02` | `REGISTER`   | Control | Empty (0 bytes). |
+| `0x03` | `REGISTERED` | Control | 8 bytes big-endian: `TransportSessionId` (non-zero). |
+| `0xFF` | `ERROR`      | Control | 2 bytes big-endian: error code (see below). |
+
+All other frame type payloads remain undefined in Session 06.
+
 ## Payload Maximum
 
 The maximum payload size is **64 KiB** (`65,536` bytes).
@@ -189,6 +202,18 @@ Encoding
 All protocol errors are recoverable. The decoder never panics on malformed
 input.
 
+### Handshake Error Codes
+
+Session 06 defines a minimal set of handshake-level error codes transmitted
+in ERROR frame payloads:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | `UnexpectedFrame` | Frame was not expected at this point in the handshake. |
+| 2 | `InvalidHello` | HELLO frame had an invalid payload. |
+| 3 | `InvalidRegister` | REGISTER frame had a non-empty payload. |
+| 4 | `ProtocolViolation` | General protocol violation. |
+
 ## Security Considerations
 
 - All validated untrusted input. Every byte of every incoming frame is
@@ -205,16 +230,18 @@ input.
 
 Protocol v1 framing does **not** include:
 
-- Authentication, credentials, or TLS.
-- Agent ↔ Edge handshake behavior (HELLO / REGISTER / REGISTERED frames
-  exist as types but carry no domain semantics yet).
+- TLS or encryption.
+- Agent authentication or credentials.
 - Stream multiplexing runtime (stream IDs exist as a concept but the
   demultiplexing logic is not implemented).
 - Heartbeat timer or keepalive behavior (PING / PONG frame types exist
   as types but the behavior is not implemented).
 - Reconnect logic.
 - HTTP, WebSocket, or any higher-layer protocol.
-- Payload schemas for any frame type.
+- Payload schemas for frame types other than HELLO, REGISTER, REGISTERED,
+  and ERROR (defined in Session 06).
+- Tunnel registration, hostname allocation, or durable identity.
+- Traffic forwarding / reverse tunneling.
 
 ## Dependencies
 

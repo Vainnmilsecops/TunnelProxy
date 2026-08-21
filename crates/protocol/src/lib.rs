@@ -26,9 +26,14 @@
 mod codec;
 mod error;
 mod frame;
+mod handshake;
 mod wire;
 
 pub use codec::{FrameDecoder, FrameEncoder};
 pub use error::ProtocolError;
 pub use frame::{Frame, FrameType, Scope, StreamId};
-pub use wire::{HEADER_SIZE, MAGIC, MAX_FRAME_PAYLOAD, VERSION};
+pub use handshake::{HandshakeErrorCode, HelloRole, TransportSessionId, ROLE_AGENT};
+pub use wire::{
+    ERROR_PAYLOAD_SIZE, HEADER_SIZE, HELLO_PAYLOAD_SIZE, MAGIC, MAX_FRAME_PAYLOAD,
+    REGISTERED_PAYLOAD_SIZE, VERSION,
+};

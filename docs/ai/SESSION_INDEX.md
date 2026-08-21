@@ -9,6 +9,7 @@
 | 03      | Bidirectional TCP Streaming / TCP Relay        | complete |
 | 04      | TCP Relay Lifecycle Hardening / Local Port Forwarding | complete |
 | 05      | Tunnel Protocol v1: Binary Framing & Message Design | complete |
+| 06      | Persistent Agent ↔ Edge Transport & Protocol Handshake | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -201,6 +202,69 @@ Out of scope (explicitly NOT delivered in Session 05):
 - Authentication, TLS, HTTP, WebSocket.
 - Graceful shutdown (DEBT-005 still open).
 - Idle read deadline (DEBT-006 still open).
+- Upstream connection pool (DEBT-008 still open).
+- Per-IP admission control (DEBT-009 still open).
+- Telemetry backend (DEBT-010 still open).
+
+## Session 06 — Persistent Agent ↔ Edge Transport & Protocol Handshake — complete
+
+Scope that was actually delivered:
+
+- Extended `tunnelproxy-protocol` with the handshake type module
+  (`crates/protocol/src/handshake.rs`): `HelloRole`, `TransportSessionId`,
+  `TransportSessionIdAllocator`, `HandshakeErrorCode`, plus the wire
+  constants `HELLO_PAYLOAD_SIZE`, `REGISTERED_PAYLOAD_SIZE`, `ERROR_PAYLOAD_SIZE`.
+- Added `tunnelproxy-edge` dependency on `tunnelproxy-protocol`.
+- Added `tunnelproxy-agent` dependency on `tunnelproxy-protocol`.
+- New Edge module `crates/edge/src/agent_transport.rs`:
+  `AgentListenerConfig`, `AgentTransportListener`, `TransportSessionIdAllocator`,
+  `HandshakeState`, `AgentTransportError`, `AgentSession`. The listener
+  binds via `bind()` and runs via `run()`. Per-connection task performs the
+  v1 handshake under a bounded semaphore and timeout. Strict state machine:
+  AWAIT_HELLO → AWAIT_REGISTER → ESTABLISHED → CLOSED. ERROR frame sent for
+  protocol violations. Established session waits for incoming bytes / EOF.
+- New Agent module `crates/agent/src/agent_transport.rs`:
+  `AgentError`, `AgentSession`, `ConnectOutcome`, `connect()`.
+  Performs HELLO → REGISTER → REGISTERED handshake. `AgentSession` owns
+  the socket and exposes `read_frame()` for future use.
+- Strict handshake sequencing enforced on both sides: HELLO must be first,
+  REGISTER must be second. Any deviation is a protocol violation.
+- Bounded concurrent admission: `Semaphore` sized to `max_agent_sessions`,
+  permit acquired **before** handshake, held until connection closes.
+- Bounded handshake timeout: Tokio timeout wraps the handshake phase only.
+  Established session lifetime is unlimited in Session 06.
+- Structured `tracing` events throughout with `session_id`, `peer`, `duration_ms`.
+- New integration tests in `crates/edge/tests/agent_transport.rs` (12 tests):
+  valid handshake, invalid first/second frames, invalid payloads, timeout,
+  capacity release, peer disconnect cleanup, session ID uniqueness, session
+  remains open.
+- New unit tests in `crates/edge/src/agent_transport.rs` (6 tests):
+  config validation, allocator monotonicity, handshake state.
+- New unit tests in `crates/protocol/src/handshake.rs` (4 tests):
+  role roundtrip, session ID validity/bytes, error code roundtrip.
+- All 82 workspace tests pass (70 pre-existing + 12 new integration).
+- New `docs/AGENT_EDGE_TRANSPORT.md`: topology, handshake sequence diagram,
+  payload schemas, TransportSessionId semantics, state machines, bounded
+  admission, timeout semantics, disconnect behavior, ERROR codes, reader/writer
+  ownership note, what is NOT implemented.
+- Updated `docs/TUNNEL_PROTOCOL_V1.md`: Session 06 payload schemas,
+  handshake error codes, updated "What Is NOT Implemented" section.
+- Updated `docs/ai/CURRENT_STATE.md`, `docs/ai/TEST_MATRIX.md`,
+  `docs/ai/SESSION_INDEX.md`.
+
+Out of scope (explicitly NOT delivered in Session 06):
+
+- TLS / encryption (transport is development-only, loopback only).
+- Agent authentication.
+- Heartbeat / PING-PONG timers (PING/PONG frame types exist, behavior not implemented).
+- Reconnect logic.
+- Stream multiplexing (OPEN_STREAM / DATA frames have no runtime).
+- Durable tunnel registration (REGISTER here means only "register this
+  TCP connection as an ephemeral transport session").
+- Public endpoint / hostname allocation.
+- Traffic forwarding / reverse tunneling.
+- Graceful shutdown channel (DEBT-005 still open).
+- Idle read deadline on established sessions (DEBT-006 still open).
 - Upstream connection pool (DEBT-008 still open).
 - Per-IP admission control (DEBT-009 still open).
 - Telemetry backend (DEBT-010 still open).

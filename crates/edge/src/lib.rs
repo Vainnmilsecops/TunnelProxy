@@ -31,11 +31,19 @@
 //!   underlying full-duplex and half-close semantics are preserved by
 //!   construction.
 //!
-//! Neither primitive implements the TunnelProxy reverse-tunnel
-//! protocol. They are **layer-4 TCP** primitives that exist to
-//! validate the byte-stream pipeline, lifecycle, and resource
-//! discipline that later sessions will reuse for the agent ↔ edge
-//! tunnel. See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006) and
+//! - The **Agent control transport** from Session 06
+//!   (`AgentTransportListener`, `AgentListenerConfig`,
+//!   `TransportSessionId`, `AgentSession`, `HandshakeState`).
+//!   A protocol-aware TCP listener that accepts Agent connections,
+//!   performs the v1 handshake (HELLO → REGISTER → REGISTERED),
+//!   and maintains established transport sessions. Bounded concurrent
+//!   admission via semaphore; bounded handshake via timeout.
+//!
+//! The echo baseline and relay primitives are **layer-4 TCP** primitives
+//! that exist to validate the byte-stream pipeline, lifecycle, and
+//! resource discipline. The Agent transport is the first protocol-aware
+//! runtime. Neither implements the reverse-tunnel traffic forwarding yet.
+//! See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006, ADR-007) and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
 #![deny(unsafe_code)]
@@ -1031,6 +1039,8 @@ fn log_outcome(outcome: &ConnectionOutcome, _upstream: SocketAddr) {
         }
     }
 }
+
+pub mod agent_transport;
 
 #[cfg(test)]
 mod tests {

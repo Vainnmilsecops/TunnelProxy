@@ -151,6 +151,38 @@
   there are real production workloads to measure.
 - **Tracking:** open.
 
+### DEBT-011 — No heartbeat / liveness detection on established sessions
+
+- **Introduced in:** Session 06
+- **Category:** correctness
+- **Impact:** medium
+- **Rationale:** After the handshake, an established Agent ↔ Edge
+  transport session can hang indefinitely if the Agent crashes or the
+  network is partitioned. INV-005 requires timeouts on long-running
+  network operations. Session 06 intentionally does not add PING/PONG
+  timer behavior so the handshake can be stabilized first.
+- **Exit plan:** Add a configurable idle timeout on established
+  sessions (Session 07). Agent sends periodic PING; Edge responds with
+  PONG; missing PONG after configurable attempts closes the session.
+- **Tracking:** Session 07 plan, `docs/ai/SESSION_INDEX.md`.
+
+### DEBT-012 — No graceful shutdown for Agent transport listener
+
+- **Introduced in:** Session 06
+- **Category:** ops
+- **Impact:** medium
+- **Rationale:** `AgentTransportListener::run` executes an infinite
+  accept loop and only returns when `accept` itself errors. There is
+  no signal-driven graceful-shutdown path and no cancellation token
+  passed to spawned session tasks. In production we need clean draining
+  of in-flight connections on SIGTERM.
+- **Exit plan:** Add a `tokio::sync::watch` or `CancellationToken`
+  channel that `AgentTransportListener::run` selects on alongside
+  `accept`, and that in-flight `agent_session_task` tasks also
+  observe to abort their copies cleanly. DEBT-005 applies the same
+  fix to `Forwarder::run`.
+- **Tracking:** Session 07+ plan, `docs/ai/SESSION_INDEX.md`.
+
 ## Resolved items
 
 ### DEBT-001 — Foundation crates are placeholders only
