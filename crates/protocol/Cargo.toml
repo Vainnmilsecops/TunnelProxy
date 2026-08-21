@@ -1,6 +1,6 @@
 [package]
 name = "tunnelproxy-protocol"
-description = "Wire protocol types between TunnelProxy Edge and Agent (placeholder)."
+description = "Wire protocol types and codecs between TunnelProxy Edge and Agent."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Async I/O primitives — codec sits at the I/O boundary.
+tokio = { workspace = true, features = ["io-util"] }
+
+# Derive macros for thiserror.
+thiserror = "2"

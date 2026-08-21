@@ -129,3 +129,50 @@ plane.
 - The README does not claim performance numbers.
 - Tech debt entries that trade correctness for speed are not
   accepted.
+
+---
+
+## ADR-007 — Length-prefixed binary framing with fixed header for Tunnel Protocol v1
+
+**Status:** Accepted (Session 05).
+
+**Context:** TCP provides an ordered byte stream without message boundaries.
+Before any Agent ↔ Edge tunnel runtime can exist, we need a deterministic
+way to reconstruct application messages from that stream. We also need to
+enforce bounded resource usage (INV-002) before reading any payload.
+
+**Decision:** Tunnel Protocol v1 uses a fixed 16-byte binary header followed
+by a bounded payload:
+
+```
+Offset  Size  Field           Type
+0       4     Magic           [0x54, 0x50, 0x58, 0x31] ("TPX1")
+4       1     Version         u8  (1)
+5       1     Frame Type      u8
+6       2     Flags           u16 (big-endian; must be 0 in v1)
+8       4     Stream ID       u32 (big-endian)
+12      4     Payload Length  u32 (big-endian; max 64 KiB)
+16      N     Payload         [u8; N]
+```
+
+All multi-byte integers use big-endian / network byte order.
+
+**Consequences:**
+
+- Fixed header size (16 bytes) is known at compile time — no parsing
+  overhead beyond the initial header read.
+- Length-prefix approach is deterministic: the decoder always knows
+  how many payload bytes to expect before allocating.
+- Big-endian encoding is architecture-neutral and matches the network
+  standard used by TCP/IP.
+- Opaque payloads: no UTF-8 assumption, no schema coupling, no
+  serialization format commitment.
+- Stream ID field is present and validated (scope rules) so the
+  multiplexing runtime can be layered on top without wire-format changes.
+- Maximum payload (64 KiB) is enforced before allocation, making it
+  impossible for a malicious peer to exhaust memory by announcing a
+  large length.
+- Explicit version rejection prevents silent wire-format confusion
+  between incompatible peers.
+- Switching to HTTP/2 or QUIC later remains possible; the protocol
+  crate boundary is the single point of change.

@@ -44,7 +44,12 @@
 | Forwarder: structured error categories    | ✅   | ✅          | —   | `ForwardError::category()` returns `"capacity_exhausted"`, `"upstream_connect_failed"`, `"upstream_connect_timeout"`, `"relay_io_failed"`; logged as `error_category`. |
 | Edge: TCP forwarder CLI                   | —    | —           | —   | `edge_dev` accepts `--listen`, `--upstream`, `--max-connections`, `--connect-timeout-ms`, `--help`; manually smoke-tested.   |
 | HTTP reverse proxy                        | —    | —           | —   | Planned after Session 04.                                                                                                   |
-| Tunnel protocol framing                   | —    | —           | —   | Planned with the multiplexed tunnel (ADR-005); Session 05 design.                                                          |
+| Tunnel protocol framing                   | ✅   | —           | —   | 26 codec tests in `crates/protocol/src/codec.rs`: round-trip, binary, fragmented header/payload, coalesced frames, clean EOF, truncated header/payload, invalid magic/version/frame-type/flags, invalid stream scope, oversized encode/decode, real TCP loopback. |
+| Tunnel protocol: control stream scope    | ✅   | —           | —   | `frame::tests::frame_control_scope_validation` and `frame::tests::frame_stream_scope_validation`. |
+| Tunnel protocol: binary-safe payloads     | ✅   | —           | —   | `codec::tests::roundtrip_binary_payload` exercises 0x00–0xFF byte range. |
+| Tunnel protocol: 64 KiB max payload       | ✅   | —           | —   | `frame::tests::frame_max_payload_is_exactly_64kib`. |
+| Tunnel protocol: EOF vs truncation        | ✅   | —           | —   | `codec::tests::clean_eof`, `codec::tests::truncated_header`, `codec::tests::truncated_payload`. |
+| Tunnel protocol: real loopback TCP        | ✅   | —           | —   | `codec::tests::real_tcp_loopback_roundtrip` binds a real `TcpListener` and exchanges frames over `TcpStream`. |
 | Agent ↔ Edge protocol handshake           | —    | —           | —   | Out of scope until framing exists.                                                                                          |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
 | Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |
