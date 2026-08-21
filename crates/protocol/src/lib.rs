@@ -1,27 +1,34 @@
 //! `tunnelproxy-protocol`
 //!
-//! Placeholder for the future wire protocol spoken between
+//! Wire protocol types and codecs spoken between
 //! [`tunnelproxy-edge`] and [`tunnelproxy-agent`].
 //!
-//! Nothing here is implemented yet on purpose. Once work begins, this crate
-//! will own the protocol versioning, framing, message types, and codec.
-//! Until then, exposing anything beyond a version constant would be a lie.
+//! # Wire Format
+//!
+//! Every frame begins with a fixed 16-byte header followed by a bounded
+//! payload (max 64 KiB):
+//!
+//! ```text
+//! Offset  Size  Field           Type
+//! 0       4     Magic           [0x54, 0x50, 0x58, 0x31] ("TPX1")
+//! 4       1     Version         u8  (1)
+//! 5       1     Frame Type      u8
+//! 6       2     Flags           u16 (big-endian)
+//! 8       4     Stream ID       u32 (big-endian)
+//! 12      4     Payload Length  u32 (big-endian)
+//! 16      N     Payload         [u8; N]
+//! ```
+//!
+//! All multi-byte integers use big-endian / network byte order.
 
 #![deny(unsafe_code)]
 
-/// Protocol version negotiated between Edge and Agent.
-///
-/// Bumping this number is the explicit signal that a wire-format change
-/// happened (see INV-004 in `docs/ai/INVARIANTS.md`).
-pub const PROTOCOL_VERSION: u16 = 1;
+mod codec;
+mod error;
+mod frame;
+mod wire;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn protocol_version_is_one() {
-        // Pinning the initial version prevents accidental "0.0.0" placeholders.
-        assert_eq!(PROTOCOL_VERSION, 1);
-    }
-}
+pub use codec::{FrameDecoder, FrameEncoder};
+pub use error::ProtocolError;
+pub use frame::{Frame, FrameType, Scope, StreamId};
+pub use wire::{HEADER_SIZE, MAGIC, MAX_FRAME_PAYLOAD, VERSION};

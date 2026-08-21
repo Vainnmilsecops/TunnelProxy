@@ -8,6 +8,7 @@
 | 02      | TCP Networking Foundation                      | complete |
 | 03      | Bidirectional TCP Streaming / TCP Relay        | complete |
 | 04      | TCP Relay Lifecycle Hardening / Local Port Forwarding | complete |
+| 05      | Tunnel Protocol v1: Binary Framing & Message Design | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -148,3 +149,58 @@ Out of scope (explicitly NOT delivered in Session 04):
 - Graceful shutdown channel on the listener (DEBT-005 still open).
 - Idle read deadline on the relay path (DEBT-006 still open).
 - Upstream connection pooling (DEBT-008 still open).
+
+## Session 05 — Tunnel Protocol v1: Binary Framing & Message Design — complete
+
+Scope that was actually delivered:
+
+- Replaced the placeholder `tunnelproxy-protocol` crate with a real,
+  test-covered wire protocol foundation.
+- New module `crates/protocol/src/wire.rs`: `MAGIC = [0x54, 0x50, 0x58, 0x31]`
+  ("TPX1"), `VERSION = 1`, `HEADER_SIZE = 16`, `MAX_FRAME_PAYLOAD = 65536`.
+- New module `crates/protocol/src/frame.rs`: `FrameType` enum (stable numeric
+  values 0x01–0xFF), `Scope` (Control / Stream), `StreamId` newtype wrapper,
+  `Frame` struct with validated construction. Stream scope validation enforced
+  at construction time.
+- New module `crates/protocol/src/error.rs`: `ProtocolError` typed enum with
+  distinct variants for every failure class (I/O, invalid magic, unsupported
+  version, unknown frame type, unsupported flags, invalid stream scope,
+  frame too large, truncated header, truncated payload).
+- New module `crates/protocol/src/codec.rs`: `FrameEncoder::encode` (async,
+  `write_all` semantics, validates before writing) and
+  `FrameDecoder::decode` (async, stateful cursor, handles fragmentation and
+  coalescing). Decoder validates announced payload length **before
+  allocating buffer**. Three-way EOF distinction.
+- 26 deterministic codec tests covering: round-trip (control + stream),
+  binary/non-UTF8 payload, fragmented header (1 byte/read), fragmented
+  payload (1 byte/read), coalesced frames, clean EOF, truncated header,
+  truncated payload, invalid magic, unsupported version, unknown frame
+  type, unsupported flags, invalid stream scope (both directions),
+  oversized encode reject, oversized decode reject, and a real loopback
+  TCP test using `TcpListener` / `TcpStream`.
+- New file `docs/TUNNEL_PROTOCOL_V1.md`: complete wire format documentation,
+  header layout table, frame type registry, scope rules, EOF semantics,
+  error taxonomy, security rationale, explicit "not yet defined" statements
+  for all frame payload schemas and runtime behaviors.
+- Added `tokio` and `thiserror` as dependencies of `tunnelproxy-protocol`.
+  Protocol crate remains free of `tunnelproxy-edge`, `tunnelproxy-agent`,
+  and `tunnelproxy-control-plane` dependencies.
+- Updated `docs/ai/CURRENT_STATE.md`, `docs/ai/SESSION_INDEX.md`,
+  `docs/ai/TEST_MATRIX.md` (added tunnel protocol framing row), and
+  `docs/ai/DECISIONS.md` (ADR-007 for length-prefixed binary framing).
+- All quality gates pass: `cargo fmt --all`, `cargo clippy --workspace`,
+  `cargo test --workspace` (58 tests, 0 failures), `cargo build --workspace`.
+
+Out of scope (explicitly NOT delivered in Session 05):
+
+- Persistent Agent ↔ Edge connection.
+- HELLO / REGISTER / REGISTERED handshake behavior (types exist, semantics not implemented).
+- Stream multiplexing runtime (stream IDs exist as values, demux logic not implemented).
+- PING / PONG keepalive timer (types exist, timer not implemented).
+- Any payload schema for any frame type (all payloads are opaque `Vec<u8>`).
+- Authentication, TLS, HTTP, WebSocket.
+- Graceful shutdown (DEBT-005 still open).
+- Idle read deadline (DEBT-006 still open).
+- Upstream connection pool (DEBT-008 still open).
+- Per-IP admission control (DEBT-009 still open).
+- Telemetry backend (DEBT-010 still open).
