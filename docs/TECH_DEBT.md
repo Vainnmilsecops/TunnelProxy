@@ -199,6 +199,22 @@
   insufficient.
 - **Tracking:** open.
 
+### DEBT-015 — Raw ingress routes are ephemeral transport bindings
+
+- **Introduced in:** Session 10
+- **Category:** product
+- **Impact:** high for public use, low for the loopback vertical slice
+- **Rationale:** `RawIngressRouteManager` targets a live process-local
+  `TransportSessionId`. Routes disappear on Agent disconnect or Edge restart
+  and cannot represent durable user intent. This is deliberate: Session 10
+  proves listener/drain lifecycle without conflating transport identity with a
+  future `TunnelId`/`AgentId` model.
+- **Exit plan:** Add authenticated durable tunnel identity in the control plane,
+  push a bounded route snapshot into Edge, then resolve that snapshot to live
+  sessions without querying storage on the ingress hot path.
+- **Tracking:** open; public ingress must not use ephemeral route IDs as durable
+  identity.
+
 ## Resolved items
 
 ### DEBT-013 — Single-stream runtime rejects concurrent ingress

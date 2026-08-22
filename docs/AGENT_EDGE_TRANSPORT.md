@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 09.
+> **Status:** Implemented through Session 10.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
 > ingress or durable routing.
@@ -31,7 +31,7 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport remains unauthenticated and unencrypted through Session 09.**
+**This transport remains unauthenticated and unencrypted through Session 10.**
 
 The development listener binds `127.0.0.1` only. In production, this
 transport requires TLS and Agent authentication before use. The README
@@ -328,6 +328,14 @@ AgentSession::run_with_local_target(
     connect_timeout: Duration,
 )
 ```
+
+Session 09 adds `AgentSession::run_multiplexed(MultiplexedAgentConfig)` with
+bounded stream and writer queues. Session 10 adds loopback
+`RawIngressRouteManager` listeners above `EdgeSessionRouter`.
+`open_stream_tracked` returns a completion handle so route permits remain held
+until the logical stream closes. Removal stops accept, drains existing streams,
+and cleans the route if its target ephemeral Agent session disconnects. No wire
+protocol change was required.
 
 ## What Is NOT Implemented
 

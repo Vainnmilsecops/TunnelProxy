@@ -24,5 +24,7 @@ and the protocol-aware Agent transport listener. The listener performs the v1
 handshake, bounds concurrent sessions, and uses Edge-initiated PING/PONG to
 remove dead sessions. Session 09 adds a loopback-only `MultiplexedEdgeRuntime`
 and `EdgeSessionRouter` for bounded concurrent raw TCP streams routed to exact
-live Agent sessions. Public HTTP ingress, TLS, authentication, durable routing,
-and credit-based flow control are not implemented yet.
+live Agent sessions. Session 10 adds bounded ephemeral raw ingress listeners
+with tracked completion and drain cleanup. Public HTTP ingress, TLS,
+authentication, durable routing, and credit-based flow control are not
+implemented yet.

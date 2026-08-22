@@ -365,3 +365,28 @@ Out of scope:
 - Durable tunnel/Agent identity, persistent routing, and control-plane state.
 - Authentication, reconnect/backoff, graceful process shutdown, and multi-edge.
 - Credit-based flow-control windows and strict weighted scheduling.
+
+## Session 10 — Raw Ingress Binding & Route Lifecycle — complete
+
+Scope delivered:
+
+- Added `EdgeSessionRouter::open_stream_tracked` and `RoutedStream` completion
+  signals while preserving the Session 09 `open_stream` API.
+- Added live-session snapshot subscriptions for disconnect-aware route cleanup.
+- Added `RawIngressRouteManager` with bounded route count, loopback-only
+  listeners, per-route connection admission, monotonic process-local route IDs,
+  and typed configuration/lifecycle errors.
+- Defined `Active`, `Draining`, `TargetDisconnected`, and `Removed` states.
+  Removing stops new accepts and waits for real stream completion; drain timeout
+  never silently aborts active traffic.
+- Added 13 tests: three route/config unit tests and ten real-TCP integration
+  tests covering byte-exact traffic, concurrency, two-Agent exact routing,
+  capacity, drain, timeout, disconnect, and local-service recovery. The
+  workspace now contains 133 explicit tests.
+
+Out of scope:
+
+- Public HTTP/HTTPS ingress, hostname allocation, TLS, and authentication.
+- Durable route/tunnel identity, persistence, reconnect, and automatic rebind.
+- Process-wide graceful shutdown, OS signal wiring, and multi-edge operation.
+- Credit-based flow control and weighted DATA scheduling.

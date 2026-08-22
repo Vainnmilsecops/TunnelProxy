@@ -62,7 +62,7 @@ stream bridge to one configured local TCP service.
 ## `tunnelproxy-edge`
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
-and loopback-only one-active-stream raw TCP ingress.
+bounded stream multiplexing, and lifecycle-managed loopback raw TCP routes.
 
 **Responsibility (future)**
 

@@ -1,9 +1,9 @@
 # TunnelProxy — Architecture
 
 > Status: **pre-MVP data-path foundation.** Local TCP primitives, protocol
-> framing, Agent → Edge handshake, heartbeat, and one loopback raw-TCP reverse
-> stream are implemented. Public TLS/HTTP ingress, multiplexing, and durable
-> routing are not.
+> framing, Agent → Edge handshake, heartbeat, bounded multiplexing, and
+> ephemeral loopback raw-ingress routes are implemented. Public TLS/HTTP
+> ingress and durable routing are not.
 
 ## 1. High-level architecture
 
@@ -213,6 +213,23 @@ Agent failure does not corrupt neighboring streams or sessions.
 This layer remains loopback raw TCP and ephemeral. It does not assign public
 hostnames, authenticate Agents, persist routes, reconnect, terminate TLS, or
 implement credit/window flow control.
+
+### 2.9 Raw ingress binding and route lifecycle (Session 10)
+
+`RawIngressRouteManager` binds an independent loopback `TcpListener` for each
+ephemeral route and targets one live `TransportSessionId`. Global route count
+and per-route accepted connections are bounded. Accepted sockets pass to
+`EdgeSessionRouter::open_stream_tracked`; a completion handle holds the route
+permit until the logical stream actually releases the socket.
+
+Removing a route closes its listener and transitions it to draining. Existing
+streams finish normally, after which the route is removed. A configured drain
+deadline returns a typed timeout but does not silently abort traffic. Live
+session snapshots stop and clean routes when their target Agent disconnects.
+
+These routes are process-local development bindings, not durable tunnel
+records or public endpoints. They do not survive restart or reconnect and are
+never reassigned to another Agent session.
 
 ## 3. Control plane vs data plane
 
