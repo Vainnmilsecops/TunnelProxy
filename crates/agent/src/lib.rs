@@ -33,6 +33,7 @@ pub use agent_transport::{
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,
 };
+pub use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 
 use std::net::SocketAddr;
 use std::time::Duration;

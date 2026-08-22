@@ -131,3 +131,12 @@ A change is "done" only when **all** of the following hold:
 - [ ] `docs/ai/CURRENT_STATE.md` and `docs/ai/SESSION_INDEX.md` are
       updated if a session ends.
 - [ ] `docs/TECH_DEBT.md` records any deliberate shortcut.
+
+## 10. Exercising graceful shutdown
+
+Long-running runtimes expose a shutdown-aware variant accepting a cloneable
+`ShutdownSignal` and `RuntimeShutdownConfig`. Create one process-level pair with
+`shutdown_channel()`, clone only the signal into runtimes, and invoke
+`trigger.shutdown()` once. The default drain deadline is 10 seconds; zero is
+rejected. Runtime tests should assert the returned `RuntimeShutdownOutcome` and
+verify that listener addresses can be rebound after completion.

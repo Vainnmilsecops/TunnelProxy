@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
+use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome};
 use tunnelproxy_protocol::TransportSessionId;
 
 use crate::multiplex::{EdgeSessionRouter, RouteError};
@@ -160,6 +162,7 @@ pub enum RawIngressRouteError {
     RouteNotFound(RawIngressRouteId),
     DrainTimeout(RawIngressRouteId),
     RouteTaskStopped(RawIngressRouteId),
+    ManagerShuttingDown,
 }
 
 impl std::fmt::Display for RawIngressRouteError {
@@ -177,6 +180,7 @@ impl std::fmt::Display for RawIngressRouteError {
             Self::RouteTaskStopped(id) => {
                 write!(f, "raw ingress route {id} stopped before removal")
             }
+            Self::ManagerShuttingDown => f.write_str("raw ingress route manager is shutting down"),
         }
     }
 }
@@ -195,11 +199,13 @@ struct RouteControl {
     stop: watch::Sender<bool>,
     status: watch::Receiver<RawIngressRouteStatus>,
     drain_timeout: Duration,
+    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
 struct ManagerState {
     routes: HashMap<RawIngressRouteId, RouteControl>,
+    shutting_down: bool,
 }
 
 /// Creates, observes, and drains bounded loopback ingress routes.
@@ -234,6 +240,9 @@ impl RawIngressRouteManager {
         config
             .validate()
             .map_err(RawIngressRouteError::InvalidConfig)?;
+        if self.state.lock().await.shutting_down {
+            return Err(RawIngressRouteError::ManagerShuttingDown);
+        }
         if !self.router.is_connected(config.target_session_id).await {
             return Err(RawIngressRouteError::TargetSessionNotConnected(
                 config.target_session_id,
@@ -256,6 +265,9 @@ impl RawIngressRouteManager {
 
         {
             let mut state = self.state.lock().await;
+            if state.shutting_down {
+                return Err(RawIngressRouteError::ManagerShuttingDown);
+            }
             if state.routes.len() >= self.config.max_routes {
                 return Err(RawIngressRouteError::RouteCapacityExceeded);
             }
@@ -265,11 +277,12 @@ impl RawIngressRouteManager {
                     stop,
                     status,
                     drain_timeout: config.drain_timeout,
+                    task: None,
                 },
             );
         }
 
-        tokio::spawn(run_route(
+        let route_task = tokio::spawn(run_route(
             route_id,
             listener,
             config,
@@ -278,6 +291,9 @@ impl RawIngressRouteManager {
             status_tx,
             Arc::downgrade(&self.state),
         ));
+        if let Some(route) = self.state.lock().await.routes.get_mut(&route_id) {
+            route.task = Some(route_task);
+        }
         info!(%route_id, %local_addr, target = %config.target_session_id, event = "raw_route_added");
         Ok(RawIngressRoute {
             route_id,
@@ -361,6 +377,63 @@ impl RawIngressRouteManager {
             .map_err(|_| RawIngressRouteError::DrainTimeout(route_id))?
     }
 
+    /// Stops all listeners and drains every routed connection under one
+    /// process-level deadline. The manager cannot be reused after this call.
+    pub async fn shutdown(
+        &self,
+        shutdown: RuntimeShutdownConfig,
+    ) -> Result<RuntimeShutdownOutcome, RawIngressRouteError> {
+        shutdown.validate().map_err(|_| {
+            RawIngressRouteError::InvalidConfig(RawIngressConfigError::ZeroDrainTimeout)
+        })?;
+        let route_count = {
+            let mut state = self.state.lock().await;
+            state.shutting_down = true;
+            for route in state.routes.values() {
+                route.stop.send_replace(true);
+            }
+            state.routes.len()
+        };
+
+        let drained = async {
+            loop {
+                if self.state.lock().await.routes.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        if tokio::time::timeout(shutdown.drain_timeout, drained)
+            .await
+            .is_ok()
+        {
+            return Ok(RuntimeShutdownOutcome::Drained {
+                completed_tasks: route_count,
+            });
+        }
+
+        let (remaining, tasks) = {
+            let mut state = self.state.lock().await;
+            let remaining = state.routes.len();
+            let tasks = state
+                .routes
+                .drain()
+                .filter_map(|(_, mut route)| route.task.take())
+                .collect::<Vec<_>>();
+            (remaining, tasks)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        Ok(RuntimeShutdownOutcome::Forced {
+            completed_tasks: route_count.saturating_sub(remaining),
+            aborted_tasks: remaining,
+        })
+    }
+
     fn next_route_id(&self) -> Result<RawIngressRouteId, RawIngressRouteError> {
         let previous = self
             .route_ids
@@ -385,6 +458,7 @@ async fn run_route(
     manager: Weak<Mutex<ManagerState>>,
 ) {
     let permits = Arc::new(Semaphore::new(config.max_concurrent_connections));
+    let mut connections = JoinSet::new();
     let mut session_ids = router.subscribe_session_ids();
     if !session_ids.borrow().contains(&config.target_session_id) {
         status.send_modify(|route| route.state = RawIngressRouteState::TargetDisconnected);
@@ -427,6 +501,7 @@ async fn run_route(
                 };
                 status.send_modify(|route| route.active_connections += 1);
                 spawn_routed_connection(
+                    &mut connections,
                     route_id,
                     config.target_session_id,
                     ingress,
@@ -435,15 +510,12 @@ async fn run_route(
                     status.clone(),
                 );
             }
+            _ = connections.join_next(), if !connections.is_empty() => {}
         }
     }
 
     drop(listener);
-    let count = u32::try_from(config.max_concurrent_connections)
-        .expect("configuration validation guarantees u32 capacity");
-    if let Ok(all_permits) = permits.acquire_many_owned(count).await {
-        drop(all_permits);
-    }
+    while connections.join_next().await.is_some() {}
     status.send_modify(|route| route.state = RawIngressRouteState::Removed);
     if let Some(manager) = manager.upgrade() {
         manager.lock().await.routes.remove(&route_id);
@@ -452,6 +524,7 @@ async fn run_route(
 }
 
 fn spawn_routed_connection(
+    connections: &mut JoinSet<()>,
     route_id: RawIngressRouteId,
     session_id: TransportSessionId,
     ingress: tokio::net::TcpStream,
@@ -459,7 +532,7 @@ fn spawn_routed_connection(
     permit: OwnedSemaphorePermit,
     status: watch::Sender<RawIngressRouteStatus>,
 ) {
-    tokio::spawn(async move {
+    connections.spawn(async move {
         match router.open_stream_tracked(session_id, ingress).await {
             Ok(stream) => {
                 let reason = stream.wait_closed().await;

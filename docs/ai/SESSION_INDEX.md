@@ -390,3 +390,29 @@ Out of scope:
 - Durable route/tunnel identity, persistence, reconnect, and automatic rebind.
 - Process-wide graceful shutdown, OS signal wiring, and multi-edge operation.
 - Credit-based flow control and weighted DATA scheduling.
+
+## Session 11 — Graceful Runtime Shutdown & Supervision — complete
+
+Scope delivered:
+
+- Added shared idempotent shutdown trigger/signal primitives, a validated
+  process drain deadline, and typed drained/forced completion outcomes.
+- Added shutdown-aware echo, relay, forwarder, Agent listener, legacy
+  single-stream, multiplexed Edge, and multiplexed Agent runtime APIs.
+- Replaced detached accept-loop work with supervised task sets. Shutdown stops
+  admission first, drains children, then aborts and joins deadline overruns.
+- Made multiplex routing fail closed during drain and reused the protocol's
+  `SessionClosing` reset for late Agent stream requests.
+- Added global raw-route manager shutdown, post-shutdown admission rejection,
+  child connection supervision, and forced cleanup after its deadline.
+- Added 12 unit/integration tests for signal races, graceful and forced paths,
+  listener release, route-manager terminal state, and Agent/Edge admission.
+  The workspace now contains 145 explicit tests.
+- Resolved DEBT-005 and DEBT-012.
+
+Out of scope:
+
+- OS signal wiring and production runtime composition.
+- Public HTTP/HTTPS ingress, TLS, authentication, and hostname allocation.
+- Durable identity/routes, persistence, reconnect, and automatic rebind.
+- Credit/window flow control and weighted DATA scheduling.

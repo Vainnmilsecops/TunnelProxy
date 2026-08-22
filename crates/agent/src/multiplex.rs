@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatErrorCode, HeartbeatSequence, StreamId,
@@ -115,6 +118,31 @@ impl AgentSession {
         self,
         config: MultiplexedAgentConfig,
     ) -> Result<AgentSessionCloseReason, AgentError> {
+        self.run_multiplexed_inner(config, None).await
+    }
+
+    /// Runs a multiplexed session until shutdown, refusing new streams while
+    /// existing local bridges drain within the configured deadline.
+    pub async fn run_multiplexed_until_shutdown(
+        self,
+        config: MultiplexedAgentConfig,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> Result<AgentSessionCloseReason, AgentError> {
+        shutdown
+            .validate()
+            .map_err(|_| AgentError::ProtocolViolation {
+                reason: "zero shutdown drain timeout",
+            })?;
+        self.run_multiplexed_inner(config, Some((signal, shutdown)))
+            .await
+    }
+
+    async fn run_multiplexed_inner(
+        self,
+        config: MultiplexedAgentConfig,
+        shutdown: Option<(ShutdownSignal, RuntimeShutdownConfig)>,
+    ) -> Result<AgentSessionCloseReason, AgentError> {
         config
             .validate()
             .map_err(|error| AgentError::ProtocolViolation {
@@ -134,10 +162,40 @@ impl AgentSession {
         let mut writer_task = tokio::spawn(writer_actor(writer, control_rx, data_rx));
         let (event_tx, mut event_rx) = mpsc::channel(config.max_concurrent_streams);
         let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
+        let mut stream_tasks = JoinSet::new();
         let mut decoder = FrameDecoder::new();
+        let drain_timeout = shutdown.as_ref().map(|(_, config)| config.drain_timeout);
+        let shutdown_wait = async move {
+            match shutdown {
+                Some((signal, _)) => signal.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(shutdown_wait);
+        let drain_deadline = tokio::time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+        tokio::pin!(drain_deadline);
+        let mut draining = false;
+        let mut forced = false;
+        let mut close_reason = AgentSessionCloseReason::PeerClosed;
 
         loop {
             tokio::select! {
+                biased;
+                () = &mut shutdown_wait, if !draining => {
+                    draining = true;
+                    close_reason = AgentSessionCloseReason::LocalShutdown;
+                    drain_deadline.as_mut().reset(
+                        Instant::now() + drain_timeout.expect("shutdown signal has a deadline")
+                    );
+                    if streams.is_empty() {
+                        break;
+                    }
+                }
+                () = &mut drain_deadline, if draining => {
+                    forced = true;
+                    close_reason = AgentSessionCloseReason::LocalShutdown;
+                    break;
+                }
                 decoded = decoder.decode(&mut reader) => {
                     let frame = match decoded.map_err(AgentError::ProtocolDecode)? {
                         Some(frame) => frame,
@@ -151,6 +209,10 @@ impl AgentSession {
                             send_control(&control_tx, FrameType::Pong, sequence.to_be_bytes().to_vec()).await?;
                         }
                         FrameType::OpenStream => {
+                            if draining {
+                                send_reset(&control_tx, frame.stream_id, StreamResetCode::SessionClosing).await?;
+                                continue;
+                            }
                             if !frame.payload.is_empty() || streams.contains_key(&frame.stream_id) {
                                 send_reset(&control_tx, frame.stream_id, StreamResetCode::ProtocolViolation).await?;
                                 continue;
@@ -161,7 +223,7 @@ impl AgentSession {
                             }
                             let (stream_tx, stream_rx) = mpsc::channel(config.per_stream_queue_capacity);
                             streams.insert(frame.stream_id, stream_tx);
-                            tokio::spawn(run_local_stream(
+                            stream_tasks.spawn(run_local_stream(
                                 frame.stream_id,
                                 config.clone(),
                                 stream_rx,
@@ -210,8 +272,12 @@ impl AgentSession {
                 event = event_rx.recv() => {
                     if let Some(StreamEvent::Closed(stream_id)) = event {
                         streams.remove(&stream_id);
+                        if draining && streams.is_empty() {
+                            break;
+                        }
                     }
                 }
+                _ = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}
                 result = &mut writer_task => {
                     return writer_result(result);
                 }
@@ -219,10 +285,14 @@ impl AgentSession {
         }
 
         streams.clear();
+        if forced {
+            stream_tasks.abort_all();
+        }
+        while stream_tasks.join_next().await.is_some() {}
         drop(control_tx);
         drop(data_tx);
         match writer_task.await {
-            Ok(Ok(())) => Ok(AgentSessionCloseReason::PeerClosed),
+            Ok(Ok(())) => Ok(close_reason),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(join_error(error)),
         }

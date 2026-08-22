@@ -15,6 +15,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
+tunnelproxy-common = { path = "../common" }
 
 [dev-dependencies]
 tunnelproxy-agent = { path = "../agent" }
