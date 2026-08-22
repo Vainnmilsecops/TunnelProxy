@@ -77,6 +77,73 @@ async fn wait_until_registered(router: &EdgeSessionRouter, session_id: Transport
     .expect("session was not published to router");
 }
 
+#[tokio::test]
+async fn runtime_shutdown_releases_listener_and_router_rejects_new_streams() {
+    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
+        .await
+        .unwrap();
+    let addr = runtime.agent_addr();
+    let router = runtime.router();
+    let (trigger, signal) = tunnelproxy_edge::shutdown_channel();
+    trigger.shutdown();
+
+    let outcome = runtime
+        .run_until_shutdown(
+            signal,
+            tunnelproxy_edge::RuntimeShutdownConfig::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        tunnelproxy_edge::RuntimeShutdownOutcome::Drained { completed_tasks: 0 }
+    );
+    TcpListener::bind(addr)
+        .await
+        .expect("multiplexed listener must be released");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::spawn(TcpStream::connect(pair_listener.local_addr().unwrap()));
+    let (server, _) = pair_listener.accept().await.unwrap();
+    let _client = client.await.unwrap().unwrap();
+    let session_id = TransportSessionId::new(1).unwrap();
+    assert!(matches!(
+        router.open_stream(session_id, server).await,
+        Err(RouteError::RuntimeDraining)
+    ));
+}
+
+#[tokio::test]
+async fn agent_honors_shutdown_requested_before_multiplex_loop_starts() {
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
+        .await
+        .unwrap();
+    let edge_addr = runtime.agent_addr();
+    let edge = tokio::spawn(runtime.run());
+    let session = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("Agent handshake failed: {reason}"),
+    };
+    let config = MultiplexedAgentConfig::new(local.local_addr().unwrap());
+    let (trigger, signal) = tunnelproxy_edge::shutdown_channel();
+    trigger.shutdown();
+
+    let reason = session
+        .run_multiplexed_until_shutdown(
+            config,
+            signal,
+            tunnelproxy_agent::RuntimeShutdownConfig::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reason,
+        tunnelproxy_agent::AgentSessionCloseReason::LocalShutdown
+    );
+    edge.abort();
+}
+
 async fn spawn_echo_service(connection_count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -89,6 +89,10 @@
 | Raw route admission                       | ✅   | ✅          | —   | Global route and per-route connection bounds reject excess work without stopping healthy routes. |
 | Raw route drain lifecycle                 | ✅   | ✅          | —   | Remove stops accept, active streams finish, and drain timeout is typed without forced cancellation. |
 | Raw route disconnect cleanup              | —    | ✅          | —   | Agent disconnect removes its route; local-connect failure leaves the route available for recovery. |
+| Shutdown signal semantics                 | ✅   | ✅          | —   | Requests are idempotent and not lost before wait; dropping a trigger is not cancellation. |
+| Supervised listener shutdown              | ✅   | ✅          | —   | Echo, forwarder, Agent listener, and single-stream tests cover listener release, child cancellation, graceful completion, and forced deadline outcomes. |
+| Multiplexed Edge/Agent drain              | ✅   | ✅          | —   | Edge releases admission and its router fails closed; Agent honors a shutdown already requested before its multiplex loop starts. |
+| Raw route process shutdown                | ✅   | ✅          | —   | Global route drain rejects manager reuse and force-aborts an active route only after its deadline. |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
 | TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |

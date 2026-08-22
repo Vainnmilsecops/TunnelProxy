@@ -64,7 +64,13 @@ use std::time::{Duration, Instant};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
+
+pub use tunnelproxy_common::{
+    shutdown_channel, RuntimeShutdownConfig, RuntimeShutdownConfigError, RuntimeShutdownOutcome,
+    ShutdownSignal, ShutdownTrigger,
+};
 
 /// Default development bind address for the edge listener.
 ///
@@ -138,22 +144,50 @@ pub async fn run_listener(bind_addr: SocketAddr) -> std::io::Result<()> {
     let local = listener.local_addr()?;
     info!(addr = %local, event = "tcp_server_started", "TCP server bound");
 
+    let mut tasks = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
                 info!(
                     peer = %peer,
                     event = "tcp_connection_accepted",
                     "accepted connection"
                 );
-                tokio::spawn(handle_connection(stream, peer));
-            }
-            Err(err) => {
+                    tasks.spawn(handle_connection(stream, peer));
+                }
+                Err(err) => {
                 error!(error = %err, event = "tcp_listener_accept_error", "accept failed");
                 return Err(err);
-            }
+                }
+            },
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+}
+
+/// Runs the echo baseline until shutdown, then joins or aborts every child.
+pub async fn run_listener_until_shutdown(
+    bind_addr: SocketAddr,
+    signal: ShutdownSignal,
+    shutdown: RuntimeShutdownConfig,
+) -> std::io::Result<RuntimeShutdownOutcome> {
+    validate_shutdown(shutdown)?;
+    let listener = TcpListener::bind(bind_addr).await?;
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                tasks.spawn(handle_connection(stream, peer));
+            }
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+        }
+    }
+    drop(listener);
+    Ok(drain_tasks(tasks, shutdown.drain_timeout).await)
 }
 
 /// Drive a single accepted TCP connection: read bytes in a fixed
@@ -420,19 +454,50 @@ pub async fn run_relay_listener(
         "relay server bound"
     );
 
+    let mut tasks = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                tokio::spawn(async move {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    tasks.spawn(async move {
+                        let _ = relay_connection(stream, peer, upstream_addr).await;
+                    });
+                }
+                Err(err) => {
+                    error!(error = %err, event = "relay_listener_accept_error", "accept failed");
+                    return Err(err);
+                }
+            },
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+        }
+    }
+}
+
+/// Runs the relay listener until shutdown and drains supervised relays.
+pub async fn run_relay_listener_until_shutdown(
+    bind_addr: SocketAddr,
+    upstream_addr: SocketAddr,
+    signal: ShutdownSignal,
+    shutdown: RuntimeShutdownConfig,
+) -> std::io::Result<RuntimeShutdownOutcome> {
+    validate_shutdown(shutdown)?;
+    let listener = TcpListener::bind(bind_addr).await?;
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                tasks.spawn(async move {
                     let _ = relay_connection(stream, peer, upstream_addr).await;
                 });
             }
-            Err(err) => {
-                error!(error = %err, event = "relay_listener_accept_error", "accept failed");
-                return Err(err);
-            }
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+    drop(listener);
+    Ok(drain_tasks(tasks, shutdown.drain_timeout).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -786,67 +851,93 @@ impl Forwarder {
         let upstream_addr = self.config.upstream_addr;
         let connect_timeout = self.config.connect_timeout;
 
+        let mut tasks = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    let semaphore = Arc::clone(&semaphore);
-                    let ids = Arc::clone(&ids);
-                    tokio::spawn(async move {
-                        let id = ids.next_id();
-                        info!(
-                            connection_id = %id,
-                            peer = %peer,
-                            upstream = %upstream_addr,
-                            event = "connection_accepted",
-                            "downstream connection accepted"
-                        );
-                        let permit = match semaphore.try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(TryAcquireError::NoPermits) => {
-                                let _ = stream.shutdown().await;
-                                error!(
-                                    connection_id = %id,
-                                    peer = %peer,
-                                    upstream = %upstream_addr,
-                                    event = "connection_rejected_capacity",
-                                    "no capacity permit available; downstream closed"
-                                );
-                                return;
-                            }
-                            Err(TryAcquireError::Closed) => {
-                                let _ = stream.shutdown().await;
-                                error!(
-                                    connection_id = %id,
-                                    peer = %peer,
-                                    upstream = %upstream_addr,
-                                    event = "connection_rejected_capacity",
-                                    "semaphore closed; downstream closed"
-                                );
-                                return;
-                            }
-                        };
-                        // Hand ownership of `permit` and `stream` into
-                        // the per-connection handler. Drop at the end
-                        // of the handler releases both resources.
-                        let outcome = forward_handle_connection(
-                            id,
-                            stream,
-                            peer,
-                            upstream_addr,
-                            connect_timeout,
-                            permit,
-                        )
-                        .await;
-                        log_outcome(&outcome, upstream_addr);
-                    });
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    spawn_forwarder_task(
+                        &mut tasks,
+                        stream,
+                        peer,
+                        Arc::clone(&semaphore),
+                        Arc::clone(&ids),
+                        upstream_addr,
+                        connect_timeout,
+                    );
                 }
-                Err(err) => {
-                    error!(error = %err, event = "forwarder_accept_error", "accept failed");
-                    return Err(err);
-                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
     }
+
+    /// Runs until signalled, then drains supervised forwarder connections.
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> std::io::Result<RuntimeShutdownOutcome> {
+        validate_shutdown(shutdown)?;
+        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        let semaphore = self.semaphore;
+        let ids = self.ids;
+        let upstream_addr = self.config.upstream_addr;
+        let connect_timeout = self.config.connect_timeout;
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => break,
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    spawn_forwarder_task(
+                        &mut tasks,
+                        stream,
+                        peer,
+                        Arc::clone(&semaphore),
+                        Arc::clone(&ids),
+                        upstream_addr,
+                        connect_timeout,
+                    );
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        drop(listener);
+        Ok(drain_tasks(tasks, shutdown.drain_timeout).await)
+    }
+}
+
+fn spawn_forwarder_task(
+    tasks: &mut JoinSet<()>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    semaphore: Arc<Semaphore>,
+    ids: Arc<ConnectionIdAllocator>,
+    upstream_addr: SocketAddr,
+    connect_timeout: Duration,
+) {
+    tasks.spawn(async move {
+        let id = ids.next_id();
+        let permit = match semaphore.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                let _ = stream.shutdown().await;
+                error!(
+                    connection_id = %id,
+                    peer = %peer,
+                    upstream = %upstream_addr,
+                    event = "connection_rejected_capacity",
+                    "forwarder capacity unavailable; downstream closed"
+                );
+                return;
+            }
+        };
+        let outcome =
+            forward_handle_connection(id, stream, peer, upstream_addr, connect_timeout, permit)
+                .await;
+        log_outcome(&outcome, upstream_addr);
+    });
 }
 
 /// Drive a single accepted downstream connection through the full
@@ -1046,6 +1137,36 @@ fn log_outcome(outcome: &ConnectionOutcome, _upstream: SocketAddr) {
             );
         }
     }
+}
+
+fn validate_shutdown(config: RuntimeShutdownConfig) -> std::io::Result<()> {
+    config
+        .validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+async fn drain_tasks<T: 'static>(
+    mut tasks: JoinSet<T>,
+    drain_timeout: Duration,
+) -> RuntimeShutdownOutcome {
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    let mut completed_tasks = 0;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(_)) => completed_tasks += 1,
+            Ok(None) => break,
+            Err(_) => {
+                let aborted_tasks = tasks.len();
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return RuntimeShutdownOutcome::Forced {
+                    completed_tasks,
+                    aborted_tasks,
+                };
+            }
+        }
+    }
+    RuntimeShutdownOutcome::Drained { completed_tasks }
 }
 
 pub mod agent_transport;

@@ -65,24 +65,16 @@
   unbounded admission in the production surface.
 - **Tracking:** open.
 
-### DEBT-005 — No graceful shutdown for the edge listener
+### DEBT-005 — No graceful shutdown for the edge listener — resolved
 
 - **Introduced in:** Session 02
 - **Category:** ops
 - **Impact:** medium
-- **Rationale:** Both `run_listener` and `Forwarder::run` execute an
-  infinite accept loop and only return when `accept` itself errors
-  (typically when the bound socket is dropped). There is no
-  signal-driven graceful-shutdown path and no cancellation token
-  passed to spawned connection tasks. In production we need clean
-  draining of in-flight connections on SIGTERM.
-- **Exit plan:** Add a `tokio::sync::watch` or `CancellationToken`
-  channel that `Forwarder::run` selects on alongside `accept`, and
-  that in-flight `forward_handle_connection` tasks also observe to
-  abort their copies cleanly. The `Forwarder` is the right anchor
-  for this change; the Session 02 echo baseline will follow the
-  same pattern if it is kept around.
-- **Tracking:** Session 05+ plan, `docs/ai/SESSION_INDEX.md`.
+- **Resolution:** Session 11 added a shared shutdown channel plus supervised
+  `JoinSet` ownership for echo, relay, and forwarder connections. Admission
+  stops on signal; children drain within `RuntimeShutdownConfig` and are
+  explicitly aborted and joined after the deadline.
+- **Tracking:** resolved in Session 11.
 
 ### DEBT-006 — No connection-level read/write idle timeout
 
@@ -153,21 +145,16 @@
   there are real production workloads to measure.
 - **Tracking:** open.
 
-### DEBT-012 — No graceful shutdown for Agent transport runtimes
+### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 
 - **Introduced in:** Session 06
 - **Category:** ops
 - **Impact:** medium
-- **Rationale:** `AgentTransportListener::run` executes an infinite accept loop
-  and `SingleStreamEdgeRuntime::run` owns long-lived listeners/session state.
-  Neither has a signal-driven graceful-shutdown path or cancellation token. In
-  production we need clean draining of in-flight connections on SIGTERM.
-- **Exit plan:** Add a `tokio::sync::watch` or `CancellationToken`
-  channel that `AgentTransportListener::run` selects on alongside
-  `accept`, and that in-flight `agent_session_task` tasks also
-  observe to abort their copies cleanly. DEBT-005 applies the same
-  fix to `Forwarder::run`.
-- **Tracking:** Session 07+ plan, `docs/ai/SESSION_INDEX.md`.
+- **Resolution:** Session 11 added shutdown-aware Agent listeners, the legacy
+  single-stream runtime, multiplexed Edge sessions, and multiplexed Agent
+  streams. New admission is refused during drain; owned child tasks are joined
+  or force-aborted under the configured process deadline.
+- **Tracking:** resolved in Session 11.
 
 ### DEBT-013 — Single-stream runtime rejects concurrent ingress
 

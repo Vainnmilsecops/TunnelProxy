@@ -34,7 +34,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
+
+use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, HeartbeatErrorCode,
@@ -520,47 +523,109 @@ impl AgentTransportListener {
         let heartbeat_interval = self.config.heartbeat_interval;
         let pong_timeout = self.config.pong_timeout;
 
+        let mut tasks = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    let semaphore = Arc::clone(&semaphore);
-                    let session_ids = Arc::clone(&session_ids);
-                    tokio::spawn(async move {
-                        let permit = match semaphore.try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                error!(
-                                    peer = %peer,
-                                    event = "agent_connection_rejected_capacity",
-                                    "no session capacity; closing connection"
-                                );
-                                let _ = stream.shutdown().await;
-                                return;
-                            }
-                        };
-                        agent_session_task(
-                            stream,
-                            peer,
-                            session_ids,
-                            handshake_timeout,
-                            heartbeat_interval,
-                            pong_timeout,
-                            permit,
-                        )
-                        .await;
-                    });
-                }
-                Err(err) => {
-                    error!(
-                        error = %err,
-                        event = "agent_transport_accept_error",
-                        "accept failed"
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    spawn_agent_session(
+                        &mut tasks,
+                        stream,
+                        peer,
+                        Arc::clone(&semaphore),
+                        Arc::clone(&session_ids),
+                        handshake_timeout,
+                        heartbeat_interval,
+                        pong_timeout,
+                        None,
                     );
-                    return Err(err);
                 }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
     }
+
+    /// Stops Agent admission on signal, then drains or aborts all sessions.
+    pub async fn run_until_shutdown(
+        &mut self,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> std::io::Result<RuntimeShutdownOutcome> {
+        crate::validate_shutdown(shutdown)?;
+        let listener = self.listener.take().expect("run must be called once");
+        let semaphore = Arc::clone(&self.semaphore);
+        let session_ids = Arc::clone(&self.session_ids);
+        let handshake_timeout = self.config.handshake_timeout;
+        let heartbeat_interval = self.config.heartbeat_interval;
+        let pong_timeout = self.config.pong_timeout;
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => break,
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    spawn_agent_session(
+                        &mut tasks,
+                        stream,
+                        peer,
+                        Arc::clone(&semaphore),
+                        Arc::clone(&session_ids),
+                        handshake_timeout,
+                        heartbeat_interval,
+                        pong_timeout,
+                        Some(signal.clone()),
+                    );
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        drop(listener);
+        Ok(crate::drain_tasks(tasks, shutdown.drain_timeout).await)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_agent_session(
+    tasks: &mut JoinSet<()>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    semaphore: Arc<Semaphore>,
+    session_ids: Arc<TransportSessionIdAllocator>,
+    handshake_timeout: Duration,
+    heartbeat_interval: Duration,
+    pong_timeout: Duration,
+    shutdown: Option<ShutdownSignal>,
+) {
+    tasks.spawn(async move {
+        let permit = match semaphore.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(peer = %peer, event = "agent_connection_rejected_capacity");
+                let _ = stream.shutdown().await;
+                return;
+            }
+        };
+        let session = agent_session_task(
+            stream,
+            peer,
+            session_ids,
+            handshake_timeout,
+            heartbeat_interval,
+            pong_timeout,
+            permit,
+        );
+        tokio::pin!(session);
+        match shutdown {
+            Some(signal) => {
+                tokio::select! {
+                    () = signal.cancelled() => {}
+                    () = &mut session => {}
+                }
+            }
+            None => session.await,
+        }
+    });
 }
 
 /// Session 08 development runtime: one Agent transport and one active raw TCP
@@ -721,6 +786,31 @@ impl SingleStreamEdgeRuntime {
                     let _ = ingress.shutdown().await;
                 }
                 StreamOpenOutcome::AgentClosed => return Ok(()),
+            }
+        }
+    }
+
+    /// Cancels the legacy single-stream runtime as one owned unit.
+    ///
+    /// Unlike the multiplexed runtime this compatibility path has no child
+    /// tasks: dropping its run future releases both listeners and any active
+    /// sockets immediately, so there is nothing separate to join or drain.
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> Result<RuntimeShutdownOutcome, AgentTransportError> {
+        shutdown
+            .validate()
+            .map_err(|error| AgentTransportError::SessionIo(std::io::Error::other(error)))?;
+        let runtime = self.run();
+        tokio::pin!(runtime);
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => Ok(RuntimeShutdownOutcome::Drained { completed_tasks: 0 }),
+            result = &mut runtime => {
+                result?;
+                Ok(RuntimeShutdownOutcome::Drained { completed_tasks: 1 })
             }
         }
     }

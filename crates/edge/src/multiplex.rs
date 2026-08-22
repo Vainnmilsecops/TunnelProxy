@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
+
+use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatSequence, StreamId, StreamResetCode,
@@ -144,6 +148,7 @@ fn sorted_session_ids(
 pub struct EdgeSessionRouter {
     sessions: SessionRegistry,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    accepting_streams: Arc<AtomicBool>,
 }
 
 impl EdgeSessionRouter {
@@ -184,6 +189,9 @@ impl EdgeSessionRouter {
         session_id: TransportSessionId,
         ingress: TcpStream,
     ) -> Result<RoutedStream, RouteError> {
+        if !self.accepting_streams.load(Ordering::Acquire) {
+            return Err(RouteError::RuntimeDraining);
+        }
         let sender = self.sessions.read().await.get(&session_id).cloned();
         let sender = sender.ok_or(RouteError::SessionNotFound(session_id))?;
         let (response_tx, response_rx) = oneshot::channel();
@@ -249,6 +257,7 @@ pub enum RoutedStreamCloseReason {
 /// Failure to route an ingress connection to a logical stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteError {
+    RuntimeDraining,
     SessionNotFound(TransportSessionId),
     SessionBusy(TransportSessionId),
     SessionClosing(TransportSessionId),
@@ -261,6 +270,7 @@ pub enum RouteError {
 impl std::fmt::Display for RouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RuntimeDraining => f.write_str("Edge runtime is draining"),
             Self::SessionNotFound(id) => write!(f, "transport session {id} was not found"),
             Self::SessionBusy(id) => write!(f, "transport session {id} command queue is full"),
             Self::SessionClosing(id) => write!(f, "transport session {id} is closing"),
@@ -285,6 +295,7 @@ pub struct MultiplexedEdgeRuntime {
     session_ids: Arc<TransportSessionIdAllocator>,
     permits: Arc<Semaphore>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    accepting_streams: Arc<AtomicBool>,
 }
 
 impl MultiplexedEdgeRuntime {
@@ -304,6 +315,7 @@ impl MultiplexedEdgeRuntime {
             session_ids: Arc::new(TransportSessionIdAllocator::new()),
             permits,
             session_updates,
+            accepting_streams: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -315,40 +327,104 @@ impl MultiplexedEdgeRuntime {
         EdgeSessionRouter {
             sessions: Arc::clone(&self.sessions),
             session_updates: self.session_updates.clone(),
+            accepting_streams: Arc::clone(&self.accepting_streams),
         }
     }
 
     /// Runs until the listener fails or the task is cancelled.
     pub async fn run(self) -> std::io::Result<()> {
         info!(addr = %self.local_addr, event = "multiplexed_edge_started");
+        let mut tasks = JoinSet::new();
         loop {
-            let (socket, peer) = self.listener.accept().await?;
-            let permit = match Arc::clone(&self.permits).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    warn!(peer = %peer, event = "agent_capacity_rejected");
-                    drop(socket);
-                    continue;
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (socket, peer) = accepted?;
+                    spawn_accepted_session(
+                        &mut tasks,
+                        socket,
+                        peer,
+                        Arc::clone(&self.permits),
+                        self.config.clone(),
+                        Arc::clone(&self.sessions),
+                        Arc::clone(&self.session_ids),
+                        self.session_updates.clone(),
+                    );
                 }
-            };
-            let config = self.config.clone();
-            let sessions = Arc::clone(&self.sessions);
-            let session_ids = Arc::clone(&self.session_ids);
-            let session_updates = self.session_updates.clone();
-            tokio::spawn(async move {
-                run_accepted_session(
-                    socket,
-                    peer,
-                    permit,
-                    config,
-                    sessions,
-                    session_ids,
-                    session_updates,
-                )
-                .await;
-            });
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+            }
         }
     }
+
+    /// Stops Agent and stream admission, drains sessions, then force-closes
+    /// any task still alive at the configured deadline.
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> std::io::Result<RuntimeShutdownOutcome> {
+        crate::validate_shutdown(shutdown)?;
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => break,
+                accepted = self.listener.accept() => {
+                    let (socket, peer) = accepted?;
+                    spawn_accepted_session(
+                        &mut tasks,
+                        socket,
+                        peer,
+                        Arc::clone(&self.permits),
+                        self.config.clone(),
+                        Arc::clone(&self.sessions),
+                        Arc::clone(&self.session_ids),
+                        self.session_updates.clone(),
+                    );
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        self.accepting_streams.store(false, Ordering::Release);
+        let senders: Vec<_> = self.sessions.read().await.values().cloned().collect();
+        for sender in senders {
+            let _ = sender.try_send(SessionCommand::BeginDrain);
+        }
+        drop(self.listener);
+        let outcome = crate::drain_tasks(tasks, shutdown.drain_timeout).await;
+        self.sessions.write().await.clear();
+        self.session_updates.send_replace(Arc::new(Vec::new()));
+        Ok(outcome)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_accepted_session(
+    tasks: &mut JoinSet<()>,
+    socket: TcpStream,
+    peer: SocketAddr,
+    permits: Arc<Semaphore>,
+    config: MultiplexedEdgeConfig,
+    sessions: SessionRegistry,
+    session_ids: Arc<TransportSessionIdAllocator>,
+    session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+) {
+    let permit = match permits.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(peer = %peer, event = "agent_capacity_rejected");
+            drop(socket);
+            return;
+        }
+    };
+    tasks.spawn(run_accepted_session(
+        socket,
+        peer,
+        permit,
+        config,
+        sessions,
+        session_ids,
+        session_updates,
+    ));
 }
 
 enum SessionCommand {
@@ -357,6 +433,7 @@ enum SessionCommand {
         response: oneshot::Sender<Result<StreamId, RouteError>>,
         completion: oneshot::Sender<RoutedStreamCloseReason>,
     },
+    BeginDrain,
 }
 
 enum StreamEvent {
@@ -427,6 +504,7 @@ async fn run_edge_session(
     let mut decoder = FrameDecoder::new();
     let mut heartbeat_sequence = HeartbeatSequence::FIRST;
     let mut pending_heartbeat: Option<HeartbeatSequence> = None;
+    let mut draining = false;
     let heartbeat_timer = tokio::time::sleep(config.agent_listener.heartbeat_interval);
     tokio::pin!(heartbeat_timer);
 
@@ -487,7 +565,19 @@ async fn run_edge_session(
                 }
             }
             command = command_rx.recv() => {
-                let Some(SessionCommand::Open { ingress, response, completion }) = command else { break };
+                let Some(command) = command else { break };
+                let SessionCommand::Open { ingress, response, completion } = command else {
+                    draining = true;
+                    if streams.is_empty() {
+                        break;
+                    }
+                    continue;
+                };
+                if draining {
+                    let _ = response.send(Err(RouteError::RuntimeDraining));
+                    drop(completion);
+                    continue;
+                }
                 if streams.len() >= config.max_streams_per_session {
                     let _ = response.send(Err(RouteError::CapacityExceeded(session_id)));
                     continue;
@@ -518,6 +608,9 @@ async fn run_edge_session(
             event = event_rx.recv() => {
                 if let Some(StreamEvent::Closed(stream_id)) = event {
                     streams.remove(&stream_id);
+                    if draining && streams.is_empty() {
+                        break;
+                    }
                 }
             }
             () = &mut heartbeat_timer => {

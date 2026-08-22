@@ -231,6 +231,20 @@ These routes are process-local development bindings, not durable tunnel
 records or public endpoints. They do not survive restart or reconnect and are
 never reassigned to another Agent session.
 
+### 2.10 Graceful runtime shutdown and supervision (Session 11)
+
+`tunnelproxy-common` owns an idempotent watch-based shutdown trigger/signal and
+the shared drain deadline. Runtime APIs stop listener admission before waiting
+on their `JoinSet` children. Completion is explicit: `Drained` counts joined
+tasks, while `Forced` reports both completed and deadline-aborted tasks.
+
+Multiplexed Edge flips its router to a fail-closed draining state before asking
+live sessions to stop accepting stream commands. The Agent answers any later
+`OPEN_STREAM` with `SessionClosing` and lets existing local bridges finish.
+Raw-route shutdown similarly prevents new route creation and supervises every
+routed connection. OS signal handling is intentionally one layer above these
+mechanisms and remains entrypoint work for Session 12.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

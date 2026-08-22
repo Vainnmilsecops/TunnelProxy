@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Raw Ingress Binding & Route Lifecycle** (Session 10).
+**Graceful Runtime Shutdown & Supervision** (Session 11).
 
 ## Completed
 
@@ -85,7 +85,18 @@
   prevent stale ephemeral session IDs from accepting more ingress.
 - Ten real-TCP Session 10 tests cover byte-exact traffic, concurrent clients,
   two-Agent routing, capacity, drain, drain timeout, disconnect, and recovery.
-- 133 explicit workspace tests are present; all prior behavior is preserved.
+- Shared idempotent `ShutdownTrigger` / `ShutdownSignal` primitives preserve
+  shutdown requests made before a runtime begins waiting.
+- Echo, relay, forwarder, Agent transport, single-stream, multiplexed Edge,
+  multiplexed Agent, and raw-route runtimes expose explicit shutdown paths.
+- Listener admission stops first. Supervised child tasks drain under a shared
+  configurable deadline and report `Drained` or `Forced` outcomes.
+- Multiplexed Edge rejects new routed streams while draining and sends a drain
+  command to every live Agent session. Multiplexed Agent rejects later
+  `OPEN_STREAM` frames with `SessionClosing` while current streams finish.
+- Raw ingress shutdown is process-wide, prevents route reuse, joins connection
+  tasks, and force-aborts remaining routes only after the deadline.
+- 145 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -99,19 +110,17 @@
 - Public HTTP/TLS reverse proxy and raw public ingress.
 - Durable Agent identity (`TunnelId`, `AgentId`).
 - Upstream connection pool (DEBT-008 open).
-- Graceful shutdown channel on listeners (DEBT-005 / DEBT-012 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
 - Production telemetry / metrics backend (DEBT-010 open).
 
 ## Next planned session
 
-**Session 11 — Graceful Runtime Shutdown & Supervision.**
+**Session 12 — Production Runtime Entrypoints & OS Signal Wiring.**
 
 Goals:
 
-- Add explicit cancellation to Agent transport, multiplexed Edge, raw route,
-  echo, relay, and forwarder accept loops.
-- Drain bounded in-flight sessions/routes under configurable deadlines.
-- Remove detached task ambiguity and resolve DEBT-005/DEBT-012.
-- Keep OS signal wiring, public HTTP/TLS, persistence, and reconnect separate.
+- Compose the supervised runtime APIs behind production-oriented CLI entrypoints.
+- Translate Ctrl-C / SIGTERM into one idempotent shutdown request.
+- Define startup rollback and ordered shutdown reporting without adding public
+  HTTP/TLS, persistence, authentication, or reconnect.

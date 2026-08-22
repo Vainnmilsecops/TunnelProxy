@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 10.
+> **Status:** Implemented through Session 11.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
 > ingress or durable routing.
@@ -31,7 +31,7 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport remains unauthenticated and unencrypted through Session 10.**
+**This transport remains unauthenticated and unencrypted through Session 11.**
 
 The development listener binds `127.0.0.1` only. In production, this
 transport requires TLS and Agent authentication before use. The README
@@ -336,6 +336,12 @@ bounded stream and writer queues. Session 10 adds loopback
 until the logical stream closes. Removal stops accept, drains existing streams,
 and cleans the route if its target ephemeral Agent session disconnects. No wire
 protocol change was required.
+
+Session 11 adds `run_until_shutdown` / `run_multiplexed_until_shutdown`
+variants. Edge stops Agent and ingress admission first, then drains supervised
+sessions under `RuntimeShutdownConfig`. During multiplexed drain, new routed
+streams fail closed and Agent rejects new `OPEN_STREAM` frames with the existing
+`SessionClosing` reset code. Shutdown introduces no wire-format change.
 
 ## What Is NOT Implemented
 

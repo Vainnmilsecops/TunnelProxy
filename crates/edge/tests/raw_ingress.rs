@@ -89,6 +89,65 @@ fn route_config(session_id: TransportSessionId) -> RawIngressRouteConfig {
     config
 }
 
+#[tokio::test]
+async fn manager_shutdown_drains_routes_and_rejects_reuse() {
+    let (local_addr, local) = spawn_echo_service(0).await;
+    let harness = spawn_harness(local_addr).await;
+    let manager = manager(&harness.router);
+    manager
+        .add_route(route_config(harness.session_id))
+        .await
+        .unwrap();
+
+    let outcome = manager
+        .shutdown(tunnelproxy_edge::RuntimeShutdownConfig::new(
+            Duration::from_secs(1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        tunnelproxy_edge::RuntimeShutdownOutcome::Drained { completed_tasks: 1 }
+    );
+    assert!(matches!(
+        manager.add_route(route_config(harness.session_id)).await,
+        Err(RawIngressRouteError::ManagerShuttingDown)
+    ));
+    local.await.unwrap();
+}
+
+#[tokio::test]
+async fn manager_shutdown_forces_routes_that_exceed_the_deadline() {
+    let (local_addr, local) = spawn_echo_service(1).await;
+    let harness = spawn_harness(local_addr).await;
+    let manager = manager(&harness.router);
+    let route = manager
+        .add_route(route_config(harness.session_id))
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(route.local_addr).await.unwrap();
+    client.write_all(b"active").await.unwrap();
+    let mut echoed = [0_u8; 6];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"active");
+
+    let outcome = manager
+        .shutdown(tunnelproxy_edge::RuntimeShutdownConfig::new(
+            Duration::from_millis(20),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        tunnelproxy_edge::RuntimeShutdownOutcome::Forced {
+            completed_tasks: 0,
+            aborted_tasks: 1,
+        }
+    );
+    drop(client);
+    local.await.unwrap();
+}
+
 async fn spawn_echo_service(connection_count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
