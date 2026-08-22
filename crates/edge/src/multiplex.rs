@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use tunnelproxy_protocol::{
@@ -130,11 +130,20 @@ impl std::error::Error for MultiplexedEdgeConfigError {}
 
 type SessionRegistry = Arc<RwLock<HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>>>;
 
+fn sorted_session_ids(
+    sessions: &HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>,
+) -> Vec<TransportSessionId> {
+    let mut ids: Vec<_> = sessions.keys().copied().collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// Cloneable routing handle. The registry contains only live, process-local
 /// transport sessions and never acts as durable tunnel identity.
 #[derive(Clone)]
 pub struct EdgeSessionRouter {
     sessions: SessionRegistry,
+    session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
 }
 
 impl EdgeSessionRouter {
@@ -145,6 +154,16 @@ impl EdgeSessionRouter {
         ids
     }
 
+    /// Returns whether one ephemeral transport session is currently live.
+    pub async fn is_connected(&self, session_id: TransportSessionId) -> bool {
+        self.sessions.read().await.contains_key(&session_id)
+    }
+
+    /// Subscribes to live-session snapshots for route lifecycle management.
+    pub fn subscribe_session_ids(&self) -> watch::Receiver<Arc<Vec<TransportSessionId>>> {
+        self.session_updates.subscribe()
+    }
+
     /// Routes an already-accepted ingress socket to one exact Agent session.
     /// Success means the Agent acknowledged `OPEN_STREAM`.
     pub async fn open_stream(
@@ -152,22 +171,79 @@ impl EdgeSessionRouter {
         session_id: TransportSessionId,
         ingress: TcpStream,
     ) -> Result<StreamId, RouteError> {
+        Ok(self
+            .open_stream_tracked(session_id, ingress)
+            .await?
+            .stream_id)
+    }
+
+    /// Opens a logical stream and returns a completion handle used by ingress
+    /// owners to track drain lifecycle without retaining the TCP socket.
+    pub async fn open_stream_tracked(
+        &self,
+        session_id: TransportSessionId,
+        ingress: TcpStream,
+    ) -> Result<RoutedStream, RouteError> {
         let sender = self.sessions.read().await.get(&session_id).cloned();
         let sender = sender.ok_or(RouteError::SessionNotFound(session_id))?;
         let (response_tx, response_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
         sender
             .try_send(SessionCommand::Open {
                 ingress,
                 response: response_tx,
+                completion: completion_tx,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => RouteError::SessionBusy(session_id),
                 mpsc::error::TrySendError::Closed(_) => RouteError::SessionClosing(session_id),
             })?;
-        response_rx
+        let stream_id = response_rx
             .await
-            .unwrap_or(Err(RouteError::SessionClosing(session_id)))
+            .unwrap_or(Err(RouteError::SessionClosing(session_id)))?;
+        Ok(RoutedStream {
+            session_id,
+            stream_id,
+            completion: completion_rx,
+        })
     }
+}
+
+/// A logical stream acknowledged by Agent plus its close notification.
+pub struct RoutedStream {
+    pub session_id: TransportSessionId,
+    pub stream_id: StreamId,
+    completion: oneshot::Receiver<RoutedStreamCloseReason>,
+}
+
+impl RoutedStream {
+    /// Waits until the Edge stream task releases its ingress socket.
+    pub async fn wait_closed(self) -> RoutedStreamCloseReason {
+        self.completion
+            .await
+            .unwrap_or(RoutedStreamCloseReason::SessionClosed)
+    }
+}
+
+impl std::fmt::Debug for RoutedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutedStream")
+            .field("session_id", &self.session_id)
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a tracked logical stream released its ingress socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedStreamCloseReason {
+    Graceful,
+    PeerReset(StreamResetCode),
+    SessionClosed,
+    IoFailure,
+    OpenTimeout,
+    IdleTimeout,
+    ProtocolViolation,
 }
 
 /// Failure to route an ingress connection to a logical stream.
@@ -208,6 +284,7 @@ pub struct MultiplexedEdgeRuntime {
     sessions: SessionRegistry,
     session_ids: Arc<TransportSessionIdAllocator>,
     permits: Arc<Semaphore>,
+    session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
 }
 
 impl MultiplexedEdgeRuntime {
@@ -218,6 +295,7 @@ impl MultiplexedEdgeRuntime {
         let listener = TcpListener::bind(config.agent_listener.listen_addr).await?;
         let local_addr = listener.local_addr()?;
         let permits = Arc::new(Semaphore::new(config.agent_listener.max_agent_sessions));
+        let (session_updates, _) = watch::channel(Arc::new(Vec::new()));
         Ok(Self {
             listener,
             local_addr,
@@ -225,6 +303,7 @@ impl MultiplexedEdgeRuntime {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             session_ids: Arc::new(TransportSessionIdAllocator::new()),
             permits,
+            session_updates,
         })
     }
 
@@ -235,6 +314,7 @@ impl MultiplexedEdgeRuntime {
     pub fn router(&self) -> EdgeSessionRouter {
         EdgeSessionRouter {
             sessions: Arc::clone(&self.sessions),
+            session_updates: self.session_updates.clone(),
         }
     }
 
@@ -254,8 +334,18 @@ impl MultiplexedEdgeRuntime {
             let config = self.config.clone();
             let sessions = Arc::clone(&self.sessions);
             let session_ids = Arc::clone(&self.session_ids);
+            let session_updates = self.session_updates.clone();
             tokio::spawn(async move {
-                run_accepted_session(socket, peer, permit, config, sessions, session_ids).await;
+                run_accepted_session(
+                    socket,
+                    peer,
+                    permit,
+                    config,
+                    sessions,
+                    session_ids,
+                    session_updates,
+                )
+                .await;
             });
         }
     }
@@ -265,6 +355,7 @@ enum SessionCommand {
     Open {
         ingress: TcpStream,
         response: oneshot::Sender<Result<StreamId, RouteError>>,
+        completion: oneshot::Sender<RoutedStreamCloseReason>,
     },
 }
 
@@ -279,6 +370,7 @@ async fn run_accepted_session(
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
     session_ids: Arc<TransportSessionIdAllocator>,
+    session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
 ) {
     let handshake = tokio::time::timeout(
         config.agent_listener.handshake_timeout,
@@ -299,13 +391,23 @@ async fn run_accepted_session(
 
     let session_id = session.session_id;
     let (command_tx, command_rx) = mpsc::channel(config.session_command_capacity);
-    sessions.write().await.insert(session_id, command_tx);
+    let snapshot = {
+        let mut sessions = sessions.write().await;
+        sessions.insert(session_id, command_tx);
+        sorted_session_ids(&sessions)
+    };
+    session_updates.send_replace(Arc::new(snapshot));
     info!(%session_id, peer = %peer, event = "multiplexed_session_registered");
 
     if let Err(error) = run_edge_session(socket, session_id, config, command_rx).await {
         warn!(%session_id, error = %error, event = "multiplexed_session_failed");
     }
-    sessions.write().await.remove(&session_id);
+    let snapshot = {
+        let mut sessions = sessions.write().await;
+        sessions.remove(&session_id);
+        sorted_session_ids(&sessions)
+    };
+    session_updates.send_replace(Arc::new(snapshot));
     info!(%session_id, event = "multiplexed_session_removed");
 }
 
@@ -385,7 +487,7 @@ async fn run_edge_session(
                 }
             }
             command = command_rx.recv() => {
-                let Some(SessionCommand::Open { ingress, response }) = command else { break };
+                let Some(SessionCommand::Open { ingress, response, completion }) = command else { break };
                 if streams.len() >= config.max_streams_per_session {
                     let _ = response.send(Err(RouteError::CapacityExceeded(session_id)));
                     continue;
@@ -405,6 +507,7 @@ async fn run_edge_session(
                     stream_id,
                     ingress,
                     response,
+                    completion,
                     config.clone(),
                     stream_rx,
                     control_tx.clone(),
@@ -449,6 +552,7 @@ async fn run_ingress_stream(
     stream_id: StreamId,
     mut ingress: TcpStream,
     response: oneshot::Sender<Result<StreamId, RouteError>>,
+    completion: oneshot::Sender<RoutedStreamCloseReason>,
     config: MultiplexedEdgeConfig,
     mut inbound: mpsc::Receiver<Frame>,
     control_tx: mpsc::Sender<Frame>,
@@ -460,6 +564,7 @@ async fn run_ingress_stream(
         .is_err()
     {
         let _ = response.send(Err(RouteError::SessionClosing(session_id)));
+        let _ = completion.send(RoutedStreamCloseReason::SessionClosed);
         let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
         return;
     }
@@ -474,11 +579,13 @@ async fn run_ingress_stream(
         Ok(Some(frame)) if frame.frame_type == FrameType::ResetStream => {
             let code = decode_reset(&frame).unwrap_or(StreamResetCode::ProtocolViolation);
             let _ = response.send(Err(RouteError::StreamRejected(code)));
+            let _ = completion.send(RoutedStreamCloseReason::PeerReset(code));
             let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
             return;
         }
         Ok(None) => {
             let _ = response.send(Err(RouteError::SessionClosing(session_id)));
+            let _ = completion.send(RoutedStreamCloseReason::SessionClosed);
             let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
             return;
         }
@@ -487,12 +594,14 @@ async fn run_ingress_stream(
                 StreamResetCode::ProtocolViolation,
             )));
             let _ = send_reset(&control_tx, stream_id, StreamResetCode::ProtocolViolation).await;
+            let _ = completion.send(RoutedStreamCloseReason::ProtocolViolation);
             let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
             return;
         }
         Err(_) => {
             let _ = response.send(Err(RouteError::OpenTimeout(stream_id)));
             let _ = send_reset(&control_tx, stream_id, StreamResetCode::OpenTimeout).await;
+            let _ = completion.send(RoutedStreamCloseReason::OpenTimeout);
             let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
             return;
         }
@@ -503,18 +612,23 @@ async fn run_ingress_stream(
     let mut agent_ended = false;
     let idle = tokio::time::sleep(config.stream_idle_timeout);
     tokio::pin!(idle);
+    let mut close_reason = RoutedStreamCloseReason::Graceful;
     loop {
         if ingress_ended && agent_ended {
             break;
         }
         tokio::select! {
             frame = inbound.recv() => {
-                let Some(frame) = frame else { break };
+                let Some(frame) = frame else {
+                    close_reason = RoutedStreamCloseReason::SessionClosed;
+                    break;
+                };
                 idle.as_mut().reset(tokio::time::Instant::now() + config.stream_idle_timeout);
                 match frame.frame_type {
                     FrameType::Data if !agent_ended => {
                         if ingress.write_all(&frame.payload).await.is_err() {
                             let _ = send_reset(&control_tx, stream_id, StreamResetCode::IoFailure).await;
+                            close_reason = RoutedStreamCloseReason::IoFailure;
                             break;
                         }
                     }
@@ -522,12 +636,19 @@ async fn run_ingress_stream(
                         agent_ended = true;
                         if ingress.shutdown().await.is_err() {
                             let _ = send_reset(&control_tx, stream_id, StreamResetCode::IoFailure).await;
+                            close_reason = RoutedStreamCloseReason::IoFailure;
                             break;
                         }
                     }
-                    FrameType::ResetStream if decode_reset(&frame).is_some() => break,
+                    FrameType::ResetStream if decode_reset(&frame).is_some() => {
+                        close_reason = RoutedStreamCloseReason::PeerReset(
+                            decode_reset(&frame).expect("guard validated reset payload")
+                        );
+                        break;
+                    }
                     _ => {
                         let _ = send_reset(&control_tx, stream_id, StreamResetCode::ProtocolViolation).await;
+                        close_reason = RoutedStreamCloseReason::ProtocolViolation;
                         break;
                     }
                 }
@@ -537,27 +658,32 @@ async fn run_ingress_stream(
                     Ok(0) => {
                         ingress_ended = true;
                         if send_stream(&data_tx, FrameType::EndStream, stream_id, Vec::new()).await.is_err() {
+                            close_reason = RoutedStreamCloseReason::SessionClosed;
                             break;
                         }
                     }
                     Ok(count) => {
                         idle.as_mut().reset(tokio::time::Instant::now() + config.stream_idle_timeout);
                         if send_stream(&data_tx, FrameType::Data, stream_id, buffer[..count].to_vec()).await.is_err() {
+                            close_reason = RoutedStreamCloseReason::SessionClosed;
                             break;
                         }
                     }
                     Err(_) => {
                         let _ = send_reset(&control_tx, stream_id, StreamResetCode::IoFailure).await;
+                        close_reason = RoutedStreamCloseReason::IoFailure;
                         break;
                     }
                 }
             }
             () = &mut idle => {
                 let _ = send_reset(&control_tx, stream_id, StreamResetCode::IdleTimeout).await;
+                close_reason = RoutedStreamCloseReason::IdleTimeout;
                 break;
             }
         }
     }
+    let _ = completion.send(close_reason);
     let _ = event_tx.send(StreamEvent::Closed(stream_id)).await;
 }
 

@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Stream Multiplexing & Session Routing** (Session 09).
+**Raw Ingress Binding & Route Lifecycle** (Session 10).
 
 ## Completed
 
@@ -71,7 +71,21 @@
   and closing sessions without changing Protocol v1 frame numbers.
 - Real-TCP tests cover eight simultaneous streams, capacity rejection,
   two-Agent exact routing, local failure isolation, and heartbeat during load.
-- 120 explicit workspace tests are present; all prior behavior is preserved.
+- 120 explicit workspace tests were present through Session 09.
+- `EdgeSessionRouter::open_stream_tracked` returns a `RoutedStream` completion
+  handle while the Session 09 `open_stream` API remains compatible.
+- `RawIngressRouteManager` creates bounded loopback TCP listeners targeting one
+  exact live `TransportSessionId`; no registry lock is held across network I/O.
+- Route lifecycle is explicit: `Active` → `Draining` or
+  `TargetDisconnected` → `Removed`. Removing stops acceptance immediately and
+  active streams retain their sockets until actual completion.
+- Route count and per-route connection count are bounded. Drain has a typed
+  deadline and never force-kills active streams on timeout.
+- Live-session snapshots remove routes targeting a disconnected Agent and
+  prevent stale ephemeral session IDs from accepting more ingress.
+- Ten real-TCP Session 10 tests cover byte-exact traffic, concurrent clients,
+  two-Agent routing, capacity, drain, drain timeout, disconnect, and recovery.
+- 133 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -92,12 +106,12 @@
 
 ## Next planned session
 
-**Session 10 — Raw Ingress Binding & Route Lifecycle.**
+**Session 11 — Graceful Runtime Shutdown & Supervision.**
 
 Goals:
 
-- Bind raw loopback ingress endpoints to selected live transport sessions.
-- Define explicit route add/remove/drain lifecycle above `EdgeSessionRouter`.
-- Exercise disconnect and route-removal races without introducing persistence.
-- Keep public HTTP/TLS, durable identity, authentication, and reconnect out of
-  scope until the route lifecycle is proven.
+- Add explicit cancellation to Agent transport, multiplexed Edge, raw route,
+  echo, relay, and forwarder accept loops.
+- Drain bounded in-flight sessions/routes under configurable deadlines.
+- Remove detached task ambiguity and resolve DEBT-005/DEBT-012.
+- Keep OS signal wiring, public HTTP/TLS, persistence, and reconnect separate.

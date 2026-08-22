@@ -17,6 +17,8 @@ correct agent, which in turn proxies them into the local service.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
 - A loopback-only multiplexed reverse TCP data path with bounded queues,
   half-close, typed reset, open/idle deadlines, and per-session routing.
+- Ephemeral loopback raw-ingress routes with bounded connection admission,
+  tracked stream completion, graceful drain, and Agent-disconnect cleanup.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.

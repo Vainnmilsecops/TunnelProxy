@@ -287,3 +287,26 @@ copies the session sender before releasing the registry lock.
 all application queues have explicit capacity, and stale session IDs fail
 closed. This is cooperative bounded backpressure, not a credit-based flow
 control protocol or strict weighted scheduler.
+
+---
+
+## ADR-012 — Ephemeral raw routes stop accept before draining streams
+
+**Status:** Accepted (Session 10).
+
+**Context:** A bound ingress listener must be removable without dropping
+already-routed client traffic. Counting accepted sockets is insufficient
+because Edge transfers socket ownership into per-stream tasks, and a stale
+`TransportSessionId` must never silently target a replacement Agent.
+
+**Decision:** `open_stream_tracked` returns a completion receiver for the real
+stream task. A raw route holds one semaphore permit per accepted connection
+until that receiver completes. Remove first closes the listener and enters
+`Draining`; removal from the registry happens only after all permits return.
+Agent session snapshots transition targeted routes to `TargetDisconnected` and
+the route is never rebound automatically.
+
+**Consequences:** Active streams survive route removal, drain timeout is
+observable without forced traffic loss, and stale sessions fail closed. Routes
+remain loopback-only and ephemeral; durable tunnel routing is separate work
+tracked by DEBT-015.

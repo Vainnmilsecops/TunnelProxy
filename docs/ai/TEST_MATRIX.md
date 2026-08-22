@@ -84,6 +84,11 @@
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
 | Live session routing                      | ✅   | ✅          | —   | `router_targets_the_requested_agent_session` proves exact routing across two connected Agents. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |
+| Raw ingress route golden path             | ✅   | ✅          | —   | `raw_route_golden_path_is_byte_exact_and_drains` binds an ephemeral listener and crosses Edge → Agent → local service. |
+| Raw ingress concurrent routing            | —    | ✅          | —   | Six concurrent clients remain byte-exact; two routes target two exact Agent sessions. |
+| Raw route admission                       | ✅   | ✅          | —   | Global route and per-route connection bounds reject excess work without stopping healthy routes. |
+| Raw route drain lifecycle                 | ✅   | ✅          | —   | Remove stops accept, active streams finish, and drain timeout is typed without forced cancellation. |
+| Raw route disconnect cleanup              | —    | ✅          | —   | Agent disconnect removes its route; local-connect failure leaves the route available for recovery. |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
 | TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |

@@ -1050,10 +1050,16 @@ fn log_outcome(outcome: &ConnectionOutcome, _upstream: SocketAddr) {
 
 pub mod agent_transport;
 pub mod multiplex;
+pub mod raw_ingress;
 
 pub use multiplex::{
     EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
-    RouteError,
+    RouteError, RoutedStream, RoutedStreamCloseReason,
+};
+pub use raw_ingress::{
+    RawIngressConfigError, RawIngressManagerConfig, RawIngressRoute, RawIngressRouteConfig,
+    RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager, RawIngressRouteState,
+    RawIngressRouteStatus,
 };
 
 #[cfg(test)]
