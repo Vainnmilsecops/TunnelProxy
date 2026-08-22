@@ -81,9 +81,11 @@
 | Heartbeat during stream traffic | — | ✅ | — | `heartbeat_remains_live_during_active_stream` spans multiple heartbeat intervals during a slow local response. |
 | Stream lifecycle violation | — | ✅ | — | `data_before_open_is_reset_without_killing_agent_session`. |
 | Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
-| Multiplexing                              | —    | —           | —   | Deferred until simple bidirectional tunnel works.                                                                           |
+| Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
+| Live session routing                      | ✅   | ✅          | —   | `router_targets_the_requested_agent_session` proves exact routing across two connected Agents. |
+| Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |
-| Backpressure                              | ✅   | ✅          | —   | Session 08 uses fixed 16 KiB reads, direct sequential frame writes, a 64 KiB codec ceiling, and no unbounded data queue; multiplexed fairness remains deferred. |
+| Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
 | TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |
 | Authentication                            | —    | —           | —   | INV-003; deferred.                                                                                                          |
 | Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |

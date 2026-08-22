@@ -265,3 +265,25 @@ serve later streams sequentially.
   TLS, hostname routing, authentication, or durable registration.
 - Session 09 can replace the single active state with a bounded stream map and
   writer queue without changing Session 08 payload semantics.
+
+---
+
+## ADR-011 — One reader, one writer actor, bounded per-stream dispatch
+
+**Status:** Accepted (Session 09).
+
+**Context:** Concurrent logical streams must not read or write the same framed
+TCP transport independently. Unbounded fan-in queues would turn a slow peer or
+local service into process-wide memory growth, while lifecycle priority must
+not reorder END_STREAM ahead of DATA from the same direction.
+
+**Decision:** Each established transport has one decoder owner and one writer
+actor. The reader dispatches to bounded per-stream queues. Heartbeat and reset
+frames use a priority queue; DATA and END_STREAM share FIFO ordering. Edge keeps
+an ephemeral registry keyed only by live `TransportSessionId`, and routing
+copies the session sender before releasing the registry lock.
+
+**Consequences:** Concurrent streams and Agent sessions are failure-isolated,
+all application queues have explicit capacity, and stale session IDs fail
+closed. This is cooperative bounded backpressure, not a credit-based flow
+control protocol or strict weighted scheduler.

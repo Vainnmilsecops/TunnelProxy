@@ -21,8 +21,8 @@ Future local TunnelProxy agent / CLI runtime.
 
 The library opens an outbound TCP connection to Edge, performs the v1
 HELLO → REGISTER → REGISTERED handshake, and exposes an established
-`AgentSession`. It validates Edge PING and returns the matching PONG. Session 08
-adds `AgentSession::run_with_local_target`, which connects an Edge-opened stream
-to one configured local TCP service with bounded DATA frames, half-close, and
-per-stream reset/cleanup. Concurrent stream multiplexing, reconnect, TLS,
+`AgentSession`. It validates Edge PING and returns the matching PONG. Session 09
+adds `AgentSession::run_multiplexed`, which connects concurrent Edge-opened
+streams to one configured local TCP service with bounded queues and DATA
+frames, half-close, and per-stream reset/cleanup. Reconnect, TLS,
 authentication, durable registration, and the final CLI UX remain unimplemented.

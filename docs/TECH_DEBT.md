@@ -182,9 +182,32 @@
   stream registry, one reader task, one bounded writer queue, per-stream
   cancellation, and explicit capacity/fairness policy. Preserve the Session 08
   wire payloads.
-- **Tracking:** Session 09 plan, `docs/ai/SESSION_INDEX.md`.
+- **Tracking:** resolved in Session 09; the Session 08 compatibility runtime
+  intentionally retains its single-stream contract.
+
+### DEBT-014 — No credit-based flow-control window or weighted scheduler
+
+- **Introduced in:** Session 09
+- **Category:** performance
+- **Impact:** medium
+- **Rationale:** Session 09 bounds every queue and prioritizes heartbeat/reset
+  traffic. DATA senders share Tokio's bounded FIFO channel, which provides
+  cooperative backpressure but not byte-credit negotiation or weighted
+  round-robin service for permanently backlogged streams.
+- **Exit plan:** Add explicit per-stream/session byte credits and a deficit
+  round-robin writer only after measurements show the bounded FIFO policy is
+  insufficient.
+- **Tracking:** open.
 
 ## Resolved items
+
+### DEBT-013 — Single-stream runtime rejects concurrent ingress
+
+- **Introduced in:** Session 08
+- **Resolved in:** Session 09
+- **Resolution:** Added a bounded concurrent stream map, one reader and writer
+  actor per transport, per-stream queues and cleanup, capacity reset, and exact
+  live-session routing. The Session 08 runtime remains as a compatibility API.
 
 ### DEBT-011 — No heartbeat / liveness detection on established sessions
 

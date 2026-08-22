@@ -1049,6 +1049,12 @@ fn log_outcome(outcome: &ConnectionOutcome, _upstream: SocketAddr) {
 }
 
 pub mod agent_transport;
+pub mod multiplex;
+
+pub use multiplex::{
+    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
+    RouteError,
+};
 
 #[cfg(test)]
 mod tests {

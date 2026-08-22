@@ -1,9 +1,9 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 08.
+> **Status:** Implemented through Session 09.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
-> Session 08 single-stream raw-TCP vertical slice. It does not describe public
-> HTTP/TLS ingress or concurrent stream multiplexing.
+> bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
+> ingress or durable routing.
 
 ## Purpose
 
@@ -12,7 +12,7 @@ connection over which Agent and Edge establish an ephemeral transport
 session and exchange heartbeat frames. It is the foundation for future
 tunnel registration and stream multiplexing.
 
-Session 08 carries one active raw TCP stream over this transport on loopback.
+Session 09 carries bounded concurrent raw TCP streams over this transport.
 It is not yet a public reverse-tunnel product surface.
 
 ## Topology
@@ -31,7 +31,7 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport remains unauthenticated and unencrypted through Session 08.**
+**This transport remains unauthenticated and unencrypted through Session 09.**
 
 The development listener binds `127.0.0.1` only. In production, this
 transport requires TLS and Agent authentication before use. The README
@@ -281,15 +281,13 @@ error and closes without attempting an ERROR response.
 
 ## Reader/Writer Ownership
 
-Session 08 keeps exactly one decoder and one sequential writer per Agent
-transport:
+Session 09 keeps exactly one decoder and one writer actor per Agent transport:
 
 - The handshake is sequential; no concurrent reads/writes during handshake.
-- After establishment, one task selects between Agent frames, bounded local or
-  ingress reads, heartbeat deadlines, and stream deadlines.
-
-Future multiplexing will require a dedicated reader plus a bounded writer
-queue; Session 08 deliberately avoids multiple socket owners.
+- After establishment, the reader dispatches frames to bounded per-stream
+  queues. Independent tasks own ingress/local sockets.
+- One writer actor serializes bounded control and DATA queues. DATA and
+  END_STREAM share FIFO order so half-close cannot overtake payload bytes.
 
 ## Configuration
 
@@ -336,7 +334,7 @@ AgentSession::run_with_local_target(
 - TLS / encryption
 - Agent authentication
 - Reconnect logic
-- Concurrent stream multiplexing and flow-control windows
+- Credit/window-based flow control and weighted scheduling
 - Tunnel registration
 - Public endpoint allocation
 - Public HTTP/TLS ingress and hostname routing
