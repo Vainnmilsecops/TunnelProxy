@@ -338,3 +338,30 @@ Out of scope:
 - Agent authentication, durable registration/identity, and control-plane state.
 - Reconnect and exponential backoff.
 - Production CLI wiring, graceful process shutdown, and multi-edge operation.
+
+## Session 09 — Bounded Stream Multiplexing & Session Routing — complete
+
+Scope delivered:
+
+- Added bounded concurrent stream maps on Edge and Agent while preserving the
+  Session 08 OPEN_STREAM/DATA/END_STREAM/RESET_STREAM wire contract.
+- Added one decoder owner and one bounded writer actor per transport, bounded
+  per-stream receive queues, a shared bounded DATA queue, and priority handling
+  for heartbeat and reset traffic.
+- Added `MultiplexedEdgeRuntime`, a live session registry, and
+  `EdgeSessionRouter::open_stream(TransportSessionId, TcpStream)` for exact
+  ephemeral session routing.
+- Added Agent `run_multiplexed(MultiplexedAgentConfig)` with independent local
+  TCP tasks, half-close, connect/idle deadlines, and stream-local cleanup.
+- Added capacity, unknown-stream, flow-control, and session-closing reset codes.
+- Added eight unit/integration tests. Real TCP coverage includes eight
+  concurrent streams, capacity rejection, two-Agent routing, local failure
+  isolation, bounded framing, and heartbeat interleaving. The workspace now
+  contains 120 explicit tests.
+
+Out of scope:
+
+- Public HTTP/HTTPS ingress, hostname allocation, and TLS termination.
+- Durable tunnel/Agent identity, persistent routing, and control-plane state.
+- Authentication, reconnect/backoff, graceful process shutdown, and multi-edge.
+- Credit-based flow-control windows and strict weighted scheduling.

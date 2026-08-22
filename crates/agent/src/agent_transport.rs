@@ -126,7 +126,7 @@ pub struct AgentSession {
     pub edge_addr: SocketAddr,
     /// When the session was established.
     pub established_at: Instant,
-    socket: TcpStream,
+    pub(crate) socket: TcpStream,
 }
 
 /// Normal reason the Agent session loop stopped.

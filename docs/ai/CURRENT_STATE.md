@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Single-Stream Reverse Data Path** (Session 08).
+**Bounded Stream Multiplexing & Session Routing** (Session 09).
 
 ## Completed
 
@@ -52,16 +52,34 @@
   heartbeat interleaving, idle timeout, local-connect failure, and lifecycle
   violations.
 - 20 Agent transport integration tests cover the handshake and heartbeat paths.
-- 112 explicit workspace tests are present (94 through Session 07 plus 18 for
-  Session 08).
+- 112 explicit workspace tests were present through Session 08 (94 through
+  Session 07 plus 18 for Session 08).
 - Prior Session 01–07 capabilities and tests are preserved.
+- `MultiplexedEdgeRuntime` accepts multiple loopback Agent transports and
+  publishes only live `TransportSessionId` values through `EdgeSessionRouter`.
+- `EdgeSessionRouter::open_stream` routes an accepted TCP socket to one exact
+  ephemeral Agent session and returns after OPEN_STREAM is acknowledged.
+- Agent `run_multiplexed` bridges a configurable number of concurrent logical
+  streams to its configured local service.
+- Every session has one frame reader and one writer actor. Separate bounded
+  lifecycle/heartbeat and DATA queues keep control traffic responsive; DATA
+  and END_STREAM share FIFO ordering so half-close cannot overtake payloads.
+- Per-stream inbound queues, a 16 KiB DATA-frame limit, bounded session queues,
+  capacity admission, and open/connect/idle deadlines bound memory and failure
+  scope.
+- Four new reset codes cover capacity, unknown streams, queue/flow overflow,
+  and closing sessions without changing Protocol v1 frame numbers.
+- Real-TCP tests cover eight simultaneous streams, capacity rejection,
+  two-Agent exact routing, local failure isolation, and heartbeat during load.
+- 120 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - TLS / encryption.
 - Agent authentication.
 - Reconnect logic.
-- Concurrent stream multiplexing and flow-control windows.
+- Credit/window-based flow control and strict weighted fairness between
+  continuously backlogged streams.
 - Tunnel registration (REGISTER is ephemeral transport registration only).
 - Public tunnel endpoints / hostname allocation.
 - Public HTTP/TLS reverse proxy and raw public ingress.
@@ -74,12 +92,12 @@
 
 ## Next planned session
 
-**Session 09 — Bounded Stream Multiplexing & Session Routing.**
+**Session 10 — Raw Ingress Binding & Route Lifecycle.**
 
 Goals:
 
-- Replace the single-active-stream state with a bounded concurrent stream map.
-- Introduce one reader task and one bounded writer queue per Agent transport.
-- Add per-stream cancellation, capacity admission, and fair dispatch.
-- Keep public HTTP/TLS ingress, durable routing, authentication, and reconnect
-  out of scope until multiplexing is proven over raw TCP.
+- Bind raw loopback ingress endpoints to selected live transport sessions.
+- Define explicit route add/remove/drain lifecycle above `EdgeSessionRouter`.
+- Exercise disconnect and route-removal races without introducing persistence.
+- Keep public HTTP/TLS, durable identity, authentication, and reconnect out of
+  scope until the route lifecycle is proven.

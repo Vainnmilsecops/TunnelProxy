@@ -196,6 +196,24 @@ The ingress is deliberately loopback raw TCP. There is no public listener,
 hostname resolution, HTTP parsing, TLS, authentication, durable registration,
 or concurrent multiplexing in this runtime.
 
+### 2.8 Bounded multiplexing and session routing (Session 09)
+
+`MultiplexedEdgeRuntime` owns a live registry keyed by process-local
+`TransportSessionId`. `EdgeSessionRouter` clones only a bounded command sender
+from that registry, releases the registry lock, then asks the selected session
+to open a stream. Registry removal on session exit makes stale IDs fail closed.
+
+Each Agent transport is split once: one task decodes frames and dispatches them
+to bounded per-stream queues, and one writer actor serializes all outbound
+frames. Heartbeat/reset traffic has a priority queue; DATA and END_STREAM use a
+shared FIFO so lifecycle frames cannot overtake earlier bytes. Each logical
+stream owns its ingress/local socket and failure cleanup, so one stream or one
+Agent failure does not corrupt neighboring streams or sessions.
+
+This layer remains loopback raw TCP and ephemeral. It does not assign public
+hostnames, authenticate Agents, persist routes, reconnect, terminate TLS, or
+implement credit/window flow control.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

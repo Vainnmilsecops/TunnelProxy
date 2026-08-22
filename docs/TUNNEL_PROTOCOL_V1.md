@@ -74,8 +74,8 @@ streams over a single TCP connection.
 stream-scoped frame with `stream_id == 0`, or a control-scoped frame with
 `stream_id > 0`, is a protocol error.
 
-> **Note:** Session 08 activates the stream lifecycle for one active stream.
-> Concurrent stream multiplexing is still not implemented.
+> **Note:** Session 09 uses the same stream lifecycle concurrently on a bounded
+> number of logical streams. Frame numbers and payload schemas are unchanged.
 
 ## Frame Types
 
@@ -262,6 +262,10 @@ RESET_STREAM uses a state-independent two-byte big-endian code:
 | 5 | `StreamBusy` | A second open was attempted while one stream was active. |
 | 6 | `OpenTimeout` | Edge did not receive Agent's open acknowledgment. |
 | 7 | `IdleTimeout` | The active stream made no application-data progress. |
+| 8 | `CapacityExceeded` | The session reached its concurrent-stream limit. |
+| 9 | `UnknownStream` | A frame referenced a stream that is no longer active. |
+| 10 | `FlowControlExceeded` | A bounded receive queue or frame budget was exceeded. |
+| 11 | `SessionClosing` | The transport cannot accept more stream work. |
 
 ## Security Considerations
 
@@ -281,7 +285,7 @@ Protocol v1 framing does **not** include:
 
 - TLS or encryption.
 - Agent authentication or credentials.
-- Concurrent stream multiplexing and flow-control windows.
+- Credit/window-based flow control and weighted scheduling.
 - Reconnect logic.
 - HTTP, WebSocket, or any higher-layer protocol.
 - Tunnel registration, hostname allocation, or durable identity.

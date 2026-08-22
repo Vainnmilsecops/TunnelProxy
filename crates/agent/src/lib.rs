@@ -17,17 +17,21 @@
 //! (INV-001). All sockets in this crate are outbound.
 //!
 //! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Session 08
-//! adds a loopback-tested single-stream local TCP bridge through
-//! `AgentSession::run_with_local_target`; concurrent multiplexing remains out
-//! of scope, as do reconnect and the final CLI. See
+//! adds a loopback-tested single-stream local TCP bridge, and Session 09 adds
+//! bounded concurrent streams through `AgentSession::run_multiplexed`.
+//! Reconnect and the final CLI remain out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]
 
 mod agent_transport;
+mod multiplex;
 
 pub use agent_transport::{
     connect, AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
+};
+pub use multiplex::{
+    MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,
 };
 
 use std::net::SocketAddr;

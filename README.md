@@ -15,15 +15,15 @@ correct agent, which in turn proxies them into the local service.
 - Async TCP echo, relay, and bounded local-forwarder primitives.
 - Tunnel Protocol v1 binary framing with a 64 KiB payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
-- A loopback-only, single-active-stream reverse TCP data path with bounded
-  frames, half-close, reset, open/idle deadlines, and sequential reuse.
+- A loopback-only multiplexed reverse TCP data path with bounded queues,
+  half-close, typed reset, open/idle deadlines, and per-session routing.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
 
 The following are **not yet implemented**:
 
-- Stream multiplexing and flow control.
+- Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
 - TLS and Agent authentication.
 - Persistence and durable tunnel identity.

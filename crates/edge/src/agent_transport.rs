@@ -1430,7 +1430,7 @@ async fn validate_pong(
 ///
 /// Returns `Ok(AgentSession)` on success, or an error on any violation.
 /// The socket is owned by this function during the handshake.
-async fn perform_handshake(
+pub(crate) async fn perform_handshake(
     socket: &mut TcpStream,
     peer: SocketAddr,
     session_ids: &TransportSessionIdAllocator,

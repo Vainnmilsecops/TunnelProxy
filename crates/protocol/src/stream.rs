@@ -24,6 +24,14 @@ pub enum StreamResetCode {
     OpenTimeout = 6,
     /// Neither data direction made progress before the stream idle deadline.
     IdleTimeout = 7,
+    /// The session reached its configured concurrent-stream limit.
+    CapacityExceeded = 8,
+    /// A frame referenced a stream that is not active in this session.
+    UnknownStream = 9,
+    /// A peer exceeded the bounded per-stream receive queue or frame budget.
+    FlowControlExceeded = 10,
+    /// The transport session is closing and cannot accept more stream work.
+    SessionClosing = 11,
 }
 
 impl StreamResetCode {
@@ -43,6 +51,10 @@ impl StreamResetCode {
             5 => Some(Self::StreamBusy),
             6 => Some(Self::OpenTimeout),
             7 => Some(Self::IdleTimeout),
+            8 => Some(Self::CapacityExceeded),
+            9 => Some(Self::UnknownStream),
+            10 => Some(Self::FlowControlExceeded),
+            11 => Some(Self::SessionClosing),
             _ => None,
         }
     }
@@ -72,6 +84,10 @@ impl fmt::Display for StreamResetCode {
             Self::StreamBusy => "stream_busy",
             Self::OpenTimeout => "open_timeout",
             Self::IdleTimeout => "idle_timeout",
+            Self::CapacityExceeded => "capacity_exceeded",
+            Self::UnknownStream => "unknown_stream",
+            Self::FlowControlExceeded => "flow_control_exceeded",
+            Self::SessionClosing => "session_closing",
         };
         f.write_str(name)
     }
@@ -91,6 +107,10 @@ mod tests {
             StreamResetCode::StreamBusy,
             StreamResetCode::OpenTimeout,
             StreamResetCode::IdleTimeout,
+            StreamResetCode::CapacityExceeded,
+            StreamResetCode::UnknownStream,
+            StreamResetCode::FlowControlExceeded,
+            StreamResetCode::SessionClosing,
         ] {
             assert_eq!(
                 StreamResetCode::from_be_bytes(code.to_be_bytes()),
