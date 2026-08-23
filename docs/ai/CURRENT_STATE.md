@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Production Runtime Entrypoints & OS Signal Wiring** (Session 12).
+**Agent Reconnect & Route Recovery** (Session 13).
 
 ## Completed
 
@@ -109,14 +109,26 @@
   and unexpected peer disconnects produce non-zero process exits.
 - Real-TCP composition tests cover byte-exact forwarding, shutdown before an
   Agent arrives, startup rollback, and Agent cancellation before connect.
-- 162 explicit workspace tests are present; all prior behavior is preserved.
+- `AgentRuntime` retries transient connection and established-session failures
+  with validated bounded exponential delay, downward jitter, shutdown-aware
+  sleep, a stable-session streak reset, and an optional consecutive-failure
+  budget. Protocol violations remain terminal.
+- Agent outcomes report attempts, established sessions, successful reconnects,
+  and the last ephemeral session ID. Structured events expose attempts,
+  scheduled delay, establishment, disconnect recovery, and route generation.
+- `EdgeRuntime` keeps its transport listener alive after an Agent disconnect,
+  waits for dead-session route cleanup, and binds the same configured loopback
+  raw address to the next live ephemeral Agent session.
+- Recovery never reuses a `TransportSessionId` and does not replay interrupted
+  streams. No Protocol v1 frame or payload changed.
+- Real-TCP recovery tests cover shutdown during backoff, typed retry exhaustion,
+  Agent replacement on one Edge, and Agent recovery across an Edge restart.
+- 167 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - TLS / encryption.
 - Agent authentication.
-- Reconnect logic.
-- Automatic raw-route rebind after Agent disconnect (DEBT-016 open).
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Tunnel registration (REGISTER is ephemeral transport registration only).
@@ -130,12 +142,15 @@
 
 ## Next planned session
 
-**Session 13 — Agent Reconnect & Route Recovery.**
+**Session 14 — Secure Agent Transport Foundation.**
 
 Goals:
 
-- Add bounded exponential reconnect with jitter and cancellation.
-- Rebind the single loopback raw route to a replacement live session without
-  treating ephemeral session IDs as durable identity.
-- Preserve explicit startup/shutdown reporting; keep authentication, durable
-  identity, public HTTP/TLS, and multi-edge separate.
+- Add TLS configuration and certificate validation to the Agent ↔ Edge
+  transport without silently weakening development defaults.
+- Define and enforce an explicit Agent authentication contract before a session
+  becomes routable.
+- Keep credentials out of logs and committed fixtures, and add negative tests
+  for trust and authentication failures.
+- Preserve the Session 13 reconnect boundary: security/protocol failures remain
+  terminal rather than entering an infinite retry loop.

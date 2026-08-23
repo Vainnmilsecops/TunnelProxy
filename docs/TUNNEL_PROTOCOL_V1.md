@@ -286,7 +286,8 @@ Protocol v1 framing does **not** include:
 - TLS or encryption.
 - Agent authentication or credentials.
 - Credit/window-based flow control and weighted scheduling.
-- Reconnect logic.
+- Session resumption or reconnect signaling. Session 13 process runtimes
+  reconnect by performing a completely fresh Protocol v1 handshake.
 - HTTP, WebSocket, or any higher-layer protocol.
 - Tunnel registration, hostname allocation, or durable identity.
 - Public HTTP/TLS traffic routing; Session 08 is raw TCP loopback only.

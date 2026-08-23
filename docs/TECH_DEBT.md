@@ -202,21 +202,20 @@
 - **Tracking:** open; public ingress must not use ephemeral route IDs as durable
   identity.
 
+## Resolved items
+
 ### DEBT-016 — Runnable tunnel stops after its sole Agent disconnects
 
 - **Introduced in:** Session 12
+- **Resolved in:** Session 13
 - **Category:** reliability
 - **Impact:** high for unattended use, low for the local lifecycle slice
-- **Rationale:** The process entrypoint deliberately admits one Agent and binds
-  one raw route to that live session. An unexpected disconnect removes the
-  route and terminates both processes with a non-zero result. There is no
-  reconnect, replacement-session selection, or automatic route rebind.
-- **Exit plan:** Add cancellable exponential backoff with jitter on Agent, then
-  let Edge rebind the loopback route to the replacement session while keeping
-  durable intent separate from ephemeral `TransportSessionId` values.
-- **Tracking:** planned for Session 13.
-
-## Resolved items
+- **Resolution:** `AgentRuntime` now retries transient failures with cancellable
+  bounded exponential backoff and jitter. `EdgeRuntime` keeps accepting Agent
+  transports, waits for dead-session route cleanup, and rebinds the same
+  loopback raw address to a replacement session. Recovery remains deliberately
+  separate from durable identity (DEBT-015), and interrupted streams are not
+  replayed.
 
 ### DEBT-013 — Single-stream runtime rejects concurrent ingress
 

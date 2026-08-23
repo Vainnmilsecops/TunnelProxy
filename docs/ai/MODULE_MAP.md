@@ -44,7 +44,8 @@ single-stream lifecycle payload types/codecs.
 ## `tunnelproxy-agent`
 
 **Current implementation:** Outbound handshake/heartbeat, bounded multiplexed
-local bridging, and a runnable single-session process supervisor/CLI.
+local bridging, and a runnable reconnecting single-session process
+supervisor/CLI.
 
 **Responsibility (future)**
 
@@ -64,7 +65,8 @@ local bridging, and a runnable single-session process supervisor/CLI.
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed loopback raw TCP routes, and a
-runnable single-tunnel process supervisor/CLI.
+runnable single-tunnel process supervisor/CLI that rebinds its configured raw
+address after replacement Agent sessions arrive.
 
 **Responsibility (future)**
 

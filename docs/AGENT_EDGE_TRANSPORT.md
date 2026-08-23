@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 12.
+> **Status:** Implemented through Session 13.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
 > ingress or durable routing.
@@ -31,7 +31,7 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport remains unauthenticated and unencrypted through Session 12.**
+**This transport remains unauthenticated and unencrypted through Session 13.**
 
 The development listener binds `127.0.0.1` only. In production, this
 transport requires TLS and Agent authentication before use. The README
@@ -348,11 +348,18 @@ Edge entrypoint waits for one registered Agent before binding its loopback raw
 route; the Agent entrypoint owns one outbound session. OS shutdown and startup
 rollback remain process concerns and introduce no protocol changes.
 
+Session 13 adds process-level recovery without changing Protocol v1.
+`AgentRuntime` creates a fresh outbound handshake after transient transport
+failure using bounded exponential backoff. Every successful handshake receives
+a new ephemeral `TransportSessionId`. `EdgeRuntime` removes the route targeting
+the disconnected session, keeps its Agent listener alive, and rebinds the same
+configured loopback raw address after a replacement session registers. In-flight
+streams are not replayed or migrated.
+
 ## What Is NOT Implemented
 
 - TLS / encryption
 - Agent authentication
-- Reconnect logic
 - Credit/window-based flow control and weighted scheduling
 - Tunnel registration
 - Public endpoint allocation

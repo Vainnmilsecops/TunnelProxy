@@ -26,5 +26,8 @@ adds `AgentSession::run_multiplexed`, which connects concurrent Edge-opened
 streams to one configured local TCP service with bounded queues and DATA
 frames, half-close, and per-stream reset/cleanup. Session 12 adds
 `AgentRuntime` and the runnable `tunnelproxy-agent` binary with validated CLI
-configuration and Ctrl-C/SIGTERM shutdown. Reconnect, TLS, authentication,
-durable registration, and the final `tunnelproxy http` UX remain unimplemented.
+configuration and Ctrl-C/SIGTERM shutdown. Session 13 adds cancellable bounded
+exponential reconnect with downward jitter, a stable-session failure-streak
+reset, an optional consecutive-failure budget, and reconnect outcome counters.
+TLS, authentication, durable registration, and the final `tunnelproxy http` UX
+remain unimplemented.

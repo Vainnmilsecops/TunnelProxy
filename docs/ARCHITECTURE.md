@@ -256,12 +256,27 @@ is told to close.
 
 `AgentRuntime` owns one outbound connect, handshake, and multiplexed local
 bridge. Cancellation can win before connect completes or while the session is
-established. There is intentionally no reconnect loop yet.
+established.
 
 The `tunnelproxy-edge` and `tunnelproxy-agent` binaries translate Ctrl-C on all
 platforms and SIGTERM on Unix into the shared idempotent trigger. OS handlers
 never perform socket cleanup themselves. This is production-style lifecycle
 composition over a development-only loopback route; it is not public ingress.
+
+### 2.12 Reconnect and route recovery (Session 13)
+
+`AgentRuntime` retries transient connect, timeout, established-session I/O, and
+peer-close failures with bounded exponential delay and downward jitter. A
+shutdown signal interrupts both connection attempts and backoff sleep. Protocol
+violations remain terminal, an optional consecutive-failure budget can stop the
+loop, and a sufficiently stable session resets the failure streak.
+
+`EdgeRuntime` no longer exits when its sole Agent disconnects. The raw route is
+removed with the dead session, the transport listener remains available, and
+the same configured loopback address is rebound to the next live session.
+Active streams are not replayed. Each handshake still receives a new ephemeral
+`TransportSessionId`; reconnect does not introduce durable Agent or tunnel
+identity, persistence, authentication, or any wire-protocol change.
 
 ## 3. Control plane vs data plane
 

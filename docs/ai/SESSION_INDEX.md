@@ -11,6 +11,12 @@
 | 05      | Tunnel Protocol v1: Binary Framing & Message Design | complete |
 | 06      | Persistent Agent ↔ Edge Transport & Protocol Handshake | complete |
 | 07      | Heartbeat, Liveness & Dead-Session Detection   | complete |
+| 08      | Single-Stream Reverse Data Path                | complete |
+| 09      | Bounded Stream Multiplexing & Session Routing  | complete |
+| 10      | Raw Ingress Binding & Route Lifecycle          | complete |
+| 11      | Graceful Runtime Shutdown & Supervision        | complete |
+| 12      | Production Runtime Entrypoints & OS Signal Wiring | complete |
+| 13      | Agent Reconnect & Route Recovery               | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -444,3 +450,34 @@ Out of scope:
 - Authentication, TLS, public HTTP ingress, and hostname allocation.
 - Durable tunnel/Agent identity, persistence, and control-plane routing state.
 - Multi-Agent route selection and multi-edge operation.
+
+## Session 13 — Agent Reconnect & Route Recovery — complete
+
+Scope delivered:
+
+- Added validated `ReconnectConfig` with bounded exponential delay, downward
+  jitter, a stable-session failure-streak reset, and an optional consecutive
+  failure budget.
+- Changed `AgentRuntime` into a cancellation-aware reconnect supervisor.
+  Transient connect, timeout, established I/O, and peer-close failures retry;
+  protocol and handshake-contract violations remain terminal.
+- Added Agent attempt/session/reconnect outcomes and structured recovery events,
+  plus CLI flags for every reconnect policy input.
+- Kept the Edge Agent listener running after disconnect. Once dead-session route
+  cleanup releases its listener, `EdgeRuntime` binds the same configured
+  loopback raw address to the next live ephemeral session.
+- Added typed recovery failure and Edge generation/recovery counters. Every
+  handshake still receives a new `TransportSessionId`; no stream is replayed.
+- Added five tests, including four real-TCP scenarios for backoff cancellation,
+  retry-budget exhaustion, replacement Agent recovery, and Edge restart
+  recovery. The workspace now contains 167 explicit tests.
+- Resolved DEBT-016. DEBT-015 remains open because routes and session identity
+  are still process-local and non-durable.
+
+Out of scope:
+
+- Authentication, TLS, public HTTP ingress, and hostname allocation.
+- Durable tunnel/Agent identity, persistence, and control-plane routing state.
+- In-flight stream replay/migration, multi-Agent route selection, and multi-edge
+  operation.
+- Credit/window flow control and weighted DATA scheduling.
