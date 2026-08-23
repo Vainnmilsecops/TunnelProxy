@@ -71,8 +71,8 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-Concurrent reverse-traffic multiplexing, HTTP reverse proxying, TLS, auth,
-persistence, custom domains, dashboard, billing, rate limiting, request
-inspection, replay, and cloud deployment are explicitly **not implemented** in
-this phase. Session 08 contains only one loopback raw-TCP stream at a time; any
-change that presents it as the public product surface is a bug.
+Public HTTP reverse proxying, custom domains, dashboard, billing, rate limiting,
+request inspection, stream replay, certificate lifecycle automation,
+multi-edge ownership, and cloud deployment are explicitly **not implemented**.
+The implemented surface is still loopback raw TCP plus authenticated Agent and
+snapshot transports; presenting it as the public product surface is a bug.

@@ -26,5 +26,8 @@ and enabled/disabled status. Session 16 adds non-zero monotonic snapshot
 versions and a bounded latest-value publisher/subscriber. Higher full snapshots
 replace the previous authority, duplicate content is idempotent, and stale or
 same-version conflicting updates fail closed. Edge consumes the latest cached
-snapshot outside the ingress hot path. There is still no database, external API
-server, cross-process transport, or restart persistence.
+snapshot outside the ingress hot path. Session 17 adds canonical encoding,
+transactional SQLite persistence, durable-before-live publication, and a
+dedicated mutually authenticated Edge bootstrap/push service with bounded
+reconnect. There is still no runnable Control Plane CLI, administrative API,
+certificate lifecycle, or multi-edge coordination.

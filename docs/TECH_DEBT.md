@@ -186,24 +186,18 @@
   insufficient.
 - **Tracking:** open.
 
-### DEBT-015 — Durable route snapshots are not persisted across restarts
+### DEBT-015 — Durable route snapshots are not persisted across restarts — resolved
 
 - **Introduced in:** Session 10
 - **Category:** product
 - **Impact:** high for public use, low for the loopback vertical slice
-- **Rationale:** Session 15 resolves the data-plane half of this debt: runnable
-  raw ingress targets durable `TunnelId`, stays bound across Agent reconnect,
-  and resolves a cached live `TransportSessionId` without storage lookup.
-  Session 16 adds full monotonic snapshot versions, bounded latest-value
-  distribution, atomic Edge apply, live enable/disable/add/remove, revocation,
-  and cached operation after the publisher closes. The source is still
-  in-process and no snapshot survives a full control-plane/Edge restart.
-- **Exit plan:** Persist durable tunnel intent outside Edge, expose an
-  authenticated cross-process snapshot service, and bootstrap a fresh Edge
-  from the latest committed version while keeping per-connection routing in
-  memory.
-- **Tracking:** narrowed by Sessions 15–16; persistence and external
-  distribution remain open before public ingress.
+- **Resolution:** Session 17 persists the latest full authorization snapshot
+  and version in transactional SQLite, reloads it after Control Plane restart,
+  and exposes a dedicated mutually authenticated snapshot service. A fresh Edge
+  bootstraps from that service; reconnect uses its last in-memory version, and
+  ingress continues to use cached memory without storage/network lookup.
+- **Tracking:** resolved in Session 17. Edge cold-start cache during simultaneous
+  Control Plane outage and production process wiring are separate future work.
 
 ### DEBT-017 — TLS certificates are static process-start configuration
 

@@ -1,20 +1,45 @@
 //! Durable authorization and routing snapshots shared with Edge.
 //!
-//! Session 16 keeps this crate storage-free while adding monotonic full-snapshot
-//! versions and bounded latest-value distribution. Edge consumes immutable
-//! cached snapshots without querying a database on the ingress hot path
-//! (INV-007).
+//! Session 17 persists monotonic full snapshots and distributes them over a
+//! dedicated authenticated channel. Edge still consumes immutable cached
+//! snapshots without querying a database on the ingress hot path (INV-007).
 
 #![deny(unsafe_code)]
 
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tunnelproxy_common::{AgentId, TunnelId};
+
+mod repository;
+mod snapshot_codec;
+mod snapshot_protocol;
+mod snapshot_service;
+
+pub use repository::{
+    PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotCommitOutcome,
+    SnapshotRepository, SnapshotRepositoryError, SqliteSnapshotRepository,
+};
+pub use snapshot_codec::{
+    decode_snapshot, decode_versioned_snapshot, encode_snapshot, encode_versioned_snapshot,
+    snapshot_digest, SnapshotCodecError, MAX_AGENTS_PER_SNAPSHOT, MAX_SNAPSHOT_BYTES,
+    MAX_TUNNELS_PER_AGENT,
+};
+pub use snapshot_protocol::{
+    decode_snapshot_message, encode_snapshot_message, read_snapshot_message,
+    write_snapshot_message, SnapshotMessage, SnapshotProtocolError, SnapshotServiceErrorCode,
+    SNAPSHOT_PROTOCOL_ALPN, SNAPSHOT_PROTOCOL_VERSION,
+};
+pub use snapshot_service::{
+    SnapshotBootstrapClient, SnapshotClientConfig, SnapshotClientError, SnapshotClientRuntime,
+    SnapshotDistributionServer, SnapshotServerConfig, SnapshotServerError, SnapshotServerTlsConfig,
+    SnapshotTlsConfigError,
+};
 
 /// SHA-256 digest of one leaf client certificate in DER form.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,6 +184,25 @@ impl AuthorizationSnapshot {
             .values()
             .any(|agent| agent.tunnels.contains_key(tunnel_id))
     }
+
+    /// Returns a canonical grant view sorted by fingerprint and TunnelId.
+    pub fn grants(&self) -> Vec<AgentGrant> {
+        let mut grants: Vec<_> = self
+            .agents
+            .iter()
+            .map(|(certificate, agent)| {
+                let mut tunnels: Vec<_> = agent
+                    .tunnels
+                    .iter()
+                    .map(|(tunnel_id, status)| TunnelGrant::new(tunnel_id.clone(), *status))
+                    .collect();
+                tunnels.sort_unstable_by(|left, right| left.tunnel_id.cmp(&right.tunnel_id));
+                AgentGrant::new(*certificate, agent.agent_id.clone(), tunnels)
+            })
+            .collect();
+        grants.sort_unstable_by_key(|grant| *grant.certificate.as_bytes());
+        grants
+    }
 }
 
 /// Monotonic version assigned by the authoritative snapshot producer.
@@ -217,6 +261,7 @@ impl VersionedAuthorizationSnapshot {
 struct SnapshotPublisherState {
     current: Arc<VersionedAuthorizationSnapshot>,
     updates: watch::Sender<Arc<VersionedAuthorizationSnapshot>>,
+    health: Arc<AtomicU8>,
 }
 
 /// Cloneable authoritative producer for latest-value snapshot distribution.
@@ -272,6 +317,21 @@ impl AuthorizationSnapshotPublisher {
             current: state.current.version,
         })
     }
+
+    pub fn subscribe(&self) -> AuthorizationSnapshotSubscription {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        AuthorizationSnapshotSubscription {
+            updates: state.updates.subscribe(),
+            health: Arc::clone(&state.health),
+        }
+    }
+
+    /// Updates source health and wakes subscribers without changing content.
+    pub fn set_source_health(&self, health: SnapshotSourceHealth) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.health.store(health as u8, Ordering::Release);
+        state.updates.send_replace(Arc::clone(&state.current));
+    }
 }
 
 impl fmt::Debug for AuthorizationSnapshotPublisher {
@@ -287,6 +347,7 @@ impl fmt::Debug for AuthorizationSnapshotPublisher {
 #[derive(Debug, Clone)]
 pub struct AuthorizationSnapshotSubscription {
     updates: watch::Receiver<Arc<VersionedAuthorizationSnapshot>>,
+    health: Arc<AtomicU8>,
 }
 
 impl AuthorizationSnapshotSubscription {
@@ -303,6 +364,10 @@ impl AuthorizationSnapshotSubscription {
             .map_err(|_| SnapshotSourceClosed)?;
         Ok(self.current())
     }
+
+    pub fn source_health(&self) -> SnapshotSourceHealth {
+        SnapshotSourceHealth::from_raw(self.health.load(Ordering::Acquire))
+    }
 }
 
 /// Creates a bounded latest-value distribution channel with an initial
@@ -315,15 +380,36 @@ pub fn authorization_snapshot_channel(
 ) {
     let initial = Arc::new(initial);
     let (updates, receiver) = watch::channel(Arc::clone(&initial));
+    let health = Arc::new(AtomicU8::new(SnapshotSourceHealth::Live as u8));
     (
         AuthorizationSnapshotPublisher {
             state: Arc::new(Mutex::new(SnapshotPublisherState {
                 current: initial,
                 updates,
+                health: Arc::clone(&health),
             })),
         },
-        AuthorizationSnapshotSubscription { updates: receiver },
+        AuthorizationSnapshotSubscription {
+            updates: receiver,
+            health,
+        },
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SnapshotSourceHealth {
+    Live = 1,
+    Stale = 2,
+}
+
+impl SnapshotSourceHealth {
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Live,
+            _ => Self::Stale,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

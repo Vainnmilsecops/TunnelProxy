@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
 use tunnelproxy_control_plane::{
     AuthorizationSnapshotSubscription, CertificateFingerprint, SnapshotSourceClosed,
-    SnapshotVersion, VersionedAuthorizationSnapshot,
+    SnapshotSourceHealth, SnapshotVersion, VersionedAuthorizationSnapshot,
 };
 
 use tunnelproxy_protocol::{
@@ -454,10 +454,14 @@ impl MultiplexedEdgeRuntime {
         let permits = Arc::new(Semaphore::new(config.agent_listener.max_agent_sessions));
         let (session_updates, _) = watch::channel(Arc::new(Vec::new()));
         let (tunnel_updates, _) = watch::channel(Arc::new(Vec::new()));
-        let source = if config.registration.snapshot_subscription().is_some() {
-            AuthorizationSourceStatus::Live
-        } else {
-            AuthorizationSourceStatus::Static
+        let source = match config.registration.snapshot_source_health() {
+            Some(SnapshotSourceHealth::Live) if config.registration.has_live_updates() => {
+                AuthorizationSourceStatus::Live
+            }
+            Some(SnapshotSourceHealth::Stale) if config.registration.has_live_updates() => {
+                AuthorizationSourceStatus::Stale
+            }
+            _ => AuthorizationSourceStatus::Static,
         };
         let (authorization_updates, _) = watch::channel(EdgeAuthorizationStatus {
             version: config.registration.snapshot_version(),
@@ -523,14 +527,17 @@ impl MultiplexedEdgeRuntime {
                 }
                 update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
                     match update {
-                        Ok(snapshot) => reconcile_authorization_snapshot(
+                        Ok((snapshot, source)) => reconcile_authorization_snapshot(
                             snapshot,
-                            &self.sessions,
-                            &self.tunnels,
-                            &self.authorization_gate,
-                            &self.session_updates,
-                            &self.tunnel_updates,
-                            &self.authorization_updates,
+                            source,
+                            AuthorizationReconciliation {
+                                sessions: &self.sessions,
+                                tunnels: &self.tunnels,
+                                gate: &self.authorization_gate,
+                                session_updates: &self.session_updates,
+                                tunnel_updates: &self.tunnel_updates,
+                                authorization_updates: &self.authorization_updates,
+                            },
                         ).await,
                         Err(_) => {
                             mark_snapshot_source_stale(&self.authorization_updates);
@@ -576,14 +583,17 @@ impl MultiplexedEdgeRuntime {
                 }
                 update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
                     match update {
-                        Ok(snapshot) => reconcile_authorization_snapshot(
+                        Ok((snapshot, source)) => reconcile_authorization_snapshot(
                             snapshot,
-                            &self.sessions,
-                            &self.tunnels,
-                            &self.authorization_gate,
-                            &self.session_updates,
-                            &self.tunnel_updates,
-                            &self.authorization_updates,
+                            source,
+                            AuthorizationReconciliation {
+                                sessions: &self.sessions,
+                                tunnels: &self.tunnels,
+                                gate: &self.authorization_gate,
+                                session_updates: &self.session_updates,
+                                tunnel_updates: &self.tunnel_updates,
+                                authorization_updates: &self.authorization_updates,
+                            },
                         ).await,
                         Err(_) => {
                             mark_snapshot_source_stale(&self.authorization_updates);
@@ -617,12 +627,22 @@ impl MultiplexedEdgeRuntime {
 
 async fn next_snapshot_update(
     updates: &mut Option<AuthorizationSnapshotSubscription>,
-) -> Result<Arc<VersionedAuthorizationSnapshot>, SnapshotSourceClosed> {
-    updates
+) -> Result<
+    (
+        Arc<VersionedAuthorizationSnapshot>,
+        AuthorizationSourceStatus,
+    ),
+    SnapshotSourceClosed,
+> {
+    let updates = updates
         .as_mut()
-        .expect("select guard only polls a configured snapshot subscription")
-        .changed()
-        .await
+        .expect("select guard only polls a configured snapshot subscription");
+    let snapshot = updates.changed().await?;
+    let source = match updates.source_health() {
+        SnapshotSourceHealth::Live => AuthorizationSourceStatus::Live,
+        SnapshotSourceHealth::Stale => AuthorizationSourceStatus::Stale,
+    };
+    Ok((snapshot, source))
 }
 
 fn principal_is_authorized(
@@ -638,17 +658,23 @@ fn principal_is_authorized(
         .is_ok()
 }
 
+struct AuthorizationReconciliation<'a> {
+    sessions: &'a SessionRegistry,
+    tunnels: &'a TunnelRegistry,
+    gate: &'a AuthorizationGate,
+    session_updates: &'a watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: &'a watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    authorization_updates: &'a watch::Sender<EdgeAuthorizationStatus>,
+}
+
 async fn reconcile_authorization_snapshot(
     snapshot: Arc<VersionedAuthorizationSnapshot>,
-    sessions: &SessionRegistry,
-    tunnels: &TunnelRegistry,
-    authorization_gate: &AuthorizationGate,
-    session_updates: &watch::Sender<Arc<Vec<TransportSessionId>>>,
-    tunnel_updates: &watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
-    authorization_updates: &watch::Sender<EdgeAuthorizationStatus>,
+    source: AuthorizationSourceStatus,
+    reconciliation: AuthorizationReconciliation<'_>,
 ) {
-    let gate = authorization_gate.lock().await;
-    let revoked_ids: Vec<_> = sessions
+    let gate = reconciliation.gate.lock().await;
+    let revoked_ids: Vec<_> = reconciliation
+        .sessions
         .read()
         .await
         .iter()
@@ -661,14 +687,16 @@ async fn reconcile_authorization_snapshot(
         Vec::new()
     } else {
         let tunnel_snapshot = {
-            let mut tunnels = tunnels.write().await;
+            let mut tunnels = reconciliation.tunnels.write().await;
             tunnels.retain(|_, session_id| !revoked_ids.contains(session_id));
             sorted_tunnel_bindings(&tunnels)
         };
-        tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+        reconciliation
+            .tunnel_updates
+            .send_replace(Arc::new(tunnel_snapshot));
 
         let (senders, session_snapshot) = {
-            let mut sessions = sessions.write().await;
+            let mut sessions = reconciliation.sessions.write().await;
             let senders = revoked_ids
                 .iter()
                 .filter_map(|session_id| sessions.remove(session_id))
@@ -676,18 +704,22 @@ async fn reconcile_authorization_snapshot(
                 .collect();
             (senders, sorted_session_ids(&sessions))
         };
-        session_updates.send_replace(Arc::new(session_snapshot));
+        reconciliation
+            .session_updates
+            .send_replace(Arc::new(session_snapshot));
         senders
     };
 
-    let previous_status = *authorization_updates.borrow();
-    authorization_updates.send_replace(EdgeAuthorizationStatus {
-        version: Some(snapshot.version()),
-        source: AuthorizationSourceStatus::Live,
-        revoked_sessions: previous_status
-            .revoked_sessions
-            .saturating_add(revoked_ids.len() as u64),
-    });
+    let previous_status = *reconciliation.authorization_updates.borrow();
+    reconciliation
+        .authorization_updates
+        .send_replace(EdgeAuthorizationStatus {
+            version: Some(snapshot.version()),
+            source,
+            revoked_sessions: previous_status
+                .revoked_sessions
+                .saturating_add(revoked_ids.len() as u64),
+        });
     drop(gate);
 
     for sender in revoked_senders {

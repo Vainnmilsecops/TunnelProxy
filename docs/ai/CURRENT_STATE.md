@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Control-Plane Snapshot Distribution & Live Revocation** (Session 16).
+**Persistent Snapshot Storage & Authenticated Edge Bootstrap** (Session 17).
 
 ## Completed
 
@@ -183,14 +183,28 @@
   conflicts, bounded latest-value delivery, cached state after source close,
   publication-race revalidation, live grant add, unrelated updates, active
   revocation, and re-enable on the same listener.
-- 207 explicit workspace tests are present; all prior behavior is preserved.
+- Authorization snapshots have a canonical bounded binary representation and
+  SHA-256 digest independent of input/hash-map ordering.
+- `SqliteSnapshotRepository` durably commits the complete grant set plus its
+  version/digest in one transaction and reloads the exact state after restart.
+- `PersistentSnapshotAuthority` performs blocking SQLite work away from Tokio,
+  rejects empty storage, serializes writers, and never publishes before commit.
+- A separate mTLS snapshot service uses ALPN `tunnelproxy-snapshot/1`; it does
+  not modify or multiplex over Agent ↔ Edge Tunnel Protocol v2.
+- Edge authenticates the Control Plane server, presents its own client
+  certificate, bootstraps a full snapshot before creating the live policy, and
+  resumes reconnects from the last in-memory version.
+- Snapshot-service loss changes source health to `Stale` without clearing the
+  cached authority. Successful authenticated reconnect returns it to `Live` and
+  later versions continue through Session 16 atomic reconciliation.
+- 215 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - Certificate issuance, CA/trust revocation, rotation, expiry monitoring, and
   TLS-config hot reload (DEBT-017 open).
-- Persistent authorization storage, restart bootstrap, and authenticated
-  cross-process snapshot distribution.
+- Runnable Control Plane daemon/CLI, administrative mutation API, and Edge disk
+  cache for cold startup while the Control Plane is unavailable.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
@@ -204,14 +218,15 @@
 
 ## Next planned session
 
-**Session 17 — Persistent Authorization Storage & Edge Bootstrap.**
+**Session 18 — Runnable Snapshot Service & Operations Wiring.**
 
 Goals:
 
-- Define durable schema and repository boundaries for Agent/certificate/tunnel
-  grants without moving storage into Edge.
-- Commit and reload the latest full snapshot version across process restarts.
-- Bootstrap Edge from an authenticated external snapshot source and resume from
-  its last applied version while preserving cached-only ingress routing.
-- Keep public ingress, certificate issuance/rotation, and multi-edge ownership
-  separate unless explicitly scoped into that session.
+- Add a supervised Control Plane process entrypoint around the SQLite authority
+  and mTLS snapshot server with validated file/address/deadline configuration.
+- Wire the snapshot client into the runnable Edge configuration while keeping
+  the existing explicit static/development modes.
+- Define safe initialization and operator-driven full-snapshot import without
+  building the broader account/billing API.
+- Add process restart, invalid configuration, shutdown, and secret-safe
+  diagnostics coverage; keep public ingress and multi-edge ownership separate.
