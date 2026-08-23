@@ -217,22 +217,23 @@
   on the data-plane hot path.
 - **Tracking:** open; static files are not a production credential lifecycle.
 
+## Resolved items
+
 ### DEBT-018 — Dynamic Edge cannot cold start without Control Plane
 
 - **Introduced in:** Session 18
+- **Resolved in:** Session 19
 - **Category:** reliability / security
 - **Impact:** medium
-- **Rationale:** A running Edge deliberately retains the last authenticated
-  in-memory snapshot while distribution reconnects, but a new process has no
-  trusted local authority. Session 18 therefore bootstraps before binding and
-  fails closed when Control Plane is unavailable.
-- **Exit plan:** Atomically persist the last authenticated canonical snapshot on
-  Edge with integrity/version metadata and rollback protection. Make stale disk
-  bootstrap explicit and observable, then reconcile immediately with a newer
-  authenticated server version.
-- **Tracking:** planned for Session 19.
-
-## Resolved items
+- **Resolution:** An opt-in generation-file cache now persists only canonical
+  snapshots received through authenticated mTLS. Durable write precedes memory
+  publication, lower/conflicting versions fail closed, online bootstrap is
+  preferred, and only availability failures may use a fresh cache. Offline
+  startup is observable as `Stale`; reconnect restores `Live`, while the
+  configured stale deadline terminates Edge and releases its listeners.
+- **Residual boundary:** SHA-256 detects corruption but is not a signature.
+  The local Edge host/filesystem remains trusted; adversarial local rollback is
+  outside this debt item.
 
 ### DEBT-016 — Runnable tunnel stops after its sole Agent disconnects
 

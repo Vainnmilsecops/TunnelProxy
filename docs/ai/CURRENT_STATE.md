@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Runnable Snapshot Service & Operations Wiring** (Session 18).
+**Edge Cold-Start Snapshot Cache** (Session 19).
 
 ## Completed
 
@@ -212,14 +212,26 @@
 - The runnable Edge CLI supports three explicit authorization modes: plaintext
   loopback development, static certificate-bound mTLS, or dynamic snapshot mTLS.
   Partial or conflicting flag groups fail before network startup.
-- 226 explicit workspace tests are present; all prior behavior is preserved.
+- Edge can opt into an explicit generation-file snapshot cache with a bounded
+  stale age. Online bootstrap remains preferred; availability failure can cold
+  start from the last authenticated canonical snapshot as `Stale`.
+- Cache generations carry format/length/time metadata and SHA-256 integrity,
+  reject corruption, expiry, lower versions, and same-version conflicts, and
+  are synchronized before memory publication. Cache I/O never enters ingress.
+- Authenticated reconnect refreshes the durable generation before returning to
+  `Live`. Failure to reconnect before the stale deadline stops the composed
+  Edge and releases both listeners.
+- TLS identity, ALPN, protocol, and server-rejection errors never fall back to
+  disk. The local filesystem is an explicit trust boundary; the digest is not a
+  snapshot signature.
+- 233 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - Certificate issuance, CA/trust revocation, rotation, expiry monitoring, and
   TLS-config hot reload (DEBT-017 open).
-- General administrative mutation API and Edge disk cache for cold startup
-  while the Control Plane is unavailable (DEBT-018).
+- General administrative mutation API and snapshot signing/hardware-backed
+  rollback protection.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
@@ -233,15 +245,14 @@
 
 ## Next planned session
 
-**Session 19 — Edge Cold-Start Snapshot Cache.**
+**Session 20 — Certificate Lifecycle & Atomic TLS Reload.**
 
 Goals:
 
-- Persist only the last authenticated, canonical snapshot on Edge with atomic
-  replacement, integrity metadata, and rollback protection.
-- Permit explicit stale cold startup when Control Plane is unavailable, while
-  preferring authenticated online bootstrap and never blocking ingress on disk.
-- Reconcile a newer server snapshot immediately after reconnect and retain the
-  existing `Live`/`Stale` observability contract.
-- Keep admin APIs, certificate lifecycle, public ingress, and multi-edge
-  consensus outside the session unless explicitly expanded.
+- Define certificate expiry/rotation state and secret-safe reload boundaries.
+- Atomically replace Agent, Edge, and snapshot-service TLS configurations
+  without allowing unauthenticated or partially loaded state.
+- Test overlap rotation, revocation, rollback on invalid material, and graceful
+  handling of established versus new connections.
+- Keep public ingress, general admin APIs, and multi-edge consensus outside the
+  session unless explicitly expanded.

@@ -398,8 +398,26 @@ and data plane under one cancellation tree. Transient service loss preserves
 the in-memory snapshot as `Stale`; unexpected terminal snapshot failure stops
 the composed Edge rather than silently abandoning refresh.
 
-The Edge cache remains memory-only. A cold dynamic Edge cannot start while the
-Control Plane is unavailable; disk-backed verified cold startup is DEBT-018.
+### 2.18 Bounded Edge cold-start snapshot cache (Session 19)
+
+Dynamic Edge may opt into a local cache directory plus a non-zero maximum stale
+age. The client still attempts authenticated online bootstrap first. Only
+availability failures may load the latest valid generation; TLS identity,
+ALPN, protocol, server rejection, rollback, and conflicting content fail
+closed. Offline bootstrap is exposed as `Stale` and reconnect continues with
+the cached version.
+
+Each immutable generation contains format metadata, authentication time, the
+canonical versioned snapshot, and a SHA-256 integrity digest. The file is fully
+written and synchronized before a rename to its final name, and the in-memory
+publisher advances only after that durable step. Older generations are cleaned
+afterward. Cache loading and writing run on blocking workers; Agent registration
+and raw ingress continue reading only immutable memory state. If the stale
+deadline expires before authenticated recovery, the snapshot supervisor stops
+the complete Edge runtime and releases its listeners.
+
+The integrity digest is not a signature. Local host/filesystem compromise and
+cryptographic rollback resistance remain outside the model.
 
 ## 3. Control plane vs data plane
 

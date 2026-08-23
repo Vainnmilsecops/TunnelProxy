@@ -667,3 +667,37 @@ Out of scope:
 - General admin HTTP/CRUD APIs, users/accounts, quotas, and billing.
 - Edge disk cache for cold startup while Control Plane is unavailable.
 - Certificate rotation/hot reload, public ingress, and multi-edge consensus.
+
+## Session 19 — Edge Cold-Start Snapshot Cache — complete
+
+Scope delivered:
+
+- Added an opt-in filesystem cache with an explicit non-zero maximum stale age.
+  Cache records contain versioned canonical payloads, authentication timestamps,
+  bounded lengths, format metadata, and SHA-256 integrity digests.
+- Added cross-platform generation-file replacement: unique temporary write,
+  file synchronization, rename to an immutable final generation, then cleanup.
+  Temporary crash remnants are ignored and filesystem work runs off Tokio.
+- Enforced monotonic durable state. Lower versions, filename/payload mismatch,
+  same-version conflicting content, corruption, future timestamps, and expired
+  records fail closed. Durable cache write precedes in-memory publication.
+- Added online-first bootstrap. Only connection/timeout availability failures
+  may use disk; TLS identity, ALPN, protocol, server rejection, and update
+  errors remain terminal and cannot be hidden by cache fallback.
+- Added bounded stale runtime behavior. Offline cold start reports `Stale`,
+  reconnect uses the cached version, authenticated `Snapshot`/`UpToDate`
+  refreshes disk before `Live`, and deadline expiry stops Edge listeners.
+- Extended `SnapshotAwareEdgeRuntime` and the Edge CLI with optional paired
+  `--snapshot-cache-dir` / `--snapshot-cache-max-stale-ms` configuration while
+  retaining the existing online-only API and static/plaintext modes.
+- Added seven unit/integration tests for cache envelopes, generations, ordering,
+  expiry, online/offline bootstrap, TLS non-fallback, reconciliation, routed
+  cold-start traffic, persistence-before-publication failure, and listener
+  release. The workspace now contains 233 explicit tests.
+
+Out of scope:
+
+- Cryptographic snapshot signing, TPM/secure monotonic state, and hostile local
+  administrator rollback resistance.
+- Certificate issuance/rotation/hot reload, general admin APIs, public ingress,
+  and multi-edge consensus.

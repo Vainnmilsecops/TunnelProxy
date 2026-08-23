@@ -1,7 +1,7 @@
 use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
@@ -15,8 +15,10 @@ use tunnelproxy_common::ShutdownSignal;
 
 use crate::{
     authorization_snapshot_channel, read_snapshot_message, write_snapshot_message,
-    AuthorizationSnapshotPublisher, AuthorizationSnapshotSubscription, SnapshotMessage,
-    SnapshotProtocolError, SnapshotServiceErrorCode, SnapshotSourceHealth, SNAPSHOT_PROTOCOL_ALPN,
+    AuthorizationSnapshotPublisher, AuthorizationSnapshotSubscription, FileSnapshotCache,
+    SnapshotCacheConfig, SnapshotCacheError, SnapshotMessage, SnapshotProtocolError,
+    SnapshotServiceErrorCode, SnapshotSourceHealth, VersionedAuthorizationSnapshot,
+    SNAPSHOT_PROTOCOL_ALPN,
 };
 
 #[derive(Clone)]
@@ -324,15 +326,83 @@ impl SnapshotBootstrapClient {
                 config,
                 publisher,
                 stream: Some(stream),
+                cache: None,
+                authenticated_at: SystemTime::now(),
             },
         ))
     }
+
+    /// Prefers an authenticated online bootstrap and uses the bounded local
+    /// cache only when the service is temporarily unavailable.
+    pub async fn bootstrap_with_cache(
+        config: SnapshotClientConfig,
+        cache_config: SnapshotCacheConfig,
+    ) -> Result<
+        (
+            AuthorizationSnapshotSubscription,
+            SnapshotClientRuntime,
+            SnapshotBootstrapSource,
+        ),
+        SnapshotClientError,
+    > {
+        config.validate()?;
+        let cache = FileSnapshotCache::new(cache_config).map_err(SnapshotClientError::Cache)?;
+        match connect_and_subscribe(&config, 0).await {
+            Ok((stream, SnapshotMessage::Snapshot(initial))) => {
+                let authenticated_at = cache
+                    .store(&initial)
+                    .await
+                    .map_err(SnapshotClientError::Cache)?;
+                let (publisher, subscription) = authorization_snapshot_channel(initial);
+                Ok((
+                    subscription,
+                    SnapshotClientRuntime {
+                        config,
+                        publisher,
+                        stream: Some(stream),
+                        cache: Some(cache),
+                        authenticated_at,
+                    },
+                    SnapshotBootstrapSource::Online,
+                ))
+            }
+            Ok((_, SnapshotMessage::Error(code))) => Err(SnapshotClientError::Server(code)),
+            Ok(_) => Err(SnapshotClientError::BootstrapResponse),
+            Err(error) if error.allows_cache_fallback() => {
+                let cached = cache.load().await.map_err(SnapshotClientError::Cache)?;
+                let authenticated_at = cached.authenticated_at();
+                let (publisher, subscription) =
+                    authorization_snapshot_channel(cached.into_snapshot());
+                publisher.set_source_health(SnapshotSourceHealth::Stale);
+                Ok((
+                    subscription,
+                    SnapshotClientRuntime {
+                        config,
+                        publisher,
+                        stream: None,
+                        cache: Some(cache),
+                        authenticated_at,
+                    },
+                    SnapshotBootstrapSource::DiskCache,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotBootstrapSource {
+    Online,
+    DiskCache,
 }
 
 pub struct SnapshotClientRuntime {
     config: SnapshotClientConfig,
     publisher: AuthorizationSnapshotPublisher,
     stream: Option<SnapshotTlsStream>,
+    cache: Option<FileSnapshotCache>,
+    authenticated_at: SystemTime,
 }
 
 impl SnapshotClientRuntime {
@@ -349,9 +419,9 @@ impl SnapshotClientRuntime {
                     message = read_snapshot_message(stream) => {
                         match message {
                             Ok(SnapshotMessage::Snapshot(snapshot)) => {
-                                if let Err(error) = self.publisher.publish(snapshot) {
+                                if let Err(error) = self.persist_and_publish(snapshot).await {
                                     self.publisher.set_source_health(SnapshotSourceHealth::Stale);
-                                    return Err(SnapshotClientError::Update(error));
+                                    return Err(error);
                                 }
                                 continue;
                             }
@@ -373,23 +443,15 @@ impl SnapshotClientRuntime {
                 }
             }
 
-            tokio::select! {
-                biased;
-                () = signal.cancelled() => return Ok(()),
-                () = tokio::time::sleep(delay) => {}
+            if !self.wait_for_retry(&signal, delay).await? {
+                return Ok(());
             }
-            let reconnect =
-                connect_and_subscribe(&self.config, self.publisher.current().version().get());
-            let reconnect_result = tokio::select! {
-                biased;
-                () = signal.cancelled() => return Ok(()),
-                result = reconnect => result,
+            let Some(reconnect_result) = self.reconnect(&signal).await? else {
+                return Ok(());
             };
             match reconnect_result {
                 Ok((stream, SnapshotMessage::Snapshot(snapshot))) => {
-                    self.publisher
-                        .publish(snapshot)
-                        .map_err(SnapshotClientError::Update)?;
+                    self.persist_and_publish(snapshot).await?;
                     self.publisher.set_source_health(SnapshotSourceHealth::Live);
                     self.stream = Some(stream);
                     delay = self.config.reconnect_initial_delay;
@@ -398,6 +460,7 @@ impl SnapshotClientRuntime {
                     if version != self.publisher.current().version() {
                         return Err(SnapshotClientError::UnexpectedMessage);
                     }
+                    self.refresh_authenticated_cache().await?;
                     self.publisher.set_source_health(SnapshotSourceHealth::Live);
                     self.stream = Some(stream);
                     delay = self.config.reconnect_initial_delay;
@@ -406,12 +469,103 @@ impl SnapshotClientRuntime {
                     return Err(SnapshotClientError::Server(code))
                 }
                 Ok(_) => return Err(SnapshotClientError::UnexpectedMessage),
-                Err(_) => {
+                Err(error) if error.allows_cache_fallback() => {
                     delay = delay
                         .checked_mul(2)
                         .unwrap_or(self.config.reconnect_max_delay)
                         .min(self.config.reconnect_max_delay);
                 }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn persist_and_publish(
+        &mut self,
+        snapshot: VersionedAuthorizationSnapshot,
+    ) -> Result<(), SnapshotClientError> {
+        if let Some(cache) = &self.cache {
+            self.authenticated_at = cache
+                .store(&snapshot)
+                .await
+                .map_err(SnapshotClientError::Cache)?;
+        } else {
+            self.authenticated_at = SystemTime::now();
+        }
+        self.publisher
+            .publish(snapshot)
+            .map_err(SnapshotClientError::Update)?;
+        Ok(())
+    }
+
+    async fn refresh_authenticated_cache(&mut self) -> Result<(), SnapshotClientError> {
+        if let Some(cache) = &self.cache {
+            self.authenticated_at = cache
+                .store(&self.publisher.current())
+                .await
+                .map_err(SnapshotClientError::Cache)?;
+        } else {
+            self.authenticated_at = SystemTime::now();
+        }
+        Ok(())
+    }
+
+    fn stale_remaining(&self) -> Result<Option<Duration>, SnapshotClientError> {
+        let Some(cache) = &self.cache else {
+            return Ok(None);
+        };
+        let expires_at = self
+            .authenticated_at
+            .checked_add(cache.max_stale_age())
+            .ok_or(SnapshotClientError::CacheExpired)?;
+        expires_at
+            .duration_since(SystemTime::now())
+            .map(Some)
+            .map_err(|_| SnapshotClientError::CacheExpired)
+    }
+
+    async fn wait_for_retry(
+        &self,
+        signal: &ShutdownSignal,
+        delay: Duration,
+    ) -> Result<bool, SnapshotClientError> {
+        if let Some(remaining) = self.stale_remaining()? {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => Ok(false),
+                () = tokio::time::sleep(remaining) => Err(SnapshotClientError::CacheExpired),
+                () = tokio::time::sleep(delay) => Ok(true),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => Ok(false),
+                () = tokio::time::sleep(delay) => Ok(true),
+            }
+        }
+    }
+
+    async fn reconnect(
+        &self,
+        signal: &ShutdownSignal,
+    ) -> Result<
+        Option<Result<(SnapshotTlsStream, SnapshotMessage), SnapshotClientError>>,
+        SnapshotClientError,
+    > {
+        let reconnect =
+            connect_and_subscribe(&self.config, self.publisher.current().version().get());
+        if let Some(remaining) = self.stale_remaining()? {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => Ok(None),
+                () = tokio::time::sleep(remaining) => Err(SnapshotClientError::CacheExpired),
+                result = reconnect => Ok(Some(result)),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => Ok(None),
+                result = reconnect => Ok(Some(result)),
             }
         }
     }
@@ -555,6 +709,17 @@ pub enum SnapshotClientError {
     BootstrapResponse,
     UnexpectedMessage,
     Update(crate::SnapshotUpdateError),
+    Cache(SnapshotCacheError),
+    CacheExpired,
+}
+
+impl SnapshotClientError {
+    fn allows_cache_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_) | Self::ConnectTimeout | Self::TlsTimeout | Self::SubscribeTimeout
+        )
+    }
 }
 
 impl std::fmt::Display for SnapshotClientError {
@@ -572,6 +737,8 @@ impl std::fmt::Display for SnapshotClientError {
             Self::BootstrapResponse => f.write_str("snapshot bootstrap returned no snapshot"),
             Self::UnexpectedMessage => f.write_str("snapshot service sent an unexpected message"),
             Self::Update(error) => write!(f, "snapshot update was rejected: {error}"),
+            Self::Cache(error) => write!(f, "snapshot cache failed: {error}"),
+            Self::CacheExpired => f.write_str("stale snapshot cache deadline expired"),
         }
     }
 }

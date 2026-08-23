@@ -475,3 +475,35 @@ access on Edge ingress. Imports are complete replacements, so omission revokes.
 A fresh dynamic Edge still requires an online Control Plane because no trusted
 disk cache exists. General admin APIs, credential lifecycle, and multi-edge
 coordination remain separate work.
+
+---
+
+## ADR-019 — Authenticated snapshot generations permit bounded stale cold start
+
+**Status:** Accepted (Session 19).
+
+**Context:** A running Edge can retain its in-memory authority through a Control
+Plane outage, but a restarted Edge previously had no authority and could not
+bind. Persisting policy must not add disk I/O to ingress, allow indefinite stale
+grants, hide authentication failures, or publish an update that cannot survive
+the next process crash.
+
+**Decision:** Edge may opt into a local cache directory and a non-zero maximum
+stale age. Authenticated online bootstrap is always attempted first. Only
+connection availability and bounded timeout failures may fall back to disk;
+TLS identity, ALPN, protocol, server rejection, and version conflicts remain
+terminal. Cache records contain a versioned canonical snapshot, authentication
+timestamp, format metadata, length, and SHA-256 integrity digest under a 1 MiB
+payload ceiling. A new immutable generation is written, synchronized, and
+renamed before the snapshot is published to memory; lower versions and
+equal-version conflicting content are rejected. An offline Edge reports
+`Stale`, reconnects immediately, and shuts down its listeners when the stale
+deadline expires.
+
+**Consequences:** A previously authenticated Edge can restart during a bounded
+Control Plane outage without querying storage on ingress, and a reconnecting
+server can atomically advance or revoke its cached policy. The digest detects
+corruption but is not a cryptographic signature: the Edge host and cache
+filesystem are trusted, and hostile local rollback requires future signed or
+hardware-backed state. Cache use is explicit and the existing online-only API
+remains available.
