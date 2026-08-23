@@ -47,7 +47,7 @@ Snapshots cap both agents and tunnels per agent at 4096 and use canonical
 fingerprint/Tunnel ID ordering. Identifiers retain the common 1–64 safe-ASCII
 contract.
 
-## Edge lifecycle
+## Edge lifecycle and cold-start cache
 
 `SnapshotBootstrapClient::bootstrap` must authenticate and receive a complete
 snapshot before returning an Edge subscription. The returned runtime owns the
@@ -58,6 +58,22 @@ When the stream fails, source health becomes `Stale`, but the last snapshot is
 not cleared. Reconnect sleeps and network/TLS/subscription operations are
 bounded and cancellation-aware. Reconnect sends the last in-memory version;
 `UpToDate` or a valid newer snapshot changes health back to `Live`.
+
+Session 19 adds an explicit filesystem cache through
+`SnapshotBootstrapClient::bootstrap_with_cache`. Online bootstrap is attempted
+first. Connection failure/timeout may load a fresh cache, while TLS identity,
+ALPN, protocol, server rejection, and version errors never fall back. The cache
+uses immutable generation files containing format/version metadata, an
+authentication timestamp, canonical payload, and SHA-256 digest. Edge writes
+and synchronizes a new generation before publishing it, then removes older
+generations. Temporary files are ignored after a crash.
+
+Cached bootstrap begins as `Stale`. Its configured maximum age applies to both
+cold startup and the running reconnect loop; expiry is terminal and the
+snapshot-aware supervisor closes Edge listeners. Disk is touched only during
+bootstrap or authenticated snapshot refresh, never while authorizing ingress.
+The digest detects accidental corruption, not a malicious local administrator;
+the Edge host and cache directory are inside the trust boundary.
 
 ## Operator workflow
 
@@ -86,5 +102,5 @@ supervises both the data plane and reconnecting snapshot client. The Edge CLI
 selects exactly one authorization mode: plaintext loopback development, static
 mTLS certificate authorization, or mTLS plus the complete snapshot flag group.
 
-Session 18 does not include a general admin API, Edge cold-start disk cache,
+Sessions 18–19 do not include a general admin API, snapshot signing,
 certificate rotation, or multi-edge consensus.

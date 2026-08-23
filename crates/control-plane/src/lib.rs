@@ -18,6 +18,7 @@ use tunnelproxy_common::{AgentId, TunnelId};
 
 mod repository;
 mod runtime;
+mod snapshot_cache;
 mod snapshot_codec;
 mod snapshot_manifest;
 mod snapshot_protocol;
@@ -31,6 +32,9 @@ pub use runtime::{
     ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
     ControlPlaneRuntimeOutcome,
 };
+pub use snapshot_cache::{
+    CachedSnapshot, FileSnapshotCache, SnapshotCacheConfig, SnapshotCacheError,
+};
 pub use snapshot_codec::{
     decode_snapshot, decode_versioned_snapshot, encode_snapshot, encode_versioned_snapshot,
     snapshot_digest, SnapshotCodecError, MAX_AGENTS_PER_SNAPSHOT, MAX_SNAPSHOT_BYTES,
@@ -43,9 +47,9 @@ pub use snapshot_protocol::{
     SNAPSHOT_PROTOCOL_ALPN, SNAPSHOT_PROTOCOL_VERSION,
 };
 pub use snapshot_service::{
-    SnapshotBootstrapClient, SnapshotClientConfig, SnapshotClientError, SnapshotClientRuntime,
-    SnapshotDistributionServer, SnapshotServerConfig, SnapshotServerError, SnapshotServerTlsConfig,
-    SnapshotTlsConfigError,
+    SnapshotBootstrapClient, SnapshotBootstrapSource, SnapshotClientConfig, SnapshotClientError,
+    SnapshotClientRuntime, SnapshotDistributionServer, SnapshotServerConfig, SnapshotServerError,
+    SnapshotServerTlsConfig, SnapshotTlsConfigError,
 };
 
 /// SHA-256 digest of one leaf client certificate in DER form.

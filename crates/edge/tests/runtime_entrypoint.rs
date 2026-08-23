@@ -25,14 +25,15 @@ use tunnelproxy_agent::{
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
     authorization_snapshot_channel, AgentGrant, AuthorizationSnapshot, CertificateFingerprint,
-    ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotClientConfig, SnapshotRepository,
-    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotVersion, SqliteSnapshotRepository,
-    TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
+    ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotBootstrapSource, SnapshotCacheConfig,
+    SnapshotClientConfig, SnapshotClientError, SnapshotRepository, SnapshotServerConfig,
+    SnapshotServerTlsConfig, SnapshotVersion, SqliteSnapshotRepository, TunnelGrant, TunnelStatus,
+    VersionedAuthorizationSnapshot,
 };
 use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
     EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTransportSecurity,
-    RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime,
+    RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest, ROLE_AGENT,
@@ -1339,4 +1340,115 @@ async fn snapshot_bootstrap_failure_does_not_bind_edge_listeners() {
     let raw_listener = TcpListener::bind(raw_addr).await.unwrap();
     drop(agent_listener);
     drop(raw_listener);
+}
+
+#[tokio::test]
+async fn snapshot_cache_cold_start_routes_then_expiry_releases_edge_listeners() {
+    let agent_pki = test_pki("edge.test");
+    let snapshot_pki = test_pki("control-plane.test");
+    let (database, directory) = snapshot_temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    repository
+        .commit(&versioned_snapshot(
+            &agent_pki,
+            1,
+            TunnelStatus::Enabled,
+            false,
+        ))
+        .unwrap();
+    let snapshot_tls = SnapshotServerTlsConfig::from_pem(
+        snapshot_pki.server.certificate_pem.as_bytes(),
+        snapshot_pki.server.private_key_pem.as_bytes(),
+        snapshot_pki.authority_pem.as_bytes(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let control_plane = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
+        database_path: database,
+        refresh_interval: Duration::from_millis(20),
+        snapshot_server: SnapshotServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            max_edge_clients: 4,
+            request_timeout: Duration::from_secs(1),
+            tls: snapshot_tls,
+        },
+    })
+    .await
+    .unwrap();
+    let snapshot_addr = control_plane.local_addr();
+    let (control_trigger, control_signal) = shutdown_channel();
+    let control_task = tokio::spawn(control_plane.run_until_shutdown(control_signal));
+
+    let agent_addr = unused_addr().await;
+    let raw_addr = unused_addr().await;
+    let mut edge_config = edge_config(raw_addr);
+    edge_config.multiplex.agent_listener.listen_addr = agent_addr;
+    edge_config.multiplex.security = edge_tls_security(&agent_pki, Duration::from_secs(1));
+    let mut snapshot_client = SnapshotClientConfig::from_pem(
+        snapshot_addr,
+        snapshot_pki.authority_pem.as_bytes(),
+        snapshot_pki.client.certificate_pem.as_bytes(),
+        snapshot_pki.client.private_key_pem.as_bytes(),
+        "control-plane.test",
+    )
+    .unwrap();
+    snapshot_client.connect_timeout = Duration::from_millis(100);
+    snapshot_client.handshake_timeout = Duration::from_secs(1);
+    snapshot_client.subscribe_timeout = Duration::from_secs(1);
+    snapshot_client.reconnect_initial_delay = Duration::from_millis(20);
+    snapshot_client.reconnect_max_delay = Duration::from_millis(50);
+    let cache = SnapshotCacheConfig {
+        directory: directory.join("edge-cache"),
+        max_stale_age: Duration::from_secs(2),
+    };
+
+    let online = SnapshotAwareEdgeRuntime::bind_with_cache(
+        edge_config.clone(),
+        snapshot_client.clone(),
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(online.bootstrap_source(), SnapshotBootstrapSource::Online);
+    let (online_trigger, online_signal) = shutdown_channel();
+    online_trigger.shutdown();
+    online.run_until_shutdown(online_signal).await.unwrap();
+    control_trigger.shutdown();
+    control_task.await.unwrap().unwrap();
+
+    let offline = SnapshotAwareEdgeRuntime::bind_with_cache(edge_config, snapshot_client, cache)
+        .await
+        .unwrap();
+    assert_eq!(
+        offline.bootstrap_source(),
+        SnapshotBootstrapSource::DiskCache
+    );
+    let (offline_trigger, offline_signal) = shutdown_channel();
+    let offline_task = tokio::spawn(offline.run_until_shutdown(offline_signal));
+    let (local_addr, local_task) = spawn_echo().await;
+    let agent = secure_agent_runtime(agent_addr, local_addr, &agent_pki);
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    round_trip(raw_addr, b"cold-start-cache").await;
+
+    let expired = timeout(Duration::from_secs(3), offline_task)
+        .await
+        .expect("stale Edge did not stop at the cache deadline")
+        .unwrap();
+    assert!(matches!(
+        expired,
+        Err(SnapshotAwareEdgeRuntimeError::Snapshot(
+            SnapshotClientError::CacheExpired
+        ))
+    ));
+    offline_trigger.shutdown();
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+    let agent_listener = TcpListener::bind(agent_addr).await.unwrap();
+    let raw_listener = TcpListener::bind(raw_addr).await.unwrap();
+    drop(agent_listener);
+    drop(raw_listener);
+    drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
 }

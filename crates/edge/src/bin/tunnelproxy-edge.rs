@@ -8,7 +8,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
-use tunnelproxy_control_plane::{SnapshotClientConfig, SnapshotTlsConfigError};
+use tunnelproxy_control_plane::{
+    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig, SnapshotTlsConfigError,
+};
 use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
     EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
@@ -42,6 +44,8 @@ Options:
   --snapshot-subscribe-timeout-ms <ms>  subscribe timeout (default 5000)
   --snapshot-reconnect-initial-ms <ms>  first retry delay (default 250)
   --snapshot-reconnect-max-ms <ms>      maximum retry delay (default 30000)
+  --snapshot-cache-dir <path>           opt-in cold-start snapshot cache
+  --snapshot-cache-max-stale-ms <ms>    maximum offline cache age
   --help                           print this help and exit
 ";
 
@@ -93,9 +97,10 @@ async fn main() -> ExitCode {
         LoadedAuthorization::Snapshot {
             security,
             snapshots,
+            cache,
         } => {
             config.multiplex.security = security;
-            run_snapshot_edge(config, snapshots, &parsed).await
+            run_snapshot_edge(config, snapshots, cache, &parsed).await
         }
     }
 }
@@ -130,9 +135,14 @@ async fn run_static_edge(config: EdgeRuntimeConfig, parsed: &ParsedArgs) -> Exit
 async fn run_snapshot_edge(
     config: EdgeRuntimeConfig,
     snapshots: SnapshotClientConfig,
+    cache: Option<SnapshotCacheConfig>,
     parsed: &ParsedArgs,
 ) -> ExitCode {
-    let runtime = match SnapshotAwareEdgeRuntime::bind(config, snapshots).await {
+    let bind_result = match cache {
+        Some(cache) => SnapshotAwareEdgeRuntime::bind_with_cache(config, snapshots, cache).await,
+        None => SnapshotAwareEdgeRuntime::bind(config, snapshots).await,
+    };
+    let runtime = match bind_result {
         Ok(runtime) => runtime,
         Err(error) => {
             error!(%error, "failed to bootstrap snapshot-aware Edge runtime");
@@ -146,7 +156,11 @@ async fn run_snapshot_edge(
             };
         }
     };
-    log_edge_started(runtime.agent_addr(), parsed, "snapshot");
+    let authorization = match runtime.bootstrap_source() {
+        SnapshotBootstrapSource::Online => "snapshot-live",
+        SnapshotBootstrapSource::DiskCache => "snapshot-stale-cache",
+    };
+    log_edge_started(runtime.agent_addr(), parsed, authorization);
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal);
     tokio::pin!(runtime_future);
@@ -250,6 +264,8 @@ struct ParsedArgs {
     snapshot_subscribe_timeout: Duration,
     snapshot_reconnect_initial: Duration,
     snapshot_reconnect_max: Duration,
+    snapshot_cache_dir: Option<PathBuf>,
+    snapshot_cache_max_stale: Option<Duration>,
     snapshot_options_present: bool,
     help: bool,
 }
@@ -279,6 +295,8 @@ impl Default for ParsedArgs {
             snapshot_subscribe_timeout: Duration::from_secs(5),
             snapshot_reconnect_initial: Duration::from_millis(250),
             snapshot_reconnect_max: Duration::from_secs(30),
+            snapshot_cache_dir: None,
+            snapshot_cache_max_stale: None,
             snapshot_options_present: false,
             help: false,
         }
@@ -426,6 +444,17 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.snapshot_options_present = true;
                 index += 2;
             }
+            "--snapshot-cache-dir" => {
+                parsed.snapshot_cache_dir = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-cache-max-stale-ms" => {
+                parsed.snapshot_cache_max_stale =
+                    Some(Duration::from_millis(parse_number(args, index, flag)?));
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -442,6 +471,8 @@ enum TlsLoadError {
     InvalidRegistration(EdgeRegistrationPolicyError),
     InvalidSnapshotTls(SnapshotTlsConfigError),
     InvalidSnapshotConfig,
+    IncompleteSnapshotCacheArguments,
+    InvalidSnapshotCache,
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -465,6 +496,12 @@ impl std::fmt::Display for TlsLoadError {
                 write!(f, "invalid snapshot TLS configuration: {error}")
             }
             Self::InvalidSnapshotConfig => f.write_str("snapshot client configuration is invalid"),
+            Self::IncompleteSnapshotCacheArguments => f.write_str(
+                "snapshot cache requires both --snapshot-cache-dir and --snapshot-cache-max-stale-ms",
+            ),
+            Self::InvalidSnapshotCache => {
+                f.write_str("snapshot cache directory and maximum stale age are invalid")
+            }
         }
     }
 }
@@ -477,6 +514,7 @@ enum LoadedAuthorization {
     Snapshot {
         security: EdgeTransportSecurity,
         snapshots: SnapshotClientConfig,
+        cache: Option<SnapshotCacheConfig>,
     },
 }
 
@@ -560,6 +598,7 @@ async fn load_snapshot_configuration(
     parsed: &ParsedArgs,
     security: EdgeTransportSecurity,
 ) -> Result<LoadedAuthorization, TlsLoadError> {
+    let cache = snapshot_cache_configuration(parsed)?;
     let (Some(server), Some(ca), Some(client_cert), Some(client_key), Some(server_name)) = (
         parsed.snapshot_server,
         parsed.snapshot_ca.as_ref(),
@@ -588,7 +627,30 @@ async fn load_snapshot_configuration(
     Ok(LoadedAuthorization::Snapshot {
         security,
         snapshots,
+        cache,
     })
+}
+
+fn snapshot_cache_configuration(
+    parsed: &ParsedArgs,
+) -> Result<Option<SnapshotCacheConfig>, TlsLoadError> {
+    match (
+        parsed.snapshot_cache_dir.clone(),
+        parsed.snapshot_cache_max_stale,
+    ) {
+        (None, None) => Ok(None),
+        (Some(directory), Some(max_stale_age)) => {
+            let config = SnapshotCacheConfig {
+                directory,
+                max_stale_age,
+            };
+            config
+                .validate()
+                .map_err(|_| TlsLoadError::InvalidSnapshotCache)?;
+            Ok(Some(config))
+        }
+        _ => Err(TlsLoadError::IncompleteSnapshotCacheArguments),
+    }
 }
 
 async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, TlsLoadError> {
@@ -698,6 +760,10 @@ mod tests {
             "104",
             "--snapshot-reconnect-max-ms",
             "105",
+            "--snapshot-cache-dir",
+            "edge-cache",
+            "--snapshot-cache-max-stale-ms",
+            "60000",
         ]))
         .unwrap();
         assert_eq!(parsed.agent_listen.port(), 17100);
@@ -723,6 +789,11 @@ mod tests {
         );
         assert_eq!(parsed.snapshot_connect_timeout, Duration::from_millis(101));
         assert_eq!(parsed.snapshot_reconnect_max, Duration::from_millis(105));
+        assert_eq!(parsed.snapshot_cache_dir, Some(PathBuf::from("edge-cache")));
+        assert_eq!(
+            parsed.snapshot_cache_max_stale,
+            Some(Duration::from_secs(60))
+        );
         assert!(parsed.snapshot_options_present);
     }
 
@@ -777,6 +848,24 @@ mod tests {
         assert!(matches!(
             load_transport_configuration(&conflicting).await,
             Err(TlsLoadError::AuthorizationMode)
+        ));
+
+        let partial_cache = ParsedArgs {
+            tls_cert: Some(PathBuf::from("edge.pem")),
+            tls_key: Some(PathBuf::from("edge-key.pem")),
+            tls_client_ca: Some(PathBuf::from("agent-ca.pem")),
+            snapshot_server: Some("127.0.0.1:7200".parse().unwrap()),
+            snapshot_ca: Some(PathBuf::from("control-ca.pem")),
+            snapshot_client_cert: Some(PathBuf::from("edge-client.pem")),
+            snapshot_client_key: Some(PathBuf::from("edge-client-key.pem")),
+            snapshot_server_name: Some("control-plane.test".to_owned()),
+            snapshot_cache_dir: Some(PathBuf::from("edge-cache")),
+            snapshot_options_present: true,
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            snapshot_cache_configuration(&partial_cache),
+            Err(TlsLoadError::IncompleteSnapshotCacheArguments)
         ));
     }
 }

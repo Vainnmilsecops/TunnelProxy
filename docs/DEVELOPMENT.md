@@ -265,12 +265,17 @@ cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
   --snapshot-server 127.0.0.1:7200 --snapshot-ca control-plane-ca.pem \
   --snapshot-client-cert edge-client.pem \
   --snapshot-client-key edge-client-key.pem \
-  --snapshot-server-name control-plane.internal
+  --snapshot-server-name control-plane.internal \
+  --snapshot-cache-dir edge-snapshot-cache \
+  --snapshot-cache-max-stale-ms 300000
 ```
 
 Do not also pass `--authorized-client-cert` in snapshot mode. Partial groups are
-invalid. Edge authenticates and downloads the initial full snapshot before it
-binds either listener. Later imports with a higher version are picked up by the
-Control Plane refresh interval. A running Edge retains cached authority as
-`Stale` during service restart, but a cold Edge currently needs the service
-online.
+invalid. The two cache flags are optional but must be supplied together, and
+the stale duration must be non-zero. Edge prefers authenticated online
+bootstrap. If the service is temporarily unavailable, a fresh valid cache can
+bind the listeners with `Stale` authorization; TLS/authentication or protocol
+failure never falls back. Later imports with a higher version are durably
+cached before publication. If reconnect does not succeed before the stale
+deadline, Edge shuts down and releases both listeners. Cache filesystem I/O is
+never performed on the ingress path.

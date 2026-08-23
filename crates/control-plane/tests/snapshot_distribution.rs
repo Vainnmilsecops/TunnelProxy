@@ -15,9 +15,10 @@ use tunnelproxy_control_plane::{
     AgentGrant, AuthorizationSnapshot, AuthorizationSnapshotSubscription, CertificateFingerprint,
     ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotBootstrapClient,
-    SnapshotClientConfig, SnapshotClientError, SnapshotDistributionServer, SnapshotRepository,
-    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotSourceHealth, SnapshotVersion,
-    SqliteSnapshotRepository, TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
+    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotCacheError, SnapshotClientConfig,
+    SnapshotClientError, SnapshotDistributionServer, SnapshotRepository, SnapshotServerConfig,
+    SnapshotServerTlsConfig, SnapshotSourceHealth, SnapshotVersion, SqliteSnapshotRepository,
+    TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -356,5 +357,181 @@ async fn control_plane_runtime_refuses_an_uninitialized_repository() {
             PersistentSnapshotAuthorityError::Uninitialized
         ))
     ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn edge_cache_cold_starts_offline_and_reconciles_after_reconnect() {
+    let (database, directory) = temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    let first = snapshot(1, TunnelStatus::Enabled);
+    repository.commit(&first).unwrap();
+    let authority = PersistentSnapshotAuthority::open(repository.clone())
+        .await
+        .unwrap();
+    let pki = test_pki("control-plane.test");
+    let (server_addr, server_trigger, server_task) =
+        start_server("127.0.0.1:0".parse().unwrap(), &pki, &authority).await;
+    let cache = SnapshotCacheConfig {
+        directory: directory.join("edge-cache"),
+        max_stale_age: Duration::from_secs(5),
+    };
+
+    let (online, online_runtime, source) = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source, SnapshotBootstrapSource::Online);
+    assert_eq!(online.current().as_ref(), &first);
+    drop(online_runtime);
+    server_trigger.shutdown();
+    server_task.await.unwrap().unwrap();
+
+    let (mut offline, offline_runtime, source) = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache,
+    )
+    .await
+    .unwrap();
+    assert_eq!(source, SnapshotBootstrapSource::DiskCache);
+    assert_eq!(offline.source_health(), SnapshotSourceHealth::Stale);
+    assert_eq!(offline.current().as_ref(), &first);
+    let (client_trigger, client_signal) = shutdown_channel();
+    let client_task = tokio::spawn(offline_runtime.run_until_shutdown(client_signal));
+
+    let (_, restarted_trigger, restarted_task) = start_server(server_addr, &pki, &authority).await;
+    wait_for_health(&mut offline, SnapshotSourceHealth::Live).await;
+    let second = snapshot(2, TunnelStatus::Disabled);
+    authority.commit(second.clone()).await.unwrap();
+    wait_for_version(&mut offline, 2).await;
+    assert_eq!(offline.current().as_ref(), &second);
+
+    client_trigger.shutdown();
+    client_task.await.unwrap().unwrap();
+    restarted_trigger.shutdown();
+    restarted_task.await.unwrap().unwrap();
+    drop(authority);
+    drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn cache_expiry_is_terminal_and_tls_authentication_never_falls_back() {
+    let (database, directory) = temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    let authority = PersistentSnapshotAuthority::open(repository.clone())
+        .await
+        .unwrap();
+    let pki = test_pki("control-plane.test");
+    let (server_addr, server_trigger, server_task) =
+        start_server("127.0.0.1:0".parse().unwrap(), &pki, &authority).await;
+    let cache = SnapshotCacheConfig {
+        directory: directory.join("edge-cache"),
+        max_stale_age: Duration::from_secs(2),
+    };
+    let (_, online_runtime, _) = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    drop(online_runtime);
+
+    let wrong_name = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "wrong-control-plane.test"),
+        cache.clone(),
+    )
+    .await;
+    assert!(matches!(
+        wrong_name,
+        Err(SnapshotClientError::TlsAuthentication)
+    ));
+
+    server_trigger.shutdown();
+    server_task.await.unwrap().unwrap();
+    let (_, stale_runtime, source) = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source, SnapshotBootstrapSource::DiskCache);
+    let (_trigger, signal) = shutdown_channel();
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(3),
+            stale_runtime.run_until_shutdown(signal)
+        )
+        .await,
+        Ok(Err(SnapshotClientError::CacheExpired))
+    ));
+
+    let expired = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache,
+    )
+    .await;
+    assert!(matches!(
+        expired,
+        Err(SnapshotClientError::Cache(SnapshotCacheError::Expired))
+    ));
+    drop(authority);
+    drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn cache_write_failure_never_publishes_the_new_snapshot() {
+    let (database, directory) = temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    let authority = PersistentSnapshotAuthority::open(repository.clone())
+        .await
+        .unwrap();
+    let pki = test_pki("control-plane.test");
+    let (server_addr, server_trigger, server_task) =
+        start_server("127.0.0.1:0".parse().unwrap(), &pki, &authority).await;
+    let cache_directory = directory.join("edge-cache");
+    let cache = SnapshotCacheConfig {
+        directory: cache_directory.clone(),
+        max_stale_age: Duration::from_secs(5),
+    };
+    let (edge_snapshots, runtime, _) = SnapshotBootstrapClient::bootstrap_with_cache(
+        client_config(server_addr, &pki, "control-plane.test"),
+        cache,
+    )
+    .await
+    .unwrap();
+    let (_client_trigger, client_signal) = shutdown_channel();
+    let client_task = tokio::spawn(runtime.run_until_shutdown(client_signal));
+
+    std::fs::remove_dir_all(&cache_directory).unwrap();
+    std::fs::write(&cache_directory, b"blocks cache directory creation").unwrap();
+    authority
+        .commit(snapshot(2, TunnelStatus::Disabled))
+        .await
+        .unwrap();
+    let failure = timeout(Duration::from_secs(1), client_task)
+        .await
+        .expect("cache write failure did not stop the snapshot client")
+        .unwrap();
+    assert!(matches!(
+        failure,
+        Err(SnapshotClientError::Cache(SnapshotCacheError::Io(_)))
+    ));
+    assert_eq!(edge_snapshots.current().version().get(), 1);
+    assert_eq!(edge_snapshots.source_health(), SnapshotSourceHealth::Stale);
+
+    server_trigger.shutdown();
+    server_task.await.unwrap().unwrap();
+    drop(authority);
+    drop(repository);
     std::fs::remove_dir_all(directory).unwrap();
 }

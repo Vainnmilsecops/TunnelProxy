@@ -2,7 +2,10 @@
 
 use tokio::task::JoinHandle;
 use tunnelproxy_common::{shutdown_channel, ShutdownSignal};
-use tunnelproxy_control_plane::{SnapshotClientConfig, SnapshotClientError, SnapshotClientRuntime};
+use tunnelproxy_control_plane::{
+    SnapshotBootstrapClient, SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
+    SnapshotClientError, SnapshotClientRuntime,
+};
 
 use crate::{
     bootstrap_registration_from_snapshot_service, EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError,
@@ -12,6 +15,7 @@ use crate::{
 pub struct SnapshotAwareEdgeRuntime {
     edge: EdgeRuntime,
     snapshots: SnapshotClientRuntime,
+    bootstrap_source: SnapshotBootstrapSource,
 }
 
 impl SnapshotAwareEdgeRuntime {
@@ -27,7 +31,32 @@ impl SnapshotAwareEdgeRuntime {
         let edge = EdgeRuntime::bind(edge_config)
             .await
             .map_err(SnapshotAwareEdgeRuntimeError::Edge)?;
-        Ok(Self { edge, snapshots })
+        Ok(Self {
+            edge,
+            snapshots,
+            bootstrap_source: SnapshotBootstrapSource::Online,
+        })
+    }
+
+    pub async fn bind_with_cache(
+        mut edge_config: EdgeRuntimeConfig,
+        snapshot_config: SnapshotClientConfig,
+        cache_config: SnapshotCacheConfig,
+    ) -> Result<Self, SnapshotAwareEdgeRuntimeError> {
+        let (subscription, snapshots, bootstrap_source) =
+            SnapshotBootstrapClient::bootstrap_with_cache(snapshot_config, cache_config)
+                .await
+                .map_err(SnapshotAwareEdgeRuntimeError::Bootstrap)?;
+        edge_config.multiplex.registration =
+            crate::EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+        let edge = EdgeRuntime::bind(edge_config)
+            .await
+            .map_err(SnapshotAwareEdgeRuntimeError::Edge)?;
+        Ok(Self {
+            edge,
+            snapshots,
+            bootstrap_source,
+        })
     }
 
     pub const fn agent_addr(&self) -> std::net::SocketAddr {
@@ -36,6 +65,10 @@ impl SnapshotAwareEdgeRuntime {
 
     pub fn router(&self) -> EdgeSessionRouter {
         self.edge.router()
+    }
+
+    pub const fn bootstrap_source(&self) -> SnapshotBootstrapSource {
+        self.bootstrap_source
     }
 
     pub async fn run_until_shutdown(
