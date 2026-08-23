@@ -37,7 +37,7 @@ pub use multiplex::{
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError, AgentRuntimeError,
-    AgentRuntimeOutcome,
+    AgentRuntimeOutcome, ReconnectConfig, ReconnectConfigError,
 };
 pub use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 

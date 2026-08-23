@@ -377,6 +377,30 @@ impl RawIngressRouteManager {
             .map_err(|_| RawIngressRouteError::DrainTimeout(route_id))?
     }
 
+    /// Waits until a route task has released its listener and removed itself.
+    /// An already-removed route is considered complete.
+    pub async fn wait_until_removed(
+        &self,
+        route_id: RawIngressRouteId,
+    ) -> Result<(), RawIngressRouteError> {
+        let mut status = match self.state.lock().await.routes.get(&route_id) {
+            Some(route) => route.status.clone(),
+            None => return Ok(()),
+        };
+        loop {
+            if status.borrow().state == RawIngressRouteState::Removed {
+                return Ok(());
+            }
+            if status.changed().await.is_err() {
+                return if self.state.lock().await.routes.contains_key(&route_id) {
+                    Err(RawIngressRouteError::RouteTaskStopped(route_id))
+                } else {
+                    Ok(())
+                };
+            }
+        }
+    }
+
     /// Stops all listeners and drains every routed connection under one
     /// process-level deadline. The manager cannot be reused after this call.
     pub async fn shutdown(

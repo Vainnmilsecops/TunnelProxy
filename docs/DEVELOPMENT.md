@@ -153,13 +153,20 @@ cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
 
 cargo run -p tunnelproxy-agent --bin tunnelproxy-agent -- \
   --edge 127.0.0.1:7100 \
-  --local 127.0.0.1:3000
+  --local 127.0.0.1:3000 \
+  --reconnect-initial-ms 250 \
+  --reconnect-max-ms 30000
 ```
 
 TCP clients can then connect to `127.0.0.1:7000`. Press Ctrl-C to request
 ordered shutdown. Unix also observes SIGTERM. Exit code `0` means a locally
-requested graceful shutdown, `1` means runtime failure/forced drain/unexpected
-peer close, and `2` means invalid CLI or runtime configuration.
+requested graceful shutdown, `1` means runtime failure/forced drain or
+retry-budget exhaustion, and `2` means invalid CLI or runtime
+configuration. Agent reconnect flags also expose the multiplier, downward
+jitter percentage, stable-session reset duration, and optional maximum
+consecutive failure count; use `--help` for their exact names and defaults.
 
-This entrypoint intentionally supports one Agent and one loopback route. It
-does not provide authentication, reconnect, durable identity, or public ingress.
+This entrypoint intentionally supports one Agent and one loopback route. Agent
+disconnects are recovered by rebinding that address to a replacement ephemeral
+session. It does not provide authentication, durable identity, or public
+ingress, and interrupted streams are not replayed.

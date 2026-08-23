@@ -304,9 +304,32 @@ stream task. A raw route holds one semaphore permit per accepted connection
 until that receiver completes. Remove first closes the listener and enters
 `Draining`; removal from the registry happens only after all permits return.
 Agent session snapshots transition targeted routes to `TargetDisconnected` and
-the route is never rebound automatically.
+the route manager never retargets an existing route automatically.
 
 **Consequences:** Active streams survive route removal, drain timeout is
 observable without forced traffic loss, and stale sessions fail closed. Routes
 remain loopback-only and ephemeral; durable tunnel routing is separate work
 tracked by DEBT-015.
+
+---
+
+## ADR-013 — Reconnect creates a fresh ephemeral session and route generation
+
+**Status:** Accepted (Session 13).
+
+**Context:** The runnable tunnel should recover from transient Agent or Edge
+loss, but Protocol v1 has no authenticated durable Agent/tunnel identity and an
+old `TransportSessionId` must never become valid for a replacement connection.
+
+**Decision:** Agent retries only transient transport failures with cancellable,
+bounded exponential backoff. Every successful handshake creates a fresh
+ephemeral session. Edge removes the raw route targeting a disconnected session,
+waits for its listener to be released, and creates a new route generation on
+the same configured loopback address after a replacement session appears.
+Protocol failures are terminal and interrupted streams are not replayed.
+
+**Consequences:** Local development tunnels recover automatically without
+conflating transport and durable identity. There is a deliberate availability
+gap while no Agent is connected, active connections fail with their old
+session, and durable routing/authentication remain separate work under
+DEBT-015.

@@ -21,6 +21,12 @@ Options:
   --connect-timeout-ms <ms>      TCP timeout   (default 5000)
   --handshake-timeout-ms <ms>    handshake     (default 10000)
   --drain-timeout-ms <ms>        stream drain  (default 10000)
+  --reconnect-initial-ms <ms>    first retry   (default 250)
+  --reconnect-max-ms <ms>        retry ceiling (default 30000)
+  --reconnect-multiplier <n>     backoff factor(default 2)
+  --reconnect-jitter-percent <n> downward jitter (default 20)
+  --stable-session-reset-ms <ms> reset streak  (default 30000)
+  --max-reconnect-attempts <n>   failure limit (default unlimited)
   --help                         print this help and exit
 ";
 
@@ -50,6 +56,12 @@ async fn main() -> ExitCode {
     config.handshake_timeout = parsed.handshake_timeout;
     config.multiplex.max_concurrent_streams = parsed.max_streams;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+    config.reconnect.initial_delay = parsed.reconnect_initial;
+    config.reconnect.max_delay = parsed.reconnect_max;
+    config.reconnect.multiplier = parsed.reconnect_multiplier;
+    config.reconnect.jitter_percent = parsed.reconnect_jitter_percent;
+    config.reconnect.stable_session_reset_after = parsed.stable_session_reset;
+    config.reconnect.max_attempts = parsed.max_reconnect_attempts;
     let runtime = match AgentRuntime::new(config) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -110,6 +122,12 @@ struct ParsedArgs {
     connect_timeout: Duration,
     handshake_timeout: Duration,
     drain_timeout: Duration,
+    reconnect_initial: Duration,
+    reconnect_max: Duration,
+    reconnect_multiplier: u32,
+    reconnect_jitter_percent: u8,
+    stable_session_reset: Duration,
+    max_reconnect_attempts: Option<u32>,
     help: bool,
 }
 
@@ -122,6 +140,12 @@ impl Default for ParsedArgs {
             connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(10),
+            reconnect_initial: Duration::from_millis(250),
+            reconnect_max: Duration::from_secs(30),
+            reconnect_multiplier: 2,
+            reconnect_jitter_percent: 20,
+            stable_session_reset: Duration::from_secs(30),
+            max_reconnect_attempts: None,
             help: false,
         }
     }
@@ -184,6 +208,31 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.drain_timeout = Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--reconnect-initial-ms" => {
+                parsed.reconnect_initial = Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
+            "--reconnect-max-ms" => {
+                parsed.reconnect_max = Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
+            "--reconnect-multiplier" => {
+                parsed.reconnect_multiplier = parse_number(args, index, flag)?;
+                index += 2;
+            }
+            "--reconnect-jitter-percent" => {
+                parsed.reconnect_jitter_percent = parse_number(args, index, flag)?;
+                index += 2;
+            }
+            "--stable-session-reset-ms" => {
+                parsed.stable_session_reset =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
+            "--max-reconnect-attempts" => {
+                parsed.max_reconnect_attempts = Some(parse_number(args, index, flag)?);
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -243,6 +292,18 @@ mod tests {
             "200",
             "--drain-timeout-ms",
             "300",
+            "--reconnect-initial-ms",
+            "10",
+            "--reconnect-max-ms",
+            "400",
+            "--reconnect-multiplier",
+            "3",
+            "--reconnect-jitter-percent",
+            "15",
+            "--stable-session-reset-ms",
+            "500",
+            "--max-reconnect-attempts",
+            "7",
         ]))
         .unwrap();
         assert_eq!(parsed.edge.port(), 17100);
@@ -251,6 +312,12 @@ mod tests {
         assert_eq!(parsed.connect_timeout, Duration::from_millis(100));
         assert_eq!(parsed.handshake_timeout, Duration::from_millis(200));
         assert_eq!(parsed.drain_timeout, Duration::from_millis(300));
+        assert_eq!(parsed.reconnect_initial, Duration::from_millis(10));
+        assert_eq!(parsed.reconnect_max, Duration::from_millis(400));
+        assert_eq!(parsed.reconnect_multiplier, 3);
+        assert_eq!(parsed.reconnect_jitter_percent, 15);
+        assert_eq!(parsed.stable_session_reset, Duration::from_millis(500));
+        assert_eq!(parsed.max_reconnect_attempts, Some(7));
     }
 
     #[test]

@@ -21,6 +21,8 @@ correct agent, which in turn proxies them into the local service.
   tracked stream completion, graceful drain, and Agent-disconnect cleanup.
 - Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries for one local
   tunnel, with Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
+- Cancellable bounded exponential Agent reconnect and automatic Edge raw-route
+  recovery on the same loopback address after a replacement session arrives.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -146,6 +148,7 @@ and Definition of Done.
 | 07–09 _(complete)_ | heartbeat, reverse streams, bounded multiplexing and routing |
 | 10–11 _(complete)_ | raw ingress lifecycle and supervised graceful shutdown |
 | 12 _(complete)_ | runnable Edge/Agent entrypoints and OS signal wiring |
+| 13 _(complete)_ | Agent reconnect and loopback raw-route recovery |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

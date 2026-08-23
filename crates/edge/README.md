@@ -30,3 +30,7 @@ authentication, durable routing, and credit-based flow control are not
 implemented yet. Session 12 adds `EdgeRuntime` and the runnable
 `tunnelproxy-edge` binary, composing one Agent with one loopback raw route,
 startup rollback, and ordered route-before-transport shutdown.
+Session 13 keeps the Agent listener alive after disconnect, waits for the old
+route listener to be released, and binds the same loopback raw address to the
+next live ephemeral session. This is recovery of process-local routing only;
+it does not make route or Agent identity durable.
