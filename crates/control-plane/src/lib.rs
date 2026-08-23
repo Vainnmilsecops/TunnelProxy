@@ -17,7 +17,9 @@ use tokio::sync::watch;
 use tunnelproxy_common::{AgentId, TunnelId};
 
 mod repository;
+mod runtime;
 mod snapshot_codec;
+mod snapshot_manifest;
 mod snapshot_protocol;
 mod snapshot_service;
 
@@ -25,11 +27,16 @@ pub use repository::{
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotCommitOutcome,
     SnapshotRepository, SnapshotRepositoryError, SqliteSnapshotRepository,
 };
+pub use runtime::{
+    ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
+    ControlPlaneRuntimeOutcome,
+};
 pub use snapshot_codec::{
     decode_snapshot, decode_versioned_snapshot, encode_snapshot, encode_versioned_snapshot,
     snapshot_digest, SnapshotCodecError, MAX_AGENTS_PER_SNAPSHOT, MAX_SNAPSHOT_BYTES,
     MAX_TUNNELS_PER_AGENT,
 };
+pub use snapshot_manifest::{parse_snapshot_manifest, SnapshotManifestError};
 pub use snapshot_protocol::{
     decode_snapshot_message, encode_snapshot_message, read_snapshot_message,
     write_snapshot_message, SnapshotMessage, SnapshotProtocolError, SnapshotServiceErrorCode,

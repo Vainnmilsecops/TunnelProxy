@@ -72,7 +72,8 @@ TLS and exact certificate-to-Agent/Tunnel authorization before publication.
 Versioned full snapshot updates atomically unpublish and close revoked sessions
 without placing control-plane storage on the ingress hot path. Edge can
 bootstrap that cache from the dedicated authenticated snapshot service and
-retain it as stale during reconnect.
+retain it as stale during reconnect. The runnable CLI can supervise this
+snapshot client alongside the data plane without binding before bootstrap.
 
 **Responsibility (future)**
 
@@ -95,7 +96,8 @@ retain it as stale during reconnect.
 TunnelId authorization snapshots, non-zero monotonic versions, canonical
 bounded encoding, transactional SQLite persistence, bounded latest-value
 distribution, and a dedicated mutual-TLS snapshot service for Edge bootstrap
-and reconnect.
+and reconnect. A runnable binary supports strict full-snapshot import and a
+supervised SQLite-refreshing distribution service.
 
 **Responsibility (future)**
 

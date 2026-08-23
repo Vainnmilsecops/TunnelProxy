@@ -1175,6 +1175,7 @@ pub mod agent_transport;
 pub mod multiplex;
 pub mod raw_ingress;
 mod runtime;
+mod snapshot_runtime;
 mod tls;
 
 pub use multiplex::{
@@ -1189,6 +1190,9 @@ pub use raw_ingress::{
 };
 pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,
+};
+pub use snapshot_runtime::{
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
 };
 pub use tls::{
     bootstrap_registration_from_snapshot_service, EdgeRegistrationPolicy,

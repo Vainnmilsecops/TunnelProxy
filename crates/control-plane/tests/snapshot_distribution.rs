@@ -13,10 +13,11 @@ use tokio::time::timeout;
 use tunnelproxy_common::{shutdown_channel, AgentId, ShutdownTrigger, TunnelId};
 use tunnelproxy_control_plane::{
     AgentGrant, AuthorizationSnapshot, AuthorizationSnapshotSubscription, CertificateFingerprint,
-    PersistentSnapshotAuthority, SnapshotBootstrapClient, SnapshotClientConfig,
-    SnapshotClientError, SnapshotDistributionServer, SnapshotRepository, SnapshotServerConfig,
-    SnapshotServerTlsConfig, SnapshotSourceHealth, SnapshotVersion, SqliteSnapshotRepository,
-    TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
+    ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
+    PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotBootstrapClient,
+    SnapshotClientConfig, SnapshotClientError, SnapshotDistributionServer, SnapshotRepository,
+    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotSourceHealth, SnapshotVersion,
+    SqliteSnapshotRepository, TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -275,5 +276,85 @@ async fn reconnect_attempt_is_cancelled_without_waiting_for_network_timeouts() {
         .unwrap();
     drop(authority);
     drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() {
+    let (database, directory) = temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    let pki = test_pki("control-plane.test");
+    let runtime = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
+        database_path: database.clone(),
+        refresh_interval: Duration::from_millis(20),
+        snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+    })
+    .await
+    .unwrap();
+    let server_addr = runtime.local_addr();
+    let (server_trigger, server_signal) = shutdown_channel();
+    let server_task = tokio::spawn(runtime.run_until_shutdown(server_signal));
+    let (mut edge_snapshots, client) =
+        SnapshotBootstrapClient::bootstrap(client_config(server_addr, &pki, "control-plane.test"))
+            .await
+            .unwrap();
+    let (client_trigger, client_signal) = shutdown_channel();
+    let client_task = tokio::spawn(client.run_until_shutdown(client_signal));
+
+    repository
+        .commit(&snapshot(2, TunnelStatus::Disabled))
+        .unwrap();
+    wait_for_version(&mut edge_snapshots, 2).await;
+
+    server_trigger.shutdown();
+    let outcome = server_task.await.unwrap().unwrap();
+    assert_eq!(outcome.applied_refreshes, 1);
+    wait_for_health(&mut edge_snapshots, SnapshotSourceHealth::Stale).await;
+
+    let restarted = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
+        database_path: database.clone(),
+        refresh_interval: Duration::from_millis(20),
+        snapshot_server: server_config(server_addr, &pki),
+    })
+    .await
+    .unwrap();
+    assert_eq!(restarted.current_version().get(), 2);
+    let (restarted_trigger, restarted_signal) = shutdown_channel();
+    let restarted_task = tokio::spawn(restarted.run_until_shutdown(restarted_signal));
+    wait_for_health(&mut edge_snapshots, SnapshotSourceHealth::Live).await;
+
+    client_trigger.shutdown();
+    client_task.await.unwrap().unwrap();
+    restarted_trigger.shutdown();
+    restarted_task.await.unwrap().unwrap();
+    drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_runtime_refuses_an_uninitialized_repository() {
+    let (database, directory) = temp_database();
+    let pki = test_pki("control-plane.test");
+    let mut config = ControlPlaneRuntimeConfig {
+        database_path: database,
+        refresh_interval: Duration::from_millis(20),
+        snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+    };
+    config.refresh_interval = Duration::ZERO;
+    assert!(matches!(
+        ControlPlaneRuntime::bind(config.clone()).await,
+        Err(ControlPlaneRuntimeError::InvalidConfig)
+    ));
+    config.refresh_interval = Duration::from_millis(20);
+    let result = ControlPlaneRuntime::bind(config).await;
+    assert!(matches!(
+        result,
+        Err(ControlPlaneRuntimeError::Authority(
+            PersistentSnapshotAuthorityError::Uninitialized
+        ))
+    ));
     std::fs::remove_dir_all(directory).unwrap();
 }

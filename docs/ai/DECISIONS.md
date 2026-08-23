@@ -445,3 +445,33 @@ Commit failure cannot expose non-durable policy. Full snapshots make reconnect
 and skipped intermediate versions simple, at the cost of a bounded whole-state
 transfer. This does not provide an administrative mutation API, Edge disk cache,
 certificate lifecycle, or multi-writer/multi-edge consensus.
+
+---
+
+## ADR-018 — Offline full-snapshot import feeds supervised runnable processes
+
+**Status:** Accepted (Session 18).
+
+**Context:** Session 17 provides persistent and authenticated library pieces but
+no operator workflow or process owner. A production-shaped slice needs safe
+initialization, live import pickup, explicit shutdown, and Edge CLI composition
+without prematurely creating account/admin HTTP APIs or letting Edge bind with
+no authenticated authority.
+
+**Decision:** Operators import a complete, non-zero-version JSON manifest into
+SQLite through a bounded command. The manifest denies unknown fields and is
+converted into the same validated canonical domain snapshot before the existing
+transaction commits. The Control Plane daemon refuses empty storage and polls
+the repository at a bounded interval, skipping missed ticks; only newer durable
+heads reach the live publisher. Edge snapshot mode authenticates and bootstraps
+before binding any Agent/raw listener. A snapshot-aware supervisor owns both the
+reconnecting client and Edge runtime. The CLI requires exactly one of plaintext
+development, static certificate authorization, or dynamic snapshot
+authorization.
+
+**Consequences:** A real `serve|import` workflow now exercises persistence and
+cross-process distribution, including Control Plane restart, without database
+access on Edge ingress. Imports are complete replacements, so omission revokes.
+A fresh dynamic Edge still requires an online Control Plane because no trusted
+disk cache exists. General admin APIs, credential lifecycle, and multi-edge
+coordination remain separate work.
