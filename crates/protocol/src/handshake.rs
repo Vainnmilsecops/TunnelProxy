@@ -1,4 +1,4 @@
-//! Handshake-level types for Tunnel Protocol v1.
+//! Handshake-level types for Tunnel Protocol v2.
 //!
 //! These types define the binary structure of handshake frame payloads
 //! (HELLO, REGISTERED, ERROR) without encoding any domain-specific
@@ -6,8 +6,101 @@
 
 use std::fmt;
 
+use tunnelproxy_common::{AgentId, DurableIdError, TunnelId, MAX_DURABLE_ID_BYTES};
+
 /// Byte assigned to the AGENT role in a HELLO frame payload.
 pub const ROLE_AGENT: u8 = 0x01;
+
+/// Fixed prefix of a Protocol v2 REGISTER payload.
+pub const REGISTER_PREFIX_SIZE: usize = 4;
+
+/// Maximum Protocol v2 REGISTER payload size.
+pub const REGISTER_MAX_PAYLOAD_SIZE: usize = REGISTER_PREFIX_SIZE + (MAX_DURABLE_ID_BYTES * 2);
+
+/// One durable tunnel registration intent carried by Protocol v2 REGISTER.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegistrationRequest {
+    pub agent_id: AgentId,
+    pub tunnel_id: TunnelId,
+}
+
+impl RegistrationRequest {
+    pub const fn new(agent_id: AgentId, tunnel_id: TunnelId) -> Self {
+        Self {
+            agent_id,
+            tunnel_id,
+        }
+    }
+
+    /// Encodes `agent_len:u16 | tunnel_len:u16 | agent | tunnel`.
+    pub fn encode(&self) -> Vec<u8> {
+        let agent = self.agent_id.as_str().as_bytes();
+        let tunnel = self.tunnel_id.as_str().as_bytes();
+        let mut payload = Vec::with_capacity(REGISTER_PREFIX_SIZE + agent.len() + tunnel.len());
+        payload.extend_from_slice(&(agent.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&(tunnel.len() as u16).to_be_bytes());
+        payload.extend_from_slice(agent);
+        payload.extend_from_slice(tunnel);
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, RegistrationPayloadError> {
+        if payload.len() < REGISTER_PREFIX_SIZE {
+            return Err(RegistrationPayloadError::TruncatedPrefix);
+        }
+        if payload.len() > REGISTER_MAX_PAYLOAD_SIZE {
+            return Err(RegistrationPayloadError::TooLarge {
+                actual: payload.len(),
+            });
+        }
+        let agent_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let tunnel_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+        let expected = REGISTER_PREFIX_SIZE
+            .checked_add(agent_len)
+            .and_then(|size| size.checked_add(tunnel_len))
+            .ok_or(RegistrationPayloadError::InvalidLength)?;
+        if expected != payload.len() {
+            return Err(RegistrationPayloadError::InvalidLength);
+        }
+        let agent_end = REGISTER_PREFIX_SIZE + agent_len;
+        let agent = std::str::from_utf8(&payload[REGISTER_PREFIX_SIZE..agent_end])
+            .map_err(|_| RegistrationPayloadError::InvalidUtf8)?;
+        let tunnel = std::str::from_utf8(&payload[agent_end..])
+            .map_err(|_| RegistrationPayloadError::InvalidUtf8)?;
+        let agent_id = AgentId::new(agent).map_err(RegistrationPayloadError::InvalidAgentId)?;
+        let tunnel_id = TunnelId::new(tunnel).map_err(RegistrationPayloadError::InvalidTunnelId)?;
+        Ok(Self::new(agent_id, tunnel_id))
+    }
+}
+
+/// Invalid Protocol v2 REGISTER payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationPayloadError {
+    TruncatedPrefix,
+    TooLarge { actual: usize },
+    InvalidLength,
+    InvalidUtf8,
+    InvalidAgentId(DurableIdError),
+    InvalidTunnelId(DurableIdError),
+}
+
+impl fmt::Display for RegistrationPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TruncatedPrefix => f.write_str("REGISTER payload prefix is truncated"),
+            Self::TooLarge { actual } => write!(
+                f,
+                "REGISTER payload is {actual} bytes; maximum is {REGISTER_MAX_PAYLOAD_SIZE}"
+            ),
+            Self::InvalidLength => f.write_str("REGISTER payload lengths do not match payload"),
+            Self::InvalidUtf8 => f.write_str("REGISTER identifiers must be valid UTF-8"),
+            Self::InvalidAgentId(error) => write!(f, "invalid AgentId: {error}"),
+            Self::InvalidTunnelId(error) => write!(f, "invalid TunnelId: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RegistrationPayloadError {}
 
 /// The role advertised in a HELLO frame payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +238,14 @@ pub enum HandshakeErrorCode {
     InvalidRegister = 3,
     /// A general protocol violation detected during the handshake.
     ProtocolViolation = 4,
+    /// The authenticated certificate is not authorized as the claimed Agent.
+    UnauthorizedAgent = 5,
+    /// The Agent is not authorized for the claimed tunnel.
+    UnauthorizedTunnel = 6,
+    /// The requested tunnel is administratively disabled.
+    TunnelDisabled = 7,
+    /// Another live transport already owns the tunnel.
+    TunnelAlreadyConnected = 8,
 }
 
 impl HandshakeErrorCode {
@@ -165,6 +266,10 @@ impl HandshakeErrorCode {
             2 => Some(Self::InvalidHello),
             3 => Some(Self::InvalidRegister),
             4 => Some(Self::ProtocolViolation),
+            5 => Some(Self::UnauthorizedAgent),
+            6 => Some(Self::UnauthorizedTunnel),
+            7 => Some(Self::TunnelDisabled),
+            8 => Some(Self::TunnelAlreadyConnected),
             _ => None,
         }
     }
@@ -184,6 +289,10 @@ impl TryFrom<u16> for HandshakeErrorCode {
             2 => Ok(Self::InvalidHello),
             3 => Ok(Self::InvalidRegister),
             4 => Ok(Self::ProtocolViolation),
+            5 => Ok(Self::UnauthorizedAgent),
+            6 => Ok(Self::UnauthorizedTunnel),
+            7 => Ok(Self::TunnelDisabled),
+            8 => Ok(Self::TunnelAlreadyConnected),
             _ => Err(()),
         }
     }
@@ -377,6 +486,10 @@ mod tests {
             HandshakeErrorCode::InvalidHello,
             HandshakeErrorCode::InvalidRegister,
             HandshakeErrorCode::ProtocolViolation,
+            HandshakeErrorCode::UnauthorizedAgent,
+            HandshakeErrorCode::UnauthorizedTunnel,
+            HandshakeErrorCode::TunnelDisabled,
+            HandshakeErrorCode::TunnelAlreadyConnected,
         ] {
             let bytes = code.to_be_bytes();
             assert_eq!(HandshakeErrorCode::from_be_bytes(bytes), Some(code));
@@ -437,5 +550,38 @@ mod tests {
             assert_eq!(HeartbeatErrorCode::try_from(code.as_u16()), Ok(code));
         }
         assert!(HeartbeatErrorCode::from_be_bytes([0x00, 0x99]).is_none());
+    }
+
+    #[test]
+    fn registration_request_has_stable_golden_bytes() {
+        let request = RegistrationRequest::new(
+            AgentId::new("agent-a").unwrap(),
+            TunnelId::new("tunnel-1").unwrap(),
+        );
+        let payload = request.encode();
+        assert_eq!(
+            payload,
+            [
+                0x00, 0x07, 0x00, 0x08, b'a', b'g', b'e', b'n', b't', b'-', b'a', b't', b'u', b'n',
+                b'n', b'e', b'l', b'-', b'1'
+            ]
+        );
+        assert_eq!(RegistrationRequest::decode(&payload), Ok(request));
+    }
+
+    #[test]
+    fn registration_request_rejects_malformed_payloads() {
+        assert_eq!(
+            RegistrationRequest::decode(&[0, 1, 0]),
+            Err(RegistrationPayloadError::TruncatedPrefix)
+        );
+        assert_eq!(
+            RegistrationRequest::decode(&[0, 2, 0, 1, b'a', b't']),
+            Err(RegistrationPayloadError::InvalidLength)
+        );
+        assert!(matches!(
+            RegistrationRequest::decode(&[0, 1, 0, 1, 0xff, b't']),
+            Err(RegistrationPayloadError::InvalidUtf8)
+        ));
     }
 }

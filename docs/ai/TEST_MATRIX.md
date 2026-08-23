@@ -44,7 +44,7 @@
 | Forwarder: structured error categories    | ✅   | ✅          | —   | `ForwardError::category()` returns `"capacity_exhausted"`, `"upstream_connect_failed"`, `"upstream_connect_timeout"`, `"relay_io_failed"`; logged as `error_category`. |
 | Edge: TCP forwarder CLI                   | —    | —           | —   | `edge_dev` accepts `--listen`, `--upstream`, `--max-connections`, `--connect-timeout-ms`, `--help`; manually smoke-tested.   |
 | HTTP reverse proxy                        | —    | —           | —   | Planned after Session 04.                                                                                                   |
-| Tunnel protocol framing                   | ✅   | —           | —   | 26 codec tests in `crates/protocol/src/codec.rs`: round-trip, binary, fragmented header/payload, coalesced frames, clean EOF, truncated header/payload, invalid magic/version/frame-type/flags, invalid stream scope, oversized encode/decode, real TCP loopback. |
+| Tunnel protocol framing                   | ✅   | —           | —   | Protocol v2 codec covers round-trip, binary, fragmentation, truncation, invalid magic/version/frame/flags/scope, bounds, real TCP, and explicit v1 rejection. |
 | Tunnel protocol: control stream scope    | ✅   | —           | —   | `frame::tests::frame_control_scope_validation` and `frame::tests::frame_stream_scope_validation`. |
 | Tunnel protocol: binary-safe payloads     | ✅   | —           | —   | `codec::tests::roundtrip_binary_payload` exercises 0x00–0xFF byte range. |
 | Tunnel protocol: 64 KiB max payload       | ✅   | —           | —   | `frame::tests::frame_max_payload_is_exactly_64kib`. |
@@ -56,7 +56,7 @@
 | Agent ↔ Edge: invalid second frame (DATA before REGISTER) | ✅ | ✅ | — | `invalid_second_frame_data_instead_of_register`. |
 | Agent ↔ Edge: invalid HELLO (empty payload) | ✅ | ✅ | — | `invalid_hello_empty_payload`. |
 | Agent ↔ Edge: invalid HELLO (unknown role) | ✅ | ✅ | — | `invalid_hello_unknown_role`. |
-| Agent ↔ Edge: invalid REGISTER (non-empty payload) | ✅ | ✅ | — | `invalid_register_non_empty_payload`. |
+| Agent ↔ Edge: invalid REGISTER payload | ✅ | ✅ | — | Golden bounded AgentId/TunnelId codec plus malformed length/UTF-8/ID coverage; arbitrary non-schema payload is rejected. |
 | Agent ↔ Edge: handshake timeout | ✅ | ✅ | — | `handshake_timeout_no_hello`. |
 | Agent ↔ Edge: timeout releases capacity permit | ✅ | ✅ | — | `timeout_releases_capacity`. |
 | Agent ↔ Edge: peer disconnect cleans up session | ✅ | ✅ | — | `peer_disconnect_cleans_up_session`. |
@@ -80,9 +80,9 @@
 | Single-stream admission | — | ✅ | — | `second_concurrent_ingress_is_rejected` proves the one-active-stream limit. |
 | Heartbeat during stream traffic | — | ✅ | — | `heartbeat_remains_live_during_active_stream` spans multiple heartbeat intervals during a slow local response. |
 | Stream lifecycle violation | — | ✅ | — | `data_before_open_is_reset_without_killing_agent_session`. |
-| Tunnel registration                       | —    | —           | —   | Planned with control-plane work.                                                                                            |
+| Authenticated tunnel registration         | ✅   | ✅          | —   | Protocol v2 binds exact client-certificate fingerprint → AgentId → enabled TunnelId before REGISTERED/session publication. |
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
-| Live session routing                      | ✅   | ✅          | —   | `router_targets_the_requested_agent_session` proves exact routing across two connected Agents. |
+| Live session and durable tunnel routing   | ✅   | ✅          | —   | Exact session routing plus cached `TunnelId -> TransportSessionId`; duplicate claim rejects and releases after disconnect. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |
 | Raw ingress route golden path             | ✅   | ✅          | —   | `raw_route_golden_path_is_byte_exact_and_drains` binds an ephemeral listener and crosses Edge → Agent → local service. |
 | Raw ingress concurrent routing            | —    | ✅          | —   | Six concurrent clients remain byte-exact; two routes target two exact Agent sessions. |
@@ -94,13 +94,14 @@
 | Multiplexed Edge/Agent drain              | ✅   | ✅          | —   | Edge releases admission and its router fails closed; Agent honors a shutdown already requested before its multiplex loop starts. |
 | Raw route process shutdown                | ✅   | ✅          | —   | Global route drain rejects manager reuse and force-aborts an active route only after its deadline. |
 | Agent process runtime                     | ✅   | ✅          | —   | Config validation, cancellable bounded reconnect, typed retry exhaustion, and composed outbound handshake/multiplex lifecycle. |
-| Edge process runtime                      | ✅   | ✅          | —   | Creates one raw route, shuts down in route→transport order, rolls back route bind failure, and recovers after Agent replacement. |
-| Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Both binary parsers cover defaults, reconnect/TLS flags, complete TLS argument sets, missing/invalid values, and unknown flags. |
+| Edge process runtime                      | ✅   | ✅          | —   | Binds one TunnelId raw route before Agent availability, fails closed offline, keeps the listener across reconnect, and shuts down route→transport. |
+| Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Parsers cover durable IDs, reconnect/TLS flags, exact authorized client certificate, complete argument sets, and invalid values. |
 | Composed local tunnel                     | —    | ✅          | —   | Real TCP crosses runnable Edge→Agent→local echo byte-exactly, then releases both listener ports after shutdown. |
 | OS process shutdown observation           | ✅   | —           | —   | Ctrl-C on all platforms and SIGTERM on Unix compile behind Tokio's signal feature; runtime cleanup is tested via injected shutdown signals. |
 | Reconnect                                 | ✅    | ✅           | —   | Backoff bounds/jitter are unit tested; real TCP covers cancellation, retry exhaustion, Edge restart, and same-address route recovery. |
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
-| Agent transport mutual TLS                | ✅    | ✅           | —   | Runtime-generated PKI covers byte-exact mTLS forwarding, wrong CA/name, timeout/cancellation, secret-safe Debug, and secure reconnect. |
-| Agent certificate authentication          | ✅    | ✅           | —   | Missing or untrusted client certificates never register; failure releases the sole Edge capacity permit for a later trusted Agent. |
+| Agent transport mutual TLS                | ✅    | ✅           | —   | Runtime-generated PKI covers byte-exact mTLS with ALPN v2, wrong CA/name, timeout/cancellation, secret-safe Debug, and secure reconnect. |
+| Agent certificate authentication          | ✅    | ✅           | —   | Missing/untrusted certs, same-CA unassigned certs, false Agent/Tunnel claims, and disabled tunnels never become routable. |
+| Durable raw route offline/reconnect       | ✅    | ✅           | —   | Listener remains bound, closes sockets while offline, and resolves the fresh authenticated session without rebind or storage lookup. |
 | Plaintext transport restriction           | ✅    | ✅           | —   | Runnable plaintext is loopback-only; a non-loopback Agent listener validates only when mutual TLS is configured. |
 | Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |

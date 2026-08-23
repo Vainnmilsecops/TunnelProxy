@@ -13,7 +13,8 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
+use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
+use tunnelproxy_control_plane::CertificateFingerprint;
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatSequence, StreamId, StreamResetCode,
@@ -21,10 +22,10 @@ use tunnelproxy_protocol::{
 };
 
 use crate::agent_transport::{
-    perform_handshake, AgentListenerConfig, AgentListenerConfigError, AgentTransportError,
-    TransportSessionIdAllocator,
+    perform_authorized_handshake, AgentListenerConfig, AgentListenerConfigError,
+    AgentTransportError, TransportSessionIdAllocator, TunnelRegistrationClaims,
 };
-use crate::tls::{BoxedTransport, EdgeTransportSecurity, TUNNELPROXY_ALPN};
+use crate::tls::{BoxedTransport, EdgeRegistrationPolicy, EdgeTransportSecurity, TUNNELPROXY_ALPN};
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
@@ -34,6 +35,7 @@ pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
 pub struct MultiplexedEdgeConfig {
     pub agent_listener: AgentListenerConfig,
     pub security: EdgeTransportSecurity,
+    pub registration: EdgeRegistrationPolicy,
     pub max_streams_per_session: usize,
     pub session_command_capacity: usize,
     pub per_stream_queue_capacity: usize,
@@ -49,6 +51,7 @@ impl MultiplexedEdgeConfig {
         Self {
             agent_listener: AgentListenerConfig::dev_defaults(),
             security: EdgeTransportSecurity::default(),
+            registration: EdgeRegistrationPolicy::default(),
             max_streams_per_session: 32,
             session_command_capacity: 64,
             per_stream_queue_capacity: 8,
@@ -69,6 +72,9 @@ impl MultiplexedEdgeConfig {
             return Err(MultiplexedEdgeConfigError::NonLoopbackAgentListener(
                 self.agent_listener.listen_addr,
             ));
+        }
+        if self.security.is_tls() != self.registration.is_mutual_tls() {
+            return Err(MultiplexedEdgeConfigError::SecurityRegistrationMismatch);
         }
         if self.max_streams_per_session == 0 {
             return Err(MultiplexedEdgeConfigError::ZeroMaxStreams);
@@ -100,6 +106,7 @@ impl MultiplexedEdgeConfig {
 pub enum MultiplexedEdgeConfigError {
     AgentListener(AgentListenerConfigError),
     NonLoopbackAgentListener(SocketAddr),
+    SecurityRegistrationMismatch,
     ZeroMaxStreams,
     ZeroSessionCommandQueue,
     ZeroPerStreamQueue,
@@ -116,6 +123,9 @@ impl std::fmt::Display for MultiplexedEdgeConfigError {
             Self::NonLoopbackAgentListener(addr) => {
                 write!(f, "Agent listener must use a loopback address, got {addr}")
             }
+            Self::SecurityRegistrationMismatch => f.write_str(
+                "mutual TLS transport requires certificate-bound registration authorization",
+            ),
             Self::ZeroMaxStreams => {
                 f.write_str("max_streams_per_session must be greater than zero")
             }
@@ -138,6 +148,7 @@ impl std::fmt::Display for MultiplexedEdgeConfigError {
 impl std::error::Error for MultiplexedEdgeConfigError {}
 
 type SessionRegistry = Arc<RwLock<HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>>>;
+type TunnelRegistry = Arc<RwLock<HashMap<TunnelId, TransportSessionId>>>;
 
 fn sorted_session_ids(
     sessions: &HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>,
@@ -147,12 +158,25 @@ fn sorted_session_ids(
     ids
 }
 
+fn sorted_tunnel_bindings(
+    tunnels: &HashMap<TunnelId, TransportSessionId>,
+) -> Vec<(TunnelId, TransportSessionId)> {
+    let mut bindings: Vec<_> = tunnels
+        .iter()
+        .map(|(tunnel_id, session_id)| (tunnel_id.clone(), *session_id))
+        .collect();
+    bindings.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    bindings
+}
+
 /// Cloneable routing handle. The registry contains only live, process-local
 /// transport sessions and never acts as durable tunnel identity.
 #[derive(Clone)]
 pub struct EdgeSessionRouter {
     sessions: SessionRegistry,
+    tunnels: TunnelRegistry,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
     accepting_streams: Arc<AtomicBool>,
 }
 
@@ -172,6 +196,42 @@ impl EdgeSessionRouter {
     /// Subscribes to live-session snapshots for route lifecycle management.
     pub fn subscribe_session_ids(&self) -> watch::Receiver<Arc<Vec<TransportSessionId>>> {
         self.session_updates.subscribe()
+    }
+
+    /// Resolves durable tunnel intent entirely from Edge's live in-memory map.
+    pub async fn resolve_tunnel(&self, tunnel_id: &TunnelId) -> Option<TransportSessionId> {
+        self.tunnels.read().await.get(tunnel_id).copied()
+    }
+
+    /// Returns a deterministic snapshot of live durable tunnel bindings.
+    pub async fn connected_tunnels(&self) -> Vec<(TunnelId, TransportSessionId)> {
+        let mut tunnels: Vec<_> = self
+            .tunnels
+            .read()
+            .await
+            .iter()
+            .map(|(tunnel_id, session_id)| (tunnel_id.clone(), *session_id))
+            .collect();
+        tunnels.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        tunnels
+    }
+
+    pub fn subscribe_tunnels(&self) -> watch::Receiver<Arc<Vec<(TunnelId, TransportSessionId)>>> {
+        self.tunnel_updates.subscribe()
+    }
+
+    /// Resolves a durable tunnel to its current ephemeral session and opens a
+    /// tracked stream without a control-plane/storage lookup.
+    pub async fn open_tunnel_stream_tracked(
+        &self,
+        tunnel_id: &TunnelId,
+        ingress: TcpStream,
+    ) -> Result<RoutedStream, RouteError> {
+        let session_id = self
+            .resolve_tunnel(tunnel_id)
+            .await
+            .ok_or_else(|| RouteError::TunnelNotConnected(tunnel_id.clone()))?;
+        self.open_stream_tracked(session_id, ingress).await
     }
 
     /// Routes an already-accepted ingress socket to one exact Agent session.
@@ -260,10 +320,11 @@ pub enum RoutedStreamCloseReason {
 }
 
 /// Failure to route an ingress connection to a logical stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     RuntimeDraining,
     SessionNotFound(TransportSessionId),
+    TunnelNotConnected(TunnelId),
     SessionBusy(TransportSessionId),
     SessionClosing(TransportSessionId),
     CapacityExceeded(TransportSessionId),
@@ -277,6 +338,7 @@ impl std::fmt::Display for RouteError {
         match self {
             Self::RuntimeDraining => f.write_str("Edge runtime is draining"),
             Self::SessionNotFound(id) => write!(f, "transport session {id} was not found"),
+            Self::TunnelNotConnected(id) => write!(f, "tunnel {id} is not connected"),
             Self::SessionBusy(id) => write!(f, "transport session {id} command queue is full"),
             Self::SessionClosing(id) => write!(f, "transport session {id} is closing"),
             Self::CapacityExceeded(id) => {
@@ -297,9 +359,12 @@ pub struct MultiplexedEdgeRuntime {
     local_addr: SocketAddr,
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
+    tunnels: TunnelRegistry,
+    tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     permits: Arc<Semaphore>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
     accepting_streams: Arc<AtomicBool>,
 }
 
@@ -312,14 +377,18 @@ impl MultiplexedEdgeRuntime {
         let local_addr = listener.local_addr()?;
         let permits = Arc::new(Semaphore::new(config.agent_listener.max_agent_sessions));
         let (session_updates, _) = watch::channel(Arc::new(Vec::new()));
+        let (tunnel_updates, _) = watch::channel(Arc::new(Vec::new()));
         Ok(Self {
             listener,
             local_addr,
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            tunnels: Arc::new(RwLock::new(HashMap::new())),
+            tunnel_claims: Arc::new(TunnelRegistrationClaims::default()),
             session_ids: Arc::new(TransportSessionIdAllocator::new()),
             permits,
             session_updates,
+            tunnel_updates,
             accepting_streams: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -331,7 +400,9 @@ impl MultiplexedEdgeRuntime {
     pub fn router(&self) -> EdgeSessionRouter {
         EdgeSessionRouter {
             sessions: Arc::clone(&self.sessions),
+            tunnels: Arc::clone(&self.tunnels),
             session_updates: self.session_updates.clone(),
+            tunnel_updates: self.tunnel_updates.clone(),
             accepting_streams: Arc::clone(&self.accepting_streams),
         }
     }
@@ -351,8 +422,11 @@ impl MultiplexedEdgeRuntime {
                         Arc::clone(&self.permits),
                         self.config.clone(),
                         Arc::clone(&self.sessions),
+                        Arc::clone(&self.tunnels),
+                        Arc::clone(&self.tunnel_claims),
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
+                        self.tunnel_updates.clone(),
                     );
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -382,8 +456,11 @@ impl MultiplexedEdgeRuntime {
                         Arc::clone(&self.permits),
                         self.config.clone(),
                         Arc::clone(&self.sessions),
+                        Arc::clone(&self.tunnels),
+                        Arc::clone(&self.tunnel_claims),
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
+                        self.tunnel_updates.clone(),
                     );
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -397,7 +474,9 @@ impl MultiplexedEdgeRuntime {
         drop(self.listener);
         let outcome = crate::drain_tasks(tasks, shutdown.drain_timeout).await;
         self.sessions.write().await.clear();
+        self.tunnels.write().await.clear();
         self.session_updates.send_replace(Arc::new(Vec::new()));
+        self.tunnel_updates.send_replace(Arc::new(Vec::new()));
         Ok(outcome)
     }
 }
@@ -410,8 +489,11 @@ fn spawn_accepted_session(
     permits: Arc<Semaphore>,
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
+    tunnels: TunnelRegistry,
+    tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
 ) {
     let permit = match permits.try_acquire_owned() {
         Ok(permit) => permit,
@@ -427,8 +509,11 @@ fn spawn_accepted_session(
         permit,
         config,
         sessions,
+        tunnels,
+        tunnel_claims,
         session_ids,
         session_updates,
+        tunnel_updates,
     ));
 }
 
@@ -445,42 +530,64 @@ enum StreamEvent {
     Closed(StreamId),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_accepted_session(
     socket: TcpStream,
     peer: SocketAddr,
     _permit: OwnedSemaphorePermit,
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
+    tunnels: TunnelRegistry,
+    tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
 ) {
-    let mut socket: BoxedTransport = match &config.security {
-        EdgeTransportSecurity::PlaintextLoopback => Box::new(socket),
-        EdgeTransportSecurity::MutualTls(tls) => {
-            let acceptor = TlsAcceptor::from(Arc::clone(&tls.server_config));
-            match tokio::time::timeout(tls.handshake_timeout, acceptor.accept(socket)).await {
-                Ok(Ok(stream)) if stream.get_ref().1.alpn_protocol() == Some(TUNNELPROXY_ALPN) => {
-                    info!(peer = %peer, event = "edge_tls_established", "mutual TLS established");
-                    Box::new(stream)
-                }
-                Ok(Ok(_)) => {
-                    warn!(peer = %peer, event = "edge_tls_alpn_rejected", "Agent did not negotiate TunnelProxy ALPN");
-                    return;
-                }
-                Ok(Err(_)) => {
-                    warn!(peer = %peer, event = "edge_tls_authentication_rejected", "Agent TLS authentication failed");
-                    return;
-                }
-                Err(_) => {
-                    warn!(peer = %peer, event = "edge_tls_handshake_timeout", "Agent TLS handshake timed out");
-                    return;
+    let (mut socket, peer_certificate): (BoxedTransport, Option<CertificateFingerprint>) =
+        match &config.security {
+            EdgeTransportSecurity::PlaintextLoopback => (Box::new(socket), None),
+            EdgeTransportSecurity::MutualTls(tls) => {
+                let acceptor = TlsAcceptor::from(Arc::clone(&tls.server_config));
+                match tokio::time::timeout(tls.handshake_timeout, acceptor.accept(socket)).await {
+                    Ok(Ok(stream))
+                        if stream.get_ref().1.alpn_protocol() == Some(TUNNELPROXY_ALPN) =>
+                    {
+                        let peer_certificate = stream
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|certificates| certificates.first())
+                            .map(|certificate| {
+                                CertificateFingerprint::from_certificate_der(certificate.as_ref())
+                            });
+                        info!(peer = %peer, event = "edge_tls_established", "mutual TLS established");
+                        (Box::new(stream), peer_certificate)
+                    }
+                    Ok(Ok(_)) => {
+                        warn!(peer = %peer, event = "edge_tls_alpn_rejected", "Agent did not negotiate TunnelProxy ALPN");
+                        return;
+                    }
+                    Ok(Err(_)) => {
+                        warn!(peer = %peer, event = "edge_tls_authentication_rejected", "Agent TLS authentication failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(peer = %peer, event = "edge_tls_handshake_timeout", "Agent TLS handshake timed out");
+                        return;
+                    }
                 }
             }
-        }
-    };
+        };
     let handshake = tokio::time::timeout(
         config.agent_listener.handshake_timeout,
-        perform_handshake(&mut socket, peer, &session_ids),
+        perform_authorized_handshake(
+            &mut socket,
+            peer,
+            &session_ids,
+            &config.registration,
+            peer_certificate.as_ref(),
+            Some(&tunnel_claims),
+        ),
     )
     .await;
     let session = match handshake {
@@ -496,6 +603,8 @@ async fn run_accepted_session(
     };
 
     let session_id = session.session_id;
+    let agent_id = session.agent_id.clone();
+    let tunnel_id = session.tunnel_id.clone();
     let (command_tx, command_rx) = mpsc::channel(config.session_command_capacity);
     let snapshot = {
         let mut sessions = sessions.write().await;
@@ -503,7 +612,23 @@ async fn run_accepted_session(
         sorted_session_ids(&sessions)
     };
     session_updates.send_replace(Arc::new(snapshot));
-    info!(%session_id, peer = %peer, event = "multiplexed_session_registered");
+    let tunnel_snapshot = {
+        let mut tunnels = tunnels.write().await;
+        let replaced = tunnels.insert(tunnel_id.clone(), session_id);
+        debug_assert!(
+            replaced.is_none(),
+            "tunnel claim prevents duplicate registration"
+        );
+        sorted_tunnel_bindings(&tunnels)
+    };
+    tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+    info!(
+        %session_id,
+        %agent_id,
+        %tunnel_id,
+        peer = %peer,
+        event = "multiplexed_session_registered"
+    );
 
     if let Err(error) = run_edge_session(socket, session_id, config, command_rx).await {
         warn!(%session_id, error = %error, event = "multiplexed_session_failed");
@@ -514,7 +639,15 @@ async fn run_accepted_session(
         sorted_session_ids(&sessions)
     };
     session_updates.send_replace(Arc::new(snapshot));
-    info!(%session_id, event = "multiplexed_session_removed");
+    let tunnel_snapshot = {
+        let mut tunnels = tunnels.write().await;
+        if tunnels.get(&tunnel_id) == Some(&session_id) {
+            tunnels.remove(&tunnel_id);
+        }
+        sorted_tunnel_bindings(&tunnels)
+    };
+    tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+    info!(%session_id, %agent_id, %tunnel_id, event = "multiplexed_session_removed");
 }
 
 async fn run_edge_session(

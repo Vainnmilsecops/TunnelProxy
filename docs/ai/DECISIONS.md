@@ -358,3 +358,30 @@ unchanged, so INV-004 requires no version bump. mTLS proves certificate
 possession but does not assign durable `AgentId`/`TunnelId` or tunnel
 authorization. Certificate lifecycle remains static and is tracked by
 DEBT-017.
+
+---
+
+## ADR-015 — Protocol v2 binds authenticated certificates to durable tunnel intent
+
+**Status:** Accepted (Session 15).
+
+**Context:** A CA-valid client certificate proves possession but does not say
+which durable Agent or tunnel the peer may claim. Routing by ephemeral
+`TransportSessionId` also forces the raw listener to be recreated after every
+reconnect and cannot express stable tunnel intent.
+
+**Decision:** Protocol version 2 and ALPN `tunnelproxy/2` replace the empty
+REGISTER payload with two bounded length-prefixed identifiers: `AgentId` and
+`TunnelId`. Edge hashes the authenticated leaf certificate with SHA-256 and
+authorizes the exact certificate/Agent/tunnel tuple against an immutable
+control-plane snapshot before sending REGISTERED. One live session may claim a
+TunnelId; duplicate claims fail closed. Edge maintains an in-memory
+`TunnelId -> TransportSessionId` map, and runnable raw ingress remains bound to
+the durable TunnelId while the Agent is offline or reconnecting.
+
+**Consequences:** Protocol v1 peers fail explicitly with `UnsupportedVersion`
+and there is no silent downgrade. Reconnect creates a new transport session but
+does not recreate the raw listener or change tunnel identity. Ingress routing
+uses only cached Edge state, satisfying INV-007. Snapshot distribution,
+persistence, certificate rotation/revocation, public ingress, and multi-edge
+coordination remain future work.

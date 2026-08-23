@@ -5,11 +5,12 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
-use tunnelproxy_protocol::TransportSessionId;
+use tunnelproxy_protocol::{RegistrationRequest, TransportSessionId};
 
 use crate::{
-    connect_with_security, AgentError, AgentSessionCloseReason, AgentTransportSecurity,
-    ConnectOutcome, MultiplexedAgentConfig, MultiplexedAgentConfigError,
+    connect_registered_with_security, development_registration, AgentError,
+    AgentSessionCloseReason, AgentTransportSecurity, ConnectOutcome, MultiplexedAgentConfig,
+    MultiplexedAgentConfigError,
 };
 
 /// Bounded exponential reconnect policy.
@@ -126,6 +127,7 @@ pub struct AgentRuntimeConfig {
     pub handshake_timeout: Duration,
     pub multiplex: MultiplexedAgentConfig,
     pub security: AgentTransportSecurity,
+    pub registration: RegistrationRequest,
     pub reconnect: ReconnectConfig,
     pub shutdown: RuntimeShutdownConfig,
 }
@@ -138,6 +140,7 @@ impl AgentRuntimeConfig {
             handshake_timeout: Duration::from_secs(10),
             multiplex: MultiplexedAgentConfig::new(local_addr),
             security: AgentTransportSecurity::default(),
+            registration: development_registration(),
             reconnect: ReconnectConfig::default(),
             shutdown: RuntimeShutdownConfig::default(),
         }
@@ -291,11 +294,12 @@ impl AgentRuntime {
                 event = "reconnect_attempt_started",
                 "Agent connection attempt started"
             );
-            let connecting = connect_with_security(
+            let connecting = connect_registered_with_security(
                 self.config.edge_addr,
                 self.config.connect_timeout,
                 self.config.handshake_timeout,
                 &self.config.security,
+                &self.config.registration,
             );
             tokio::pin!(connecting);
             let session = tokio::select! {
@@ -416,6 +420,9 @@ fn is_retryable(error: &AgentError) -> bool {
             | AgentError::HandshakeTimeout
             | AgentError::SessionIo(_)
             | AgentError::ConnectionClosed
+            | AgentError::RegistrationRejected {
+                code: Some(tunnelproxy_protocol::HandshakeErrorCode::TunnelAlreadyConnected),
+            }
     )
 }
 
@@ -555,6 +562,12 @@ mod tests {
         assert!(is_retryable(&AgentError::ConnectionClosed));
         assert!(!is_retryable(&AgentError::ProtocolViolation {
             reason: "test"
+        }));
+        assert!(is_retryable(&AgentError::RegistrationRejected {
+            code: Some(tunnelproxy_protocol::HandshakeErrorCode::TunnelAlreadyConnected),
+        }));
+        assert!(!is_retryable(&AgentError::RegistrationRejected {
+            code: Some(tunnelproxy_protocol::HandshakeErrorCode::UnauthorizedAgent),
         }));
     }
 }

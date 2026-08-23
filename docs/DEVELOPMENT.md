@@ -149,11 +149,15 @@ terminals:
 ```bash
 cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
   --agent-listen 127.0.0.1:7100 \
-  --raw-listen 127.0.0.1:7000
+  --raw-listen 127.0.0.1:7000 \
+  --agent-id agent-dev \
+  --tunnel-id tunnel-dev
 
 cargo run -p tunnelproxy-agent --bin tunnelproxy-agent -- \
   --edge 127.0.0.1:7100 \
   --local 127.0.0.1:3000 \
+  --agent-id agent-dev \
+  --tunnel-id tunnel-dev \
   --reconnect-initial-ms 250 \
   --reconnect-max-ms 30000
 ```
@@ -176,23 +180,31 @@ cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
   --raw-listen 127.0.0.1:7000 \
   --tls-cert edge.pem \
   --tls-key edge-key.pem \
-  --tls-client-ca agent-ca.pem
+  --tls-client-ca agent-ca.pem \
+  --authorized-client-cert agent.pem \
+  --agent-id agent-prod \
+  --tunnel-id tunnel-prod
 
 cargo run -p tunnelproxy-agent --bin tunnelproxy-agent -- \
   --edge 192.0.2.10:7100 \
   --local 127.0.0.1:3000 \
+  --agent-id agent-prod \
+  --tunnel-id tunnel-prod \
   --tls-ca edge-ca.pem \
   --tls-client-cert agent.pem \
   --tls-client-key agent-key.pem \
   --tls-server-name edge.example.com
 ```
 
-All TLS arguments for one process are required together. TLS uses ALPN
-`tunnelproxy/1`; its handshake timeout defaults to 10 seconds. Plaintext is
+All TLS arguments for one process are required together. Edge additionally
+requires the exact public client certificate to bind its fingerprint to the
+configured Agent/Tunnel grant. TLS uses ALPN `tunnelproxy/2`; its handshake
+timeout defaults to 10 seconds. Plaintext is
 rejected for non-loopback Agent transport addresses.
 
-This entrypoint intentionally supports one Agent and one loopback route. Agent
-disconnects are recovered by rebinding that address to a replacement ephemeral
-session, and interrupted streams are not replayed. Mutual TLS authenticates a
-CA-issued Agent certificate, but durable Agent/tunnel authorization, public
-ingress, and certificate lifecycle automation are still absent.
+This entrypoint intentionally supports one Agent and one loopback route. The raw
+listener targets durable TunnelId, stays bound across Agent reconnect, and
+fails closed while no authorized session is live. Reconnect receives a fresh
+TransportSessionId and interrupted streams are not replayed. Snapshot
+persistence/distribution, public ingress, and certificate lifecycle automation
+are still absent.

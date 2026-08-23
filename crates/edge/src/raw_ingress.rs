@@ -11,7 +11,7 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome};
+use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, TunnelId};
 use tunnelproxy_protocol::TransportSessionId;
 
 use crate::multiplex::{EdgeSessionRouter, RouteError};
@@ -53,11 +53,29 @@ impl RawIngressManagerConfig {
     }
 }
 
-/// Configuration for one ephemeral loopback ingress route.
-#[derive(Debug, Clone, Copy)]
+/// Target resolved for each accepted raw ingress connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawIngressRouteTarget {
+    /// Compatibility route pinned to one ephemeral transport session.
+    TransportSession(TransportSessionId),
+    /// Durable route resolved from Edge's cached live-tunnel snapshot.
+    Tunnel(TunnelId),
+}
+
+impl std::fmt::Display for RawIngressRouteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransportSession(session_id) => write!(f, "{session_id}"),
+            Self::Tunnel(tunnel_id) => write!(f, "tunnel:{tunnel_id}"),
+        }
+    }
+}
+
+/// Configuration for one loopback ingress route.
+#[derive(Debug, Clone)]
 pub struct RawIngressRouteConfig {
     pub listen_addr: SocketAddr,
-    pub target_session_id: TransportSessionId,
+    pub target: RawIngressRouteTarget,
     pub max_concurrent_connections: usize,
     pub drain_timeout: Duration,
 }
@@ -66,17 +84,29 @@ impl RawIngressRouteConfig {
     pub fn new(listen_addr: SocketAddr, target_session_id: TransportSessionId) -> Self {
         Self {
             listen_addr,
-            target_session_id,
+            target: RawIngressRouteTarget::TransportSession(target_session_id),
             max_concurrent_connections: 32,
             drain_timeout: Duration::from_secs(10),
         }
     }
 
-    pub fn validate(self) -> Result<(), RawIngressConfigError> {
+    pub fn for_tunnel(listen_addr: SocketAddr, tunnel_id: TunnelId) -> Self {
+        Self {
+            listen_addr,
+            target: RawIngressRouteTarget::Tunnel(tunnel_id),
+            max_concurrent_connections: 32,
+            drain_timeout: Duration::from_secs(10),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RawIngressConfigError> {
         if !self.listen_addr.ip().is_loopback() {
             return Err(RawIngressConfigError::NonLoopbackListener(self.listen_addr));
         }
-        if self.target_session_id.is_invalid() {
+        if matches!(
+            self.target,
+            RawIngressRouteTarget::TransportSession(session_id) if session_id.is_invalid()
+        ) {
             return Err(RawIngressConfigError::InvalidTargetSession);
         }
         if self.max_concurrent_connections == 0 {
@@ -134,21 +164,21 @@ pub enum RawIngressRouteState {
 }
 
 /// Immutable route identity and its current counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawIngressRouteStatus {
     pub route_id: RawIngressRouteId,
     pub local_addr: SocketAddr,
-    pub target_session_id: TransportSessionId,
+    pub target: RawIngressRouteTarget,
     pub state: RawIngressRouteState,
     pub active_connections: usize,
 }
 
 /// Handle returned when a route listener is successfully bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawIngressRoute {
     pub route_id: RawIngressRouteId,
     pub local_addr: SocketAddr,
-    pub target_session_id: TransportSessionId,
+    pub target: RawIngressRouteTarget,
 }
 
 /// Raw route lifecycle operation failure.
@@ -243,10 +273,10 @@ impl RawIngressRouteManager {
         if self.state.lock().await.shutting_down {
             return Err(RawIngressRouteError::ManagerShuttingDown);
         }
-        if !self.router.is_connected(config.target_session_id).await {
-            return Err(RawIngressRouteError::TargetSessionNotConnected(
-                config.target_session_id,
-            ));
+        if let RawIngressRouteTarget::TransportSession(session_id) = &config.target {
+            if !self.router.is_connected(*session_id).await {
+                return Err(RawIngressRouteError::TargetSessionNotConnected(*session_id));
+            }
         }
         let listener = TcpListener::bind(config.listen_addr)
             .await
@@ -256,7 +286,7 @@ impl RawIngressRouteManager {
         let initial_status = RawIngressRouteStatus {
             route_id,
             local_addr,
-            target_session_id: config.target_session_id,
+            target: config.target.clone(),
             state: RawIngressRouteState::Active,
             active_connections: 0,
         };
@@ -282,6 +312,7 @@ impl RawIngressRouteManager {
             );
         }
 
+        let target = config.target.clone();
         let route_task = tokio::spawn(run_route(
             route_id,
             listener,
@@ -294,11 +325,11 @@ impl RawIngressRouteManager {
         if let Some(route) = self.state.lock().await.routes.get_mut(&route_id) {
             route.task = Some(route_task);
         }
-        info!(%route_id, %local_addr, target = %config.target_session_id, event = "raw_route_added");
+        info!(%route_id, %local_addr, target = %target, event = "raw_route_added");
         Ok(RawIngressRoute {
             route_id,
             local_addr,
-            target_session_id: config.target_session_id,
+            target,
         })
     }
 
@@ -311,7 +342,7 @@ impl RawIngressRouteManager {
             .await
             .routes
             .get(&route_id)
-            .map(|route| *route.status.borrow())
+            .map(|route| route.status.borrow().clone())
             .ok_or(RawIngressRouteError::RouteNotFound(route_id))
     }
 
@@ -320,7 +351,7 @@ impl RawIngressRouteManager {
         let mut routes: Vec<_> = state
             .routes
             .values()
-            .map(|route| *route.status.borrow())
+            .map(|route| route.status.borrow().clone())
             .collect();
         routes.sort_unstable_by_key(|route| route.route_id);
         routes
@@ -484,7 +515,11 @@ async fn run_route(
     let permits = Arc::new(Semaphore::new(config.max_concurrent_connections));
     let mut connections = JoinSet::new();
     let mut session_ids = router.subscribe_session_ids();
-    if !session_ids.borrow().contains(&config.target_session_id) {
+    let target_session_id = match &config.target {
+        RawIngressRouteTarget::TransportSession(session_id) => Some(*session_id),
+        RawIngressRouteTarget::Tunnel(_) => None,
+    };
+    if target_session_id.is_some_and(|session_id| !session_ids.borrow().contains(&session_id)) {
         status.send_modify(|route| route.state = RawIngressRouteState::TargetDisconnected);
     }
     loop {
@@ -499,9 +534,9 @@ async fn run_route(
                     break;
                 }
             }
-            changed = session_ids.changed() => {
+            changed = session_ids.changed(), if target_session_id.is_some() => {
                 let connected = changed.is_ok()
-                    && session_ids.borrow().contains(&config.target_session_id);
+                    && target_session_id.is_some_and(|session_id| session_ids.borrow().contains(&session_id));
                 if !connected {
                     status.send_modify(|route| route.state = RawIngressRouteState::TargetDisconnected);
                     break;
@@ -527,7 +562,7 @@ async fn run_route(
                 spawn_routed_connection(
                     &mut connections,
                     route_id,
-                    config.target_session_id,
+                    config.target.clone(),
                     ingress,
                     router.clone(),
                     permit,
@@ -550,20 +585,28 @@ async fn run_route(
 fn spawn_routed_connection(
     connections: &mut JoinSet<()>,
     route_id: RawIngressRouteId,
-    session_id: TransportSessionId,
+    target: RawIngressRouteTarget,
     ingress: tokio::net::TcpStream,
     router: EdgeSessionRouter,
     permit: OwnedSemaphorePermit,
     status: watch::Sender<RawIngressRouteStatus>,
 ) {
     connections.spawn(async move {
-        match router.open_stream_tracked(session_id, ingress).await {
+        let opened = match &target {
+            RawIngressRouteTarget::TransportSession(session_id) => {
+                router.open_stream_tracked(*session_id, ingress).await
+            }
+            RawIngressRouteTarget::Tunnel(tunnel_id) => {
+                router.open_tunnel_stream_tracked(tunnel_id, ingress).await
+            }
+        };
+        match opened {
             Ok(stream) => {
                 let reason = stream.wait_closed().await;
-                info!(%route_id, %session_id, ?reason, event = "raw_route_stream_closed");
+                info!(%route_id, %target, ?reason, event = "raw_route_stream_closed");
             }
             Err(error) => {
-                log_route_open_failure(route_id, session_id, error);
+                log_route_open_failure(route_id, &target, error);
             }
         }
         status.send_modify(|route| {
@@ -575,10 +618,10 @@ fn spawn_routed_connection(
 
 fn log_route_open_failure(
     route_id: RawIngressRouteId,
-    session_id: TransportSessionId,
+    target: &RawIngressRouteTarget,
     error: RouteError,
 ) {
-    warn!(%route_id, %session_id, %error, event = "raw_route_stream_open_failed");
+    warn!(%route_id, %target, %error, event = "raw_route_stream_open_failed");
 }
 
 #[cfg(test)]
@@ -628,7 +671,7 @@ mod tests {
             Err(RawIngressConfigError::ZeroDrainTimeout)
         ));
         config.drain_timeout = Duration::from_secs(1);
-        config.target_session_id = TransportSessionId::INVALID;
+        config.target = RawIngressRouteTarget::TransportSession(TransportSessionId::INVALID);
         assert!(matches!(
             config.validate(),
             Err(RawIngressConfigError::InvalidTargetSession)

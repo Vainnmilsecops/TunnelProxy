@@ -1,7 +1,7 @@
 //! Agent-side transport: outbound connection, protocol handshake, and session management.
 //!
 //! This module implements the Agent runtime for connecting to Edge,
-//! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
+//! performing the Tunnel Protocol v2 handshake (HELLO → REGISTER → REGISTERED),
 //! and maintaining the established session by answering Edge-initiated
 //! heartbeat PING frames with matching PONG frames. Session 08 also bridges one
 //! active framed stream to a configured local TCP service.
@@ -15,11 +15,13 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
+use tunnelproxy_common::{AgentId, TunnelId};
 
 use tunnelproxy_protocol::{
-    Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatErrorCode, HeartbeatSequence,
-    ProtocolError, StreamId, StreamResetCode, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE,
-    REGISTERED_PAYLOAD_SIZE, ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
+    Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, HeartbeatErrorCode,
+    HeartbeatSequence, ProtocolError, RegistrationRequest, StreamId, StreamResetCode,
+    TransportSessionId, ERROR_PAYLOAD_SIZE, HEARTBEAT_PAYLOAD_SIZE, REGISTERED_PAYLOAD_SIZE,
+    ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
 };
 
 use crate::tls::{AgentTransportSecurity, BoxedTransport};
@@ -58,7 +60,7 @@ pub enum AgentError {
     ConnectTimeout,
     /// Handshake timed out before completion.
     HandshakeTimeout,
-    /// TLS negotiation timed out before Protocol v1 began.
+    /// TLS negotiation timed out before Protocol v2 began.
     TlsHandshakeTimeout,
     /// Transient network I/O failed while negotiating TLS.
     TlsTransport(std::io::Error),
@@ -72,6 +74,8 @@ pub enum AgentError {
     UnexpectedFrame { frame_type: FrameType },
     /// The REGISTERED payload was invalid.
     InvalidRegisteredPayload { reason: &'static str },
+    /// Edge rejected the durable Agent/Tunnel registration intent.
+    RegistrationRejected { code: Option<HandshakeErrorCode> },
     /// I/O error during the established session.
     SessionIo(std::io::Error),
     /// The connection was closed by the peer.
@@ -106,6 +110,12 @@ impl std::fmt::Display for AgentError {
             }
             Self::InvalidRegisteredPayload { reason } => {
                 write!(f, "invalid REGISTERED payload: {reason}")
+            }
+            Self::RegistrationRejected { code: Some(code) } => {
+                write!(f, "registration rejected by Edge: {code:?}")
+            }
+            Self::RegistrationRejected { code: None } => {
+                f.write_str("registration rejected by Edge with an unknown error")
             }
             Self::SessionIo(e) => write!(f, "session I/O error: {e}"),
             Self::ConnectionClosed => write!(f, "connection closed by peer"),
@@ -144,6 +154,10 @@ impl std::error::Error for AgentError {
 pub struct AgentSession {
     /// Session identifier assigned by Edge (from the REGISTERED frame).
     pub session_id: TransportSessionId,
+    /// Durable Agent identity registered on this transport.
+    pub agent_id: AgentId,
+    /// Durable tunnel identity registered on this transport.
+    pub tunnel_id: TunnelId,
     /// Address of the connected Edge.
     pub edge_addr: SocketAddr,
     /// When the session was established.
@@ -155,6 +169,8 @@ impl std::fmt::Debug for AgentSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentSession")
             .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id)
+            .field("tunnel_id", &self.tunnel_id)
             .field("edge_addr", &self.edge_addr)
             .field("established_at", &self.established_at)
             .field("transport", &"redacted byte stream")
@@ -554,7 +570,7 @@ pub enum ConnectOutcome {
     Failed { reason: AgentError },
 }
 
-/// Connects to `edge_addr`, performs the v1 handshake, and returns an
+/// Connects to `edge_addr`, performs the v2 handshake, and returns an
 /// established session.
 ///
 /// This is the primary public entry point. The session remains open
@@ -571,22 +587,49 @@ pub async fn connect(
     connect_timeout: Duration,
     handshake_timeout: Duration,
 ) -> ConnectOutcome {
-    connect_with_security(
+    connect_registered_with_security(
         edge_addr,
         connect_timeout,
         handshake_timeout,
         &AgentTransportSecurity::PlaintextLoopback,
+        &development_registration(),
     )
     .await
 }
 
-/// Connects using the configured plaintext-loopback or mutual-TLS transport,
-/// then performs the unchanged Protocol v1 handshake.
+/// Default durable identity used only by compatibility and loopback helpers.
+pub fn development_registration() -> RegistrationRequest {
+    RegistrationRequest::new(
+        AgentId::new("agent-dev").expect("hardcoded AgentId is valid"),
+        TunnelId::new("tunnel-dev").expect("hardcoded TunnelId is valid"),
+    )
+}
+
+/// Connects with the default loopback development registration.
 pub async fn connect_with_security(
     edge_addr: SocketAddr,
     connect_timeout: Duration,
     handshake_timeout: Duration,
     security: &AgentTransportSecurity,
+) -> ConnectOutcome {
+    connect_registered_with_security(
+        edge_addr,
+        connect_timeout,
+        handshake_timeout,
+        security,
+        &development_registration(),
+    )
+    .await
+}
+
+/// Connects using plaintext-loopback or mutual TLS, then performs the
+/// Protocol v2 durable registration handshake.
+pub async fn connect_registered_with_security(
+    edge_addr: SocketAddr,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    security: &AgentTransportSecurity,
+    registration: &RegistrationRequest,
 ) -> ConnectOutcome {
     if matches!(security, AgentTransportSecurity::PlaintextLoopback)
         && !edge_addr.ip().is_loopback()
@@ -649,10 +692,17 @@ pub async fn connect_with_security(
         }
     };
 
-    match timeout(handshake_timeout, perform_handshake(&mut socket, edge_addr)).await {
+    match timeout(
+        handshake_timeout,
+        perform_handshake(&mut socket, edge_addr, registration),
+    )
+    .await
+    {
         Ok(Ok(session_id)) => {
             let session = AgentSession {
                 session_id,
+                agent_id: registration.agent_id.clone(),
+                tunnel_id: registration.tunnel_id.clone(),
                 edge_addr,
                 established_at: Instant::now(),
                 socket,
@@ -679,10 +729,11 @@ pub async fn connect_with_security(
     }
 }
 
-/// Performs the v1 handshake: HELLO → REGISTER → REGISTERED.
+/// Performs the Protocol v2 handshake: HELLO → REGISTER → REGISTERED.
 async fn perform_handshake(
     socket: &mut BoxedTransport,
     edge_addr: SocketAddr,
+    registration: &RegistrationRequest,
 ) -> Result<TransportSessionId, AgentError> {
     info!(edge = %edge_addr, event = "agent_handshake_started", "starting handshake");
 
@@ -695,8 +746,8 @@ async fn perform_handshake(
     info!(edge = %edge_addr, event = "agent_hello_sent", "HELLO sent");
 
     // --- Send REGISTER ---
-    let register_frame =
-        Frame::control(FrameType::Register, vec![]).expect("empty payload is always valid");
+    let register_frame = Frame::control(FrameType::Register, registration.encode())
+        .expect("validated durable IDs fit the bounded REGISTER payload");
     FrameEncoder::encode(socket, &register_frame)
         .await
         .map_err(|e| AgentError::SessionIo(std::io::Error::other(e.to_string())))?;
@@ -709,6 +760,18 @@ async fn perform_handshake(
         Ok(None) => return Err(AgentError::ConnectionClosed),
         Err(e) => return Err(AgentError::ProtocolDecode(e)),
     };
+
+    if registered_frame.frame_type == FrameType::Error {
+        let code = if registered_frame.payload.len() as u32 == ERROR_PAYLOAD_SIZE {
+            HandshakeErrorCode::from_be_bytes([
+                registered_frame.payload[0],
+                registered_frame.payload[1],
+            ])
+        } else {
+            None
+        };
+        return Err(AgentError::RegistrationRejected { code });
+    }
 
     if registered_frame.frame_type != FrameType::Registered {
         return Err(AgentError::UnexpectedFrame {

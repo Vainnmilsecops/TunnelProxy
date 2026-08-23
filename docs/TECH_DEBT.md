@@ -186,21 +186,22 @@
   insufficient.
 - **Tracking:** open.
 
-### DEBT-015 — Raw ingress routes are ephemeral transport bindings
+### DEBT-015 — Durable route snapshots are not persisted or distributed
 
 - **Introduced in:** Session 10
 - **Category:** product
 - **Impact:** high for public use, low for the loopback vertical slice
-- **Rationale:** `RawIngressRouteManager` targets a live process-local
-  `TransportSessionId`. Routes disappear on Agent disconnect or Edge restart
-  and cannot represent durable user intent. This is deliberate: Session 10
-  proves listener/drain lifecycle without conflating transport identity with a
-  future `TunnelId`/`AgentId` model.
-- **Exit plan:** Add authenticated durable tunnel identity in the control plane,
-  push a bounded route snapshot into Edge, then resolve that snapshot to live
-  sessions without querying storage on the ingress hot path.
-- **Tracking:** open; public ingress must not use ephemeral route IDs as durable
-  identity.
+- **Rationale:** Session 15 resolves the data-plane half of this debt: runnable
+  raw ingress targets durable `TunnelId`, stays bound across Agent reconnect,
+  and resolves a cached live `TransportSessionId` without storage lookup.
+  However, the authorization/route snapshot is still constructed from process
+  startup configuration. It is not persisted, versioned, distributed, or
+  atomically updated from a control-plane service after Edge restart.
+- **Exit plan:** Add an authoritative versioned snapshot source, atomic Edge
+  updates, and enable/disable/removal lifecycle. Persist durable tunnel intent
+  outside Edge while keeping all per-connection routing in memory.
+- **Tracking:** narrowed by Session 15; persistence and live snapshot
+  distribution remain open before public ingress.
 
 ### DEBT-017 — TLS certificates are static process-start configuration
 

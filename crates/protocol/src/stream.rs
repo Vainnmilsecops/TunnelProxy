@@ -1,4 +1,4 @@
-//! Stream-lifecycle payload types for Tunnel Protocol v1.
+//! Stream-lifecycle payload types retained by Tunnel Protocol v2.
 
 use std::fmt;
 

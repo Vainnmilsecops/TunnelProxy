@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
+use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
 use tunnelproxy_edge::{
-    EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig,
-    EdgeTlsConfigError, EdgeTransportSecurity, RuntimeShutdownConfig,
+    EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
+    EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
+    RuntimeShutdownConfig,
 };
 
 const USAGE: &str = "\
@@ -19,12 +20,15 @@ Usage: tunnelproxy-edge [OPTIONS]
 Options:
   --agent-listen <addr>            Agent listener (default 127.0.0.1:7100)
   --raw-listen <addr>              raw ingress   (default 127.0.0.1:7000)
+  --agent-id <id>                  authorized Agent ID (default agent-dev)
+  --tunnel-id <id>                 authorized Tunnel ID (default tunnel-dev)
   --max-streams <usize>            stream limit  (default 32)
   --max-raw-connections <usize>    ingress limit (default 32)
   --drain-timeout-ms <ms>          stage drain   (default 10000)
   --tls-cert <path>                Edge certificate PEM
   --tls-key <path>                 Edge private key PEM
   --tls-client-ca <path>           trusted Agent CA PEM
+  --authorized-client-cert <path>  exact authorized Agent certificate PEM
   --tls-handshake-timeout-ms <ms>  TLS timeout   (default 10000)
   --help                           print this help and exit
 ";
@@ -55,15 +59,18 @@ async fn main() -> ExitCode {
     config.multiplex.agent_listener.listen_addr = parsed.agent_listen;
     config.multiplex.max_streams_per_session = parsed.max_streams;
     config.raw_listen_addr = parsed.raw_listen;
+    config.tunnel_id = parsed.tunnel_id.clone();
     config.max_raw_connections = parsed.max_raw_connections;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-    config.multiplex.security = match load_transport_security(&parsed).await {
-        Ok(security) => security,
+    let (security, registration) = match load_transport_configuration(&parsed).await {
+        Ok(configuration) => configuration,
         Err(error) => {
-            error!(%error, "failed to configure Edge TLS");
+            error!(%error, "failed to configure Edge transport authorization");
             return ExitCode::from(2);
         }
     };
+    config.multiplex.security = security;
+    config.multiplex.registration = registration;
     let runtime = match EdgeRuntime::bind(config).await {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -78,6 +85,8 @@ async fn main() -> ExitCode {
     info!(
         agent_addr = %runtime.agent_addr(),
         raw_addr = %parsed.raw_listen,
+        agent_id = %parsed.agent_id,
+        tunnel_id = %parsed.tunnel_id,
         "Edge runtime is waiting for one Agent"
     );
 
@@ -128,12 +137,15 @@ fn edge_exit_code(
 struct ParsedArgs {
     agent_listen: SocketAddr,
     raw_listen: SocketAddr,
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
     max_streams: usize,
     max_raw_connections: usize,
     drain_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
+    authorized_client_cert: Option<PathBuf>,
     tls_handshake_timeout: Duration,
     help: bool,
 }
@@ -143,12 +155,15 @@ impl Default for ParsedArgs {
         Self {
             agent_listen: "127.0.0.1:7100".parse().unwrap(),
             raw_listen: "127.0.0.1:7000".parse().unwrap(),
+            agent_id: AgentId::new("agent-dev").unwrap(),
+            tunnel_id: TunnelId::new("tunnel-dev").unwrap(),
             max_streams: 32,
             max_raw_connections: 32,
             drain_timeout: Duration::from_secs(10),
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            authorized_client_cert: None,
             tls_handshake_timeout: Duration::from_secs(10),
             help: false,
         }
@@ -160,6 +175,7 @@ enum ArgError {
     MissingValue(String),
     InvalidAddress { flag: String, value: String },
     InvalidNumber { flag: String, value: String },
+    InvalidIdentifier { flag: String, value: String },
     UnknownFlag(String),
 }
 
@@ -172,6 +188,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::InvalidNumber { flag, value } => {
                 write!(f, "{flag}={value} is not a valid integer")
+            }
+            Self::InvalidIdentifier { flag, value } => {
+                write!(f, "{flag}={value} is not a valid durable identifier")
             }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
@@ -194,6 +213,14 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--raw-listen" => {
                 parsed.raw_listen = parse_addr(args, index, flag)?;
+                index += 2;
+            }
+            "--agent-id" => {
+                parsed.agent_id = parse_agent_id(args, index, flag)?;
+                index += 2;
+            }
+            "--tunnel-id" => {
+                parsed.tunnel_id = parse_tunnel_id(args, index, flag)?;
                 index += 2;
             }
             "--max-streams" => {
@@ -220,6 +247,10 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.tls_client_ca = Some(PathBuf::from(value(args, index, flag)?));
                 index += 2;
             }
+            "--authorized-client-cert" => {
+                parsed.authorized_client_cert = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
             "--tls-handshake-timeout-ms" => {
                 parsed.tls_handshake_timeout =
                     Duration::from_millis(parse_number(args, index, flag)?);
@@ -236,26 +267,41 @@ enum TlsLoadError {
     IncompleteArguments,
     Read(&'static str),
     Invalid(EdgeTlsConfigError),
+    InvalidRegistration(EdgeRegistrationPolicyError),
 }
 
 impl std::fmt::Display for TlsLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IncompleteArguments => {
-                f.write_str("TLS requires --tls-cert, --tls-key, and --tls-client-ca")
-            }
+            Self::IncompleteArguments => f.write_str(
+                "TLS requires --tls-cert, --tls-key, --tls-client-ca, and --authorized-client-cert",
+            ),
             Self::Read(kind) => write!(f, "failed to read TLS {kind} PEM file"),
             Self::Invalid(error) => write!(f, "invalid TLS configuration: {error}"),
+            Self::InvalidRegistration(error) => {
+                write!(f, "invalid registration authorization: {error}")
+            }
         }
     }
 }
 
-async fn load_transport_security(
+async fn load_transport_configuration(
     parsed: &ParsedArgs,
-) -> Result<EdgeTransportSecurity, TlsLoadError> {
-    match (&parsed.tls_cert, &parsed.tls_key, &parsed.tls_client_ca) {
-        (None, None, None) => Ok(EdgeTransportSecurity::PlaintextLoopback),
-        (Some(cert), Some(key), Some(client_ca)) => {
+) -> Result<(EdgeTransportSecurity, EdgeRegistrationPolicy), TlsLoadError> {
+    match (
+        &parsed.tls_cert,
+        &parsed.tls_key,
+        &parsed.tls_client_ca,
+        &parsed.authorized_client_cert,
+    ) {
+        (None, None, None, None) => Ok((
+            EdgeTransportSecurity::PlaintextLoopback,
+            EdgeRegistrationPolicy::loopback_development(
+                parsed.agent_id.clone(),
+                parsed.tunnel_id.clone(),
+            ),
+        )),
+        (Some(cert), Some(key), Some(client_ca), Some(authorized_client_cert)) => {
             let cert = tokio::fs::read(cert)
                 .await
                 .map_err(|_| TlsLoadError::Read("server certificate"))?;
@@ -265,9 +311,20 @@ async fn load_transport_security(
             let client_ca = tokio::fs::read(client_ca)
                 .await
                 .map_err(|_| TlsLoadError::Read("client CA"))?;
-            EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
-                .map(EdgeTransportSecurity::MutualTls)
-                .map_err(TlsLoadError::Invalid)
+            let authorized_client_cert = tokio::fs::read(authorized_client_cert)
+                .await
+                .map_err(|_| TlsLoadError::Read("authorized client certificate"))?;
+            let security =
+                EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
+                    .map(EdgeTransportSecurity::MutualTls)
+                    .map_err(TlsLoadError::Invalid)?;
+            let registration = EdgeRegistrationPolicy::mutual_tls_from_client_cert_pem(
+                parsed.agent_id.clone(),
+                parsed.tunnel_id.clone(),
+                &authorized_client_cert,
+            )
+            .map_err(TlsLoadError::InvalidRegistration)?;
+            Ok((security, registration))
         }
         _ => Err(TlsLoadError::IncompleteArguments),
     }
@@ -298,6 +355,22 @@ where
     })
 }
 
+fn parse_agent_id(args: &[String], index: usize, flag: &str) -> Result<AgentId, ArgError> {
+    let raw = value(args, index, flag)?;
+    AgentId::new(raw).map_err(|_| ArgError::InvalidIdentifier {
+        flag: flag.to_string(),
+        value: raw.to_string(),
+    })
+}
+
+fn parse_tunnel_id(args: &[String], index: usize, flag: &str) -> Result<TunnelId, ArgError> {
+    let raw = value(args, index, flag)?;
+    TunnelId::new(raw).map_err(|_| ArgError::InvalidIdentifier {
+        flag: flag.to_string(),
+        value: raw.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +391,10 @@ mod tests {
             "127.0.0.1:17100",
             "--raw-listen",
             "127.0.0.1:17000",
+            "--agent-id",
+            "agent-prod",
+            "--tunnel-id",
+            "tunnel-prod",
             "--max-streams",
             "8",
             "--max-raw-connections",
@@ -330,18 +407,26 @@ mod tests {
             "edge-key.pem",
             "--tls-client-ca",
             "ca.pem",
+            "--authorized-client-cert",
+            "agent.pem",
             "--tls-handshake-timeout-ms",
             "350",
         ]))
         .unwrap();
         assert_eq!(parsed.agent_listen.port(), 17100);
         assert_eq!(parsed.raw_listen.port(), 17000);
+        assert_eq!(parsed.agent_id.as_str(), "agent-prod");
+        assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
         assert_eq!(parsed.max_streams, 8);
         assert_eq!(parsed.max_raw_connections, 9);
         assert_eq!(parsed.drain_timeout, Duration::from_millis(250));
         assert_eq!(parsed.tls_cert, Some(PathBuf::from("edge.pem")));
         assert_eq!(parsed.tls_key, Some(PathBuf::from("edge-key.pem")));
         assert_eq!(parsed.tls_client_ca, Some(PathBuf::from("ca.pem")));
+        assert_eq!(
+            parsed.authorized_client_cert,
+            Some(PathBuf::from("agent.pem"))
+        );
         assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(350));
     }
 
@@ -359,6 +444,10 @@ mod tests {
             parse_args(&args(&["--unknown"])),
             Err(ArgError::UnknownFlag(_))
         ));
+        assert!(matches!(
+            parse_args(&args(&["--tunnel-id", "bad/id"])),
+            Err(ArgError::InvalidIdentifier { .. })
+        ));
     }
 
     #[tokio::test]
@@ -368,7 +457,7 @@ mod tests {
             ..ParsedArgs::default()
         };
         assert!(matches!(
-            load_transport_security(&parsed).await,
+            load_transport_configuration(&parsed).await,
             Err(TlsLoadError::IncompleteArguments)
         ));
     }

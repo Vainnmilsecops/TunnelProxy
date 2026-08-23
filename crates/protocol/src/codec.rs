@@ -1,4 +1,4 @@
-//! Async frame encoder and decoder for Tunnel Protocol v1.
+//! Async frame encoder and decoder for Tunnel Protocol v2.
 //!
 //! Both the encoder and decoder operate on Tokio `AsyncRead` / `AsyncWrite`
 //! streams and handle partial reads and writes correctly.
@@ -468,6 +468,20 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let err = decoder.decode(&mut Box::pin(r)).await.unwrap_err();
         assert!(matches!(err, ProtocolError::UnsupportedVersion(99)));
+    }
+
+    #[tokio::test]
+    async fn protocol_v1_client_is_rejected_explicitly() {
+        let (r, mut w) = duplex(4096);
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&MAGIC);
+        header[4] = 1;
+        header[5] = FrameType::Hello.as_u8();
+        w.write_all(&header).await.unwrap();
+        drop(w);
+        let mut decoder = FrameDecoder::new();
+        let err = decoder.decode(&mut Box::pin(r)).await.unwrap_err();
+        assert!(matches!(err, ProtocolError::UnsupportedVersion(1)));
     }
 
     // TEST 11 — Unknown frame type.

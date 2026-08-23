@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use tunnelproxy_common::{
     shutdown_channel, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
-    ShutdownTrigger,
+    ShutdownTrigger, TunnelId,
 };
 
 use crate::{
@@ -19,6 +19,7 @@ use crate::{
 pub struct EdgeRuntimeConfig {
     pub multiplex: MultiplexedEdgeConfig,
     pub raw_listen_addr: SocketAddr,
+    pub tunnel_id: TunnelId,
     pub max_raw_connections: usize,
     pub shutdown: RuntimeShutdownConfig,
 }
@@ -32,6 +33,7 @@ impl EdgeRuntimeConfig {
             raw_listen_addr: "127.0.0.1:7000"
                 .parse()
                 .expect("hardcoded raw listener is valid"),
+            tunnel_id: TunnelId::new("tunnel-dev").expect("hardcoded TunnelId is valid"),
             max_raw_connections: 32,
             shutdown: RuntimeShutdownConfig::default(),
         }
@@ -52,6 +54,11 @@ impl EdgeRuntimeConfig {
         if self.max_raw_connections == 0 {
             return Err(EdgeRuntimeConfigError::ZeroRawConnections);
         }
+        if !self.multiplex.registration.contains_tunnel(&self.tunnel_id) {
+            return Err(EdgeRuntimeConfigError::RawTunnelNotAuthorized(
+                self.tunnel_id.clone(),
+            ));
+        }
         self.shutdown
             .validate()
             .map_err(|_| EdgeRuntimeConfigError::ZeroDrainTimeout)
@@ -65,6 +72,7 @@ pub enum EdgeRuntimeConfigError {
     AgentCapacityMustBeOne,
     NonLoopbackRawListener(SocketAddr),
     ZeroRawConnections,
+    RawTunnelNotAuthorized(TunnelId),
     ZeroDrainTimeout,
 }
 
@@ -81,6 +89,10 @@ impl std::fmt::Display for EdgeRuntimeConfigError {
             Self::ZeroRawConnections => {
                 f.write_str("max_raw_connections must be greater than zero")
             }
+            Self::RawTunnelNotAuthorized(tunnel_id) => write!(
+                f,
+                "raw TunnelId {tunnel_id} is absent from the registration policy"
+            ),
             Self::ZeroDrainTimeout => f.write_str("drain_timeout must be greater than zero"),
         }
     }
@@ -189,8 +201,8 @@ impl EdgeRuntime {
         self.agent_addr
     }
 
-    /// Keeps the Agent listener alive across disconnects and rebinds the raw
-    /// route to each replacement session until process shutdown.
+    /// Keeps one durable raw route bound while its authenticated Agent session
+    /// disconnects and reconnects with fresh ephemeral session IDs.
     pub async fn run_until_shutdown(
         self,
         signal: ShutdownSignal,
@@ -199,103 +211,36 @@ impl EdgeRuntime {
         let manager =
             RawIngressRouteManager::new(router.clone(), RawIngressManagerConfig { max_routes: 1 })
                 .map_err(EdgeRuntimeError::RouteStartup)?;
-        let (transport_trigger, transport_signal) = shutdown_channel();
         let shutdown = self.config.shutdown;
+        let mut route_config = RawIngressRouteConfig::for_tunnel(
+            self.config.raw_listen_addr,
+            self.config.tunnel_id.clone(),
+        );
+        route_config.max_concurrent_connections = self.config.max_raw_connections;
+        route_config.drain_timeout = shutdown.drain_timeout;
+        let route = manager
+            .add_route(route_config)
+            .await
+            .map_err(EdgeRuntimeError::RouteStartup)?;
+        let (transport_trigger, transport_signal) = shutdown_channel();
         let mut transport_task = tokio::spawn(
             self.transport
                 .run_until_shutdown(transport_signal, shutdown),
         );
-        let mut sessions = router.subscribe_session_ids();
-
-        let mut active = None;
-        let mut progress = RuntimeProgress::default();
+        let mut tunnels = router.subscribe_tunnels();
+        let mut current_session = None;
+        let mut progress = RuntimeProgress {
+            raw_addr: Some(route.local_addr),
+            agent_sessions_seen: 0,
+            route_generations: 1,
+        };
+        info!(
+            tunnel_id = %self.config.tunnel_id,
+            raw_addr = %route.local_addr,
+            event = "durable_raw_route_bound",
+            "raw route bound before Agent availability"
+        );
         loop {
-            if active.is_none() {
-                let available = { sessions.borrow().first().copied() };
-                if let Some(session_id) = available {
-                    let mut route_config =
-                        RawIngressRouteConfig::new(self.config.raw_listen_addr, session_id);
-                    route_config.max_concurrent_connections = self.config.max_raw_connections;
-                    route_config.drain_timeout = shutdown.drain_timeout;
-                    match manager.add_route(route_config).await {
-                        Ok(route) => {
-                            progress.agent_sessions_seen =
-                                progress.agent_sessions_seen.saturating_add(1);
-                            progress.route_generations =
-                                progress.route_generations.saturating_add(1);
-                            progress.raw_addr = Some(route.local_addr);
-                            info!(
-                                %session_id,
-                                raw_addr = %route.local_addr,
-                                generation = progress.route_generations,
-                                event = "raw_route_rebound",
-                                "raw route bound to live Agent session"
-                            );
-                            active = Some((session_id, route));
-                            continue;
-                        }
-                        Err(RawIngressRouteError::TargetSessionNotConnected(_)) => {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        Err(route_error) => {
-                            let startup = progress.route_generations == 0;
-                            let cleanup = shutdown_components(
-                                manager,
-                                transport_trigger,
-                                transport_task,
-                                shutdown,
-                                self.agent_addr,
-                                progress,
-                            )
-                            .await;
-                            return match (startup, cleanup) {
-                                (true, Ok(_)) => Err(EdgeRuntimeError::RouteStartup(route_error)),
-                                (true, Err(cleanup)) => Err(EdgeRuntimeError::StartupRollback {
-                                    startup: route_error,
-                                    cleanup: Box::new(cleanup),
-                                }),
-                                (false, Ok(_)) => Err(EdgeRuntimeError::RouteRecovery(route_error)),
-                                (false, Err(cleanup)) => Err(cleanup),
-                            };
-                        }
-                    }
-                }
-
-                tokio::select! {
-                    biased;
-                    () = signal.cancelled() => {
-                        return shutdown_components(
-                            manager,
-                            transport_trigger,
-                            transport_task,
-                            shutdown,
-                            self.agent_addr,
-                            progress,
-                        ).await;
-                    }
-                    result = &mut transport_task => return Err(unexpected_transport_result(result)),
-                    changed = sessions.changed() => {
-                        if changed.is_err() {
-                            let cleanup = shutdown_components(
-                                manager,
-                                transport_trigger,
-                                transport_task,
-                                shutdown,
-                                self.agent_addr,
-                                progress,
-                            ).await;
-                            return match cleanup {
-                                Ok(_) => Err(EdgeRuntimeError::TransportStopped),
-                                Err(error) => Err(error),
-                            };
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let (session_id, route) = active.expect("active route checked above");
             tokio::select! {
                 biased;
                 () = signal.cancelled() => {
@@ -316,44 +261,33 @@ impl EdgeRuntime {
                         .map_err(EdgeRuntimeError::RouteShutdown)?;
                     return Err(transport_error);
                 }
-                changed = sessions.changed() => {
-                    let connected = changed.is_ok()
-                        && sessions.borrow().contains(&session_id);
-                    if !connected {
-                        warn!(
-                            %session_id,
-                            generation = progress.route_generations,
-                            event = "route_recovery_started",
-                            "Agent disconnected; waiting for replacement"
-                        );
-                        let removal_manager = manager.clone();
-                        let removed = async move {
-                            removal_manager.wait_until_removed(route.route_id).await
-                        };
-                        tokio::pin!(removed);
-                        tokio::select! {
-                            biased;
-                            () = signal.cancelled() => {
-                                return shutdown_components(
-                                    manager,
-                                    transport_trigger,
-                                    transport_task,
-                                    shutdown,
-                                    self.agent_addr,
-                                    progress,
-                                ).await;
+                changed = tunnels.changed() => {
+                    if changed.is_err() {
+                        return Err(EdgeRuntimeError::TransportStopped);
+                    }
+                    let next_session = tunnels
+                        .borrow()
+                        .iter()
+                        .find(|(tunnel_id, _)| tunnel_id == &self.config.tunnel_id)
+                        .map(|(_, session_id)| *session_id);
+                    if next_session != current_session {
+                        match next_session {
+                            Some(session_id) => {
+                                progress.agent_sessions_seen = progress.agent_sessions_seen.saturating_add(1);
+                                info!(
+                                    %session_id,
+                                    tunnel_id = %self.config.tunnel_id,
+                                    event = "durable_tunnel_connected",
+                                    "durable tunnel now resolves to a live session"
+                                );
                             }
-                            result = &mut transport_task => {
-                                let transport_error = unexpected_transport_result(result);
-                                manager.shutdown(shutdown).await
-                                    .map_err(EdgeRuntimeError::RouteShutdown)?;
-                                return Err(transport_error);
-                            }
-                            result = &mut removed => {
-                                result.map_err(EdgeRuntimeError::RouteRecovery)?;
-                            }
+                            None => warn!(
+                                tunnel_id = %self.config.tunnel_id,
+                                event = "durable_tunnel_disconnected",
+                                "raw listener remains bound while tunnel is unavailable"
+                            ),
                         }
-                        active = None;
+                        current_session = next_session;
                     }
                 }
             }
@@ -380,7 +314,7 @@ async fn shutdown_components(
         raw_addr: progress.raw_addr,
         agent_sessions_seen: progress.agent_sessions_seen,
         route_generations: progress.route_generations,
-        successful_recoveries: progress.route_generations.saturating_sub(1),
+        successful_recoveries: progress.agent_sessions_seen.saturating_sub(1),
         raw_routes: raw_routes?,
         agent_sessions: agent_sessions?,
     })
@@ -424,6 +358,16 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(EdgeRuntimeConfigError::NonLoopbackRawListener(_))
+        ));
+    }
+
+    #[test]
+    fn raw_tunnel_must_exist_in_registration_policy() {
+        let mut config = EdgeRuntimeConfig::dev_defaults();
+        config.tunnel_id = TunnelId::new("unconfigured-tunnel").unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::RawTunnelNotAuthorized(_))
         ));
     }
 

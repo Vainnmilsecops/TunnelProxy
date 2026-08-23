@@ -1,7 +1,7 @@
 //! Agent control transport: Edge-side protocol handshake and session management.
 //!
 //! This module implements the Edge runtime for accepting Agent connections,
-//! performing the Tunnel Protocol v1 handshake (HELLO → REGISTER → REGISTERED),
+//! performing the Tunnel Protocol v2 handshake (HELLO → REGISTER → REGISTERED),
 //! maintaining established sessions, and driving the Session 08 loopback
 //! single-stream reverse data path.
 //!
@@ -26,9 +26,11 @@
 //! of the connection (from TCP_ACCEPTED through CLOSED), ensuring bounded
 //! admission even during slow handshakes.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,13 +39,19 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
+use tunnelproxy_common::{
+    AgentId, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
+};
+use tunnelproxy_control_plane::CertificateFingerprint;
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HandshakeErrorCode, HeartbeatErrorCode,
-    HeartbeatSequence, ProtocolError, StreamId, StreamResetCode, TransportSessionId,
-    HEARTBEAT_PAYLOAD_SIZE, HELLO_PAYLOAD_SIZE, ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
+    HeartbeatSequence, ProtocolError, RegistrationRequest, StreamId, StreamResetCode,
+    TransportSessionId, HEARTBEAT_PAYLOAD_SIZE, HELLO_PAYLOAD_SIZE, ROLE_AGENT,
+    STREAM_RESET_PAYLOAD_SIZE,
 };
+
+use crate::tls::EdgeRegistrationPolicy;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -340,6 +348,8 @@ pub enum AgentTransportError {
     HandshakeTimeout { state: HandshakeState },
     /// Protocol violation detected (wrong frame, wrong payload, etc.).
     ProtocolViolation { reason: &'static str },
+    /// A well-formed durable registration was rejected by policy/liveness.
+    RegistrationRejected(HandshakeErrorCode),
     /// Decoder returned a protocol error (bad magic, version, etc.).
     ProtocolDecode(ProtocolError),
     /// Unexpected peer disconnect during handshake.
@@ -368,6 +378,9 @@ impl std::fmt::Display for AgentTransportError {
                 write!(f, "handshake timeout in state {:?}", state)
             }
             Self::ProtocolViolation { reason } => write!(f, "protocol violation: {reason}"),
+            Self::RegistrationRejected(code) => {
+                write!(f, "registration rejected: {code:?}")
+            }
             Self::ProtocolDecode(e) => write!(f, "protocol decode error: {e}"),
             Self::UnexpectedEof { state } => write!(f, "unexpected EOF in state {:?}", state),
             Self::SessionIo(e) => write!(f, "session I/O error: {e}"),
@@ -394,6 +407,7 @@ impl std::error::Error for AgentTransportError {
         match self {
             Self::HandshakeTimeout { .. } => None,
             Self::ProtocolViolation { .. } => None,
+            Self::RegistrationRejected(_) => None,
             Self::ProtocolDecode(e) => Some(e),
             Self::UnexpectedEof { .. } => None,
             Self::SessionIo(e) => Some(e),
@@ -422,10 +436,52 @@ pub enum SessionCloseReason {
 pub struct AgentSession {
     /// Process-local session identifier assigned by Edge.
     pub session_id: TransportSessionId,
+    /// Durable Agent identity authorized during Protocol v2 registration.
+    pub agent_id: AgentId,
+    /// Durable tunnel intent authorized during Protocol v2 registration.
+    pub tunnel_id: TunnelId,
     /// Address of the connected Agent.
     pub peer_addr: SocketAddr,
     /// When the session was established.
     pub established_at: Instant,
+    _tunnel_claim: Option<TunnelRegistrationClaim>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TunnelRegistrationClaims {
+    active: Mutex<HashSet<TunnelId>>,
+}
+
+impl TunnelRegistrationClaims {
+    fn claim(self: &Arc<Self>, tunnel_id: &TunnelId) -> Option<TunnelRegistrationClaim> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !active.insert(tunnel_id.clone()) {
+            return None;
+        }
+        Some(TunnelRegistrationClaim {
+            tunnel_id: tunnel_id.clone(),
+            claims: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TunnelRegistrationClaim {
+    tunnel_id: TunnelId,
+    claims: Arc<TunnelRegistrationClaims>,
+}
+
+impl Drop for TunnelRegistrationClaim {
+    fn drop(&mut self) {
+        self.claims
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.tunnel_id);
+    }
 }
 
 /// Sends an ERROR frame and closes the connection.
@@ -462,7 +518,7 @@ async fn send_heartbeat_error_and_close(socket: &mut TcpStream, code: HeartbeatE
 /// Bounded, protocol-aware Agent control transport listener.
 ///
 /// Binds a `TcpListener` on `config.listen_addr` and accepts incoming
-/// Agent connections. Each connection performs the v1 handshake
+/// Agent connections. Each connection performs the v2 handshake
 /// (HELLO → REGISTER → REGISTERED) under a configurable timeout.
 ///
 /// Capacity is bounded by a `Semaphore` sized to `config.max_agent_sessions`.
@@ -1519,14 +1575,34 @@ async fn validate_pong(
     Ok(())
 }
 
-/// Performs the v1 handshake: HELLO → REGISTER → REGISTERED.
-///
-/// Returns `Ok(AgentSession)` on success, or an error on any violation.
-/// The socket is owned by this function during the handshake.
 pub(crate) async fn perform_handshake<S>(
     socket: &mut S,
     peer: SocketAddr,
     session_ids: &TransportSessionIdAllocator,
+) -> Result<AgentSession, AgentTransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    perform_authorized_handshake(
+        socket,
+        peer,
+        session_ids,
+        &EdgeRegistrationPolicy::default(),
+        None,
+        None,
+    )
+    .await
+}
+
+/// Performs Protocol v2 HELLO → REGISTER → REGISTERED and authorizes the
+/// claimed durable identity before returning an established session.
+pub(crate) async fn perform_authorized_handshake<S>(
+    socket: &mut S,
+    peer: SocketAddr,
+    session_ids: &TransportSessionIdAllocator,
+    registration_policy: &EdgeRegistrationPolicy,
+    peer_certificate: Option<&CertificateFingerprint>,
+    tunnel_claims: Option<&Arc<TunnelRegistrationClaims>>,
 ) -> Result<AgentSession, AgentTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1616,21 +1692,55 @@ where
         });
     }
 
-    // REGISTER payload must be empty in v1.
-    if !register_frame.payload.is_empty() {
+    let registration = match RegistrationRequest::decode(&register_frame.payload) {
+        Ok(registration) => registration,
+        Err(_) => {
+            info!(
+                peer = %peer,
+                payload_len = register_frame.payload.len(),
+                event = "agent_invalid_register",
+                "REGISTER payload is invalid"
+            );
+            send_error_and_close(socket, HandshakeErrorCode::InvalidRegister).await;
+            return Err(AgentTransportError::ProtocolViolation {
+                reason: "invalid REGISTER payload",
+            });
+        }
+    };
+
+    if let Err(code) = registration_policy.authorize(peer_certificate, &registration) {
         info!(
             peer = %peer,
-            payload_len = register_frame.payload.len(),
-            event = "agent_invalid_register",
-            "REGISTER payload must be empty in v1"
+            agent_id = %registration.agent_id,
+            tunnel_id = %registration.tunnel_id,
+            rejection = ?code,
+            event = "agent_registration_rejected",
+            "Agent registration was not authorized"
         );
-        send_error_and_close(socket, HandshakeErrorCode::InvalidRegister).await;
-        return Err(AgentTransportError::ProtocolViolation {
-            reason: "REGISTER payload must be empty",
-        });
+        send_error_and_close(socket, code).await;
+        return Err(AgentTransportError::RegistrationRejected(code));
     }
 
-    info!(peer = %peer, event = "agent_register_received", "REGISTER received");
+    let tunnel_claim = match tunnel_claims {
+        Some(claims) => match claims.claim(&registration.tunnel_id) {
+            Some(claim) => Some(claim),
+            None => {
+                send_error_and_close(socket, HandshakeErrorCode::TunnelAlreadyConnected).await;
+                return Err(AgentTransportError::RegistrationRejected(
+                    HandshakeErrorCode::TunnelAlreadyConnected,
+                ));
+            }
+        },
+        None => None,
+    };
+
+    info!(
+        peer = %peer,
+        agent_id = %registration.agent_id,
+        tunnel_id = %registration.tunnel_id,
+        event = "agent_register_received",
+        "authorized REGISTER received"
+    );
 
     // --- Allocate session ID ---
     let session_id = match session_ids.next_id() {
@@ -1663,14 +1773,19 @@ where
     info!(
         peer = %peer,
         session_id = %session_id,
+        agent_id = %registration.agent_id,
+        tunnel_id = %registration.tunnel_id,
         event = "agent_registered_sent",
         "REGISTERED sent"
     );
 
     Ok(AgentSession {
         session_id,
+        agent_id: registration.agent_id,
+        tunnel_id: registration.tunnel_id,
         peer_addr: peer,
         established_at: Instant::now(),
+        _tunnel_claim: tunnel_claim,
     })
 }
 

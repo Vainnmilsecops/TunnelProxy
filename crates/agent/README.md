@@ -19,7 +19,7 @@ Future local TunnelProxy agent / CLI runtime.
 
 ## Current state
 
-The library opens an outbound TCP connection to Edge, performs the v1
+The library opens an outbound TCP connection to Edge, performs the v2
 HELLO → REGISTER → REGISTERED handshake, and exposes an established
 `AgentSession`. It validates Edge PING and returns the matching PONG. Session 09
 adds `AgentSession::run_multiplexed`, which connects concurrent Edge-opened
@@ -32,5 +32,8 @@ reset, an optional consecutive-failure budget, and reconnect outcome counters.
 Session 14 adds optional mutual TLS with trusted-CA/server-name verification,
 an Agent client certificate, ALPN, bounded TLS negotiation, and terminal
 certificate/authentication failures. Plaintext process configuration is limited
-to loopback. Durable registration/authorization, certificate lifecycle
-automation, and the final `tunnelproxy http` UX remain unimplemented.
+to loopback. Session 15 sends bounded `AgentId`/`TunnelId` registration intent,
+classifies authorization rejection for reconnect, and preserves the durable
+tunnel identity across fresh ephemeral sessions. Persistent control-plane
+configuration, certificate lifecycle automation, and the final
+`tunnelproxy http` UX remain unimplemented.

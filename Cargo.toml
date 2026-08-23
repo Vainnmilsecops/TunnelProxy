@@ -45,6 +45,7 @@ rcgen = "0.13"
 # rcgen's broad time requirement otherwise resolves to releases above the
 # workspace's Rust 1.75 MSRV. Keep test certificate generation MSRV-compatible.
 time = "=0.3.36"
+sha2 = { version = "0.10", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

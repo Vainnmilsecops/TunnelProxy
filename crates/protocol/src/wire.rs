@@ -1,4 +1,4 @@
-//! Fixed wire-format constants for Tunnel Protocol v1.
+//! Fixed wire-format constants for Tunnel Protocol v2.
 
 /// Magic bytes that must appear at the start of every valid frame.
 ///
@@ -9,7 +9,10 @@ pub const MAGIC: [u8; 4] = [0x54, 0x50, 0x58, 0x31];
 pub const HEADER_SIZE: u32 = 16;
 
 /// Supported protocol version.
-pub const VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
+
+/// Backwards-compatible constant name used by the codec.
+pub const VERSION: u8 = PROTOCOL_VERSION;
 
 /// Maximum allowed payload size in bytes (64 KiB).
 pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;

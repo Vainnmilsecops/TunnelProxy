@@ -19,6 +19,7 @@ rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
 tunnelproxy-common = { path = "../common" }
+tunnelproxy-control-plane = { path = "../control-plane" }
 
 [dev-dependencies]
 tunnelproxy-agent = { path = "../agent" }

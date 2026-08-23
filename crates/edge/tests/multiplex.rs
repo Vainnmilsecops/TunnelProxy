@@ -7,11 +7,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use tunnelproxy_agent::{connect, ConnectOutcome, MultiplexedAgentConfig};
-use tunnelproxy_edge::{
-    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeRuntime, RouteError,
+use tunnelproxy_agent::{
+    connect, connect_registered_with_security, AgentTransportSecurity, ConnectOutcome,
+    MultiplexedAgentConfig,
 };
-use tunnelproxy_protocol::TransportSessionId;
+use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_edge::{
+    EdgeRegistrationPolicy, EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeRuntime,
+    RouteError,
+};
+use tunnelproxy_protocol::{HandshakeErrorCode, RegistrationRequest, TransportSessionId};
 
 struct Harness {
     router: EdgeSessionRouter,
@@ -36,6 +41,29 @@ fn fast_edge_config() -> MultiplexedEdgeConfig {
     config.stream_open_timeout = Duration::from_secs(1);
     config.stream_idle_timeout = Duration::from_secs(2);
     config
+}
+
+fn registration(label: &str) -> RegistrationRequest {
+    RegistrationRequest::new(
+        AgentId::new(format!("agent-{label}")).unwrap(),
+        TunnelId::new(format!("tunnel-{label}")).unwrap(),
+    )
+}
+
+async fn connect_as(edge_addr: SocketAddr, label: &str) -> tunnelproxy_agent::AgentSession {
+    let registration = registration(label);
+    match connect_registered_with_security(
+        edge_addr,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        &AgentTransportSecurity::PlaintextLoopback,
+        &registration,
+    )
+    .await
+    {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("Agent {label} failed: {reason}"),
+    }
 }
 
 async fn spawn_harness(local_addr: SocketAddr, edge_config: MultiplexedEdgeConfig) -> Harness {
@@ -75,6 +103,57 @@ async fn wait_until_registered(router: &EdgeSessionRouter, session_id: Transport
     })
     .await
     .expect("session was not published to router");
+}
+
+#[tokio::test]
+async fn duplicate_tunnel_is_rejected_and_claim_releases_after_disconnect() {
+    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
+        .await
+        .unwrap();
+    let edge_addr = runtime.agent_addr();
+    let router = runtime.router();
+    let edge = tokio::spawn(runtime.run());
+
+    let first = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("first Agent failed: {reason}"),
+    };
+    wait_until_registered(&router, first.session_id).await;
+    assert_eq!(
+        router
+            .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+            .await,
+        Some(first.session_id)
+    );
+
+    let duplicate = connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await;
+    assert!(matches!(
+        duplicate,
+        ConnectOutcome::Failed {
+            reason: tunnelproxy_agent::AgentError::RegistrationRejected {
+                code: Some(HandshakeErrorCode::TunnelAlreadyConnected)
+            }
+        }
+    ));
+
+    drop(first);
+    timeout(Duration::from_secs(1), async {
+        while router
+            .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+            .await
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tunnel claim was not released");
+
+    assert!(matches!(
+        connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await,
+        ConnectOutcome::Established(_)
+    ));
+    edge.abort();
 }
 
 #[tokio::test]
@@ -267,25 +346,20 @@ async fn spawn_fixed_response_service(response: &'static [u8]) -> SocketAddr {
 
 #[tokio::test]
 async fn router_targets_the_requested_agent_session() {
-    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
-        .await
-        .unwrap();
+    let mut edge_config = fast_edge_config();
+    edge_config.registration =
+        EdgeRegistrationPolicy::loopback_allowlist(vec![registration("a"), registration("b")]);
+    let runtime = MultiplexedEdgeRuntime::bind(edge_config).await.unwrap();
     let edge_addr = runtime.agent_addr();
     let router = runtime.router();
     let edge = tokio::spawn(runtime.run());
     let local_a = spawn_fixed_response_service(b"agent-a").await;
     let local_b = spawn_fixed_response_service(b"agent-b").await;
 
-    let session_a = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("Agent A failed: {reason}"),
-    };
+    let session_a = connect_as(edge_addr, "a").await;
     let id_a = session_a.session_id;
     let agent_a = tokio::spawn(session_a.run_multiplexed(MultiplexedAgentConfig::new(local_a)));
-    let session_b = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("Agent B failed: {reason}"),
-    };
+    let session_b = connect_as(edge_addr, "b").await;
     let id_b = session_b.session_id;
     let agent_b = tokio::spawn(session_b.run_multiplexed(MultiplexedAgentConfig::new(local_b)));
     wait_until_registered(&router, id_a).await;
@@ -307,9 +381,10 @@ async fn router_targets_the_requested_agent_session() {
 
 #[tokio::test]
 async fn one_agent_local_failure_is_isolated_from_another_agent() {
-    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
-        .await
-        .unwrap();
+    let mut edge_config = fast_edge_config();
+    edge_config.registration =
+        EdgeRegistrationPolicy::loopback_allowlist(vec![registration("good"), registration("bad")]);
+    let runtime = MultiplexedEdgeRuntime::bind(edge_config).await.unwrap();
     let edge_addr = runtime.agent_addr();
     let router = runtime.router();
     let edge = tokio::spawn(runtime.run());
@@ -318,16 +393,10 @@ async fn one_agent_local_failure_is_isolated_from_another_agent() {
     let bad_local = unavailable.local_addr().unwrap();
     drop(unavailable);
 
-    let good = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("good Agent failed: {reason}"),
-    };
+    let good = connect_as(edge_addr, "good").await;
     let good_id = good.session_id;
     let good_task = tokio::spawn(good.run_multiplexed(MultiplexedAgentConfig::new(good_local)));
-    let bad = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("bad Agent failed: {reason}"),
-    };
+    let bad = connect_as(edge_addr, "bad").await;
     let bad_id = bad.session_id;
     let mut bad_config = MultiplexedAgentConfig::new(bad_local);
     bad_config.connect_timeout = Duration::from_millis(200);
