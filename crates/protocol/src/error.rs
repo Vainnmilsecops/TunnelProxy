@@ -29,7 +29,7 @@ pub enum ProtocolError {
     #[error("unknown frame type: {0}")]
     UnknownFrameType(u8),
 
-    /// Non-zero flags value on a v1 frame.
+    /// Non-zero flags value on a protocol frame.
     #[error("unsupported flags: 0x{0:04x}")]
     UnsupportedFlags(u16),
 

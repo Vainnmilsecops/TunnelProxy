@@ -13,7 +13,8 @@ correct agent, which in turn proxies them into the local service.
 
 - The Cargo workspace layout and component boundaries.
 - Async TCP echo, relay, and bounded local-forwarder primitives.
-- Tunnel Protocol v1 binary framing with a 64 KiB payload limit.
+- Tunnel Protocol v2 binary framing with bounded durable registration and a
+  64 KiB frame payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
 - A loopback-only multiplexed reverse TCP data path with bounded queues,
   half-close, typed reset, open/idle deadlines, and per-session routing.
@@ -26,6 +27,9 @@ correct agent, which in turn proxies them into the local service.
 - Optional mutual TLS on the Agent transport with Edge server-name validation,
   required Agent client certificates, ALPN, and plaintext restricted to
   loopback development.
+- Certificate-bound `AgentId`/`TunnelId` authorization and cached durable
+  tunnel-to-live-session routing. The loopback raw listener stays bound while
+  its Agent reconnects and fails closed while offline.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -34,8 +38,8 @@ The following are **not yet implemented**:
 
 - Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
-- Public-ingress TLS and application-level Agent/tunnel authorization.
-- Persistence and durable tunnel identity.
+- Public-ingress TLS and public-client access authorization.
+- Persistent control-plane storage and live snapshot distribution.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
 
@@ -75,7 +79,8 @@ The architecture conceptually separates:
 - **Data Plane** — live agent connections, public ingress, tunnel routing,
   request/response traffic.
 
-Today the control plane remains a placeholder while the data plane has a
+Today the control-plane crate provides immutable certificate/Agent/tunnel
+authorization snapshots but no database or service API. The data plane has a
 tested loopback raw-TCP reverse path but no public HTTP/TLS routing. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
@@ -104,7 +109,7 @@ tunnelproxy/
 │   ├── protocol/           # Edge ↔ Agent framing and stream contracts
 │   ├── agent/              # outbound Agent transport and local TCP bridge
 │   ├── edge/               # Agent transport and loopback raw TCP ingress
-│   └── control-plane/      # future durable configuration and APIs
+│   └── control-plane/      # immutable authorization snapshot model
 │
 ├── tests/                  # cross-crate integration tests (future)
 ├── scripts/                # local developer scripts
@@ -153,6 +158,7 @@ and Definition of Done.
 | 12 _(complete)_ | runnable Edge/Agent entrypoints and OS signal wiring |
 | 13 _(complete)_ | Agent reconnect and loopback raw-route recovery |
 | 14 _(complete)_ | mutual TLS and certificate-authenticated Agent transport |
+| 15 _(complete)_ | Protocol v2 authenticated identity and durable tunnel routing |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

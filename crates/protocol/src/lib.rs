@@ -34,12 +34,13 @@ pub use codec::{FrameDecoder, FrameEncoder};
 pub use error::ProtocolError;
 pub use frame::{Frame, FrameType, Scope, StreamId};
 pub use handshake::{
-    HandshakeErrorCode, HeartbeatErrorCode, HeartbeatSequence, HelloRole, TransportSessionId,
+    HandshakeErrorCode, HeartbeatErrorCode, HeartbeatSequence, HelloRole, RegistrationPayloadError,
+    RegistrationRequest, TransportSessionId, REGISTER_MAX_PAYLOAD_SIZE, REGISTER_PREFIX_SIZE,
     ROLE_AGENT,
 };
 pub use stream::StreamResetCode;
 pub use wire::{
     EMPTY_STREAM_PAYLOAD_SIZE, ERROR_PAYLOAD_SIZE, HEADER_SIZE, HEARTBEAT_PAYLOAD_SIZE,
-    HELLO_PAYLOAD_SIZE, MAGIC, MAX_FRAME_PAYLOAD, REGISTERED_PAYLOAD_SIZE,
+    HELLO_PAYLOAD_SIZE, MAGIC, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, REGISTERED_PAYLOAD_SIZE,
     STREAM_RESET_PAYLOAD_SIZE, VERSION,
 };

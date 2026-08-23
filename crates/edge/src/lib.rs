@@ -35,7 +35,7 @@
 //!   (`AgentTransportListener`, `AgentListenerConfig`,
 //!   `TransportSessionId`, `AgentSession`, `HandshakeState`).
 //!   A protocol-aware TCP listener that accepts Agent connections,
-//!   performs the v1 handshake (HELLO → REGISTER → REGISTERED),
+//!   performs the v2 handshake (HELLO → REGISTER → REGISTERED),
 //!   and maintains established transport sessions. Bounded concurrent
 //!   admission via semaphore; bounded handshake and Edge-initiated heartbeat
 //!   liveness via configurable timeouts.
@@ -1184,12 +1184,15 @@ pub use multiplex::{
 pub use raw_ingress::{
     RawIngressConfigError, RawIngressManagerConfig, RawIngressRoute, RawIngressRouteConfig,
     RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager, RawIngressRouteState,
-    RawIngressRouteStatus,
+    RawIngressRouteStatus, RawIngressRouteTarget,
 };
 pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,
 };
-pub use tls::{EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity};
+pub use tls::{
+    EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeTlsConfig, EdgeTlsConfigError,
+    EdgeTransportSecurity,
+};
 
 #[cfg(test)]
 mod tests {

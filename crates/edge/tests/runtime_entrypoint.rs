@@ -20,11 +20,17 @@ use tunnelproxy_agent::{
     AgentError, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError, AgentRuntimeOutcome,
     AgentTlsConfig, AgentTransportSecurity, RuntimeShutdownConfig,
 };
-use tunnelproxy_edge::{
-    shutdown_channel, EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeTlsConfig,
-    EdgeTransportSecurity, RuntimeShutdownOutcome,
+use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_control_plane::{
+    AgentGrant, AuthorizationSnapshot, CertificateFingerprint, TunnelGrant, TunnelStatus,
 };
-use tunnelproxy_protocol::{Frame, FrameEncoder, FrameType, ROLE_AGENT};
+use tunnelproxy_edge::{
+    shutdown_channel, EdgeRegistrationPolicy, EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError,
+    EdgeTlsConfig, EdgeTransportSecurity, RuntimeShutdownOutcome,
+};
+use tunnelproxy_protocol::{
+    Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest, ROLE_AGENT,
+};
 
 struct TestIdentity {
     certificate_pem: String,
@@ -35,6 +41,7 @@ struct TestPki {
     authority_pem: String,
     server: TestIdentity,
     client: TestIdentity,
+    other_client: TestIdentity,
 }
 
 fn test_pki(server_name: &str) -> TestPki {
@@ -59,10 +66,17 @@ fn test_pki(server_name: &str) -> TestPki {
         &authority,
         &authority_key,
     );
+    let other_client = signed_identity(
+        "other-agent.test",
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &authority,
+        &authority_key,
+    );
     TestPki {
         authority_pem: authority.pem(),
         server,
         client,
+        other_client,
     }
 }
 
@@ -83,11 +97,16 @@ fn signed_identity(
     }
 }
 
-fn mutual_tls_security() -> (EdgeTransportSecurity, AgentTransportSecurity) {
+fn mutual_tls_security() -> (
+    EdgeTransportSecurity,
+    EdgeRegistrationPolicy,
+    AgentTransportSecurity,
+) {
     let pki = test_pki("edge.test");
     let edge = edge_tls_security(&pki, Duration::from_secs(1));
+    let registration = edge_tls_registration(&pki);
     let agent = agent_tls_security(&pki.authority_pem, &pki.client, "edge.test");
-    (edge, agent)
+    (edge, registration, agent)
 }
 
 fn edge_tls_security(pki: &TestPki, timeout: Duration) -> EdgeTransportSecurity {
@@ -100,6 +119,15 @@ fn edge_tls_security(pki: &TestPki, timeout: Duration) -> EdgeTransportSecurity 
         )
         .unwrap(),
     )
+}
+
+fn edge_tls_registration(pki: &TestPki) -> EdgeRegistrationPolicy {
+    EdgeRegistrationPolicy::mutual_tls_from_client_cert_pem(
+        AgentId::new("agent-dev").unwrap(),
+        TunnelId::new("tunnel-dev").unwrap(),
+        pki.client.certificate_pem.as_bytes(),
+    )
+    .unwrap()
 }
 
 fn agent_tls_security(
@@ -143,7 +171,7 @@ fn raw_tls_client_config(
         None => builder.with_no_client_auth(),
     };
     if advertise_alpn {
-        config.alpn_protocols = vec![b"tunnelproxy/1".to_vec()];
+        config.alpn_protocols = vec![b"tunnelproxy/2".to_vec()];
     }
     Arc::new(config)
 }
@@ -220,14 +248,47 @@ async fn spawn_echo_connections(
 }
 
 async fn round_trip(raw_addr: SocketAddr, payload: &[u8]) {
-    let mut client = connect_eventually(raw_addr).await;
-    client.write_all(payload).await.unwrap();
-    let mut echoed = vec![0_u8; payload.len()];
-    client.read_exact(&mut echoed).await.unwrap();
-    assert_eq!(echoed, payload);
-    client.shutdown().await.unwrap();
-    let mut end = Vec::new();
-    client.read_to_end(&mut end).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let mut client = connect_eventually(raw_addr).await;
+            if client.write_all(payload).await.is_err() {
+                continue;
+            }
+            let mut echoed = vec![0_u8; payload.len()];
+            if client.read_exact(&mut echoed).await.is_ok() && echoed == payload {
+                client.shutdown().await.unwrap();
+                let mut end = Vec::new();
+                client.read_to_end(&mut end).await.unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("tunnel did not become routable");
+}
+
+async fn registration_rejection(
+    edge_addr: SocketAddr,
+    local_addr: SocketAddr,
+    security: AgentTransportSecurity,
+    registration: RegistrationRequest,
+) -> HandshakeErrorCode {
+    let mut config = AgentRuntimeConfig::new(edge_addr, local_addr);
+    config.security = security;
+    config.registration = registration;
+    config.connect_timeout = Duration::from_secs(1);
+    config.handshake_timeout = Duration::from_secs(1);
+    let runtime = AgentRuntime::new(config).unwrap();
+    let (_trigger, signal) = shutdown_channel();
+    let error = timeout(Duration::from_secs(1), runtime.run_until_shutdown(signal))
+        .await
+        .expect("registration rejection was not terminal")
+        .unwrap_err();
+    match error {
+        AgentRuntimeError::Terminal(AgentError::RegistrationRejected { code: Some(code) }) => code,
+        other => panic!("unexpected registration result: {other:?}"),
+    }
 }
 
 async fn wait_until_bindable(addr: SocketAddr) {
@@ -255,10 +316,10 @@ async fn edge_shutdown_before_agent_releases_transport_listener() {
     trigger.shutdown();
 
     let outcome = runtime.run_until_shutdown(signal).await.unwrap();
-    assert_eq!(outcome.raw_addr, None);
+    assert_eq!(outcome.raw_addr, Some(raw_addr));
     assert_eq!(
         outcome.raw_routes,
-        RuntimeShutdownOutcome::Drained { completed_tasks: 0 }
+        RuntimeShutdownOutcome::Drained { completed_tasks: 1 }
     );
     assert!(!outcome.was_forced());
     TcpListener::bind(agent_addr).await.unwrap();
@@ -376,7 +437,7 @@ async fn edge_rebinds_the_same_raw_address_to_a_replacement_agent() {
 
     agent_one_task.abort();
     let _ = agent_one_task.await;
-    wait_until_bindable(raw_addr).await;
+    assert!(TcpListener::bind(raw_addr).await.is_err());
 
     let (agent_two_trigger, agent_two_signal) = shutdown_channel();
     let agent_two_task =
@@ -390,7 +451,7 @@ async fn edge_rebinds_the_same_raw_address_to_a_replacement_agent() {
     assert_eq!(agent_outcome.established_sessions, 1);
     assert_eq!(edge_outcome.raw_addr, Some(raw_addr));
     assert_eq!(edge_outcome.agent_sessions_seen, 2);
-    assert_eq!(edge_outcome.route_generations, 2);
+    assert_eq!(edge_outcome.route_generations, 1);
     assert_eq!(edge_outcome.successful_recoveries, 1);
     local_task.await.unwrap();
 }
@@ -450,11 +511,12 @@ async fn agent_shutdown_before_connect_skips_network_startup() {
 
 #[tokio::test]
 async fn mutual_tls_runtimes_authenticate_and_forward_bytes() {
-    let (edge_security, agent_security) = mutual_tls_security();
+    let (edge_security, edge_registration, agent_security) = mutual_tls_security();
     let (local_addr, local_task) = spawn_echo().await;
     let raw_addr = unused_addr().await;
     let mut config = edge_config(raw_addr);
     config.multiplex.security = edge_security;
+    config.multiplex.registration = edge_registration;
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -481,11 +543,138 @@ async fn mutual_tls_runtimes_authenticate_and_forward_bytes() {
 }
 
 #[tokio::test]
+async fn durable_raw_listener_fails_closed_offline_then_routes_after_registration() {
+    let (local_addr, local_task) = spawn_echo().await;
+    let raw_addr = unused_addr().await;
+    let edge = EdgeRuntime::bind(edge_config(raw_addr)).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let mut offline = connect_eventually(raw_addr).await;
+    offline.write_all(b"offline").await.unwrap();
+    let mut byte = [0_u8; 1];
+    let offline_result = timeout(Duration::from_secs(1), offline.read(&mut byte))
+        .await
+        .expect("offline ingress was not closed");
+    assert!(matches!(offline_result, Ok(0) | Err(_)));
+    assert!(TcpListener::bind(raw_addr).await.is_err());
+
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    round_trip(raw_addr, b"online-after-registration").await;
+
+    agent_trigger.shutdown();
+    edge_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    edge_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn certificate_binding_rejects_same_ca_peer_and_false_identity_claims() {
+    let pki = test_pki("edge.test");
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let local_addr = unused_addr().await;
+
+    let unknown_certificate = registration_rejection(
+        edge_addr,
+        local_addr,
+        agent_tls_security(&pki.authority_pem, &pki.other_client, "edge.test"),
+        RegistrationRequest::new(
+            AgentId::new("agent-dev").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(unknown_certificate, HandshakeErrorCode::UnauthorizedAgent);
+
+    let wrong_agent = registration_rejection(
+        edge_addr,
+        local_addr,
+        agent_tls_security(&pki.authority_pem, &pki.client, "edge.test"),
+        RegistrationRequest::new(
+            AgentId::new("agent-impostor").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(wrong_agent, HandshakeErrorCode::UnauthorizedAgent);
+
+    let wrong_tunnel = registration_rejection(
+        edge_addr,
+        local_addr,
+        agent_tls_security(&pki.authority_pem, &pki.client, "edge.test"),
+        RegistrationRequest::new(
+            AgentId::new("agent-dev").unwrap(),
+            TunnelId::new("tunnel-other").unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(wrong_tunnel, HandshakeErrorCode::UnauthorizedTunnel);
+
+    edge_trigger.shutdown();
+    edge_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn disabled_tunnel_is_rejected_before_session_publication() {
+    let pki = test_pki("edge.test");
+    let mut certificates = BufReader::new(Cursor::new(pki.client.certificate_pem.as_bytes()));
+    let leaf = rustls_pemfile::certs(&mut certificates)
+        .next()
+        .unwrap()
+        .unwrap();
+    let snapshot = AuthorizationSnapshot::new(vec![AgentGrant::new(
+        CertificateFingerprint::from_certificate_der(leaf.as_ref()),
+        AgentId::new("agent-dev").unwrap(),
+        vec![TunnelGrant::new(
+            TunnelId::new("tunnel-dev").unwrap(),
+            TunnelStatus::Disabled,
+        )],
+    )])
+    .unwrap();
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls(snapshot);
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let rejection = registration_rejection(
+        edge_addr,
+        unused_addr().await,
+        agent_tls_security(&pki.authority_pem, &pki.client, "edge.test"),
+        RegistrationRequest::new(
+            AgentId::new("agent-dev").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(rejection, HandshakeErrorCode::TunnelDisabled);
+
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    assert_eq!(outcome.agent_sessions_seen, 0);
+}
+
+#[tokio::test]
 async fn wrong_tls_server_name_is_terminal_and_never_becomes_routable() {
     let pki = test_pki("edge.test");
     let raw_addr = unused_addr().await;
     let mut config = edge_config(raw_addr);
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -517,6 +706,7 @@ async fn untrusted_edge_ca_is_terminal() {
     let raw_addr = unused_addr().await;
     let mut config = edge_config(raw_addr);
     config.multiplex.security = edge_tls_security(&trusted, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&trusted);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -549,6 +739,7 @@ async fn untrusted_client_certificate_is_isolated_and_releases_capacity() {
     let mut config = edge_config(raw_addr);
     config.multiplex.agent_listener.max_agent_sessions = 1;
     config.multiplex.security = edge_tls_security(&trusted, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&trusted);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -598,6 +789,7 @@ async fn missing_client_certificate_is_rejected_before_protocol_registration() {
     let mut config = edge_config(raw_addr);
     config.multiplex.agent_listener.max_agent_sessions = 1;
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -633,6 +825,7 @@ async fn missing_tunnelproxy_alpn_is_rejected_before_protocol_registration() {
     let raw_addr = unused_addr().await;
     let mut config = edge_config(raw_addr);
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -667,6 +860,7 @@ async fn stalled_tls_handshake_times_out_and_releases_capacity() {
     let mut config = edge_config(raw_addr);
     config.multiplex.agent_listener.max_agent_sessions = 1;
     config.multiplex.security = edge_tls_security(&pki, Duration::from_millis(50));
+    config.multiplex.registration = edge_tls_registration(&pki);
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let (edge_trigger, edge_signal) = shutdown_channel();
@@ -737,6 +931,7 @@ async fn agent_performs_a_fresh_mutual_tls_handshake_after_edge_restart() {
     let mut edge_config = edge_config(raw_addr);
     edge_config.multiplex.agent_listener.listen_addr = agent_addr;
     edge_config.multiplex.security = edge_security;
+    edge_config.multiplex.registration = edge_tls_registration(&pki);
 
     let edge_one = EdgeRuntime::bind(edge_config.clone()).await.unwrap();
     let (edge_one_trigger, edge_one_signal) = shutdown_channel();
@@ -778,6 +973,7 @@ fn tls_allows_a_non_loopback_agent_listener_but_plaintext_does_not() {
     config.multiplex.agent_listener.listen_addr = "0.0.0.0:7100".parse().unwrap();
     assert!(config.validate().is_err());
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
     assert!(config.validate().is_ok());
 }
 

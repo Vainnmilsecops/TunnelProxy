@@ -1,16 +1,15 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 14.
+> **Status:** Implemented through Session 15.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
-> ingress or durable routing.
+> ingress or persisted/multi-edge routing.
 
 ## Purpose
 
 The Agent ↔ Edge transport is a persistent, protocol-aware TCP control
-connection over which Agent and Edge establish an ephemeral transport
-session and exchange heartbeat frames. It is the foundation for future
-tunnel registration and stream multiplexing.
+connection over which Agent and Edge authenticate durable tunnel intent,
+establish an ephemeral transport session, and exchange heartbeat/stream frames.
 
 Session 09 carries bounded concurrent raw TCP streams over this transport.
 It is not yet a public reverse-tunnel product surface.
@@ -31,17 +30,19 @@ Edge does not dial Agent.
 
 ## Security Status
 
-Session 14 adds optional mutual TLS before Protocol v1. Agent validates the
+Session 14 added optional mutual TLS before Protocol v1. Session 15 upgrades
+the current transport to Protocol v2. Agent validates the
 configured Edge CA and DNS server name. Edge requires a client certificate
-signed by its configured Agent CA, and requires ALPN `tunnelproxy/1`, before it
+signed by its configured Agent CA, and requires ALPN `tunnelproxy/2`, before it
 reads HELLO or publishes a session to the router. TLS negotiation has a
 separate deadline and consumes the same bounded admission permit as protocol
 handshake/session lifetime.
 
-Plaintext remains available only when the runnable Agent and Edge endpoints are
-loopback. mTLS authenticates possession of a CA-issued certificate; it does not
-yet map that certificate to a durable `AgentId`, authorize a tunnel, rotate or
-revoke certificates, or secure the future public HTTP ingress.
+Plaintext remains available only for an explicit loopback development
+allowlist. In mTLS mode Edge hashes the leaf certificate and authorizes its
+exact `AgentId`/`TunnelId` grant before REGISTERED. Certificate rotation,
+revocation, snapshot distribution, and future public HTTP ingress remain out of
+scope.
 
 ## Handshake Sequence
 
@@ -54,8 +55,9 @@ Agent                         Edge
   |---- HELLO(role=AGENT) ----->|
   |                             | (validate HELLO)
   |                             |
-  |---- REGISTER -------------->|
-  |                             | (validate REGISTER)
+  |---- REGISTER(ids) ---------->|
+  |                             | (decode and authorize certificate/IDs)
+  |                             | (reserve live TunnelId)
   |                             | (allocate TransportSessionId)
   |                             |
   |<--- REGISTERED(session_id) --|
@@ -91,15 +93,14 @@ Unknown role bytes are rejected.
 ```
 Frame type:  REGISTER (0x02)
 Stream ID:   0 (control)
-Payload:     empty (0 bytes)
+Payload:     agent_len:u16 | tunnel_len:u16 | AgentId | TunnelId
 ```
 
-In Session 06, REGISTER means only: "register this TCP connection as an
-ephemeral transport session." It does NOT mean: create a public tunnel,
-allocate a hostname, authenticate a user, persist an Agent, or create a
-durable `TunnelId`.
-
-A non-empty REGISTER payload is a protocol violation.
+Both IDs contain 1–64 ASCII letters, digits, `-`, or `_`. Declared lengths must
+consume the payload exactly. The maximum REGISTER payload is 132 bytes.
+Certificate/Agent/Tunnel authorization completes before the Edge allocates and
+publishes the ephemeral session. This registers durable intent but does not
+allocate a public hostname or persist state in a database.
 
 ### REGISTERED
 
@@ -148,7 +149,7 @@ CLOSED
 
 AWAIT_REGISTER
     |
-    | valid REGISTER(empty)
+    | valid authorized REGISTER(AgentId, TunnelId)
     v
 ESTABLISHED
     |
@@ -310,9 +311,10 @@ AgentListenerConfig {
 
 MultiplexedEdgeConfig {
     security: EdgeTransportSecurity,
+    registration: EdgeRegistrationPolicy,
     // PlaintextLoopback or MutualTls(EdgeTlsConfig)
     // EdgeTlsConfig is built from server cert/key + trusted client CA PEM.
-    // TLS handshake timeout is separate from Protocol v1 handshake timeout.
+    // TLS handshake timeout is separate from Protocol v2 handshake timeout.
     // Other bounded multiplex fields omitted here.
 }
 ```
@@ -344,8 +346,17 @@ connect_with_security(
     security: &AgentTransportSecurity,
 ) -> ConnectOutcome
 
+connect_registered_with_security(
+    edge_addr,
+    connect_timeout,
+    handshake_timeout,
+    security,
+    registration: &RegistrationRequest,
+) -> ConnectOutcome
+
 AgentRuntimeConfig {
     security: AgentTransportSecurity,
+    registration: RegistrationRequest,
     // PlaintextLoopback or MutualTls(AgentTlsConfig)
     // AgentTlsConfig is built from trusted Edge CA, client cert/key,
     // verified server name, and TLS handshake timeout.
@@ -391,12 +402,21 @@ number changed. A reconnect performs a fresh TCP, TLS, and Protocol v1
 handshake. Certificate/identity rejection is terminal; transient transport
 loss and TLS timeout remain retryable.
 
+Session 15 bumps the version byte and ALPN to v2, gives REGISTER a bounded
+`AgentId`/`TunnelId` payload, and binds mTLS leaf-certificate fingerprints to
+immutable authorization grants. Edge reserves one live claim per TunnelId and
+publishes both ephemeral-session and durable-tunnel snapshots. The runnable raw
+listener targets TunnelId and stays bound across disconnect/reconnect; accepted
+sockets fail closed while no authorized session is live. Registration identity
+failures are terminal, while a duplicate live TunnelId retries with the
+existing bounded backoff.
+
 ## What Is NOT Implemented
 
-- Durable Agent identity/authorization and certificate-to-Agent mapping
 - Certificate issuance, rotation, revocation, and hot reload
+- Persistent/live control-plane snapshot distribution
 - Credit/window-based flow control and weighted scheduling
-- Tunnel registration
+- Multiple tunnel registrations on one transport
 - Public endpoint allocation
 - Public HTTP/TLS ingress and hostname routing
-- Durable identity (TunnelId, AgentId)
+- Multi-edge tunnel ownership and failover

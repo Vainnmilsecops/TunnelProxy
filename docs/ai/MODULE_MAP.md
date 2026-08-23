@@ -23,8 +23,8 @@
 
 ## `tunnelproxy-protocol`
 
-**Current implementation:** Version 1 framing, handshake, heartbeat, and
-single-stream lifecycle payload types/codecs.
+**Current implementation:** Version 2 framing, durable REGISTER payload,
+handshake rejection, heartbeat, and multiplexed stream payload types/codecs.
 
 **Responsibility (future)**
 
@@ -44,8 +44,9 @@ single-stream lifecycle payload types/codecs.
 ## `tunnelproxy-agent`
 
 **Current implementation:** Outbound mutual-TLS-or-loopback transport,
-handshake/heartbeat, bounded multiplexed local bridging, and a runnable
-reconnecting single-session process supervisor/CLI.
+certificate-bound Protocol v2 registration intent, handshake/heartbeat,
+bounded multiplexed local bridging, and a runnable reconnecting single-session
+process supervisor/CLI.
 
 **Responsibility (future)**
 
@@ -65,9 +66,9 @@ reconnecting single-session process supervisor/CLI.
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed loopback raw TCP routes, and a
-runnable single-tunnel process supervisor/CLI that rebinds its configured raw
-address after replacement Agent sessions arrive. Its Agent listener can require
-mutual TLS and a CA-signed client certificate before protocol registration.
+runnable single-tunnel process supervisor/CLI whose durable TunnelId route stays
+bound across replacement Agent sessions. Its Agent listener can require mutual
+TLS and exact certificate-to-Agent/Tunnel authorization before publication.
 
 **Responsibility (future)**
 
@@ -85,6 +86,10 @@ mutual TLS and a CA-signed client certificate before protocol registration.
 - Blocking I/O on async paths (INV-008).
 
 ## `tunnelproxy-control-plane`
+
+**Current implementation:** Immutable certificate-fingerprint → AgentId →
+TunnelId authorization snapshots and administrative tunnel status, without
+storage or network service code.
 
 **Responsibility (future)**
 

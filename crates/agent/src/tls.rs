@@ -9,7 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub const TUNNELPROXY_ALPN: &[u8] = b"tunnelproxy/1";
+pub const TUNNELPROXY_ALPN: &[u8] = b"tunnelproxy/2";
 
 pub(crate) trait TransportIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -17,7 +17,7 @@ impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) type BoxedTransport = Box<dyn TransportIo>;
 
-/// Security applied before the Tunnel Protocol v1 handshake.
+/// Security applied before the Tunnel Protocol v2 handshake.
 #[derive(Clone, Default)]
 pub enum AgentTransportSecurity {
     /// Development-only transport. Runtime validation restricts this mode to

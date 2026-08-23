@@ -9,8 +9,14 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_control_plane::{
+    AgentGrant, AuthorizationError, AuthorizationSnapshot, CertificateFingerprint, SnapshotError,
+    TunnelGrant, TunnelStatus,
+};
+use tunnelproxy_protocol::{HandshakeErrorCode, RegistrationRequest};
 
-pub const TUNNELPROXY_ALPN: &[u8] = b"tunnelproxy/1";
+pub const TUNNELPROXY_ALPN: &[u8] = b"tunnelproxy/2";
 
 pub(crate) trait TransportIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -18,7 +24,151 @@ impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) type BoxedTransport = Box<dyn TransportIo>;
 
-/// Security applied before Edge accepts a Protocol v1 Agent handshake.
+/// Registration authorization applied after Protocol v2 REGISTER decoding.
+#[derive(Clone)]
+pub enum EdgeRegistrationPolicy {
+    /// Explicit non-cryptographic policy for loopback development only.
+    LoopbackDevelopment {
+        registrations: Arc<Vec<RegistrationRequest>>,
+    },
+    /// Immutable certificate-bound authorization pushed from the control plane.
+    MutualTls(Arc<AuthorizationSnapshot>),
+}
+
+impl EdgeRegistrationPolicy {
+    pub fn loopback_development(agent_id: AgentId, tunnel_id: TunnelId) -> Self {
+        Self::LoopbackDevelopment {
+            registrations: Arc::new(vec![RegistrationRequest::new(agent_id, tunnel_id)]),
+        }
+    }
+
+    pub fn loopback_allowlist(registrations: Vec<RegistrationRequest>) -> Self {
+        Self::LoopbackDevelopment {
+            registrations: Arc::new(registrations),
+        }
+    }
+
+    pub fn mutual_tls(snapshot: AuthorizationSnapshot) -> Self {
+        Self::MutualTls(Arc::new(snapshot))
+    }
+
+    /// Builds a one-Agent/one-Tunnel snapshot from the exact public client
+    /// certificate authorized by the current single-tunnel CLI.
+    pub fn mutual_tls_from_client_cert_pem(
+        agent_id: AgentId,
+        tunnel_id: TunnelId,
+        client_certificate_pem: &[u8],
+    ) -> Result<Self, EdgeRegistrationPolicyError> {
+        let certificates = parse_registration_certificates(client_certificate_pem)?;
+        let fingerprint = CertificateFingerprint::from_certificate_der(certificates[0].as_ref());
+        let snapshot = AuthorizationSnapshot::new(vec![AgentGrant::new(
+            fingerprint,
+            agent_id,
+            vec![TunnelGrant::new(tunnel_id, TunnelStatus::Registered)],
+        )])
+        .map_err(EdgeRegistrationPolicyError::Snapshot)?;
+        Ok(Self::mutual_tls(snapshot))
+    }
+
+    pub const fn is_mutual_tls(&self) -> bool {
+        matches!(self, Self::MutualTls(_))
+    }
+
+    pub fn contains_tunnel(&self, tunnel_id: &TunnelId) -> bool {
+        match self {
+            Self::LoopbackDevelopment { registrations } => registrations
+                .iter()
+                .any(|registration| &registration.tunnel_id == tunnel_id),
+            Self::MutualTls(snapshot) => snapshot.contains_tunnel(tunnel_id),
+        }
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        peer_certificate: Option<&CertificateFingerprint>,
+        request: &RegistrationRequest,
+    ) -> Result<(), HandshakeErrorCode> {
+        match self {
+            Self::LoopbackDevelopment { registrations }
+                if registrations.iter().any(|allowed| allowed == request) =>
+            {
+                Ok(())
+            }
+            Self::LoopbackDevelopment { registrations }
+                if registrations
+                    .iter()
+                    .any(|allowed| allowed.agent_id == request.agent_id) =>
+            {
+                Err(HandshakeErrorCode::UnauthorizedTunnel)
+            }
+            Self::LoopbackDevelopment { .. } => Err(HandshakeErrorCode::UnauthorizedAgent),
+            Self::MutualTls(snapshot) => {
+                let certificate = peer_certificate.ok_or(HandshakeErrorCode::UnauthorizedAgent)?;
+                snapshot
+                    .authorize(certificate, &request.agent_id, &request.tunnel_id)
+                    .map_err(|error| match error {
+                        AuthorizationError::UnknownCertificate
+                        | AuthorizationError::AgentMismatch => {
+                            HandshakeErrorCode::UnauthorizedAgent
+                        }
+                        AuthorizationError::TunnelNotAuthorized => {
+                            HandshakeErrorCode::UnauthorizedTunnel
+                        }
+                        AuthorizationError::TunnelDisabled => HandshakeErrorCode::TunnelDisabled,
+                    })
+            }
+        }
+    }
+}
+
+impl Default for EdgeRegistrationPolicy {
+    fn default() -> Self {
+        Self::loopback_development(
+            AgentId::new("agent-dev").expect("hardcoded AgentId is valid"),
+            TunnelId::new("tunnel-dev").expect("hardcoded TunnelId is valid"),
+        )
+    }
+}
+
+impl fmt::Debug for EdgeRegistrationPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoopbackDevelopment { registrations } => f
+                .debug_struct("LoopbackDevelopment")
+                .field("registration_count", &registrations.len())
+                .finish(),
+            Self::MutualTls(snapshot) => f
+                .debug_struct("MutualTlsAuthorization")
+                .field("certificate_count", &snapshot.certificate_count())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum EdgeRegistrationPolicyError {
+    MissingClientCertificate,
+    InvalidClientCertificate,
+    Snapshot(SnapshotError),
+}
+
+impl fmt::Display for EdgeRegistrationPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingClientCertificate => {
+                f.write_str("authorized client certificate bundle is empty")
+            }
+            Self::InvalidClientCertificate => {
+                f.write_str("authorized client certificate bundle is invalid")
+            }
+            Self::Snapshot(error) => write!(f, "invalid authorization snapshot: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for EdgeRegistrationPolicyError {}
+
+/// Security applied before Edge accepts a Protocol v2 Agent handshake.
 #[derive(Clone, Default)]
 pub enum EdgeTransportSecurity {
     /// Development-only mode restricted to a loopback Agent listener.
@@ -161,6 +311,19 @@ fn parse_certificates(
     Ok(certificates)
 }
 
+fn parse_registration_certificates(
+    pem: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, EdgeRegistrationPolicyError> {
+    let mut reader = BufReader::new(Cursor::new(pem));
+    let certificates: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certificates =
+        certificates.map_err(|_| EdgeRegistrationPolicyError::InvalidClientCertificate)?;
+    if certificates.is_empty() {
+        return Err(EdgeRegistrationPolicyError::MissingClientCertificate);
+    }
+    Ok(certificates)
+}
+
 fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, EdgeTlsConfigError> {
     let mut reader = BufReader::new(Cursor::new(pem));
     rustls_pemfile::private_key(&mut reader)
@@ -184,5 +347,23 @@ mod tests {
     fn debug_output_contains_no_key_material() {
         let security = EdgeTransportSecurity::PlaintextLoopback;
         assert_eq!(format!("{security:?}"), "PlaintextLoopback");
+    }
+
+    #[test]
+    fn loopback_policy_requires_exact_identity() {
+        let policy = EdgeRegistrationPolicy::default();
+        let valid = RegistrationRequest::new(
+            AgentId::new("agent-dev").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        );
+        assert_eq!(policy.authorize(None, &valid), Ok(()));
+        let wrong = RegistrationRequest::new(
+            AgentId::new("other-agent").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        );
+        assert_eq!(
+            policy.authorize(None, &wrong),
+            Err(HandshakeErrorCode::UnauthorizedAgent)
+        );
     }
 }

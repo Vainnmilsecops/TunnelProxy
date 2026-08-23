@@ -2,8 +2,8 @@
 
 > Status: **pre-MVP data-path foundation.** Local TCP primitives, protocol
 > framing, Agent → Edge handshake, heartbeat, bounded multiplexing, and
-> ephemeral loopback raw-ingress routes are implemented. Public TLS/HTTP
-> ingress and durable routing are not.
+> durable-identity loopback raw-ingress routes are implemented. Public
+> TLS/HTTP ingress, persistence, and multi-edge routing are not.
 
 ## 1. High-level architecture
 
@@ -292,6 +292,30 @@ REGISTERED, heartbeat, and multiplex frames are unchanged. Authentication means
 only possession of a certificate signed by the configured CA. No certificate
 is mapped to durable `AgentId`/`TunnelId` or tunnel authorization yet. Private
 key material is parsed into rustls configuration and excluded from diagnostics.
+
+### 2.14 Authenticated durable tunnel routing (Session 15)
+
+Protocol v2 and ALPN `tunnelproxy/2` add bounded `AgentId`/`TunnelId` intent to
+REGISTER. After mTLS, Edge computes the SHA-256 fingerprint of the authenticated
+leaf certificate and checks an immutable authorization snapshot:
+
+```text
+certificate fingerprint -> AgentId -> TunnelId -> enabled/disabled
+```
+
+The session is not published until authorization and a unique live TunnelId
+claim both succeed. Edge retains its ephemeral session registry for stream
+ownership and adds a cached `TunnelId -> TransportSessionId` registry for
+durable route resolution. The lookup is in-memory and never reaches control
+plane storage on ingress (INV-007).
+
+The runnable raw listener is created from TunnelId before Agent availability.
+It remains bound while the tunnel is offline, closes new sockets when there is
+no live mapping, and automatically resolves the next authenticated session.
+Existing streams remain owned by their original session and are never replayed.
+Authorization snapshots and route intent are still startup configuration; live
+distribution, persistence, revocation, and multi-edge ownership remain future
+control-plane work.
 
 ## 3. Control plane vs data plane
 

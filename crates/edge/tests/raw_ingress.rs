@@ -8,13 +8,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use tunnelproxy_agent::{connect, ConnectOutcome, MultiplexedAgentConfig};
-use tunnelproxy_edge::{
-    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeRuntime, RawIngressManagerConfig,
-    RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager,
-    RawIngressRouteState,
+use tunnelproxy_agent::{
+    connect, connect_registered_with_security, AgentTransportSecurity, ConnectOutcome,
+    MultiplexedAgentConfig,
 };
-use tunnelproxy_protocol::TransportSessionId;
+use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_edge::{
+    EdgeRegistrationPolicy, EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeRuntime,
+    RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteId,
+    RawIngressRouteManager, RawIngressRouteState,
+};
+use tunnelproxy_protocol::{RegistrationRequest, TransportSessionId};
 
 struct Harness {
     router: EdgeSessionRouter,
@@ -39,6 +43,29 @@ fn fast_edge_config() -> MultiplexedEdgeConfig {
     config.stream_open_timeout = Duration::from_secs(1);
     config.stream_idle_timeout = Duration::from_secs(3);
     config
+}
+
+fn registration(label: &str) -> RegistrationRequest {
+    RegistrationRequest::new(
+        AgentId::new(format!("agent-{label}")).unwrap(),
+        TunnelId::new(format!("tunnel-{label}")).unwrap(),
+    )
+}
+
+async fn connect_as(edge_addr: SocketAddr, label: &str) -> tunnelproxy_agent::AgentSession {
+    let registration = registration(label);
+    match connect_registered_with_security(
+        edge_addr,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        &AgentTransportSecurity::PlaintextLoopback,
+        &registration,
+    )
+    .await
+    {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("Agent {label} failed: {reason}"),
+    }
 }
 
 async fn spawn_harness(local_addr: SocketAddr) -> Harness {
@@ -308,25 +335,20 @@ async fn concurrent_route_clients_do_not_cross_talk_and_heartbeat_survives() {
 
 #[tokio::test]
 async fn two_raw_routes_target_two_exact_agent_sessions() {
-    let runtime = MultiplexedEdgeRuntime::bind(fast_edge_config())
-        .await
-        .unwrap();
+    let mut edge_config = fast_edge_config();
+    edge_config.registration =
+        EdgeRegistrationPolicy::loopback_allowlist(vec![registration("a"), registration("b")]);
+    let runtime = MultiplexedEdgeRuntime::bind(edge_config).await.unwrap();
     let edge_addr = runtime.agent_addr();
     let router = runtime.router();
     let edge = tokio::spawn(runtime.run());
     let local_a = spawn_fixed_response_service(b"raw-agent-a").await;
     let local_b = spawn_fixed_response_service(b"raw-agent-b").await;
 
-    let session_a = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("Agent A failed: {reason}"),
-    };
+    let session_a = connect_as(edge_addr, "a").await;
     let id_a = session_a.session_id;
     let agent_a = tokio::spawn(session_a.run_multiplexed(MultiplexedAgentConfig::new(local_a)));
-    let session_b = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
-        ConnectOutcome::Established(session) => session,
-        ConnectOutcome::Failed { reason } => panic!("Agent B failed: {reason}"),
-    };
+    let session_b = connect_as(edge_addr, "b").await;
     let id_b = session_b.session_id;
     let agent_b = tokio::spawn(session_b.run_multiplexed(MultiplexedAgentConfig::new(local_b)));
     wait_until_registered(&router, id_a).await;

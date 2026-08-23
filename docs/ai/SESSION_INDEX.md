@@ -18,6 +18,7 @@
 | 12      | Production Runtime Entrypoints & OS Signal Wiring | complete |
 | 13      | Agent Reconnect & Route Recovery               | complete |
 | 14      | Mutual TLS & Agent Authentication              | complete |
+| 15      | Authenticated Tunnel Identity & Registration   | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -517,3 +518,39 @@ Out of scope:
 - Certificate issuance, rotation, revocation, and hot reload.
 - Public HTTP/HTTPS ingress, hostname allocation, and public raw ingress.
 - Protocol v2, token registration, multi-edge routing, and stream replay.
+
+## Session 15 — Authenticated Tunnel Identity & Registration — complete
+
+Scope delivered:
+
+- Bumped the wire header to Protocol v2 and TLS ALPN to `tunnelproxy/2`.
+  Protocol v1 peers are rejected explicitly; no downgrade is attempted.
+- Added bounded `AgentId`/`TunnelId` validation and a deterministic REGISTER
+  schema: two big-endian `u16` lengths followed by UTF-8 identifier bytes.
+- Replaced the control-plane placeholder with immutable authorization
+  snapshots mapping SHA-256 client-certificate fingerprints to exact Agent and
+  enabled Tunnel grants.
+- Edge now extracts the authenticated TLS leaf certificate, authorizes the
+  claimed identity before REGISTERED, and returns typed terminal rejection for
+  unknown certificates, identity mismatch, unauthorized/disabled tunnels, and
+  malformed registration.
+- Added RAII live-tunnel claims. A duplicate TunnelId is rejected before
+  publication; `TunnelAlreadyConnected` is the only retryable registration
+  rejection and the claim releases on every close/failure path.
+- Added cached `TunnelId -> TransportSessionId` routing. The runnable raw
+  listener targets TunnelId, stays bound while Agent is offline, fails closed,
+  and starts using the fresh session after authenticated reconnect without a
+  storage lookup or listener rebind.
+- Added Agent/Edge identity CLI flags and exact authorized-client-certificate
+  input for the single-tunnel TLS CLI.
+- Added 14 tests for ID/codec/config bounds, v1 rejection, snapshot authorization,
+  same-CA unassigned certificates, false identity claims, disabled/duplicate
+  tunnels, claim release, and durable offline/online routing. The workspace now
+  contains 199 explicit tests.
+
+Out of scope:
+
+- Persistent database/API control plane and live snapshot distribution.
+- Certificate issuance, rotation, revocation, expiry monitoring, and hot reload.
+- Public HTTP/HTTPS or raw ingress, hostname allocation, and access policy.
+- Multiple tunnels on one transport, multi-edge routing, and stream replay.

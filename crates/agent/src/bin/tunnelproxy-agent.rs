@@ -11,7 +11,8 @@ use tunnelproxy_agent::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
     AgentTransportSecurity, RuntimeShutdownConfig,
 };
-use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
+use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
+use tunnelproxy_protocol::RegistrationRequest;
 
 const USAGE: &str = "\
 Usage: tunnelproxy-agent [OPTIONS]
@@ -19,6 +20,8 @@ Usage: tunnelproxy-agent [OPTIONS]
 Options:
   --edge <addr>                  Edge address  (default 127.0.0.1:7100)
   --local <addr>                 local service (default 127.0.0.1:3000)
+  --agent-id <id>                durable Agent ID (default agent-dev)
+  --tunnel-id <id>               durable Tunnel ID (default tunnel-dev)
   --max-streams <usize>          stream limit  (default 32)
   --connect-timeout-ms <ms>      TCP timeout   (default 5000)
   --handshake-timeout-ms <ms>    handshake     (default 10000)
@@ -69,6 +72,8 @@ async fn main() -> ExitCode {
     config.reconnect.jitter_percent = parsed.reconnect_jitter_percent;
     config.reconnect.stable_session_reset_after = parsed.stable_session_reset;
     config.reconnect.max_attempts = parsed.max_reconnect_attempts;
+    config.registration =
+        RegistrationRequest::new(parsed.agent_id.clone(), parsed.tunnel_id.clone());
     config.security = match load_transport_security(&parsed).await {
         Ok(security) => security,
         Err(error) => {
@@ -83,7 +88,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    info!(edge = %parsed.edge, local = %parsed.local, "Agent runtime starting");
+    info!(
+        edge = %parsed.edge,
+        local = %parsed.local,
+        agent_id = %parsed.agent_id,
+        tunnel_id = %parsed.tunnel_id,
+        "Agent runtime starting"
+    );
 
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal);
@@ -132,6 +143,8 @@ fn agent_exit_code(
 struct ParsedArgs {
     edge: SocketAddr,
     local: SocketAddr,
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
     max_streams: usize,
     connect_timeout: Duration,
     handshake_timeout: Duration,
@@ -155,6 +168,8 @@ impl Default for ParsedArgs {
         Self {
             edge: "127.0.0.1:7100".parse().unwrap(),
             local: "127.0.0.1:3000".parse().unwrap(),
+            agent_id: AgentId::new("agent-dev").unwrap(),
+            tunnel_id: TunnelId::new("tunnel-dev").unwrap(),
             max_streams: 32,
             connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
@@ -180,6 +195,7 @@ enum ArgError {
     MissingValue(String),
     InvalidAddress { flag: String, value: String },
     InvalidNumber { flag: String, value: String },
+    InvalidIdentifier { flag: String, value: String },
     UnknownFlag(String),
 }
 
@@ -192,6 +208,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::InvalidNumber { flag, value } => {
                 write!(f, "{flag}={value} is not a valid integer")
+            }
+            Self::InvalidIdentifier { flag, value } => {
+                write!(f, "{flag}={value} is not a valid durable identifier")
             }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
@@ -214,6 +233,14 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--local" => {
                 parsed.local = parse_addr(args, index, flag)?;
+                index += 2;
+            }
+            "--agent-id" => {
+                parsed.agent_id = parse_agent_id(args, index, flag)?;
+                index += 2;
+            }
+            "--tunnel-id" => {
+                parsed.tunnel_id = parse_tunnel_id(args, index, flag)?;
                 index += 2;
             }
             "--max-streams" => {
@@ -356,6 +383,22 @@ where
     })
 }
 
+fn parse_agent_id(args: &[String], index: usize, flag: &str) -> Result<AgentId, ArgError> {
+    let raw = value(args, index, flag)?;
+    AgentId::new(raw).map_err(|_| ArgError::InvalidIdentifier {
+        flag: flag.to_string(),
+        value: raw.to_string(),
+    })
+}
+
+fn parse_tunnel_id(args: &[String], index: usize, flag: &str) -> Result<TunnelId, ArgError> {
+    let raw = value(args, index, flag)?;
+    TunnelId::new(raw).map_err(|_| ArgError::InvalidIdentifier {
+        flag: flag.to_string(),
+        value: raw.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +419,10 @@ mod tests {
             "127.0.0.1:17100",
             "--local",
             "127.0.0.1:13000",
+            "--agent-id",
+            "agent-prod",
+            "--tunnel-id",
+            "tunnel-prod",
             "--max-streams",
             "8",
             "--connect-timeout-ms",
@@ -410,6 +457,8 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.edge.port(), 17100);
         assert_eq!(parsed.local.port(), 13000);
+        assert_eq!(parsed.agent_id.as_str(), "agent-prod");
+        assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
         assert_eq!(parsed.max_streams, 8);
         assert_eq!(parsed.connect_timeout, Duration::from_millis(100));
         assert_eq!(parsed.handshake_timeout, Duration::from_millis(200));
@@ -440,6 +489,10 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["--unknown"])),
             Err(ArgError::UnknownFlag(_))
+        ));
+        assert!(matches!(
+            parse_args(&args(&["--agent-id", "bad/id"])),
+            Err(ArgError::InvalidIdentifier { .. })
         ));
     }
 

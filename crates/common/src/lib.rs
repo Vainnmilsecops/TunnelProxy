@@ -164,17 +164,64 @@ pub enum RuntimeShutdownOutcome {
     },
 }
 
+/// Maximum encoded length of an Agent or Tunnel identifier.
+pub const MAX_DURABLE_ID_BYTES: usize = 64;
+
+/// Why a durable identifier was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableIdError {
+    Empty,
+    TooLong { actual: usize },
+    InvalidCharacter { index: usize, byte: u8 },
+}
+
+impl std::fmt::Display for DurableIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("identifier must not be empty"),
+            Self::TooLong { actual } => write!(
+                f,
+                "identifier is {actual} bytes; maximum is {MAX_DURABLE_ID_BYTES}"
+            ),
+            Self::InvalidCharacter { index, byte } => write!(
+                f,
+                "identifier contains invalid byte 0x{byte:02x} at index {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableIdError {}
+
+fn validate_durable_id(value: &str) -> Result<(), DurableIdError> {
+    if value.is_empty() {
+        return Err(DurableIdError::Empty);
+    }
+    if value.len() > MAX_DURABLE_ID_BYTES {
+        return Err(DurableIdError::TooLong {
+            actual: value.len(),
+        });
+    }
+    for (index, byte) in value.bytes().enumerate() {
+        if !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_' {
+            return Err(DurableIdError::InvalidCharacter { index, byte });
+        }
+    }
+    Ok(())
+}
+
 /// Stable identifier for an `agent` registered with the control plane.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct AgentId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentId(String);
 
 impl AgentId {
     /// Construct an [`AgentId`] from a checked string.
     ///
-    /// The string must be non-empty. Any further validation (length, charset)
-    /// is intentionally deferred to the control plane.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// IDs contain 1..=64 ASCII letters, digits, `-`, or `_`.
+    pub fn new(value: impl Into<String>) -> Result<Self, DurableIdError> {
+        let value = value.into();
+        validate_durable_id(&value)?;
+        Ok(Self(value))
     }
 
     /// Borrow the underlying string slice.
@@ -183,17 +230,31 @@ impl AgentId {
     }
 }
 
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Stable identifier for a public tunnel exposed by an agent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct TunnelId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TunnelId(String);
 
 impl TunnelId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new(value: impl Into<String>) -> Result<Self, DurableIdError> {
+        let value = value.into();
+        validate_durable_id(&value)?;
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for TunnelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -203,14 +264,28 @@ mod tests {
 
     #[test]
     fn agent_id_roundtrips_string() {
-        let id = AgentId::new("agent-abc");
+        let id = AgentId::new("agent-abc").unwrap();
         assert_eq!(id.as_str(), "agent-abc");
     }
 
     #[test]
     fn tunnel_id_roundtrips_string() {
-        let id = TunnelId::new("blue-cat");
+        let id = TunnelId::new("blue-cat").unwrap();
         assert_eq!(id.as_str(), "blue-cat");
+    }
+
+    #[test]
+    fn durable_ids_reject_empty_oversized_and_unsafe_values() {
+        assert_eq!(AgentId::new(""), Err(DurableIdError::Empty));
+        assert!(matches!(
+            TunnelId::new("x".repeat(MAX_DURABLE_ID_BYTES + 1)),
+            Err(DurableIdError::TooLong { .. })
+        ));
+        assert!(matches!(
+            AgentId::new("agent/escape"),
+            Err(DurableIdError::InvalidCharacter { .. })
+        ));
+        assert!(TunnelId::new("blue_cat-01").is_ok());
     }
 
     #[tokio::test]

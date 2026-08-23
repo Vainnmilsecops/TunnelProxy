@@ -6,14 +6,14 @@
 
 ## Current milestone
 
-**Mutual TLS & Agent Authentication** (Session 14).
+**Authenticated Tunnel Identity & Registration** (Session 15).
 
 ## Completed
 
 - Outbound Agent → Edge TCP control connection (INV-001: Agent dials Edge only).
-- Tunnel Protocol v1 handshake runtime: HELLO → REGISTER → REGISTERED.
+- Tunnel Protocol v2 handshake runtime: HELLO → REGISTER → REGISTERED.
 - HELLO payload schema: 1 byte role (`0x01` = AGENT), strictly validated.
-- REGISTER payload: empty in v1 (no durable tunnel creation).
+- REGISTER payload: bounded length-prefixed `AgentId` and `TunnelId` intent.
 - REGISTERED payload: 8-byte big-endian non-zero `TransportSessionId`.
 - Strongly typed process-local session IDs with safe non-zero allocation.
 - Edge `AgentTransportListener` with bounded concurrent admission (`Semaphore`).
@@ -126,8 +126,8 @@
 - The runnable/multiplexed Agent transport supports mutual TLS using rustls.
   Agent validates the Edge CA and DNS server name; Edge requires a client
   certificate signed by its configured Agent CA before Protocol v1 begins.
-- TunnelProxy ALPN is `tunnelproxy/1`. Missing or mismatched ALPN never reaches
-  protocol registration. TLS has its own bounded handshake deadline and Edge
+- Session 14 introduced versioned TunnelProxy ALPN; missing or mismatched ALPN
+  never reaches protocol registration. TLS has its own bounded handshake deadline and Edge
   holds the existing session-capacity permit throughout negotiation.
 - Plaintext runtime transport is restricted to loopback. TLS permits a
   non-loopback Agent listener while raw ingress remains loopback-only.
@@ -138,18 +138,41 @@
 - 18 new unit/real-TCP tests cover config/CLI validation, mTLS forwarding,
   wrong CA/name, missing ALPN, missing/untrusted client certificates, capacity
   release, timeout/cancellation, secure restart, and secret-safe diagnostics.
-- 185 explicit workspace tests are present; all prior behavior is preserved.
+- Protocol header version and TLS ALPN are now v2 / `tunnelproxy/2`. Protocol
+  v1 clients fail explicitly with no downgrade.
+- Durable IDs contain 1–64 ASCII letters, digits, `-`, or `_`; malformed,
+  truncated, oversized, or unsafe REGISTER payloads fail closed.
+- The control-plane crate builds immutable authorization snapshots mapping
+  SHA-256 client-leaf-certificate fingerprints to exact Agent and Tunnel grants.
+- Edge authorizes the certificate/Agent/Tunnel tuple before REGISTERED and
+  session publication. Unknown certificates, false identity claims, disabled
+  tunnels, and unauthorized tunnels are terminal Agent failures.
+- One live transport may claim a TunnelId. Duplicate claims receive typed
+  `TunnelAlreadyConnected`, retry under bounded reconnect policy, and release
+  through RAII on every connection exit.
+- `EdgeSessionRouter` caches `TunnelId -> TransportSessionId` alongside its
+  ephemeral session registry; ingress performs no database/network lookup.
+- Runnable raw ingress targets TunnelId, binds before Agent availability, stays
+  bound across reconnect, and closes accepted sockets while the tunnel is
+  offline instead of reusing a stale session.
+- Agent and Edge CLIs expose durable IDs; TLS Edge configuration also requires
+  the exact public Agent certificate used for the current static authorization
+  mapping.
+- 14 new unit/real-TCP tests cover v2 codec/ID/config bounds, v1 rejection,
+  authorization mismatches, disabled/duplicate tunnels, claim release, and
+  durable offline/online routing.
+- 199 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - Certificate issuance, rotation, revocation, and hot reload (DEBT-017 open).
-- Durable Agent authorization or certificate-to-`AgentId` mapping.
+- Persistent authorization/route storage and live snapshot distribution.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
-- Tunnel registration (REGISTER is ephemeral transport registration only).
+- Multiple tunnel registrations on one Agent transport.
 - Public tunnel endpoints / hostname allocation.
 - Public HTTP/TLS reverse proxy and raw public ingress.
-- Durable Agent identity (`TunnelId`, `AgentId`).
+- Multi-edge ownership/failover for durable tunnel identity.
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
@@ -157,13 +180,13 @@
 
 ## Next planned session
 
-**Session 15 — Authenticated Tunnel Identity & Registration.**
+**Session 16 — Control-Plane Snapshot Distribution.**
 
 Goals:
 
-- Define durable `AgentId`/`TunnelId` registration separately from ephemeral
-  `TransportSessionId` values.
-- Version the protocol explicitly before changing the empty REGISTER payload.
-- Authorize a certificate-authenticated Agent for exact tunnel intent and push
-  routable state without adding a storage lookup to the ingress hot path.
-- Preserve bounded reconnect, mTLS admission, and loopback raw-ingress scope.
+- Define a versioned authoritative snapshot update API separate from ingress.
+- Atomically apply Agent/tunnel enable, disable, add, and remove updates at Edge.
+- Drain or fail closed when an active grant is revoked without querying storage
+  on the connection hot path.
+- Keep database/schema implementation, public ingress, and certificate rotation
+  separate unless explicitly scoped into that session.

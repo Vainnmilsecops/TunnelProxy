@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use tunnelproxy_agent::{connect, AgentError, ConnectOutcome};
+use tunnelproxy_agent::{connect, development_registration, AgentError, ConnectOutcome};
 use tunnelproxy_edge::agent_transport::{
     AgentListenerConfig, AgentTransportListener, TransportSessionIdAllocator,
 };
@@ -52,7 +52,8 @@ async fn raw_handshake(addr: SocketAddr) -> (TcpStream, TransportSessionId) {
     let mut socket = TcpStream::connect(addr).await.unwrap();
     let hello = Frame::control(FrameType::Hello, vec![ROLE_AGENT]).unwrap();
     FrameEncoder::encode(&mut socket, &hello).await.unwrap();
-    let register = Frame::control(FrameType::Register, vec![]).unwrap();
+    let register =
+        Frame::control(FrameType::Register, development_registration().encode()).unwrap();
     FrameEncoder::encode(&mut socket, &register).await.unwrap();
 
     let mut decoder = FrameDecoder::new();

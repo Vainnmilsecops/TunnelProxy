@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use tunnelproxy_agent::{connect, ConnectOutcome};
+use tunnelproxy_agent::{connect, development_registration, ConnectOutcome};
 use tunnelproxy_edge::agent_transport::{SingleStreamEdgeConfig, SingleStreamEdgeRuntime};
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, StreamId, StreamResetCode, TransportSessionId,
@@ -316,7 +316,8 @@ async fn data_before_open_is_reset_without_killing_agent_session() {
     let mut socket = TcpStream::connect(agent_addr).await.unwrap();
     let hello = Frame::control(FrameType::Hello, vec![ROLE_AGENT]).unwrap();
     FrameEncoder::encode(&mut socket, &hello).await.unwrap();
-    let register = Frame::control(FrameType::Register, Vec::new()).unwrap();
+    let register =
+        Frame::control(FrameType::Register, development_registration().encode()).unwrap();
     FrameEncoder::encode(&mut socket, &register).await.unwrap();
     let mut decoder = FrameDecoder::new();
     let registered = decoder.decode(&mut socket).await.unwrap().unwrap();
@@ -364,7 +365,7 @@ async fn sequential_stream_ids_are_monotonic() {
     .unwrap();
     FrameEncoder::encode(
         &mut agent,
-        &Frame::control(FrameType::Register, Vec::new()).unwrap(),
+        &Frame::control(FrameType::Register, development_registration().encode()).unwrap(),
     )
     .await
     .unwrap();

@@ -1,4 +1,7 @@
-# TunnelProxy Protocol v1 — Wire Framing
+# TunnelProxy Protocol v1 — Retired Wire Contract
+
+> **Historical:** Session 15 replaced this contract with Protocol v2. Current
+> implementations reject v1 explicitly. See `TUNNEL_PROTOCOL_V2.md`.
 
 > **Status:** Implemented (Session 05).
 > **Wire format is stable** once both peers speak v1.

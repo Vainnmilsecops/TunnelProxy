@@ -1,6 +1,6 @@
 # `tunnelproxy-control-plane`
 
-Future durable tunnel / account configuration and APIs.
+Durable tunnel authorization model and future account/configuration APIs.
 
 ## Responsibility (future)
 
@@ -20,5 +20,8 @@ Future durable tunnel / account configuration and APIs.
 
 ## Current state
 
-Foundation-only. Today this is a library crate exposing only a
-`TunnelStatus` enum. No database, no API server.
+Session 15 implements immutable authorization snapshots that map an exact
+SHA-256 client-certificate fingerprint to `AgentId`, allowed `TunnelId` values,
+and tunnel status. Edge consumes these snapshots from memory, outside the
+ingress hot path. There is still no database, API server, persistence, or live
+snapshot distribution.

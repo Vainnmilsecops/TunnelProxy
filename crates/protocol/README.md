@@ -20,10 +20,11 @@ Wire protocol between `tunnelproxy-edge` and `tunnelproxy-agent`.
 
 ## Current state
 
-Tunnel Protocol v1 framing is implemented: fixed 16-byte headers, binary-safe
+Tunnel Protocol v2 framing is implemented: fixed 16-byte headers, binary-safe
 payloads capped at 64 KiB, strict frame/stream scope validation, typed errors,
-and async encode/decode. HELLO/REGISTER/REGISTERED handshake payloads and the
+and async encode/decode. REGISTER carries bounded durable `AgentId`/`TunnelId`
+intent and v1 is rejected explicitly. HELLO/REGISTER/REGISTERED payloads and the
 Session 07 PING/PONG heartbeat payload are defined and tested. Session 08
 defines OPEN_STREAM acknowledgment, binary DATA, directional END_STREAM, and
-typed RESET_STREAM semantics for a single active stream. Multiplexing remains
-out of scope.
+typed RESET_STREAM semantics. Session 09 multiplexing retains those stream
+frame numbers and payloads.

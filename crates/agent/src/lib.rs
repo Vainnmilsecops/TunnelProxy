@@ -10,7 +10,7 @@
 //! integration tests something concrete to drive.
 //!
 //! Session 06 adds the Agent-side transport layer (`agent_transport`):
-//! outbound TCP connection to Edge, Tunnel Protocol v1 handshake
+//! outbound TCP connection to Edge, Tunnel Protocol v2 handshake
 //! (HELLO → REGISTER → REGISTERED), and established session management.
 //!
 //! The agent NEVER accepts inbound connections from the public internet
@@ -20,9 +20,9 @@
 //! adds a loopback-tested single-stream local TCP bridge, and Session 09 adds
 //! bounded concurrent streams through `AgentSession::run_multiplexed`.
 //! Session 12 adds the runnable single-session `AgentRuntime` and CLI, Session
-//! 13 adds reconnect, and Session 14 adds mutual TLS for the runnable transport.
-//! Durable tunnel authorization and the final `tunnelproxy http` UX remain out
-//! of scope. See
+//! 13 adds reconnect, Session 14 adds mutual TLS, and Session 15 binds durable
+//! Agent/tunnel registration to the authenticated certificate. The final
+//! `tunnelproxy http` UX remains out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]
@@ -33,8 +33,8 @@ mod runtime;
 mod tls;
 
 pub use agent_transport::{
-    connect, connect_with_security, AgentError, AgentSession, AgentSessionCloseReason,
-    ConnectOutcome,
+    connect, connect_registered_with_security, connect_with_security, development_registration,
+    AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,

@@ -181,7 +181,7 @@ impl From<StreamId> for u32 {
 pub struct Frame {
     /// Which kind of frame this is.
     pub frame_type: FrameType,
-    /// Flags for this frame. Must be zero in protocol v1.
+    /// Flags for this frame. Must be zero in protocol v2.
     pub flags: u16,
     /// Stream identifier (0 = control, >0 = stream).
     pub stream_id: StreamId,
