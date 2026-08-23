@@ -11,6 +11,7 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -19,10 +20,11 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 use tunnelproxy_agent::{
-    AgentError, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError, AgentRuntimeOutcome,
-    AgentTlsConfig, AgentTransportSecurity, RuntimeShutdownConfig,
+    connect_registered_with_security, AgentError, AgentRuntime, AgentRuntimeConfig,
+    AgentRuntimeError, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig,
+    AgentTlsReloadRuntime, AgentTransportSecurity, ConnectOutcome, RuntimeShutdownConfig,
 };
-use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_common::{AgentId, TlsConfigHealth, TunnelId};
 use tunnelproxy_control_plane::{
     authorization_snapshot_channel, AgentGrant, AuthorizationSnapshot, CertificateFingerprint,
     ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotBootstrapSource, SnapshotCacheConfig,
@@ -32,8 +34,9 @@ use tunnelproxy_control_plane::{
 };
 use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
-    EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTransportSecurity,
-    RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
+    EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTlsReloadConfig,
+    EdgeTlsReloadRuntime, EdgeTransportSecurity, RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime,
+    SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest, ROLE_AGENT,
@@ -54,6 +57,23 @@ fn snapshot_temp_database() -> (PathBuf, PathBuf) {
     ));
     std::fs::create_dir(&directory).unwrap();
     (directory.join("snapshots.sqlite"), directory)
+}
+
+fn write_reload_manifest(path: &PathBuf, generation: u64, files: &[(&str, &PathBuf)]) {
+    let entries = files
+        .iter()
+        .map(|(name, path)| {
+            let digest = Sha256::digest(std::fs::read(path).unwrap());
+            let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!(r#""{name}":"{digest}""#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        path,
+        format!(r#"{{"generation":{generation},"files":{{{entries}}}}}"#),
+    )
+    .unwrap();
 }
 
 struct TestPki {
@@ -1450,5 +1470,231 @@ async fn snapshot_cache_cold_start_routes_then_expiry_releases_edge_listeners() 
     drop(agent_listener);
     drop(raw_listener);
     drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn tls_generation_rotation_is_atomic_and_invalid_candidate_keeps_last_good() {
+    let generation_one = test_pki("edge.test");
+    let generation_two = test_pki("edge.test");
+    let (_, directory) = snapshot_temp_database();
+    let edge_certificate = directory.join("edge.pem");
+    let edge_key = directory.join("edge-key.pem");
+    let agent_ca = directory.join("agent-ca.pem");
+    let agent_certificate = directory.join("agent.pem");
+    let agent_key = directory.join("agent-key.pem");
+    let edge_ca = directory.join("edge-ca.pem");
+    let edge_manifest = directory.join("edge-reload.json");
+    let agent_manifest = directory.join("agent-reload.json");
+
+    let write_generation = |pki: &TestPki| {
+        std::fs::write(&edge_certificate, &pki.server.certificate_pem).unwrap();
+        std::fs::write(&edge_key, &pki.server.private_key_pem).unwrap();
+        std::fs::write(&agent_ca, &pki.authority_pem).unwrap();
+        std::fs::write(&agent_certificate, &pki.client.certificate_pem).unwrap();
+        std::fs::write(&agent_key, &pki.client.private_key_pem).unwrap();
+        std::fs::write(&edge_ca, &pki.authority_pem).unwrap();
+    };
+    write_generation(&generation_one);
+    write_reload_manifest(
+        &edge_manifest,
+        1,
+        &[
+            ("server_certificate", &edge_certificate),
+            ("server_private_key", &edge_key),
+            ("client_ca", &agent_ca),
+            ("authorized_client_certificate", &agent_certificate),
+        ],
+    );
+    write_reload_manifest(
+        &agent_manifest,
+        1,
+        &[
+            ("server_ca", &edge_ca),
+            ("client_certificate", &agent_certificate),
+            ("client_private_key", &agent_key),
+        ],
+    );
+
+    let (edge_tls, registration_policy, edge_reloader) =
+        EdgeTlsReloadRuntime::bootstrap_with_static_authorization(
+            EdgeTlsReloadConfig {
+                manifest_path: edge_manifest.clone(),
+                server_certificate_path: edge_certificate.clone(),
+                server_private_key_path: edge_key.clone(),
+                client_ca_path: agent_ca.clone(),
+                poll_interval: Duration::from_millis(20),
+                expiry_warning: Duration::from_secs(60),
+            },
+            agent_certificate.clone(),
+            Duration::from_secs(1),
+            AgentId::new("agent-dev").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        )
+        .await
+        .unwrap();
+    let (agent_tls, agent_reloader) = AgentTlsReloadRuntime::bootstrap(
+        AgentTlsReloadConfig {
+            manifest_path: agent_manifest.clone(),
+            server_ca_path: edge_ca.clone(),
+            client_certificate_path: agent_certificate.clone(),
+            client_private_key_path: agent_key.clone(),
+            poll_interval: Duration::from_millis(20),
+            expiry_warning: Duration::from_secs(60),
+        },
+        "edge.test",
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let edge_status = edge_tls.clone();
+    let agent_status = agent_tls.clone();
+
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = EdgeTransportSecurity::MutualTls(edge_tls);
+    config.multiplex.registration = registration_policy;
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (edge_reload_trigger, edge_reload_signal) = shutdown_channel();
+    let edge_reload_task = tokio::spawn(edge_reloader.run_until_shutdown(edge_reload_signal));
+    let (agent_reload_trigger, agent_reload_signal) = shutdown_channel();
+    let agent_reload_task = tokio::spawn(agent_reloader.run_until_shutdown(agent_reload_signal));
+    let registration = RegistrationRequest::new(
+        AgentId::new("agent-dev").unwrap(),
+        TunnelId::new("tunnel-dev").unwrap(),
+    );
+    let security = AgentTransportSecurity::MutualTls(agent_tls);
+    let mut session = match connect_registered_with_security(
+        edge_addr,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        &security,
+        &registration,
+    )
+    .await
+    {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("generation one failed: {reason}"),
+    };
+    session.close().await.unwrap();
+
+    write_generation(&generation_two);
+    write_reload_manifest(
+        &edge_manifest,
+        2,
+        &[
+            ("server_certificate", &edge_certificate),
+            ("server_private_key", &edge_key),
+            ("client_ca", &agent_ca),
+            ("authorized_client_certificate", &agent_certificate),
+        ],
+    );
+    write_reload_manifest(
+        &agent_manifest,
+        2,
+        &[
+            ("server_ca", &edge_ca),
+            ("client_certificate", &agent_certificate),
+            ("client_private_key", &agent_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if edge_status.reload_status(Duration::from_secs(1)).generation == 2
+                && agent_status
+                    .reload_status(Duration::from_secs(1))
+                    .generation
+                    == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TLS generation two was not published");
+
+    let mut session = match connect_registered_with_security(
+        edge_addr,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        &security,
+        &registration,
+    )
+    .await
+    {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("generation two failed: {reason}"),
+    };
+    session.close().await.unwrap();
+
+    let old_security = AgentTransportSecurity::MutualTls(
+        AgentTlsConfig::from_pem(
+            generation_one.authority_pem.as_bytes(),
+            generation_one.client.certificate_pem.as_bytes(),
+            generation_one.client.private_key_pem.as_bytes(),
+            "edge.test",
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        connect_registered_with_security(
+            edge_addr,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &old_security,
+            &registration,
+        )
+        .await,
+        ConnectOutcome::Failed { .. }
+    ));
+
+    std::fs::write(&edge_key, b"invalid private key").unwrap();
+    write_reload_manifest(
+        &edge_manifest,
+        3,
+        &[
+            ("server_certificate", &edge_certificate),
+            ("server_private_key", &edge_key),
+            ("client_ca", &agent_ca),
+            ("authorized_client_certificate", &agent_certificate),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = edge_status.reload_status(Duration::from_secs(1));
+            if status.health == TlsConfigHealth::ReloadFailed {
+                assert_eq!(status.generation, 2);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid generation was not reported");
+    let mut session = match connect_registered_with_security(
+        edge_addr,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        &security,
+        &registration,
+    )
+    .await
+    {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("last-good generation failed: {reason}"),
+    };
+    session.close().await.unwrap();
+
+    edge_trigger.shutdown();
+    edge_reload_trigger.shutdown();
+    agent_reload_trigger.shutdown();
+    edge_task.await.unwrap().unwrap();
+    edge_reload_task.await.unwrap().unwrap();
+    agent_reload_task.await.unwrap().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

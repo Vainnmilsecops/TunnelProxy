@@ -22,6 +22,8 @@
 | 16      | Control-Plane Snapshot Distribution & Live Revocation | complete |
 | 17      | Persistent Snapshot Storage & Authenticated Edge Bootstrap | complete |
 | 18      | Runnable Snapshot Service & Operations Wiring  | complete |
+| 19      | Edge Cold-Start Snapshot Cache                 | complete |
+| 20      | Certificate Lifecycle & Atomic TLS Reload      | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -701,3 +703,35 @@ Out of scope:
   administrator rollback resistance.
 - Certificate issuance/rotation/hot reload, general admin APIs, public ingress,
   and multi-edge consensus.
+
+## Session 20 — Certificate Lifecycle & Atomic TLS Reload — complete
+
+Scope delivered:
+
+- Added a shared reload primitive with strict, bounded JSON manifests,
+  SHA-256 verification of an exact file set, non-zero monotonic generations,
+  same-generation conflict detection, and blocking file reads off Tokio.
+- Converted Agent client, Edge server, snapshot client, and snapshot server
+  rustls configurations to last-known-good atomic snapshots. New handshakes
+  observe one complete config generation; invalid or partial candidates never
+  replace the active generation.
+- Added optional CLI reload manifests, polling intervals, and expiry-warning
+  thresholds to all three runnable processes. Supervisors stop non-zero if the
+  active leaf identity expires before a valid replacement is published.
+- Coupled static Edge certificate authorization to its Agent-facing TLS
+  manifest. Rotating the exact Agent certificate advances the local full
+  snapshot and revokes sessions authorized by the previous certificate.
+- Added secret-safe generation/health observability with `Current`, `Expiring`,
+  `ReloadFailed`, and `Expired` state.
+- Added six unit/real-mTLS integration tests for strict manifests, monotonic
+  publication, expiry, Agent/Edge rotation, snapshot server/client rotation,
+  old-credential rejection, and invalid-generation last-known-good rollback.
+  The workspace now contains 239 explicit tests.
+
+Out of scope:
+
+- Automated issuance/enrollment, protected key custody, CRL/OCSP distribution,
+  public ingress, and multi-edge consensus.
+- Forced renegotiation of arbitrary established TLS connections. New
+  handshakes use the new generation; static Edge authorization additionally
+  closes sessions removed by its local snapshot update.

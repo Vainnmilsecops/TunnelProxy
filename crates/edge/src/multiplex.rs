@@ -816,7 +816,7 @@ async fn run_accepted_session(
         match &config.security {
             EdgeTransportSecurity::PlaintextLoopback => (Box::new(socket), None),
             EdgeTransportSecurity::MutualTls(tls) => {
-                let acceptor = TlsAcceptor::from(Arc::clone(&tls.server_config));
+                let acceptor = TlsAcceptor::from(tls.server_config.current());
                 match tokio::time::timeout(tls.handshake_timeout, acceptor.accept(socket)).await {
                     Ok(Ok(stream))
                         if stream.get_ref().1.alpn_protocol() == Some(TUNNELPROXY_ALPN) =>

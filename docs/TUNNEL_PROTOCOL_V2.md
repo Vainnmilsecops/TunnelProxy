@@ -115,7 +115,10 @@ session. If no session exists, the socket is closed; no stale session is reused.
 ## Deliberate limits
 
 - No protocol downgrade or simultaneous v1/v2 support.
-- No database, durable snapshot storage, or external control-plane service.
-- No certificate issuance, rotation, revocation, or hot reload.
+- Protocol framing itself performs no database or control-plane lookup; durable
+  snapshots and the external service are separate from this wire contract.
+- No certificate issuance or managed PKI. Session 20 can reload operator-
+  published TLS generations, and Session 16 authorization snapshots can revoke
+  an exact Agent leaf.
 - No public ingress, hostname allocation, multiple tunnels per transport,
   multi-edge coordination, or interrupted-stream replay.

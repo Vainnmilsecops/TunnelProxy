@@ -14,6 +14,15 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+mod tls_reload;
+
+pub use tls_reload::{
+    certificate_validity, load_tls_reload_generation, ReloadableConfig, TlsCertificateValidity,
+    TlsConfigHealth, TlsConfigStatus, TlsGenerationError, TlsReloadCandidate, TlsReloadFile,
+    TlsReloadGeneration, TlsReloadLoadError, TlsReloadRuntime, TlsReloadRuntimeConfig,
+    TlsReloadRuntimeError, MAX_TLS_MATERIAL_BYTES, MAX_TLS_RELOAD_MANIFEST_BYTES,
+};
+
 /// Operating-system event which requested process shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessShutdownSignal {

@@ -36,6 +36,9 @@ correct agent, which in turn proxies them into the local service.
 - Transactional SQLite snapshot persistence, strict JSON full-snapshot import,
   a runnable mutual-TLS Control Plane service, and snapshot-aware Edge CLI
   bootstrap/reconnect supervision.
+- Opt-in digest-bound TLS generation reload for Agent, Edge, and snapshot
+  transports with last-known-good rollback, expiry enforcement, and static
+  Agent-certificate authorization rotation.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -45,7 +48,8 @@ The following are **not yet implemented**:
 - Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
 - Public-ingress TLS and public-client access authorization.
-- General administrative/account API and Edge cold-start disk cache.
+- General administrative/account API and automated certificate issuance/key
+  custody.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
 
@@ -167,6 +171,7 @@ and Definition of Done.
 | 14 _(complete)_ | mutual TLS and certificate-authenticated Agent transport |
 | 15 _(complete)_ | Protocol v2 authenticated identity and durable tunnel routing |
 | 16–18 _(complete)_ | live revocation, persistent snapshots, and runnable Control Plane/Edge wiring |
+| 19–20 _(complete)_ | bounded Edge cold-start cache and atomic TLS generation reload |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

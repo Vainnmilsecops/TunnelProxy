@@ -1196,7 +1196,8 @@ pub use snapshot_runtime::{
 };
 pub use tls::{
     bootstrap_registration_from_snapshot_service, EdgeRegistrationPolicy,
-    EdgeRegistrationPolicyError, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
+    EdgeRegistrationPolicyError, EdgeTlsConfig, EdgeTlsConfigError, EdgeTlsReloadBootstrapError,
+    EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
 };
 
 #[cfg(test)]

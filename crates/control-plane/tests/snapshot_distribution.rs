@@ -8,17 +8,20 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
+use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tunnelproxy_common::{shutdown_channel, AgentId, ShutdownTrigger, TunnelId};
+use tunnelproxy_common::{shutdown_channel, AgentId, ShutdownTrigger, TlsConfigHealth, TunnelId};
 use tunnelproxy_control_plane::{
     AgentGrant, AuthorizationSnapshot, AuthorizationSnapshotSubscription, CertificateFingerprint,
     ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotBootstrapClient,
     SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotCacheError, SnapshotClientConfig,
-    SnapshotClientError, SnapshotDistributionServer, SnapshotRepository, SnapshotServerConfig,
-    SnapshotServerTlsConfig, SnapshotSourceHealth, SnapshotVersion, SqliteSnapshotRepository,
-    TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
+    SnapshotClientError, SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime,
+    SnapshotDistributionServer, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
+    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotSourceHealth,
+    SnapshotVersion, SqliteSnapshotRepository, TunnelGrant, TunnelStatus,
+    VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -101,6 +104,23 @@ fn temp_database() -> (PathBuf, PathBuf) {
     ));
     std::fs::create_dir(&directory).unwrap();
     (directory.join("snapshots.sqlite"), directory)
+}
+
+fn write_reload_manifest(path: &PathBuf, generation: u64, files: &[(&str, &PathBuf)]) {
+    let entries = files
+        .iter()
+        .map(|(name, path)| {
+            let digest = Sha256::digest(std::fs::read(path).unwrap());
+            let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!(r#""{name}":"{digest}""#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        path,
+        format!(r#"{{"generation":{generation},"files":{{{entries}}}}}"#),
+    )
+    .unwrap();
 }
 
 fn server_config(
@@ -530,6 +550,195 @@ async fn cache_write_failure_never_publishes_the_new_snapshot() {
     assert_eq!(edge_snapshots.source_health(), SnapshotSourceHealth::Stale);
 
     server_trigger.shutdown();
+    server_task.await.unwrap().unwrap();
+    drop(authority);
+    drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_tls_server_and_client_rotate_without_process_restart() {
+    let first_pki = test_pki("control-plane.test");
+    let second_pki = test_pki("control-plane.test");
+    let (database, directory) = temp_database();
+    let repository = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    let authority = PersistentSnapshotAuthority::open(repository.clone())
+        .await
+        .unwrap();
+
+    let server_certificate = directory.join("control.pem");
+    let server_key = directory.join("control-key.pem");
+    let edge_ca = directory.join("edge-ca.pem");
+    let server_ca = directory.join("control-ca.pem");
+    let client_certificate = directory.join("edge.pem");
+    let client_key = directory.join("edge-key.pem");
+    let server_manifest = directory.join("server-reload.json");
+    let client_manifest = directory.join("client-reload.json");
+    let write_generation = |pki: &TestPki| {
+        std::fs::write(&server_certificate, &pki.server.certificate_pem).unwrap();
+        std::fs::write(&server_key, &pki.server.private_key_pem).unwrap();
+        std::fs::write(&edge_ca, &pki.authority_pem).unwrap();
+        std::fs::write(&server_ca, &pki.authority_pem).unwrap();
+        std::fs::write(&client_certificate, &pki.edge.certificate_pem).unwrap();
+        std::fs::write(&client_key, &pki.edge.private_key_pem).unwrap();
+    };
+    write_generation(&first_pki);
+    write_reload_manifest(
+        &server_manifest,
+        1,
+        &[
+            ("server_certificate", &server_certificate),
+            ("server_private_key", &server_key),
+            ("client_ca", &edge_ca),
+        ],
+    );
+    write_reload_manifest(
+        &client_manifest,
+        1,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+
+    let (server_tls, server_reloader) = SnapshotServerTlsReloadRuntime::bootstrap(
+        SnapshotServerTlsReloadConfig {
+            manifest_path: server_manifest.clone(),
+            server_certificate_path: server_certificate.clone(),
+            server_private_key_path: server_key.clone(),
+            client_ca_path: edge_ca.clone(),
+            poll_interval: Duration::from_millis(20),
+            expiry_warning: Duration::from_secs(60),
+        },
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let server_status = server_tls.clone();
+    let server = SnapshotDistributionServer::bind(
+        SnapshotServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            max_edge_clients: 8,
+            request_timeout: Duration::from_secs(1),
+            tls: server_tls,
+        },
+        authority.subscribe(),
+    )
+    .await
+    .unwrap();
+    let server_addr = server.local_addr();
+    let (server_trigger, server_signal) = shutdown_channel();
+    let server_task = tokio::spawn(server.run_until_shutdown(server_signal));
+    let (server_reload_trigger, server_reload_signal) = shutdown_channel();
+    let server_reload_task = tokio::spawn(server_reloader.run_until_shutdown(server_reload_signal));
+
+    let (mut client, client_reloader) = SnapshotClientTlsReloadRuntime::bootstrap(
+        server_addr,
+        "control-plane.test",
+        SnapshotClientTlsReloadConfig {
+            manifest_path: client_manifest.clone(),
+            server_ca_path: server_ca.clone(),
+            client_certificate_path: client_certificate.clone(),
+            client_private_key_path: client_key.clone(),
+            poll_interval: Duration::from_millis(20),
+            expiry_warning: Duration::from_secs(60),
+        },
+    )
+    .await
+    .unwrap();
+    client.connect_timeout = Duration::from_secs(1);
+    client.handshake_timeout = Duration::from_secs(1);
+    client.subscribe_timeout = Duration::from_secs(1);
+    let client_status = client.clone();
+    let (_, initial_runtime) = SnapshotBootstrapClient::bootstrap(client.clone())
+        .await
+        .unwrap();
+    drop(initial_runtime);
+    let (client_reload_trigger, client_reload_signal) = shutdown_channel();
+    let client_reload_task = tokio::spawn(client_reloader.run_until_shutdown(client_reload_signal));
+
+    write_generation(&second_pki);
+    write_reload_manifest(
+        &server_manifest,
+        2,
+        &[
+            ("server_certificate", &server_certificate),
+            ("server_private_key", &server_key),
+            ("client_ca", &edge_ca),
+        ],
+    );
+    write_reload_manifest(
+        &client_manifest,
+        2,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server_status
+                .reload_status(Duration::from_secs(1))
+                .generation
+                == 2
+                && client_status
+                    .reload_status(Duration::from_secs(1))
+                    .generation
+                    == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("snapshot TLS generation two was not published");
+    let (_, rotated_runtime) = SnapshotBootstrapClient::bootstrap(client.clone())
+        .await
+        .unwrap();
+    drop(rotated_runtime);
+
+    let old_client = client_config(server_addr, &first_pki, "control-plane.test");
+    assert!(matches!(
+        SnapshotBootstrapClient::bootstrap(old_client).await,
+        Err(SnapshotClientError::TlsAuthentication)
+    ));
+
+    std::fs::write(&client_key, b"invalid private key").unwrap();
+    write_reload_manifest(
+        &client_manifest,
+        3,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = client_status.reload_status(Duration::from_secs(1));
+            if status.health == TlsConfigHealth::ReloadFailed {
+                assert_eq!(status.generation, 2);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid snapshot client generation was not reported");
+    let (_, last_good_runtime) = SnapshotBootstrapClient::bootstrap(client).await.unwrap();
+    drop(last_good_runtime);
+
+    client_reload_trigger.shutdown();
+    server_reload_trigger.shutdown();
+    server_trigger.shutdown();
+    client_reload_task.await.unwrap().unwrap();
+    server_reload_task.await.unwrap().unwrap();
     server_task.await.unwrap().unwrap();
     drop(authority);
     drop(repository);

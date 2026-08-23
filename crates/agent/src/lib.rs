@@ -43,7 +43,10 @@ pub use runtime::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError, AgentRuntimeError,
     AgentRuntimeOutcome, ReconnectConfig, ReconnectConfigError,
 };
-pub use tls::{AgentTlsConfig, AgentTlsConfigError, AgentTransportSecurity};
+pub use tls::{
+    AgentTlsConfig, AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig,
+    AgentTlsReloadRuntime, AgentTransportSecurity,
+};
 pub use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 
 use std::net::SocketAddr;

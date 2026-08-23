@@ -9,6 +9,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tunnelproxy_common::{
+    certificate_validity, load_tls_reload_generation, ReloadableConfig, ShutdownSignal,
+    TlsConfigStatus, TlsGenerationError, TlsReloadCandidate, TlsReloadFile, TlsReloadGeneration,
+    TlsReloadRuntime, TlsReloadRuntimeConfig, TlsReloadRuntimeError,
+};
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
     authorization_snapshot_channel, AgentGrant, AuthorizationError, AuthorizationSnapshot,
@@ -43,6 +48,10 @@ enum EdgeRegistrationMode {
         /// Static policies retain their producer so the source does not look
         /// stale. Dynamic policies leave ownership with the control plane.
         static_source: Option<AuthorizationSnapshotPublisher>,
+        /// Reloadable local policies consume their retained publisher just
+        /// like a remote snapshot source so removed certificates revoke live
+        /// sessions.
+        local_updates: bool,
     },
 }
 
@@ -79,6 +88,7 @@ impl EdgeRegistrationPolicy {
             mode: EdgeRegistrationMode::MutualTls {
                 snapshots,
                 static_source: Some(publisher),
+                local_updates: false,
             },
         }
     }
@@ -89,6 +99,7 @@ impl EdgeRegistrationPolicy {
             mode: EdgeRegistrationMode::MutualTls {
                 snapshots,
                 static_source: None,
+                local_updates: false,
             },
         }
     }
@@ -100,15 +111,24 @@ impl EdgeRegistrationPolicy {
         tunnel_id: TunnelId,
         client_certificate_pem: &[u8],
     ) -> Result<Self, EdgeRegistrationPolicyError> {
-        let certificates = parse_registration_certificates(client_certificate_pem)?;
-        let fingerprint = CertificateFingerprint::from_certificate_der(certificates[0].as_ref());
-        let snapshot = AuthorizationSnapshot::new(vec![AgentGrant::new(
-            fingerprint,
-            agent_id,
-            vec![TunnelGrant::new(tunnel_id, TunnelStatus::Enabled)],
-        )])
-        .map_err(EdgeRegistrationPolicyError::Snapshot)?;
+        let snapshot = static_authorization_snapshot(agent_id, tunnel_id, client_certificate_pem)?;
         Ok(Self::mutual_tls(snapshot))
+    }
+
+    fn mutual_tls_reloadable(
+        initial: VersionedAuthorizationSnapshot,
+    ) -> (Self, AuthorizationSnapshotPublisher) {
+        let (publisher, snapshots) = authorization_snapshot_channel(initial);
+        (
+            Self {
+                mode: EdgeRegistrationMode::MutualTls {
+                    snapshots,
+                    static_source: Some(publisher.clone()),
+                    local_updates: true,
+                },
+            },
+            publisher,
+        )
     }
 
     pub const fn is_mutual_tls(&self) -> bool {
@@ -189,13 +209,11 @@ impl EdgeRegistrationPolicy {
         match &self.mode {
             EdgeRegistrationMode::MutualTls {
                 snapshots,
-                static_source: None,
-            } => Some(snapshots.clone()),
+                static_source,
+                local_updates,
+            } if static_source.is_none() || *local_updates => Some(snapshots.clone()),
             EdgeRegistrationMode::LoopbackDevelopment { .. }
-            | EdgeRegistrationMode::MutualTls {
-                static_source: Some(_),
-                ..
-            } => None,
+            | EdgeRegistrationMode::MutualTls { .. } => None,
         }
     }
 
@@ -217,14 +235,15 @@ impl EdgeRegistrationPolicy {
 
     /// Dynamic policies may authorize a configured raw tunnel in a later full
     /// snapshot, so Edge can bind ingress before the grant exists.
-    pub const fn has_live_updates(&self) -> bool {
-        matches!(
-            self.mode,
+    pub fn has_live_updates(&self) -> bool {
+        match &self.mode {
             EdgeRegistrationMode::MutualTls {
-                static_source: None,
+                static_source,
+                local_updates,
                 ..
-            }
-        )
+            } => static_source.is_none() || *local_updates,
+            EdgeRegistrationMode::LoopbackDevelopment { .. } => false,
+        }
     }
 }
 
@@ -260,6 +279,7 @@ impl fmt::Debug for EdgeRegistrationPolicy {
             EdgeRegistrationMode::MutualTls {
                 snapshots,
                 static_source,
+                local_updates,
             } => f
                 .debug_struct("MutualTlsAuthorization")
                 .field("version", &snapshots.current().version())
@@ -267,7 +287,7 @@ impl fmt::Debug for EdgeRegistrationPolicy {
                     "certificate_count",
                     &snapshots.current().snapshot().certificate_count(),
                 )
-                .field("dynamic", &static_source.is_none())
+                .field("dynamic", &(static_source.is_none() || *local_updates))
                 .finish_non_exhaustive(),
         }
     }
@@ -295,6 +315,21 @@ impl fmt::Display for EdgeRegistrationPolicyError {
 }
 
 impl std::error::Error for EdgeRegistrationPolicyError {}
+
+fn static_authorization_snapshot(
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
+    client_certificate_pem: &[u8],
+) -> Result<AuthorizationSnapshot, EdgeRegistrationPolicyError> {
+    let certificates = parse_registration_certificates(client_certificate_pem)?;
+    let fingerprint = CertificateFingerprint::from_certificate_der(certificates[0].as_ref());
+    AuthorizationSnapshot::new(vec![AgentGrant::new(
+        fingerprint,
+        agent_id,
+        vec![TunnelGrant::new(tunnel_id, TunnelStatus::Enabled)],
+    )])
+    .map_err(EdgeRegistrationPolicyError::Snapshot)
+}
 
 /// Security applied before Edge accepts a Protocol v2 Agent handshake.
 #[derive(Clone, Default)]
@@ -328,7 +363,7 @@ impl fmt::Debug for EdgeTransportSecurity {
 /// its debug representation or error values.
 #[derive(Clone)]
 pub struct EdgeTlsConfig {
-    pub(crate) server_config: Arc<ServerConfig>,
+    pub(crate) server_config: ReloadableConfig<ServerConfig>,
     pub(crate) handshake_timeout: Duration,
 }
 
@@ -342,25 +377,10 @@ impl EdgeTlsConfig {
         if handshake_timeout.is_zero() {
             return Err(EdgeTlsConfigError::ZeroHandshakeTimeout);
         }
-        let server_certificates = parse_certificates(server_cert_pem, CertificateKind::Server)?;
-        let server_key = parse_private_key(server_key_pem)?;
-        let client_ca_certificates = parse_certificates(client_ca_pem, CertificateKind::Authority)?;
-        let mut client_roots = RootCertStore::empty();
-        for certificate in client_ca_certificates {
-            client_roots
-                .add(certificate)
-                .map_err(|_| EdgeTlsConfigError::InvalidClientAuthorityCertificate)?;
-        }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-            .build()
-            .map_err(|_| EdgeTlsConfigError::InvalidClientAuthorityCertificate)?;
-        let mut server_config = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(server_certificates, server_key)
-            .map_err(|_| EdgeTlsConfigError::InvalidServerIdentity)?;
-        server_config.alpn_protocols = vec![TUNNELPROXY_ALPN.to_vec()];
+        let candidate = build_server_config(server_cert_pem, server_key_pem, client_ca_pem)?;
         Ok(Self {
-            server_config: Arc::new(server_config),
+            server_config: ReloadableConfig::new(1, [0; 32], candidate.config, candidate.validity)
+                .map_err(|_| EdgeTlsConfigError::InvalidCertificateValidity)?,
             handshake_timeout,
         })
     }
@@ -368,12 +388,18 @@ impl EdgeTlsConfig {
     pub const fn handshake_timeout(&self) -> Duration {
         self.handshake_timeout
     }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.server_config
+            .status(std::time::SystemTime::now(), expiry_warning)
+    }
 }
 
 impl fmt::Debug for EdgeTlsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EdgeTlsConfig")
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("generation", &self.server_config.generation())
             .finish_non_exhaustive()
     }
 }
@@ -388,6 +414,7 @@ pub enum EdgeTlsConfigError {
     InvalidServerIdentity,
     MissingClientAuthorityCertificate,
     InvalidClientAuthorityCertificate,
+    InvalidCertificateValidity,
 }
 
 impl fmt::Display for EdgeTlsConfigError {
@@ -406,6 +433,9 @@ impl fmt::Display for EdgeTlsConfigError {
             }
             Self::InvalidClientAuthorityCertificate => {
                 "TLS client CA bundle contains an invalid certificate"
+            }
+            Self::InvalidCertificateValidity => {
+                "TLS server certificate validity is invalid or not currently active"
             }
         };
         f.write_str(message)
@@ -458,6 +488,253 @@ fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, EdgeTlsConfig
         .map_err(|_| EdgeTlsConfigError::InvalidServerPrivateKey)?
         .ok_or(EdgeTlsConfigError::MissingServerPrivateKey)
 }
+
+fn build_server_config(
+    server_cert_pem: &[u8],
+    server_key_pem: &[u8],
+    client_ca_pem: &[u8],
+) -> Result<TlsReloadCandidate<ServerConfig>, EdgeTlsConfigError> {
+    let server_certificates = parse_certificates(server_cert_pem, CertificateKind::Server)?;
+    let validity = certificate_validity(server_certificates[0].as_ref())
+        .map_err(|_| EdgeTlsConfigError::InvalidCertificateValidity)?;
+    let server_key = parse_private_key(server_key_pem)?;
+    let client_ca_certificates = parse_certificates(client_ca_pem, CertificateKind::Authority)?;
+    let mut client_roots = RootCertStore::empty();
+    for certificate in client_ca_certificates {
+        client_roots
+            .add(certificate)
+            .map_err(|_| EdgeTlsConfigError::InvalidClientAuthorityCertificate)?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|_| EdgeTlsConfigError::InvalidClientAuthorityCertificate)?;
+    let mut server_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(server_certificates, server_key)
+        .map_err(|_| EdgeTlsConfigError::InvalidServerIdentity)?;
+    server_config.alpn_protocols = vec![TUNNELPROXY_ALPN.to_vec()];
+    Ok(TlsReloadCandidate {
+        config: server_config,
+        validity,
+    })
+}
+
+const RELOAD_SERVER_CERTIFICATE: &str = "server_certificate";
+const RELOAD_SERVER_PRIVATE_KEY: &str = "server_private_key";
+const RELOAD_CLIENT_CA: &str = "client_ca";
+const RELOAD_AUTHORIZED_CLIENT_CERTIFICATE: &str = "authorized_client_certificate";
+
+#[derive(Debug, Clone)]
+pub struct EdgeTlsReloadConfig {
+    pub manifest_path: std::path::PathBuf,
+    pub server_certificate_path: std::path::PathBuf,
+    pub server_private_key_path: std::path::PathBuf,
+    pub client_ca_path: std::path::PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+}
+
+impl EdgeTlsReloadConfig {
+    fn runtime_config(&self) -> TlsReloadRuntimeConfig {
+        TlsReloadRuntimeConfig {
+            manifest_path: self.manifest_path.clone(),
+            files: vec![
+                TlsReloadFile::new(
+                    RELOAD_SERVER_CERTIFICATE,
+                    self.server_certificate_path.clone(),
+                ),
+                TlsReloadFile::new(
+                    RELOAD_SERVER_PRIVATE_KEY,
+                    self.server_private_key_path.clone(),
+                ),
+                TlsReloadFile::new(RELOAD_CLIENT_CA, self.client_ca_path.clone()),
+            ],
+            poll_interval: self.poll_interval,
+            expiry_warning: self.expiry_warning,
+        }
+    }
+
+    fn runtime_config_with_static_authorization(
+        &self,
+        authorized_client_certificate_path: std::path::PathBuf,
+    ) -> TlsReloadRuntimeConfig {
+        let mut config = self.runtime_config();
+        config.files.push(TlsReloadFile::new(
+            RELOAD_AUTHORIZED_CLIENT_CERTIFICATE,
+            authorized_client_certificate_path,
+        ));
+        config
+    }
+}
+
+type EdgeBuild =
+    Box<dyn Fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ServerConfig>, ()> + Send + Sync>;
+
+pub struct EdgeTlsReloadRuntime {
+    inner: TlsReloadRuntime<ServerConfig, EdgeBuild>,
+}
+
+impl EdgeTlsReloadRuntime {
+    pub async fn bootstrap(
+        reload: EdgeTlsReloadConfig,
+        handshake_timeout: Duration,
+    ) -> Result<(EdgeTlsConfig, Self), EdgeTlsReloadBootstrapError> {
+        if handshake_timeout.is_zero() {
+            return Err(EdgeTlsReloadBootstrapError::Tls(
+                EdgeTlsConfigError::ZeroHandshakeTimeout,
+            ));
+        }
+        let runtime_config = reload.runtime_config();
+        runtime_config
+            .validate()
+            .map_err(EdgeTlsReloadBootstrapError::Runtime)?;
+        let generation = load_tls_reload_generation(
+            runtime_config.manifest_path.clone(),
+            runtime_config.files.clone(),
+        )
+        .await
+        .map_err(EdgeTlsReloadBootstrapError::Load)?;
+        let candidate = build_reload_generation(&generation)
+            .map_err(|()| EdgeTlsReloadBootstrapError::Candidate)?;
+        let server_config = ReloadableConfig::new(
+            generation.generation(),
+            generation.manifest_digest(),
+            candidate.config,
+            candidate.validity,
+        )
+        .map_err(EdgeTlsReloadBootstrapError::Generation)?;
+        let tls = EdgeTlsConfig {
+            server_config: server_config.clone(),
+            handshake_timeout,
+        };
+        let inner = TlsReloadRuntime::new(
+            runtime_config,
+            server_config,
+            Box::new(build_reload_generation) as EdgeBuild,
+        )
+        .map_err(EdgeTlsReloadBootstrapError::Runtime)?;
+        Ok((tls, Self { inner }))
+    }
+
+    /// Bootstraps the Agent-facing TLS identity and the exact static Agent
+    /// authorization from one manifest generation. Later generations publish
+    /// authorization before TLS so a removed certificate is denied before the
+    /// newly trusted transport identity becomes active.
+    pub async fn bootstrap_with_static_authorization(
+        reload: EdgeTlsReloadConfig,
+        authorized_client_certificate_path: std::path::PathBuf,
+        handshake_timeout: Duration,
+        agent_id: AgentId,
+        tunnel_id: TunnelId,
+    ) -> Result<(EdgeTlsConfig, EdgeRegistrationPolicy, Self), EdgeTlsReloadBootstrapError> {
+        if handshake_timeout.is_zero() {
+            return Err(EdgeTlsReloadBootstrapError::Tls(
+                EdgeTlsConfigError::ZeroHandshakeTimeout,
+            ));
+        }
+        let runtime_config =
+            reload.runtime_config_with_static_authorization(authorized_client_certificate_path);
+        runtime_config
+            .validate()
+            .map_err(EdgeTlsReloadBootstrapError::Runtime)?;
+        let generation = load_tls_reload_generation(
+            runtime_config.manifest_path.clone(),
+            runtime_config.files.clone(),
+        )
+        .await
+        .map_err(EdgeTlsReloadBootstrapError::Load)?;
+        let candidate = build_reload_generation(&generation)
+            .map_err(|()| EdgeTlsReloadBootstrapError::Candidate)?;
+        let snapshot = static_authorization_snapshot(
+            agent_id.clone(),
+            tunnel_id.clone(),
+            generation
+                .file(RELOAD_AUTHORIZED_CLIENT_CERTIFICATE)
+                .map_err(EdgeTlsReloadBootstrapError::Load)?,
+        )
+        .map_err(EdgeTlsReloadBootstrapError::Authorization)?;
+        let version = SnapshotVersion::new(generation.generation())
+            .ok_or(EdgeTlsReloadBootstrapError::Candidate)?;
+        let (registration, publisher) = EdgeRegistrationPolicy::mutual_tls_reloadable(
+            VersionedAuthorizationSnapshot::new(version, snapshot),
+        );
+        let server_config = ReloadableConfig::new(
+            generation.generation(),
+            generation.manifest_digest(),
+            candidate.config,
+            candidate.validity,
+        )
+        .map_err(EdgeTlsReloadBootstrapError::Generation)?;
+        let tls = EdgeTlsConfig {
+            server_config: server_config.clone(),
+            handshake_timeout,
+        };
+        let build_agent_id = agent_id;
+        let build_tunnel_id = tunnel_id;
+        let build = Box::new(move |generation: &TlsReloadGeneration| {
+            let candidate = build_reload_generation(generation)?;
+            let snapshot = static_authorization_snapshot(
+                build_agent_id.clone(),
+                build_tunnel_id.clone(),
+                generation
+                    .file(RELOAD_AUTHORIZED_CLIENT_CERTIFICATE)
+                    .map_err(|_| ())?,
+            )
+            .map_err(|_| ())?;
+            let version = SnapshotVersion::new(generation.generation()).ok_or(())?;
+            publisher
+                .publish(VersionedAuthorizationSnapshot::new(version, snapshot))
+                .map_err(|_| ())?;
+            Ok(candidate)
+        }) as EdgeBuild;
+        let inner = TlsReloadRuntime::new(runtime_config, server_config, build)
+            .map_err(EdgeTlsReloadBootstrapError::Runtime)?;
+        Ok((tls, registration, Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
+    }
+}
+
+fn build_reload_generation(
+    generation: &TlsReloadGeneration,
+) -> Result<TlsReloadCandidate<ServerConfig>, ()> {
+    build_server_config(
+        generation.file(RELOAD_SERVER_CERTIFICATE).map_err(|_| ())?,
+        generation.file(RELOAD_SERVER_PRIVATE_KEY).map_err(|_| ())?,
+        generation.file(RELOAD_CLIENT_CA).map_err(|_| ())?,
+    )
+    .map_err(|_| ())
+}
+
+#[derive(Debug)]
+pub enum EdgeTlsReloadBootstrapError {
+    Load(tunnelproxy_common::TlsReloadLoadError),
+    Tls(EdgeTlsConfigError),
+    Generation(TlsGenerationError),
+    Runtime(TlsReloadRuntimeError),
+    Authorization(EdgeRegistrationPolicyError),
+    Candidate,
+}
+
+impl std::fmt::Display for EdgeTlsReloadBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(f),
+            Self::Tls(error) => error.fmt(f),
+            Self::Generation(error) => error.fmt(f),
+            Self::Runtime(error) => error.fmt(f),
+            Self::Authorization(error) => error.fmt(f),
+            Self::Candidate => f.write_str("TLS reload generation contains invalid credentials"),
+        }
+    }
+}
+
+impl std::error::Error for EdgeTlsReloadBootstrapError {}
 
 #[cfg(test)]
 mod tests {
