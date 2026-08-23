@@ -24,5 +24,7 @@ HELLO → REGISTER → REGISTERED handshake, and exposes an established
 `AgentSession`. It validates Edge PING and returns the matching PONG. Session 09
 adds `AgentSession::run_multiplexed`, which connects concurrent Edge-opened
 streams to one configured local TCP service with bounded queues and DATA
-frames, half-close, and per-stream reset/cleanup. Reconnect, TLS,
-authentication, durable registration, and the final CLI UX remain unimplemented.
+frames, half-close, and per-stream reset/cleanup. Session 12 adds
+`AgentRuntime` and the runnable `tunnelproxy-agent` binary with validated CLI
+configuration and Ctrl-C/SIGTERM shutdown. Reconnect, TLS, authentication,
+durable registration, and the final `tunnelproxy http` UX remain unimplemented.

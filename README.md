@@ -19,6 +19,8 @@ correct agent, which in turn proxies them into the local service.
   half-close, typed reset, open/idle deadlines, and per-session routing.
 - Ephemeral loopback raw-ingress routes with bounded connection admission,
   tracked stream completion, graceful drain, and Agent-disconnect cleanup.
+- Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries for one local
+  tunnel, with Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -140,10 +142,10 @@ and Definition of Done.
 
 | Session | Focus |
 |---------|-------|
-| 01–06 _(complete)_ | foundation, TCP relay/forwarder, framing, Agent ↔ Edge handshake |
-| 07 _(complete)_ | Edge-initiated heartbeat, liveness timeout, dead-session cleanup |
-| 08 _(complete)_ | one bounded reverse data stream before multiplexing |
-| 09 _(planned)_ | bounded concurrent stream multiplexing and session routing |
+| 01–06 _(complete)_ | foundation, relay/forwarder, framing, Agent ↔ Edge handshake |
+| 07–09 _(complete)_ | heartbeat, reverse streams, bounded multiplexing and routing |
+| 10–11 _(complete)_ | raw ingress lifecycle and supervised graceful shutdown |
+| 12 _(complete)_ | runnable Edge/Agent entrypoints and OS signal wiring |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

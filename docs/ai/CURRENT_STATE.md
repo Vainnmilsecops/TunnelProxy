@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Graceful Runtime Shutdown & Supervision** (Session 11).
+**Production Runtime Entrypoints & OS Signal Wiring** (Session 12).
 
 ## Completed
 
@@ -96,13 +96,27 @@
   `OPEN_STREAM` frames with `SessionClosing` while current streams finish.
 - Raw ingress shutdown is process-wide, prevents route reuse, joins connection
   tasks, and force-aborts remaining routes only after the deadline.
-- 145 explicit workspace tests are present; all prior behavior is preserved.
+- `EdgeRuntime` composes one multiplexed Agent listener with one loopback raw
+  ingress route. It waits for the sole Agent before binding ingress and rolls
+  the transport back if route startup fails.
+- `AgentRuntime` composes outbound connect/handshake with the multiplexed local
+  bridge and accepts cancellation even before connection completes.
+- Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries expose validated
+  addresses, capacity, timeout, and drain CLI flags.
+- Ctrl-C is supported on all platforms and SIGTERM on Unix. Signal observation
+  only triggers cancellation; owning supervisors perform ordered cleanup.
+- Edge shutdown drains raw routes before Agent transports. Forced stage results
+  and unexpected peer disconnects produce non-zero process exits.
+- Real-TCP composition tests cover byte-exact forwarding, shutdown before an
+  Agent arrives, startup rollback, and Agent cancellation before connect.
+- 162 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - TLS / encryption.
 - Agent authentication.
 - Reconnect logic.
+- Automatic raw-route rebind after Agent disconnect (DEBT-016 open).
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Tunnel registration (REGISTER is ephemeral transport registration only).
@@ -116,11 +130,12 @@
 
 ## Next planned session
 
-**Session 12 — Production Runtime Entrypoints & OS Signal Wiring.**
+**Session 13 — Agent Reconnect & Route Recovery.**
 
 Goals:
 
-- Compose the supervised runtime APIs behind production-oriented CLI entrypoints.
-- Translate Ctrl-C / SIGTERM into one idempotent shutdown request.
-- Define startup rollback and ordered shutdown reporting without adding public
-  HTTP/TLS, persistence, authentication, or reconnect.
+- Add bounded exponential reconnect with jitter and cancellation.
+- Rebind the single loopback raw route to a replacement live session without
+  treating ephemeral session IDs as durable identity.
+- Preserve explicit startup/shutdown reporting; keep authentication, durable
+  identity, public HTTP/TLS, and multi-edge separate.

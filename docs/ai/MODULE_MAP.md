@@ -11,6 +11,7 @@
   future `UserId`, `EdgeId`).
 - Cross-component error sentinels when they are genuinely shared.
 - Small allocation-light helpers used by more than one other crate.
+- Cross-platform process termination observation shared by Edge and Agent.
 
 **Prohibited**
 
@@ -42,8 +43,8 @@ single-stream lifecycle payload types/codecs.
 
 ## `tunnelproxy-agent`
 
-**Current implementation:** Outbound handshake/heartbeat plus a one-active-
-stream bridge to one configured local TCP service.
+**Current implementation:** Outbound handshake/heartbeat, bounded multiplexed
+local bridging, and a runnable single-session process supervisor/CLI.
 
 **Responsibility (future)**
 
@@ -62,7 +63,8 @@ stream bridge to one configured local TCP service.
 ## `tunnelproxy-edge`
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
-bounded stream multiplexing, and lifecycle-managed loopback raw TCP routes.
+bounded stream multiplexing, lifecycle-managed loopback raw TCP routes, and a
+runnable single-tunnel process supervisor/CLI.
 
 **Responsibility (future)**
 

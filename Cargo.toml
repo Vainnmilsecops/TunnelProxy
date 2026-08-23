@@ -25,6 +25,7 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",
     "time",
     "sync",
+    "signal",
 ] }
 # Structured logging per INV-003 (avoid leaking payloads; logs use spans/events only).
 tracing = "0.1"

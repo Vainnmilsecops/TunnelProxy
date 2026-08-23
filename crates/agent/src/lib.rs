@@ -19,19 +19,25 @@
 //! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Session 08
 //! adds a loopback-tested single-stream local TCP bridge, and Session 09 adds
 //! bounded concurrent streams through `AgentSession::run_multiplexed`.
-//! Reconnect and the final CLI remain out of scope. See
+//! Session 12 adds the runnable single-session `AgentRuntime` and CLI.
+//! Reconnect and the final `tunnelproxy http` UX remain out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]
 
 mod agent_transport;
 mod multiplex;
+mod runtime;
 
 pub use agent_transport::{
     connect, AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,
+};
+pub use runtime::{
+    AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError, AgentRuntimeError,
+    AgentRuntimeOutcome,
 };
 pub use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 

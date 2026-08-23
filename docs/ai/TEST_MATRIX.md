@@ -93,6 +93,11 @@
 | Supervised listener shutdown              | ✅   | ✅          | —   | Echo, forwarder, Agent listener, and single-stream tests cover listener release, child cancellation, graceful completion, and forced deadline outcomes. |
 | Multiplexed Edge/Agent drain              | ✅   | ✅          | —   | Edge releases admission and its router fails closed; Agent honors a shutdown already requested before its multiplex loop starts. |
 | Raw route process shutdown                | ✅   | ✅          | —   | Global route drain rejects manager reuse and force-aborts an active route only after its deadline. |
+| Agent process runtime                     | ✅   | ✅          | —   | Config validation plus pre-connect cancellation and composed outbound handshake/multiplex lifecycle. |
+| Edge process runtime                      | ✅   | ✅          | —   | Waits for one Agent, creates one raw route, shuts down in route→transport order, and rolls back route bind failure. |
+| Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Both binary parsers cover defaults, all supported flags, missing/invalid values, and unknown flags. |
+| Composed local tunnel                     | —    | ✅          | —   | Real TCP crosses runnable Edge→Agent→local echo byte-exactly, then releases both listener ports after shutdown. |
+| OS process shutdown observation           | ✅   | —           | —   | Ctrl-C on all platforms and SIGTERM on Unix compile behind Tokio's signal feature; runtime cleanup is tested via injected shutdown signals. |
 | Reconnect                                 | —    | —           | —   | Deferred until a stable tunnel exists.                                                                                      |
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
 | TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |

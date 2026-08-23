@@ -416,3 +416,31 @@ Out of scope:
 - Public HTTP/HTTPS ingress, TLS, authentication, and hostname allocation.
 - Durable identity/routes, persistence, reconnect, and automatic rebind.
 - Credit/window flow control and weighted DATA scheduling.
+
+## Session 12 — Production Runtime Entrypoints & OS Signal Wiring — complete
+
+Scope delivered:
+
+- Added validated `EdgeRuntime` and `AgentRuntime` process supervisors.
+- Edge waits for one Agent, binds one loopback raw route, performs route-first
+  ordered shutdown, and rolls back its transport if route startup fails.
+- Agent composes cancellable outbound connect/handshake with the bounded
+  multiplexed local bridge; reconnect remains disabled.
+- Added runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries with
+  addresses, capacity, connect/handshake, and drain CLI settings.
+- Added Ctrl-C observation on every platform and SIGTERM on Unix. Signal code
+  only requests cancellation; runtime owners retain cleanup responsibility.
+- Defined exit codes for graceful shutdown, runtime/forced failure, and invalid
+  configuration.
+- Added 17 unit/integration tests for config/outcomes, both CLI parsers,
+  cancellation before startup, byte-exact composed forwarding, ordered
+  shutdown, listener release, and startup rollback. The workspace now contains
+  162 explicit tests.
+- Recorded the one-Agent/no-reconnect limitation as DEBT-016.
+
+Out of scope:
+
+- Reconnect/backoff and automatic raw-route rebind.
+- Authentication, TLS, public HTTP ingress, and hostname allocation.
+- Durable tunnel/Agent identity, persistence, and control-plane routing state.
+- Multi-Agent route selection and multi-edge operation.
