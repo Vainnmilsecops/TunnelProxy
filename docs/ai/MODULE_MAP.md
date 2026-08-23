@@ -70,7 +70,9 @@ runnable single-tunnel process supervisor/CLI whose durable TunnelId route stays
 bound across replacement Agent sessions. Its Agent listener can require mutual
 TLS and exact certificate-to-Agent/Tunnel authorization before publication.
 Versioned full snapshot updates atomically unpublish and close revoked sessions
-without placing control-plane storage on the ingress hot path.
+without placing control-plane storage on the ingress hot path. Edge can
+bootstrap that cache from the dedicated authenticated snapshot service and
+retain it as stale during reconnect.
 
 **Responsibility (future)**
 
@@ -90,9 +92,10 @@ without placing control-plane storage on the ingress hot path.
 ## `tunnelproxy-control-plane`
 
 **Current implementation:** Immutable certificate-fingerprint → AgentId →
-TunnelId authorization snapshots, non-zero monotonic versions, and bounded
-latest-value in-process distribution. It has no storage or external network
-service code.
+TunnelId authorization snapshots, non-zero monotonic versions, canonical
+bounded encoding, transactional SQLite persistence, bounded latest-value
+distribution, and a dedicated mutual-TLS snapshot service for Edge bootstrap
+and reconnect.
 
 **Responsibility (future)**
 

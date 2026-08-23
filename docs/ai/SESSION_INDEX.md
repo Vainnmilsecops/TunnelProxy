@@ -20,6 +20,7 @@
 | 14      | Mutual TLS & Agent Authentication              | complete |
 | 15      | Authenticated Tunnel Identity & Registration   | complete |
 | 16      | Control-Plane Snapshot Distribution & Live Revocation | complete |
+| 17      | Persistent Snapshot Storage & Authenticated Edge Bootstrap | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -595,3 +596,39 @@ Out of scope:
 - Certificate issuance/rotation/hot reload and multi-edge consistency.
 - Public HTTP/HTTPS/raw ingress, hostname allocation, and access policy.
 - Protocol v3, multiple tunnels per Agent transport, and stream replay.
+
+## Session 17 — Persistent Snapshot Storage & Authenticated Edge Bootstrap — complete
+
+Scope delivered:
+
+- Added a canonical, bounded binary codec for complete authorization snapshots,
+  including stable ordering, SHA-256 content digests, strict identifier/status
+  validation, and a 1 MiB wire ceiling.
+- Added a synchronous `SnapshotRepository` boundary and a bundled-SQLite
+  implementation. Full snapshot replacement and its version/digest head commit
+  in one `IMMEDIATE` transaction with WAL and `synchronous = FULL`.
+- Added `PersistentSnapshotAuthority`, which loads the latest committed
+  snapshot on startup, rejects an uninitialized repository, serializes commits
+  off the async executor, and publishes only after durable commit succeeds.
+- Added a dedicated snapshot protocol and mTLS service using ALPN
+  `tunnelproxy-snapshot/1`; Tunnel Protocol v2 is unchanged. Edge sends its last
+  applied version, receives a full snapshot or `UpToDate`, and rejects an
+  ahead/invalid response.
+- Added the reconnecting Edge snapshot client and a composition helper for
+  building `EdgeRegistrationPolicy`. Loss of the service marks authorization
+  `Stale` while retaining the last cached full snapshot; reconnect resumes from
+  the in-memory version and returns the source to `Live`.
+- Bounded Edge-client admission, TLS/connect/subscribe/read-write operations,
+  snapshot size/cardinality, latest-value delivery, retry delay, and shutdown
+  cancellation are enforced.
+- Added eight unit/integration tests for canonical/malformed codecs, SQLite
+  reopen and ordering, durable-before-publish behavior, protocol strictness,
+  real mTLS bootstrap/push/reconnect, wrong server identity, and cancellation.
+  The workspace now contains 215 explicit tests.
+
+Out of scope:
+
+- Runnable Control Plane daemon/CLI and production configuration loading.
+- Administrative mutation API, accounts, quotas, and certificate issuance.
+- Edge disk cache across a Control Plane outage at cold startup.
+- Certificate rotation/hot reload, multi-edge ownership, and public ingress.

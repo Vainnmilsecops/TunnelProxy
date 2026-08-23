@@ -46,6 +46,7 @@ rcgen = "0.13"
 # workspace's Rust 1.75 MSRV. Keep test certificate generation MSRV-compatible.
 time = "=0.3.36"
 sha2 = { version = "0.10", default-features = false }
+rusqlite = { version = "0.31", default-features = false, features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

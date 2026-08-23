@@ -415,3 +415,33 @@ storage query. Revocation is fail-closed rather than graceful for active
 streams. The latest-value channel deliberately skips superseded snapshots.
 Persistence, authenticated cross-process distribution, restart bootstrap,
 certificate rotation, and multi-edge consistency remain separate work.
+
+---
+
+## ADR-017 — SQLite commits precede dedicated mTLS full-snapshot publication
+
+**Status:** Accepted (Session 17).
+
+**Context:** Session 16 has atomic in-memory authorization updates but cannot
+recover authority after a Control Plane restart or bootstrap a separate Edge
+process. Persistence must not leak into Edge ingress, publication must never
+precede durable commit, and control-plane distribution must not alter or share
+the Agent ↔ Edge Tunnel Protocol v2 channel.
+
+**Decision:** Store only the latest complete snapshot in SQLite behind a
+`SnapshotRepository` boundary. A single transaction replaces grants and writes
+the non-zero version plus canonical SHA-256 digest; `synchronous = FULL` and WAL
+are enabled. `PersistentSnapshotAuthority` runs repository calls on blocking
+workers, serializes commits, and updates its bounded watch publisher only after
+the repository succeeds. Cross-process distribution uses a separate framed
+protocol with a 1 MiB ceiling over mandatory mutual TLS and ALPN
+`tunnelproxy-snapshot/1`. Edge bootstraps with version zero, reconnects with its
+last in-memory version, and retains cached authorization as `Stale` while the
+service is unavailable.
+
+**Consequences:** Control Plane restart preserves the latest authority and a
+fresh Edge can receive it without a database query on the ingress hot path.
+Commit failure cannot expose non-durable policy. Full snapshots make reconnect
+and skipped intermediate versions simple, at the cost of a bounded whole-state
+transfer. This does not provide an administrative mutation API, Edge disk cache,
+certificate lifecycle, or multi-writer/multi-edge consensus.

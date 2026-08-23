@@ -1191,8 +1191,8 @@ pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,
 };
 pub use tls::{
-    EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeTlsConfig, EdgeTlsConfigError,
-    EdgeTransportSecurity,
+    bootstrap_registration_from_snapshot_service, EdgeRegistrationPolicy,
+    EdgeRegistrationPolicyError, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
 };
 
 #[cfg(test)]

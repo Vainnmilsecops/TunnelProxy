@@ -86,6 +86,9 @@
 | Live grant add / enable                    | —    | ✅          | —   | `live_snapshot_add_authorizes_tunnel_without_edge_restart` starts Edge from an empty snapshot and routes after a live grant without listener rebind. |
 | Live revoke and re-enable                  | ✅   | ✅          | —   | Principal revalidation closes publication race; real mTLS proves unrelated updates preserve sessions, revoke closes active streams, and re-enable restores the same raw listener. |
 | Snapshot source health                    | —    | ✅          | —   | Runtime status reports version and Live/Stale state; cached authorization remains usable after the producer closes. |
+| Canonical snapshot codec                  | ✅   | —           | —   | Stable ordering/digest, versioned round-trip, malformed payloads, strict IDs/status, cardinality, and 1 MiB bounds. |
+| Persistent snapshot repository            | ✅   | —           | —   | SQLite commit/reopen preserves exact state; stale/conflicting versions fail and injected commit failure never publishes. |
+| Authenticated snapshot bootstrap          | ✅   | ✅          | —   | Real mTLS tests cover SQLite-backed bootstrap, live push, wrong server identity, disconnect `Stale`, reconnect `Live`, and shutdown cancellation. |
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
 | Live session and durable tunnel routing   | ✅   | ✅          | —   | Exact session routing plus cached `TunnelId -> TransportSessionId`; duplicate claim rejects and releases after disconnect. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |

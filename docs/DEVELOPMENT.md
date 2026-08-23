@@ -11,8 +11,8 @@
 - A POSIX-like shell for the developer scripts in `scripts/`. On
   Windows, use WSL or Git Bash.
 
-No database, no Docker, no cloud account is required for foundation or
-MVP work.
+No external database server, Docker, or cloud account is required. Session 17
+uses bundled SQLite when exercising persistent snapshots.
 
 ## 2. Rust toolchain
 
@@ -205,9 +205,10 @@ rejected for non-loopback Agent transport addresses.
 This entrypoint intentionally supports one Agent and one loopback route. The raw
 listener targets durable TunnelId, stays bound across Agent reconnect, and
 fails closed while no authorized session is live. Reconnect receives a fresh
-TransportSessionId and interrupted streams are not replayed. Snapshot
-persistence/external service transport, public ingress, and certificate
-lifecycle automation are still absent.
+TransportSessionId and interrupted streams are not replayed. The runnable Edge
+CLI still uses static authorization; persistent snapshot libraries now exist,
+while production process wiring, public ingress, and certificate lifecycle
+automation remain absent.
 
 ## 12. Exercising live authorization snapshots
 
@@ -234,6 +235,9 @@ numbers. Reusing the current version is valid only for identical content.
 Ingress continues to use Edge's in-memory maps and never awaits this publisher.
 
 The current CLI still constructs one static version-1 snapshot from
-`--authorized-client-cert`, `--agent-id`, and `--tunnel-id`. There is no
-external administration listener or persistent snapshot source yet. Library
-tests are the supported Session 16 exercise surface for live distribution.
+`--authorized-client-cert`, `--agent-id`, and `--tunnel-id`. Session 17 adds the
+SQLite repository, persistent authority, dedicated mTLS snapshot server/client,
+and `bootstrap_registration_from_snapshot_service` library helper. See
+[`SNAPSHOT_DISTRIBUTION.md`](SNAPSHOT_DISTRIBUTION.md). A runnable Control Plane
+daemon and CLI wiring remain for Session 18; library integration tests are the
+supported exercise surface today.

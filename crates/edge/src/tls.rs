@@ -13,7 +13,9 @@ use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
     authorization_snapshot_channel, AgentGrant, AuthorizationError, AuthorizationSnapshot,
     AuthorizationSnapshotPublisher, AuthorizationSnapshotSubscription, CertificateFingerprint,
-    SnapshotError, SnapshotVersion, TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
+    SnapshotBootstrapClient, SnapshotClientConfig, SnapshotClientError, SnapshotClientRuntime,
+    SnapshotError, SnapshotSourceHealth, SnapshotVersion, TunnelGrant, TunnelStatus,
+    VersionedAuthorizationSnapshot,
 };
 use tunnelproxy_protocol::{HandshakeErrorCode, RegistrationRequest};
 
@@ -206,6 +208,13 @@ impl EdgeRegistrationPolicy {
         }
     }
 
+    pub(crate) fn snapshot_source_health(&self) -> Option<SnapshotSourceHealth> {
+        match &self.mode {
+            EdgeRegistrationMode::LoopbackDevelopment { .. } => None,
+            EdgeRegistrationMode::MutualTls { snapshots, .. } => Some(snapshots.source_health()),
+        }
+    }
+
     /// Dynamic policies may authorize a configured raw tunnel in a later full
     /// snapshot, so Edge can bind ingress before the grant exists.
     pub const fn has_live_updates(&self) -> bool {
@@ -217,6 +226,19 @@ impl EdgeRegistrationPolicy {
             }
         )
     }
+}
+
+/// Bootstraps the first durable authorization snapshot over the dedicated mTLS
+/// control-plane channel, then returns the reconnecting client runtime that
+/// feeds later versions into the same Edge policy.
+pub async fn bootstrap_registration_from_snapshot_service(
+    config: SnapshotClientConfig,
+) -> Result<(EdgeRegistrationPolicy, SnapshotClientRuntime), SnapshotClientError> {
+    let (subscription, runtime) = SnapshotBootstrapClient::bootstrap(config).await?;
+    Ok((
+        EdgeRegistrationPolicy::mutual_tls_updates(subscription),
+        runtime,
+    ))
 }
 
 impl Default for EdgeRegistrationPolicy {

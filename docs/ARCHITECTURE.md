@@ -2,8 +2,9 @@
 
 > Status: **pre-MVP data-path foundation.** Local TCP primitives, protocol
 > framing, Agent → Edge handshake, heartbeat, bounded multiplexing, and
-> durable-identity loopback raw-ingress routes are implemented. Public
-> TLS/HTTP ingress, persistence, and multi-edge routing are not.
+> durable-identity loopback raw-ingress routes, persistent authorization, and
+> authenticated Edge snapshot bootstrap are implemented. Public TLS/HTTP
+> ingress and multi-edge routing are not.
 
 ## 1. High-level architecture
 
@@ -334,9 +335,47 @@ transport; raw listeners remain bound and can use a newly authorized Agent
 without restart or rebind.
 
 If the in-process producer closes, Edge marks its authorization source stale
-but retains the last complete cached snapshot. There is still no external
-control-plane service, database persistence, restart bootstrap, certificate
-rotation, or multi-edge ownership.
+but retains the last complete cached snapshot. Session 16 itself did not yet
+provide external distribution or restart persistence; Session 17 adds those
+without changing this cache behavior.
+
+### 2.16 Persistent snapshots and authenticated Edge bootstrap (Session 17)
+
+The Control Plane stores the latest complete authorization snapshot in SQLite.
+Agent grants and tunnel status rows are replaced together with a singleton
+version/digest head under one `IMMEDIATE` transaction. The canonical digest is
+verified on reload, so malformed identifiers, status values, versions, or
+inconsistent state fail closed. SQLite work runs outside Tokio worker threads,
+and the live publisher advances only after the durable commit returns.
+
+```text
+Admin/import (future UI)
+        |
+        v
+PersistentSnapshotAuthority -- transaction --> SQLite
+        |
+        +-- bounded watch --> mTLS snapshot service
+                                  |
+                         full snapshot / UpToDate
+                                  |
+                                  v
+                         Edge in-memory cache
+                                  |
+                         registration + ingress
+                         (no storage lookup)
+```
+
+Snapshot distribution is a dedicated protocol with its own magic/version,
+strict 1 MiB bound, mutual TLS, and ALPN `tunnelproxy-snapshot/1`. It is not a
+Tunnel Protocol v2 frame and never shares the Agent transport. A fresh Edge
+requests version zero and must receive a complete snapshot before constructing
+its dynamic registration policy. After disconnect, it continues using the last
+complete cached snapshot with `Stale` health and retries with bounded backoff;
+an authenticated `UpToDate` or newer full snapshot restores `Live` health.
+
+The current implementation is a library composition surface. A supervised
+Control Plane CLI, operator mutation/import interface, Edge cold-start disk
+cache, certificate lifecycle, and multi-edge consistency remain future work.
 
 ## 3. Control plane vs data plane
 
