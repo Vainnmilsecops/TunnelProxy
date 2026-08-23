@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
@@ -24,6 +24,7 @@ use crate::agent_transport::{
     perform_handshake, AgentListenerConfig, AgentListenerConfigError, AgentTransportError,
     TransportSessionIdAllocator,
 };
+use crate::tls::{BoxedTransport, EdgeTransportSecurity, TUNNELPROXY_ALPN};
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
@@ -32,6 +33,7 @@ pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
 #[derive(Debug, Clone)]
 pub struct MultiplexedEdgeConfig {
     pub agent_listener: AgentListenerConfig,
+    pub security: EdgeTransportSecurity,
     pub max_streams_per_session: usize,
     pub session_command_capacity: usize,
     pub per_stream_queue_capacity: usize,
@@ -46,6 +48,7 @@ impl MultiplexedEdgeConfig {
     pub fn dev_defaults() -> Self {
         Self {
             agent_listener: AgentListenerConfig::dev_defaults(),
+            security: EdgeTransportSecurity::default(),
             max_streams_per_session: 32,
             session_command_capacity: 64,
             per_stream_queue_capacity: 8,
@@ -60,7 +63,9 @@ impl MultiplexedEdgeConfig {
         self.agent_listener
             .validate()
             .map_err(MultiplexedEdgeConfigError::AgentListener)?;
-        if !self.agent_listener.listen_addr.ip().is_loopback() {
+        if matches!(self.security, EdgeTransportSecurity::PlaintextLoopback)
+            && !self.agent_listener.listen_addr.ip().is_loopback()
+        {
             return Err(MultiplexedEdgeConfigError::NonLoopbackAgentListener(
                 self.agent_listener.listen_addr,
             ));
@@ -441,7 +446,7 @@ enum StreamEvent {
 }
 
 async fn run_accepted_session(
-    mut socket: TcpStream,
+    socket: TcpStream,
     peer: SocketAddr,
     _permit: OwnedSemaphorePermit,
     config: MultiplexedEdgeConfig,
@@ -449,6 +454,30 @@ async fn run_accepted_session(
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
 ) {
+    let mut socket: BoxedTransport = match &config.security {
+        EdgeTransportSecurity::PlaintextLoopback => Box::new(socket),
+        EdgeTransportSecurity::MutualTls(tls) => {
+            let acceptor = TlsAcceptor::from(Arc::clone(&tls.server_config));
+            match tokio::time::timeout(tls.handshake_timeout, acceptor.accept(socket)).await {
+                Ok(Ok(stream)) if stream.get_ref().1.alpn_protocol() == Some(TUNNELPROXY_ALPN) => {
+                    info!(peer = %peer, event = "edge_tls_established", "mutual TLS established");
+                    Box::new(stream)
+                }
+                Ok(Ok(_)) => {
+                    warn!(peer = %peer, event = "edge_tls_alpn_rejected", "Agent did not negotiate TunnelProxy ALPN");
+                    return;
+                }
+                Ok(Err(_)) => {
+                    warn!(peer = %peer, event = "edge_tls_authentication_rejected", "Agent TLS authentication failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(peer = %peer, event = "edge_tls_handshake_timeout", "Agent TLS handshake timed out");
+                    return;
+                }
+            }
+        }
+    };
     let handshake = tokio::time::timeout(
         config.agent_listener.handshake_timeout,
         perform_handshake(&mut socket, peer, &session_ids),
@@ -489,12 +518,12 @@ async fn run_accepted_session(
 }
 
 async fn run_edge_session(
-    socket: TcpStream,
+    socket: BoxedTransport,
     session_id: TransportSessionId,
     config: MultiplexedEdgeConfig,
     mut command_rx: mpsc::Receiver<SessionCommand>,
 ) -> Result<(), AgentTransportError> {
-    let (mut reader, writer) = socket.into_split();
+    let (mut reader, writer) = tokio::io::split(socket);
     let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
     let (data_tx, data_rx) = mpsc::channel(config.data_queue_capacity);
     let mut writer_task = tokio::spawn(writer_actor(writer, control_rx, data_rx));
@@ -781,7 +810,7 @@ async fn run_ingress_stream(
 }
 
 async fn writer_actor(
-    mut writer: OwnedWriteHalf,
+    mut writer: tokio::io::WriteHalf<BoxedTransport>,
     mut control_rx: mpsc::Receiver<Frame>,
     mut data_rx: mpsc::Receiver<Frame>,
 ) -> Result<(), AgentTransportError> {

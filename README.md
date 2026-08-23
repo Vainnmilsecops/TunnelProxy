@@ -23,6 +23,9 @@ correct agent, which in turn proxies them into the local service.
   tunnel, with Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
 - Cancellable bounded exponential Agent reconnect and automatic Edge raw-route
   recovery on the same loopback address after a replacement session arrives.
+- Optional mutual TLS on the Agent transport with Edge server-name validation,
+  required Agent client certificates, ALPN, and plaintext restricted to
+  loopback development.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -31,7 +34,7 @@ The following are **not yet implemented**:
 
 - Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
-- TLS and Agent authentication.
+- Public-ingress TLS and application-level Agent/tunnel authorization.
 - Persistence and durable tunnel identity.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
@@ -149,6 +152,7 @@ and Definition of Done.
 | 10–11 _(complete)_ | raw ingress lifecycle and supervised graceful shutdown |
 | 12 _(complete)_ | runnable Edge/Agent entrypoints and OS signal wiring |
 | 13 _(complete)_ | Agent reconnect and loopback raw-route recovery |
+| 14 _(complete)_ | mutual TLS and certificate-authenticated Agent transport |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

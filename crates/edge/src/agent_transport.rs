@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -433,7 +433,10 @@ pub struct AgentSession {
 /// Used for handshake violations where we want to inform the peer
 /// before closing. Errors sending the ERROR frame are silently ignored
 /// (we close the connection regardless).
-async fn send_error_and_close(socket: &mut TcpStream, code: HandshakeErrorCode) {
+async fn send_error_and_close<S>(socket: &mut S, code: HandshakeErrorCode)
+where
+    S: AsyncWrite + Unpin,
+{
     let frame = match Frame::control(FrameType::Error, code.to_be_bytes().to_vec()) {
         Ok(f) => f,
         Err(_) => return,
@@ -1520,11 +1523,14 @@ async fn validate_pong(
 ///
 /// Returns `Ok(AgentSession)` on success, or an error on any violation.
 /// The socket is owned by this function during the handshake.
-pub(crate) async fn perform_handshake(
-    socket: &mut TcpStream,
+pub(crate) async fn perform_handshake<S>(
+    socket: &mut S,
     peer: SocketAddr,
     session_ids: &TransportSessionIdAllocator,
-) -> Result<AgentSession, AgentTransportError> {
+) -> Result<AgentSession, AgentTransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     info!(peer = %peer, event = "agent_handshake_started", "starting handshake");
 
     let mut decoder = FrameDecoder::new();

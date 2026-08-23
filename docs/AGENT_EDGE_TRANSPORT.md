@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 13.
+> **Status:** Implemented through Session 14.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
 > ingress or durable routing.
@@ -19,9 +19,9 @@ It is not yet a public reverse-tunnel product surface.
 
 ```
 TunnelProxy Agent
-   (outbound TCP)
+   (outbound TCP + optional mTLS)
         |
-        |   127.0.0.1:7100 (development; loopback only)
+        |   loopback plaintext or certificate-authenticated TLS
         v
 TunnelProxy Edge
 ```
@@ -31,12 +31,17 @@ Edge does not dial Agent.
 
 ## Security Status
 
-**This transport remains unauthenticated and unencrypted through Session 13.**
+Session 14 adds optional mutual TLS before Protocol v1. Agent validates the
+configured Edge CA and DNS server name. Edge requires a client certificate
+signed by its configured Agent CA, and requires ALPN `tunnelproxy/1`, before it
+reads HELLO or publishes a session to the router. TLS negotiation has a
+separate deadline and consumes the same bounded admission permit as protocol
+handshake/session lifetime.
 
-The development listener binds `127.0.0.1` only. In production, this
-transport requires TLS and Agent authentication before use. The README
-and documentation do not describe this as a "secure tunnel" until those
-features are implemented.
+Plaintext remains available only when the runnable Agent and Edge endpoints are
+loopback. mTLS authenticates possession of a CA-issued certificate; it does not
+yet map that certificate to a durable `AgentId`, authorize a tunnel, rotate or
+revoke certificates, or secure the future public HTTP ingress.
 
 ## Handshake Sequence
 
@@ -44,6 +49,7 @@ features are implemented.
 Agent                         Edge
   |                             |
   |---- TCP connect ------------>|
+  |<=== mutual TLS + ALPN ======>|  (when configured)
   |                             |
   |---- HELLO(role=AGENT) ----->|
   |                             | (validate HELLO)
@@ -301,6 +307,14 @@ AgentListenerConfig {
     heartbeat_interval: Duration, // default: 15s
     pong_timeout: Duration,       // default: 10s
 }
+
+MultiplexedEdgeConfig {
+    security: EdgeTransportSecurity,
+    // PlaintextLoopback or MutualTls(EdgeTlsConfig)
+    // EdgeTlsConfig is built from server cert/key + trusted client CA PEM.
+    // TLS handshake timeout is separate from Protocol v1 handshake timeout.
+    // Other bounded multiplex fields omitted here.
+}
 ```
 
 The Session 08 vertical slice additionally uses:
@@ -322,6 +336,21 @@ connect(
     connect_timeout: Duration,   // default: 5s
     handshake_timeout: Duration, // default: 10s
 ) -> ConnectOutcome
+
+connect_with_security(
+    edge_addr: SocketAddr,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    security: &AgentTransportSecurity,
+) -> ConnectOutcome
+
+AgentRuntimeConfig {
+    security: AgentTransportSecurity,
+    // PlaintextLoopback or MutualTls(AgentTlsConfig)
+    // AgentTlsConfig is built from trusted Edge CA, client cert/key,
+    // verified server name, and TLS handshake timeout.
+    // Other runtime fields omitted here.
+}
 
 AgentSession::run_with_local_target(
     local_addr: SocketAddr,
@@ -356,10 +385,16 @@ the disconnected session, keeps its Agent listener alive, and rebinds the same
 configured loopback raw address after a replacement session registers. In-flight
 streams are not replayed or migrated.
 
+Session 14 wraps the byte stream in mutual TLS before the unchanged
+HELLO → REGISTER → REGISTERED sequence. No Protocol v1 frame, payload, or type
+number changed. A reconnect performs a fresh TCP, TLS, and Protocol v1
+handshake. Certificate/identity rejection is terminal; transient transport
+loss and TLS timeout remain retryable.
+
 ## What Is NOT Implemented
 
-- TLS / encryption
-- Agent authentication
+- Durable Agent identity/authorization and certificate-to-Agent mapping
+- Certificate issuance, rotation, revocation, and hot reload
 - Credit/window-based flow control and weighted scheduling
 - Tunnel registration
 - Public endpoint allocation

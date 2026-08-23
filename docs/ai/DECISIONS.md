@@ -333,3 +333,28 @@ conflating transport and durable identity. There is a deliberate availability
 gap while no Agent is connected, active connections fail with their old
 session, and durable routing/authentication remain separate work under
 DEBT-015.
+
+---
+
+## ADR-014 — Mutual TLS precedes unchanged Protocol v1 registration
+
+**Status:** Accepted (Session 14).
+
+**Context:** Agent traffic must be encrypted and an untrusted peer must never
+become routable. Adding a token to the empty REGISTER payload would change the
+wire contract and require Protocol v2, while certificate issuance and durable
+Agent/tunnel identity do not yet exist.
+
+**Decision:** Wrap the multiplexed Agent byte stream in rustls mutual TLS before
+HELLO. Agent verifies the configured Edge CA and DNS name; Edge requires a
+client certificate signed by its configured Agent CA. Both configure ALPN
+`tunnelproxy/1`. Plaintext is valid only for loopback development. Edge holds
+the bounded session permit throughout TLS negotiation, which has its own
+deadline. Certificate/authentication errors are terminal; transient transport
+failure and timeout remain reconnectable.
+
+**Consequences:** Protocol v1 frames and the empty REGISTER payload remain
+unchanged, so INV-004 requires no version bump. mTLS proves certificate
+possession but does not assign durable `AgentId`/`TunnelId` or tunnel
+authorization. Certificate lifecycle remains static and is tracked by
+DEBT-017.

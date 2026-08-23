@@ -166,7 +166,33 @@ configuration. Agent reconnect flags also expose the multiplier, downward
 jitter percentage, stable-session reset duration, and optional maximum
 consecutive failure count; use `--help` for their exact names and defaults.
 
+For mutual TLS, provision an Edge certificate for the name Agents will verify,
+an Agent client certificate, and the corresponding CA certificates. No private
+keys are supplied through command-line values; only PEM file paths are passed:
+
+```bash
+cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
+  --agent-listen 0.0.0.0:7100 \
+  --raw-listen 127.0.0.1:7000 \
+  --tls-cert edge.pem \
+  --tls-key edge-key.pem \
+  --tls-client-ca agent-ca.pem
+
+cargo run -p tunnelproxy-agent --bin tunnelproxy-agent -- \
+  --edge 192.0.2.10:7100 \
+  --local 127.0.0.1:3000 \
+  --tls-ca edge-ca.pem \
+  --tls-client-cert agent.pem \
+  --tls-client-key agent-key.pem \
+  --tls-server-name edge.example.com
+```
+
+All TLS arguments for one process are required together. TLS uses ALPN
+`tunnelproxy/1`; its handshake timeout defaults to 10 seconds. Plaintext is
+rejected for non-loopback Agent transport addresses.
+
 This entrypoint intentionally supports one Agent and one loopback route. Agent
 disconnects are recovered by rebinding that address to a replacement ephemeral
-session. It does not provide authentication, durable identity, or public
-ingress, and interrupted streams are not replayed.
+session, and interrupted streams are not replayed. Mutual TLS authenticates a
+CA-issued Agent certificate, but durable Agent/tunnel authorization, public
+ingress, and certificate lifecycle automation are still absent.

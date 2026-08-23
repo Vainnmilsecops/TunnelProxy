@@ -7,11 +7,13 @@
 //! active framed stream to a configured local TCP service.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 use tunnelproxy_protocol::{
@@ -19,6 +21,8 @@ use tunnelproxy_protocol::{
     ProtocolError, StreamId, StreamResetCode, TransportSessionId, HEARTBEAT_PAYLOAD_SIZE,
     REGISTERED_PAYLOAD_SIZE, ROLE_AGENT, STREAM_RESET_PAYLOAD_SIZE,
 };
+
+use crate::tls::{AgentTransportSecurity, BoxedTransport};
 
 /// Fixed application-data read buffer used by the single-stream bridge.
 pub const STREAM_IO_BUFFER_SIZE: usize = 16 * 1024;
@@ -48,10 +52,18 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum AgentError {
     /// Failed to establish the underlying TCP connection.
     Connect(std::io::Error),
+    /// Plaintext transport was requested for a non-loopback Edge.
+    PlaintextRemoteEdge(SocketAddr),
     /// TCP connection timed out.
     ConnectTimeout,
     /// Handshake timed out before completion.
     HandshakeTimeout,
+    /// TLS negotiation timed out before Protocol v1 began.
+    TlsHandshakeTimeout,
+    /// Transient network I/O failed while negotiating TLS.
+    TlsTransport(std::io::Error),
+    /// Edge identity or mutual-TLS authentication was rejected.
+    TlsAuthentication(String),
     /// Protocol violation detected.
     ProtocolViolation { reason: &'static str },
     /// Protocol decode error.
@@ -74,8 +86,19 @@ impl std::fmt::Display for AgentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(e) => write!(f, "connect failed: {e}"),
+            Self::PlaintextRemoteEdge(addr) => {
+                write!(
+                    f,
+                    "plaintext transport is restricted to loopback, got {addr}"
+                )
+            }
             Self::ConnectTimeout => write!(f, "connect timed out"),
             Self::HandshakeTimeout => write!(f, "handshake timed out"),
+            Self::TlsHandshakeTimeout => write!(f, "TLS handshake timed out"),
+            Self::TlsTransport(error) => write!(f, "TLS transport failed: {error}"),
+            Self::TlsAuthentication(reason) => {
+                write!(f, "TLS identity or authentication rejected: {reason}")
+            }
             Self::ProtocolViolation { reason } => write!(f, "protocol violation: {reason}"),
             Self::ProtocolDecode(e) => write!(f, "protocol decode error: {e}"),
             Self::UnexpectedFrame { frame_type } => {
@@ -102,7 +125,7 @@ impl std::fmt::Display for AgentError {
 impl std::error::Error for AgentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Connect(e) => Some(e),
+            Self::Connect(e) | Self::TlsTransport(e) => Some(e),
             Self::ProtocolDecode(e) => Some(e),
             Self::SessionIo(e) => Some(e),
             _ => None,
@@ -116,9 +139,8 @@ impl std::error::Error for AgentError {
 
 /// An established Agent transport session after successful handshake.
 ///
-/// The session owns the `TcpStream` and keeps it open. Dropping the
+/// The session owns its plaintext or TLS byte stream. Dropping the
 /// session closes the connection.
-#[derive(Debug)]
 pub struct AgentSession {
     /// Session identifier assigned by Edge (from the REGISTERED frame).
     pub session_id: TransportSessionId,
@@ -126,7 +148,18 @@ pub struct AgentSession {
     pub edge_addr: SocketAddr,
     /// When the session was established.
     pub established_at: Instant,
-    pub(crate) socket: TcpStream,
+    pub(crate) socket: BoxedTransport,
+}
+
+impl std::fmt::Debug for AgentSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSession")
+            .field("session_id", &self.session_id)
+            .field("edge_addr", &self.edge_addr)
+            .field("established_at", &self.established_at)
+            .field("transport", &"redacted byte stream")
+            .finish()
+    }
 }
 
 /// Normal reason the Agent session loop stopped.
@@ -538,6 +571,30 @@ pub async fn connect(
     connect_timeout: Duration,
     handshake_timeout: Duration,
 ) -> ConnectOutcome {
+    connect_with_security(
+        edge_addr,
+        connect_timeout,
+        handshake_timeout,
+        &AgentTransportSecurity::PlaintextLoopback,
+    )
+    .await
+}
+
+/// Connects using the configured plaintext-loopback or mutual-TLS transport,
+/// then performs the unchanged Protocol v1 handshake.
+pub async fn connect_with_security(
+    edge_addr: SocketAddr,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    security: &AgentTransportSecurity,
+) -> ConnectOutcome {
+    if matches!(security, AgentTransportSecurity::PlaintextLoopback)
+        && !edge_addr.ip().is_loopback()
+    {
+        return ConnectOutcome::Failed {
+            reason: AgentError::PlaintextRemoteEdge(edge_addr),
+        };
+    }
     info!(edge = %edge_addr, event = "agent_connecting", "connecting to edge");
 
     let socket = match timeout(connect_timeout, TcpStream::connect(edge_addr)).await {
@@ -559,10 +616,38 @@ pub async fn connect(
         }
     };
 
-    let mut socket = socket;
     if let Err(e) = socket.set_nodelay(true) {
         warn!(error = %e, "failed to set TCP_NODELAY");
     }
+
+    let mut socket: BoxedTransport = match security {
+        AgentTransportSecurity::PlaintextLoopback => Box::new(socket),
+        AgentTransportSecurity::MutualTls(tls) => {
+            let connector = TlsConnector::from(Arc::clone(&tls.client_config));
+            let negotiation = connector.connect(tls.server_name.clone(), socket);
+            match timeout(tls.handshake_timeout, negotiation).await {
+                Ok(Ok(stream)) => {
+                    info!(edge = %edge_addr, event = "agent_tls_established", "mutual TLS established");
+                    Box::new(stream)
+                }
+                Ok(Err(error)) if is_transient_tls_error(&error) => {
+                    return ConnectOutcome::Failed {
+                        reason: AgentError::TlsTransport(error),
+                    };
+                }
+                Ok(Err(error)) => {
+                    return ConnectOutcome::Failed {
+                        reason: AgentError::TlsAuthentication(error.to_string()),
+                    };
+                }
+                Err(_) => {
+                    return ConnectOutcome::Failed {
+                        reason: AgentError::TlsHandshakeTimeout,
+                    };
+                }
+            }
+        }
+    };
 
     match timeout(handshake_timeout, perform_handshake(&mut socket, edge_addr)).await {
         Ok(Ok(session_id)) => {
@@ -581,6 +666,7 @@ pub async fn connect(
             ConnectOutcome::Established(session)
         }
         Ok(Err(e)) => {
+            let e = normalize_tls_handshake_error(e, security.is_tls());
             error!(edge = %edge_addr, error = %e, event = "agent_handshake_failed", "handshake failed");
             ConnectOutcome::Failed { reason: e }
         }
@@ -595,7 +681,7 @@ pub async fn connect(
 
 /// Performs the v1 handshake: HELLO → REGISTER → REGISTERED.
 async fn perform_handshake(
-    socket: &mut TcpStream,
+    socket: &mut BoxedTransport,
     edge_addr: SocketAddr,
 ) -> Result<TransportSessionId, AgentError> {
     info!(edge = %edge_addr, event = "agent_handshake_started", "starting handshake");
@@ -656,4 +742,31 @@ async fn perform_handshake(
     );
 
     Ok(session_id)
+}
+
+fn is_transient_tls_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn normalize_tls_handshake_error(error: AgentError, tls: bool) -> AgentError {
+    if !tls {
+        return error;
+    }
+    match error {
+        AgentError::ProtocolDecode(ProtocolError::Io(error)) | AgentError::SessionIo(error)
+            if error.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            AgentError::TlsAuthentication(error.to_string())
+        }
+        error => error,
+    }
 }

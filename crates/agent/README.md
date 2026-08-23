@@ -29,5 +29,8 @@ frames, half-close, and per-stream reset/cleanup. Session 12 adds
 configuration and Ctrl-C/SIGTERM shutdown. Session 13 adds cancellable bounded
 exponential reconnect with downward jitter, a stable-session failure-streak
 reset, an optional consecutive-failure budget, and reconnect outcome counters.
-TLS, authentication, durable registration, and the final `tunnelproxy http` UX
-remain unimplemented.
+Session 14 adds optional mutual TLS with trusted-CA/server-name verification,
+an Agent client certificate, ALPN, bounded TLS negotiation, and terminal
+certificate/authentication failures. Plaintext process configuration is limited
+to loopback. Durable registration/authorization, certificate lifecycle
+automation, and the final `tunnelproxy http` UX remain unimplemented.
