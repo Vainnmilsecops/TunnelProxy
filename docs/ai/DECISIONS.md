@@ -507,3 +507,37 @@ corruption but is not a cryptographic signature: the Edge host and cache
 filesystem are trusted, and hostile local rollback requires future signed or
 hardware-backed state. Cache use is explicit and the existing online-only API
 remains available.
+
+---
+
+## ADR-020 — Digest-bound generations are the atomic TLS reload boundary
+
+**Status:** Accepted (Session 20).
+
+**Context:** Agent, Edge, and the snapshot service previously parsed TLS files
+only at process start. Independently replacing a certificate, private key, CA,
+or static certificate authorization can expose a mismatched intermediate state.
+Reload must preserve the last valid configuration, avoid blocking Tokio, never
+log credential material, and terminate rather than silently run after the
+active identity expires.
+
+**Decision:** Each opt-in reload group has one strict JSON manifest containing
+a non-zero generation and the SHA-256 digest of every expected material file.
+The loader bounds and reads the manifest plus exact file set on a blocking
+worker, verifies all digests, builds a complete rustls candidate, validates the
+leaf identity time range, then publishes one immutable `Arc` for subsequent
+handshakes. Generations only increase; an identical current generation is
+idempotent, while lower or conflicting generations fail closed. Candidate
+failure marks health but retains last-known-good. Expiry of that active leaf is
+terminal. Static Edge mode includes its authorized Agent leaf in the same
+Agent-facing manifest and publishes a full local authorization snapshot before
+activating the new TLS candidate so removed identities fail closed.
+
+**Consequences:** Operators can rotate all currently implemented mTLS roles
+without process restart, and concurrent handshakes never observe a partly built
+rustls configuration. Existing negotiated TLS sessions are not generically
+renegotiated; they adopt new material on reconnect. Static Edge authorization
+does reconcile and close a session removed by local rotation, while dynamic
+authorization continues to use Control Plane snapshots. The manifest is an
+atomic commit marker, not a certificate issuer, key vault, signature, or defense
+against a compromised local filesystem; those remain future work.

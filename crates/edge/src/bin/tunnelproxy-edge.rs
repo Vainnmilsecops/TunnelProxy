@@ -9,11 +9,14 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
 use tunnelproxy_control_plane::{
-    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig, SnapshotTlsConfigError,
+    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
+    SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime, SnapshotTlsConfigError,
+    SnapshotTlsReloadBootstrapError,
 };
 use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
-    EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
+    EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
+    EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
     RuntimeShutdownConfig, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
     SnapshotAwareEdgeRuntimeOutcome,
 };
@@ -34,6 +37,7 @@ Options:
   --tls-client-ca <path>           trusted Agent CA PEM
   --authorized-client-cert <path>  exact authorized Agent certificate PEM
   --tls-handshake-timeout-ms <ms>  TLS timeout   (default 10000)
+  --tls-reload-manifest <path>     Agent-facing TLS generation manifest
   --snapshot-server <addr>         Control Plane snapshot service
   --snapshot-ca <path>             trusted Control Plane CA PEM
   --snapshot-client-cert <path>    Edge snapshot client certificate PEM
@@ -46,6 +50,9 @@ Options:
   --snapshot-reconnect-max-ms <ms>      maximum retry delay (default 30000)
   --snapshot-cache-dir <path>           opt-in cold-start snapshot cache
   --snapshot-cache-max-stale-ms <ms>    maximum offline cache age
+  --snapshot-tls-reload-manifest <path> snapshot-client TLS generation manifest
+  --tls-reload-interval-ms <ms>         reload poll (default 1000)
+  --tls-expiry-warning-ms <ms>          expiry warning (default 604800000)
   --help                           print this help and exit
 ";
 
@@ -89,35 +96,52 @@ async fn main() -> ExitCode {
         LoadedAuthorization::Static {
             security,
             registration,
+            reloaders,
         } => {
             config.multiplex.security = security;
             config.multiplex.registration = registration;
-            run_static_edge(config, &parsed).await
+            run_static_edge(config, reloaders, &parsed).await
         }
         LoadedAuthorization::Snapshot {
             security,
             snapshots,
             cache,
+            reloaders,
         } => {
             config.multiplex.security = security;
-            run_snapshot_edge(config, snapshots, cache, &parsed).await
+            run_snapshot_edge(config, snapshots, cache, reloaders, &parsed).await
         }
     }
 }
 
-async fn run_static_edge(config: EdgeRuntimeConfig, parsed: &ParsedArgs) -> ExitCode {
+async fn run_static_edge(
+    config: EdgeRuntimeConfig,
+    reloaders: LoadedTlsReloaders,
+    parsed: &ParsedArgs,
+) -> ExitCode {
     let runtime = match EdgeRuntime::bind(config).await {
         Ok(runtime) => runtime,
         Err(error) => return edge_start_error(error),
     };
     log_edge_started(runtime.agent_addr(), parsed, "static");
     let (trigger, signal) = shutdown_channel();
-    let runtime_future = runtime.run_until_shutdown(signal);
+    let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
+    let reload_future = reloaders.run_until_shutdown(signal);
+    tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
-    let result = tokio::select! {
-        result = &mut runtime_future => result,
+    tokio::select! {
+        result = &mut runtime_future => {
+            trigger.shutdown();
+            let _ = reload_future.await;
+            edge_exit_code(result)
+        },
+        reload = &mut reload_future => {
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            tls_reload_exit_code(reload)
+        },
         observed = &mut os_signal => {
             if let Err(error) = observed {
                 error!(%error, "OS shutdown listener failed");
@@ -126,16 +150,18 @@ async fn run_static_edge(config: EdgeRuntimeConfig, parsed: &ParsedArgs) -> Exit
                 return ExitCode::from(1);
             }
             trigger.shutdown();
-            runtime_future.await
+            let result = runtime_future.await;
+            let _ = reload_future.await;
+            edge_exit_code(result)
         }
-    };
-    edge_exit_code(result)
+    }
 }
 
 async fn run_snapshot_edge(
     config: EdgeRuntimeConfig,
     snapshots: SnapshotClientConfig,
     cache: Option<SnapshotCacheConfig>,
+    reloaders: LoadedTlsReloaders,
     parsed: &ParsedArgs,
 ) -> ExitCode {
     let bind_result = match cache {
@@ -162,12 +188,23 @@ async fn run_snapshot_edge(
     };
     log_edge_started(runtime.agent_addr(), parsed, authorization);
     let (trigger, signal) = shutdown_channel();
-    let runtime_future = runtime.run_until_shutdown(signal);
+    let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
+    let reload_future = reloaders.run_until_shutdown(signal);
+    tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
-    let result = tokio::select! {
-        result = &mut runtime_future => result,
+    tokio::select! {
+        result = &mut runtime_future => {
+            trigger.shutdown();
+            let _ = reload_future.await;
+            snapshot_edge_exit_code(result)
+        },
+        reload = &mut reload_future => {
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            tls_reload_exit_code(reload)
+        },
         observed = &mut os_signal => {
             if let Err(error) = observed {
                 error!(%error, "OS shutdown listener failed");
@@ -176,10 +213,21 @@ async fn run_snapshot_edge(
                 return ExitCode::from(1);
             }
             trigger.shutdown();
-            runtime_future.await
+            let result = runtime_future.await;
+            let _ = reload_future.await;
+            snapshot_edge_exit_code(result)
         }
-    };
-    snapshot_edge_exit_code(result)
+    }
+}
+
+fn tls_reload_exit_code(result: Result<(), TlsReloadSupervisorError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            error!(%error, "Edge TLS reload runtime failed");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: &'static str) {
@@ -254,6 +302,7 @@ struct ParsedArgs {
     tls_client_ca: Option<PathBuf>,
     authorized_client_cert: Option<PathBuf>,
     tls_handshake_timeout: Duration,
+    tls_reload_manifest: Option<PathBuf>,
     snapshot_server: Option<SocketAddr>,
     snapshot_ca: Option<PathBuf>,
     snapshot_client_cert: Option<PathBuf>,
@@ -266,6 +315,10 @@ struct ParsedArgs {
     snapshot_reconnect_max: Duration,
     snapshot_cache_dir: Option<PathBuf>,
     snapshot_cache_max_stale: Option<Duration>,
+    snapshot_tls_reload_manifest: Option<PathBuf>,
+    tls_reload_interval: Duration,
+    tls_expiry_warning: Duration,
+    tls_reload_options_present: bool,
     snapshot_options_present: bool,
     help: bool,
 }
@@ -285,6 +338,7 @@ impl Default for ParsedArgs {
             tls_client_ca: None,
             authorized_client_cert: None,
             tls_handshake_timeout: Duration::from_secs(10),
+            tls_reload_manifest: None,
             snapshot_server: None,
             snapshot_ca: None,
             snapshot_client_cert: None,
@@ -297,6 +351,10 @@ impl Default for ParsedArgs {
             snapshot_reconnect_max: Duration::from_secs(30),
             snapshot_cache_dir: None,
             snapshot_cache_max_stale: None,
+            snapshot_tls_reload_manifest: None,
+            tls_reload_interval: Duration::from_secs(1),
+            tls_expiry_warning: Duration::from_secs(7 * 24 * 60 * 60),
+            tls_reload_options_present: false,
             snapshot_options_present: false,
             help: false,
         }
@@ -389,6 +447,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                     Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--tls-reload-manifest" => {
+                parsed.tls_reload_manifest = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
             "--snapshot-server" => {
                 parsed.snapshot_server = Some(parse_addr(args, index, flag)?);
                 parsed.snapshot_options_present = true;
@@ -455,6 +518,23 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.snapshot_options_present = true;
                 index += 2;
             }
+            "--snapshot-tls-reload-manifest" => {
+                parsed.snapshot_tls_reload_manifest =
+                    Some(PathBuf::from(value(args, index, flag)?));
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
+            "--tls-reload-interval-ms" => {
+                parsed.tls_reload_interval =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
+            "--tls-expiry-warning-ms" => {
+                parsed.tls_expiry_warning = Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -473,6 +553,9 @@ enum TlsLoadError {
     InvalidSnapshotConfig,
     IncompleteSnapshotCacheArguments,
     InvalidSnapshotCache,
+    ReloadArguments,
+    EdgeReload(EdgeTlsReloadBootstrapError),
+    SnapshotReload(SnapshotTlsReloadBootstrapError),
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -502,6 +585,79 @@ impl std::fmt::Display for TlsLoadError {
             Self::InvalidSnapshotCache => {
                 f.write_str("snapshot cache directory and maximum stale age are invalid")
             }
+            Self::ReloadArguments => f.write_str(
+                "TLS reload manifests require complete matching TLS path groups and non-zero reload settings",
+            ),
+            Self::EdgeReload(error) => write!(f, "Agent-facing TLS reload is invalid: {error}"),
+            Self::SnapshotReload(error) => {
+                write!(f, "snapshot-client TLS reload is invalid: {error}")
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoadedTlsReloaders {
+    edge: Option<EdgeTlsReloadRuntime>,
+    snapshot: Option<SnapshotClientTlsReloadRuntime>,
+}
+
+impl LoadedTlsReloaders {
+    async fn run_until_shutdown(
+        self,
+        signal: tunnelproxy_common::ShutdownSignal,
+    ) -> Result<(), TlsReloadSupervisorError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        if let Some(runtime) = self.edge {
+            let child_signal = signal.clone();
+            tasks.spawn(async move {
+                runtime
+                    .run_until_shutdown(child_signal)
+                    .await
+                    .map_err(TlsReloadSupervisorError::Edge)
+            });
+        }
+        if let Some(runtime) = self.snapshot {
+            let child_signal = signal.clone();
+            tasks.spawn(async move {
+                runtime
+                    .run_until_shutdown(child_signal)
+                    .await
+                    .map_err(TlsReloadSupervisorError::Snapshot)
+            });
+        }
+        if tasks.is_empty() {
+            signal.cancelled().await;
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Ok(())
+            }
+            result = tasks.join_next() => match result {
+                Some(Ok(result)) => result,
+                Some(Err(_)) | None => Err(TlsReloadSupervisorError::Task),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TlsReloadSupervisorError {
+    Edge(tunnelproxy_common::TlsReloadRuntimeError),
+    Snapshot(tunnelproxy_common::TlsReloadRuntimeError),
+    Task,
+}
+
+impl std::fmt::Display for TlsReloadSupervisorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Edge(error) => write!(f, "Agent-facing TLS reload failed: {error}"),
+            Self::Snapshot(error) => write!(f, "snapshot-client TLS reload failed: {error}"),
+            Self::Task => f.write_str("TLS reload task stopped unexpectedly"),
         }
     }
 }
@@ -510,11 +666,13 @@ enum LoadedAuthorization {
     Static {
         security: EdgeTransportSecurity,
         registration: EdgeRegistrationPolicy,
+        reloaders: LoadedTlsReloaders,
     },
     Snapshot {
         security: EdgeTransportSecurity,
         snapshots: SnapshotClientConfig,
         cache: Option<SnapshotCacheConfig>,
+        reloaders: LoadedTlsReloaders,
     },
 }
 
@@ -523,7 +681,10 @@ async fn load_transport_configuration(
 ) -> Result<LoadedAuthorization, TlsLoadError> {
     match (&parsed.tls_cert, &parsed.tls_key, &parsed.tls_client_ca) {
         (None, None, None) => {
-            if parsed.authorized_client_cert.is_some() || has_snapshot_arguments(parsed) {
+            if parsed.authorized_client_cert.is_some()
+                || has_snapshot_arguments(parsed)
+                || parsed.tls_reload_options_present
+            {
                 return Err(TlsLoadError::AuthorizationMode);
             }
             Ok(LoadedAuthorization::Static {
@@ -532,6 +693,7 @@ async fn load_transport_configuration(
                     parsed.agent_id.clone(),
                     parsed.tunnel_id.clone(),
                 ),
+                reloaders: LoadedTlsReloaders::default(),
             })
         }
         (Some(cert), Some(key), Some(client_ca)) => {
@@ -544,21 +706,81 @@ async fn load_transport_configuration(
                 (None, true) if snapshot_arguments_complete(parsed) => true,
                 (None, true) => return Err(TlsLoadError::IncompleteSnapshotArguments),
             };
-            let cert = tokio::fs::read(cert)
+            if parsed.tls_reload_options_present
+                && parsed.tls_reload_manifest.is_none()
+                && parsed.snapshot_tls_reload_manifest.is_none()
+            {
+                return Err(TlsLoadError::ReloadArguments);
+            }
+            if !snapshot_mode && parsed.snapshot_tls_reload_manifest.is_some() {
+                return Err(TlsLoadError::ReloadArguments);
+            }
+            if !snapshot_mode {
+                if let Some(manifest_path) = &parsed.tls_reload_manifest {
+                    let Some(authorized_client_certificate_path) = &parsed.authorized_client_cert
+                    else {
+                        return Err(TlsLoadError::AuthorizationMode);
+                    };
+                    let (tls, registration, runtime) =
+                        EdgeTlsReloadRuntime::bootstrap_with_static_authorization(
+                            EdgeTlsReloadConfig {
+                                manifest_path: manifest_path.clone(),
+                                server_certificate_path: cert.clone(),
+                                server_private_key_path: key.clone(),
+                                client_ca_path: client_ca.clone(),
+                                poll_interval: parsed.tls_reload_interval,
+                                expiry_warning: parsed.tls_expiry_warning,
+                            },
+                            authorized_client_certificate_path.clone(),
+                            parsed.tls_handshake_timeout,
+                            parsed.agent_id.clone(),
+                            parsed.tunnel_id.clone(),
+                        )
+                        .await
+                        .map_err(TlsLoadError::EdgeReload)?;
+                    return Ok(LoadedAuthorization::Static {
+                        security: EdgeTransportSecurity::MutualTls(tls),
+                        registration,
+                        reloaders: LoadedTlsReloaders {
+                            edge: Some(runtime),
+                            snapshot: None,
+                        },
+                    });
+                }
+            }
+            let (tls, edge_reloader) = if let Some(manifest_path) = &parsed.tls_reload_manifest {
+                let (tls, runtime) = EdgeTlsReloadRuntime::bootstrap(
+                    EdgeTlsReloadConfig {
+                        manifest_path: manifest_path.clone(),
+                        server_certificate_path: cert.clone(),
+                        server_private_key_path: key.clone(),
+                        client_ca_path: client_ca.clone(),
+                        poll_interval: parsed.tls_reload_interval,
+                        expiry_warning: parsed.tls_expiry_warning,
+                    },
+                    parsed.tls_handshake_timeout,
+                )
                 .await
-                .map_err(|_| TlsLoadError::Read("server certificate"))?;
-            let key = tokio::fs::read(key)
-                .await
-                .map_err(|_| TlsLoadError::Read("server private key"))?;
-            let client_ca = tokio::fs::read(client_ca)
-                .await
-                .map_err(|_| TlsLoadError::Read("client CA"))?;
-            let security =
-                EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
-                    .map(EdgeTransportSecurity::MutualTls)
-                    .map_err(TlsLoadError::Invalid)?;
+                .map_err(TlsLoadError::EdgeReload)?;
+                (tls, Some(runtime))
+            } else {
+                let cert = tokio::fs::read(cert)
+                    .await
+                    .map_err(|_| TlsLoadError::Read("server certificate"))?;
+                let key = tokio::fs::read(key)
+                    .await
+                    .map_err(|_| TlsLoadError::Read("server private key"))?;
+                let client_ca = tokio::fs::read(client_ca)
+                    .await
+                    .map_err(|_| TlsLoadError::Read("client CA"))?;
+                let tls =
+                    EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
+                        .map_err(TlsLoadError::Invalid)?;
+                (tls, None)
+            };
+            let security = EdgeTransportSecurity::MutualTls(tls);
             if snapshot_mode {
-                load_snapshot_configuration(parsed, security).await
+                load_snapshot_configuration(parsed, security, edge_reloader).await
             } else {
                 let Some(authorized_client_cert) = &parsed.authorized_client_cert else {
                     return Err(TlsLoadError::AuthorizationMode);
@@ -575,6 +797,10 @@ async fn load_transport_configuration(
                 Ok(LoadedAuthorization::Static {
                     security,
                     registration,
+                    reloaders: LoadedTlsReloaders {
+                        edge: edge_reloader,
+                        snapshot: None,
+                    },
                 })
             }
         }
@@ -597,6 +823,7 @@ fn snapshot_arguments_complete(parsed: &ParsedArgs) -> bool {
 async fn load_snapshot_configuration(
     parsed: &ParsedArgs,
     security: EdgeTransportSecurity,
+    edge_reloader: Option<EdgeTlsReloadRuntime>,
 ) -> Result<LoadedAuthorization, TlsLoadError> {
     let cache = snapshot_cache_configuration(parsed)?;
     let (Some(server), Some(ca), Some(client_cert), Some(client_key), Some(server_name)) = (
@@ -608,14 +835,34 @@ async fn load_snapshot_configuration(
     ) else {
         return Err(TlsLoadError::IncompleteSnapshotArguments);
     };
-    let (ca, client_cert, client_key) = tokio::try_join!(
-        read_tls_file(ca, "snapshot CA"),
-        read_tls_file(client_cert, "snapshot client certificate"),
-        read_tls_file(client_key, "snapshot client private key"),
-    )?;
-    let mut snapshots =
-        SnapshotClientConfig::from_pem(server, &ca, &client_cert, &client_key, server_name)
-            .map_err(TlsLoadError::InvalidSnapshotTls)?;
+    let (mut snapshots, snapshot_reloader) =
+        if let Some(manifest_path) = &parsed.snapshot_tls_reload_manifest {
+            let (config, runtime) = SnapshotClientTlsReloadRuntime::bootstrap(
+                server,
+                server_name,
+                SnapshotClientTlsReloadConfig {
+                    manifest_path: manifest_path.clone(),
+                    server_ca_path: ca.clone(),
+                    client_certificate_path: client_cert.clone(),
+                    client_private_key_path: client_key.clone(),
+                    poll_interval: parsed.tls_reload_interval,
+                    expiry_warning: parsed.tls_expiry_warning,
+                },
+            )
+            .await
+            .map_err(TlsLoadError::SnapshotReload)?;
+            (config, Some(runtime))
+        } else {
+            let (ca, client_cert, client_key) = tokio::try_join!(
+                read_tls_file(ca, "snapshot CA"),
+                read_tls_file(client_cert, "snapshot client certificate"),
+                read_tls_file(client_key, "snapshot client private key"),
+            )?;
+            let config =
+                SnapshotClientConfig::from_pem(server, &ca, &client_cert, &client_key, server_name)
+                    .map_err(TlsLoadError::InvalidSnapshotTls)?;
+            (config, None)
+        };
     snapshots.connect_timeout = parsed.snapshot_connect_timeout;
     snapshots.handshake_timeout = parsed.snapshot_handshake_timeout;
     snapshots.subscribe_timeout = parsed.snapshot_subscribe_timeout;
@@ -628,6 +875,10 @@ async fn load_snapshot_configuration(
         security,
         snapshots,
         cache,
+        reloaders: LoadedTlsReloaders {
+            edge: edge_reloader,
+            snapshot: snapshot_reloader,
+        },
     })
 }
 
@@ -740,6 +991,8 @@ mod tests {
             "agent.pem",
             "--tls-handshake-timeout-ms",
             "350",
+            "--tls-reload-manifest",
+            "edge-tls.json",
             "--snapshot-server",
             "127.0.0.1:17200",
             "--snapshot-ca",
@@ -764,6 +1017,12 @@ mod tests {
             "edge-cache",
             "--snapshot-cache-max-stale-ms",
             "60000",
+            "--snapshot-tls-reload-manifest",
+            "snapshot-client-tls.json",
+            "--tls-reload-interval-ms",
+            "106",
+            "--tls-expiry-warning-ms",
+            "107",
         ]))
         .unwrap();
         assert_eq!(parsed.agent_listen.port(), 17100);
@@ -781,6 +1040,10 @@ mod tests {
             Some(PathBuf::from("agent.pem"))
         );
         assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(350));
+        assert_eq!(
+            parsed.tls_reload_manifest,
+            Some(PathBuf::from("edge-tls.json"))
+        );
         assert_eq!(parsed.snapshot_server.unwrap().port(), 17200);
         assert_eq!(parsed.snapshot_ca, Some(PathBuf::from("control-ca.pem")));
         assert_eq!(
@@ -794,6 +1057,12 @@ mod tests {
             parsed.snapshot_cache_max_stale,
             Some(Duration::from_secs(60))
         );
+        assert_eq!(
+            parsed.snapshot_tls_reload_manifest,
+            Some(PathBuf::from("snapshot-client-tls.json"))
+        );
+        assert_eq!(parsed.tls_reload_interval, Duration::from_millis(106));
+        assert_eq!(parsed.tls_expiry_warning, Duration::from_millis(107));
         assert!(parsed.snapshot_options_present);
     }
 

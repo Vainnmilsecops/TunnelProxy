@@ -9,6 +9,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_agent::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
+    AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
     AgentTransportSecurity, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
@@ -37,6 +38,9 @@ Options:
   --tls-client-key <path>        Agent private key PEM
   --tls-server-name <name>       verified Edge DNS name
   --tls-handshake-timeout-ms <ms> TLS timeout  (default 10000)
+  --tls-reload-manifest <path>   atomic TLS generation manifest
+  --tls-reload-interval-ms <ms>  reload poll   (default 1000)
+  --tls-expiry-warning-ms <ms>   expiry warning(default 604800000)
   --help                         print this help and exit
 ";
 
@@ -74,13 +78,14 @@ async fn main() -> ExitCode {
     config.reconnect.max_attempts = parsed.max_reconnect_attempts;
     config.registration =
         RegistrationRequest::new(parsed.agent_id.clone(), parsed.tunnel_id.clone());
-    config.security = match load_transport_security(&parsed).await {
+    let loaded_tls = match load_transport_security(&parsed).await {
         Ok(security) => security,
         Err(error) => {
             error!(%error, "failed to configure Agent TLS");
             return ExitCode::from(2);
         }
     };
+    config.security = loaded_tls.security;
     let runtime = match AgentRuntime::new(config) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -97,12 +102,29 @@ async fn main() -> ExitCode {
     );
 
     let (trigger, signal) = shutdown_channel();
-    let runtime_future = runtime.run_until_shutdown(signal);
+    let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
+    let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal);
+    tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
-    let result = tokio::select! {
-        result = &mut runtime_future => result,
+    return tokio::select! {
+        result = &mut runtime_future => {
+            trigger.shutdown();
+            let _ = reload_future.await;
+            agent_exit_code(result)
+        },
+        reload = &mut reload_future => {
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            match reload {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(%error, "Agent TLS reload runtime failed");
+                    ExitCode::from(1)
+                }
+            }
+        },
         observed = &mut os_signal => {
             match observed {
                 Ok(cause) => info!(%cause, "process shutdown requested"),
@@ -114,10 +136,24 @@ async fn main() -> ExitCode {
                 }
             }
             trigger.shutdown();
-            runtime_future.await
+            let result = runtime_future.await;
+            let _ = reload_future.await;
+            agent_exit_code(result)
         }
     };
-    agent_exit_code(result)
+}
+
+async fn run_optional_tls_reloader(
+    reloader: Option<AgentTlsReloadRuntime>,
+    signal: tunnelproxy_common::ShutdownSignal,
+) -> Result<(), tunnelproxy_common::TlsReloadRuntimeError> {
+    match reloader {
+        Some(reloader) => reloader.run_until_shutdown(signal).await,
+        None => {
+            signal.cancelled().await;
+            Ok(())
+        }
+    }
 }
 
 fn agent_exit_code(
@@ -160,6 +196,10 @@ struct ParsedArgs {
     tls_client_key: Option<PathBuf>,
     tls_server_name: Option<String>,
     tls_handshake_timeout: Duration,
+    tls_reload_manifest: Option<PathBuf>,
+    tls_reload_interval: Duration,
+    tls_expiry_warning: Duration,
+    tls_reload_options_present: bool,
     help: bool,
 }
 
@@ -185,6 +225,10 @@ impl Default for ParsedArgs {
             tls_client_key: None,
             tls_server_name: None,
             tls_handshake_timeout: Duration::from_secs(10),
+            tls_reload_manifest: None,
+            tls_reload_interval: Duration::from_secs(1),
+            tls_expiry_warning: Duration::from_secs(7 * 24 * 60 * 60),
+            tls_reload_options_present: false,
             help: false,
         }
     }
@@ -305,6 +349,22 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                     Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--tls-reload-manifest" => {
+                parsed.tls_reload_manifest = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
+            "--tls-reload-interval-ms" => {
+                parsed.tls_reload_interval =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
+            "--tls-expiry-warning-ms" => {
+                parsed.tls_expiry_warning = Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.tls_reload_options_present = true;
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -316,6 +376,8 @@ enum TlsLoadError {
     IncompleteArguments,
     Read(&'static str),
     Invalid(AgentTlsConfigError),
+    IncompleteReloadArguments,
+    Reload(AgentTlsReloadBootstrapError),
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -326,21 +388,58 @@ impl std::fmt::Display for TlsLoadError {
             ),
             Self::Read(kind) => write!(f, "failed to read TLS {kind} PEM file"),
             Self::Invalid(error) => write!(f, "invalid TLS configuration: {error}"),
+            Self::IncompleteReloadArguments => f.write_str(
+                "TLS reload options require --tls-reload-manifest and complete TLS paths",
+            ),
+            Self::Reload(error) => write!(f, "invalid TLS reload configuration: {error}"),
         }
     }
 }
 
+struct LoadedTransportSecurity {
+    security: AgentTransportSecurity,
+    reloader: Option<AgentTlsReloadRuntime>,
+}
+
 async fn load_transport_security(
     parsed: &ParsedArgs,
-) -> Result<AgentTransportSecurity, TlsLoadError> {
+) -> Result<LoadedTransportSecurity, TlsLoadError> {
     match (
         &parsed.tls_ca,
         &parsed.tls_client_cert,
         &parsed.tls_client_key,
         &parsed.tls_server_name,
     ) {
-        (None, None, None, None) => Ok(AgentTransportSecurity::PlaintextLoopback),
+        (None, None, None, None) if !parsed.tls_reload_options_present => {
+            Ok(LoadedTransportSecurity {
+                security: AgentTransportSecurity::PlaintextLoopback,
+                reloader: None,
+            })
+        }
         (Some(ca), Some(cert), Some(key), Some(server_name)) => {
+            if let Some(manifest_path) = &parsed.tls_reload_manifest {
+                let (tls, reloader) = AgentTlsReloadRuntime::bootstrap(
+                    AgentTlsReloadConfig {
+                        manifest_path: manifest_path.clone(),
+                        server_ca_path: ca.clone(),
+                        client_certificate_path: cert.clone(),
+                        client_private_key_path: key.clone(),
+                        poll_interval: parsed.tls_reload_interval,
+                        expiry_warning: parsed.tls_expiry_warning,
+                    },
+                    server_name,
+                    parsed.tls_handshake_timeout,
+                )
+                .await
+                .map_err(TlsLoadError::Reload)?;
+                return Ok(LoadedTransportSecurity {
+                    security: AgentTransportSecurity::MutualTls(tls),
+                    reloader: Some(reloader),
+                });
+            }
+            if parsed.tls_reload_options_present {
+                return Err(TlsLoadError::IncompleteReloadArguments);
+            }
             let ca = tokio::fs::read(ca)
                 .await
                 .map_err(|_| TlsLoadError::Read("CA"))?;
@@ -351,7 +450,10 @@ async fn load_transport_security(
                 .await
                 .map_err(|_| TlsLoadError::Read("client private key"))?;
             AgentTlsConfig::from_pem(&ca, &cert, &key, server_name, parsed.tls_handshake_timeout)
-                .map(AgentTransportSecurity::MutualTls)
+                .map(|tls| LoadedTransportSecurity {
+                    security: AgentTransportSecurity::MutualTls(tls),
+                    reloader: None,
+                })
                 .map_err(TlsLoadError::Invalid)
         }
         _ => Err(TlsLoadError::IncompleteArguments),
@@ -453,6 +555,12 @@ mod tests {
             "edge.test",
             "--tls-handshake-timeout-ms",
             "600",
+            "--tls-reload-manifest",
+            "agent-tls.json",
+            "--tls-reload-interval-ms",
+            "700",
+            "--tls-expiry-warning-ms",
+            "800",
         ]))
         .unwrap();
         assert_eq!(parsed.edge.port(), 17100);
@@ -474,6 +582,12 @@ mod tests {
         assert_eq!(parsed.tls_client_key, Some(PathBuf::from("agent-key.pem")));
         assert_eq!(parsed.tls_server_name.as_deref(), Some("edge.test"));
         assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(600));
+        assert_eq!(
+            parsed.tls_reload_manifest,
+            Some(PathBuf::from("agent-tls.json"))
+        );
+        assert_eq!(parsed.tls_reload_interval, Duration::from_millis(700));
+        assert_eq!(parsed.tls_expiry_warning, Duration::from_millis(800));
     }
 
     #[test]
@@ -504,6 +618,16 @@ mod tests {
         };
         assert!(matches!(
             load_transport_security(&parsed).await,
+            Err(TlsLoadError::IncompleteArguments)
+        ));
+
+        let reload_without_tls = ParsedArgs {
+            tls_reload_manifest: Some(PathBuf::from("reload.json")),
+            tls_reload_options_present: true,
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_transport_security(&reload_without_tls).await,
             Err(TlsLoadError::IncompleteArguments)
         ));
     }

@@ -7,7 +7,6 @@
 //! active framed stream to a configured local TCP service.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -666,7 +665,7 @@ pub async fn connect_registered_with_security(
     let mut socket: BoxedTransport = match security {
         AgentTransportSecurity::PlaintextLoopback => Box::new(socket),
         AgentTransportSecurity::MutualTls(tls) => {
-            let connector = TlsConnector::from(Arc::clone(&tls.client_config));
+            let connector = TlsConnector::from(tls.client_config.current());
             let negotiation = connector.connect(tls.server_name.clone(), socket);
             match timeout(tls.handshake_timeout, negotiation).await {
                 Ok(Ok(stream)) => {

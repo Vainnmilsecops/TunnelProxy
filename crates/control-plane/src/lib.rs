@@ -48,8 +48,10 @@ pub use snapshot_protocol::{
 };
 pub use snapshot_service::{
     SnapshotBootstrapClient, SnapshotBootstrapSource, SnapshotClientConfig, SnapshotClientError,
-    SnapshotClientRuntime, SnapshotDistributionServer, SnapshotServerConfig, SnapshotServerError,
-    SnapshotServerTlsConfig, SnapshotTlsConfigError,
+    SnapshotClientRuntime, SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime,
+    SnapshotDistributionServer, SnapshotServerConfig, SnapshotServerError, SnapshotServerTlsConfig,
+    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
+    SnapshotTlsReloadBootstrapError,
 };
 
 /// SHA-256 digest of one leaf client certificate in DER form.

@@ -199,25 +199,39 @@
 - **Tracking:** persistence resolved in Session 17 and runnable process wiring
   completed in Session 18. Edge cold-start cache is tracked separately below.
 
+### DEBT-019 — Certificate issuance and key custody remain manual
+
+- **Introduced in:** Session 20
+- **Category:** security / ops
+- **Impact:** high for production credential operations, low for the tested
+  operator-managed reload boundary
+- **Rationale:** Session 20 reloads digest-bound local generations and enforces
+  leaf expiry, but an operator or external system must still issue credentials,
+  protect/write private keys, publish manifests, coordinate CA overlap, and
+  distribute CRL/OCSP or emergency trust revocation.
+- **Exit plan:** Define authenticated enrollment and renewal, short-lived
+  identities, protected key custody, issuer/audit boundaries, and explicit CA
+  overlap/revocation semantics that publish through the Session 20 manifest.
+- **Tracking:** open; local manifest publication is not a managed PKI.
+
+## Resolved items
+
 ### DEBT-017 — TLS certificates are static process-start configuration
 
 - **Introduced in:** Session 14
+- **Resolved in:** Session 20
 - **Category:** security / ops
 - **Impact:** high for production certificate lifecycle, low for the tested
   transport foundation
-- **Rationale:** Session 14 accepts certificate, key, and CA PEM files at
-  process startup and proves mutual authentication. It deliberately does not
-  build a CA service, key storage, certificate-to-Agent mapping, revocation,
-  rotation, expiry monitoring, or hot reload. Session 16 can revoke an
-  authorization grant for an exact fingerprint and close its live session, but
-  rustls certificate/key/trust configuration remains static.
-- **Exit plan:** Define durable Agent identity and authorization, issue
-  short-lived credentials from a controlled PKI, distribute trust snapshots,
-  support atomic reload/rotation, and test revocation without querying storage
-  on the data-plane hot path.
-- **Tracking:** open; static files are not a production credential lifecycle.
-
-## Resolved items
+- **Resolution:** Agent, Edge, snapshot client, and snapshot server can opt
+  into strict digest-bound monotonic generation manifests. Complete rustls
+  configurations are validated and atomically published for new handshakes;
+  invalid candidates retain last-known-good, leaf validity is observable, and
+  active-credential expiry is terminal. Static Edge certificate authorization
+  rotates in its Agent-facing generation and reconciles removed sessions.
+- **Residual boundary:** Issuance, key custody, CA/CRL/OCSP lifecycle, and
+  hostile local-filesystem defense are tracked by DEBT-019. Arbitrary existing
+  TLS sessions adopt new material only after reconnect.
 
 ### DEBT-018 — Dynamic Edge cannot cold start without Control Plane
 

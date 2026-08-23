@@ -11,7 +11,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{info, warn};
-use tunnelproxy_common::ShutdownSignal;
+use tunnelproxy_common::{
+    certificate_validity, load_tls_reload_generation, ReloadableConfig, ShutdownSignal,
+    TlsConfigStatus, TlsGenerationError, TlsReloadCandidate, TlsReloadFile, TlsReloadGeneration,
+    TlsReloadRuntime, TlsReloadRuntimeConfig, TlsReloadRuntimeError,
+};
 
 use crate::{
     authorization_snapshot_channel, read_snapshot_message, write_snapshot_message,
@@ -23,7 +27,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct SnapshotServerTlsConfig {
-    server_config: Arc<ServerConfig>,
+    server_config: ReloadableConfig<ServerConfig>,
     handshake_timeout: Duration,
 }
 
@@ -37,28 +41,17 @@ impl SnapshotServerTlsConfig {
         if handshake_timeout.is_zero() {
             return Err(SnapshotTlsConfigError::ZeroHandshakeTimeout);
         }
-        let server_certificates = parse_certificates(server_cert_pem, CertificateKind::Identity)?;
-        let server_key = parse_private_key(server_key_pem)?;
-        let client_authorities =
-            parse_certificates(edge_client_ca_pem, CertificateKind::Authority)?;
-        let mut client_roots = RootCertStore::empty();
-        for certificate in client_authorities {
-            client_roots
-                .add(certificate)
-                .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
-        }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-            .build()
-            .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
-        let mut server_config = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(server_certificates, server_key)
-            .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
-        server_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+        let candidate =
+            build_server_tls_config(server_cert_pem, server_key_pem, edge_client_ca_pem)?;
         Ok(Self {
-            server_config: Arc::new(server_config),
+            server_config: ReloadableConfig::new(1, [0; 32], candidate.config, candidate.validity)
+                .map_err(|_| SnapshotTlsConfigError::InvalidCertificateValidity)?,
             handshake_timeout,
         })
+    }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.server_config.status(SystemTime::now(), expiry_warning)
     }
 }
 
@@ -66,6 +59,7 @@ impl std::fmt::Debug for SnapshotServerTlsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotServerTlsConfig")
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("generation", &self.server_config.generation())
             .finish_non_exhaustive()
     }
 }
@@ -73,7 +67,7 @@ impl std::fmt::Debug for SnapshotServerTlsConfig {
 #[derive(Clone)]
 pub struct SnapshotClientConfig {
     pub server_addr: SocketAddr,
-    client_config: Arc<ClientConfig>,
+    client_config: ReloadableConfig<ClientConfig>,
     server_name: ServerName<'static>,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
@@ -92,23 +86,15 @@ impl SnapshotClientConfig {
     ) -> Result<Self, SnapshotTlsConfigError> {
         let server_name = ServerName::try_from(server_name.to_owned())
             .map_err(|_| SnapshotTlsConfigError::InvalidServerName)?;
-        let authorities = parse_certificates(control_plane_ca_pem, CertificateKind::Authority)?;
-        let identity = parse_certificates(edge_client_cert_pem, CertificateKind::Identity)?;
-        let key = parse_private_key(edge_client_key_pem)?;
-        let mut roots = RootCertStore::empty();
-        for certificate in authorities {
-            roots
-                .add(certificate)
-                .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
-        }
-        let mut client_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(identity, key)
-            .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
-        client_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+        let candidate = build_client_tls_config(
+            control_plane_ca_pem,
+            edge_client_cert_pem,
+            edge_client_key_pem,
+        )?;
         Ok(Self {
             server_addr,
-            client_config: Arc::new(client_config),
+            client_config: ReloadableConfig::new(1, [0; 32], candidate.config, candidate.validity)
+                .map_err(|_| SnapshotTlsConfigError::InvalidCertificateValidity)?,
             server_name,
             connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(5),
@@ -129,6 +115,10 @@ impl SnapshotClientConfig {
         }
         Ok(())
     }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.client_config.status(SystemTime::now(), expiry_warning)
+    }
 }
 
 impl std::fmt::Debug for SnapshotClientConfig {
@@ -141,6 +131,7 @@ impl std::fmt::Debug for SnapshotClientConfig {
             .field("subscribe_timeout", &self.subscribe_timeout)
             .field("reconnect_initial_delay", &self.reconnect_initial_delay)
             .field("reconnect_max_delay", &self.reconnect_max_delay)
+            .field("generation", &self.client_config.generation())
             .finish_non_exhaustive()
     }
 }
@@ -231,7 +222,7 @@ async fn serve_edge(
     config: SnapshotServerConfig,
     mut snapshots: AuthorizationSnapshotSubscription,
 ) {
-    let acceptor = TlsAcceptor::from(Arc::clone(&config.tls.server_config));
+    let acceptor = TlsAcceptor::from(config.tls.server_config.current());
     let mut stream =
         match tokio::time::timeout(config.tls.handshake_timeout, acceptor.accept(socket)).await {
             Ok(Ok(stream))
@@ -582,7 +573,7 @@ async fn connect_and_subscribe(
     .await
     .map_err(|_| SnapshotClientError::ConnectTimeout)?
     .map_err(SnapshotClientError::Connect)?;
-    let connector = TlsConnector::from(Arc::clone(&config.client_config));
+    let connector = TlsConnector::from(config.client_config.current());
     let mut stream = tokio::time::timeout(
         config.handshake_timeout,
         connector.connect(config.server_name.clone(), socket),
@@ -624,6 +615,7 @@ pub enum SnapshotTlsConfigError {
     MissingPrivateKey,
     InvalidPrivateKey,
     InvalidIdentity,
+    InvalidCertificateValidity,
 }
 
 impl std::fmt::Display for SnapshotTlsConfigError {
@@ -638,6 +630,9 @@ impl std::fmt::Display for SnapshotTlsConfigError {
             Self::MissingPrivateKey => "TLS private key is missing",
             Self::InvalidPrivateKey => "TLS private key is invalid",
             Self::InvalidIdentity => "TLS certificate and private key are incompatible",
+            Self::InvalidCertificateValidity => {
+                "TLS identity certificate validity is invalid or not currently active"
+            }
         })
     }
 }
@@ -675,6 +670,294 @@ fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, SnapshotTlsCo
         .map_err(|_| SnapshotTlsConfigError::InvalidPrivateKey)?
         .ok_or(SnapshotTlsConfigError::MissingPrivateKey)
 }
+
+fn build_server_tls_config(
+    server_cert_pem: &[u8],
+    server_key_pem: &[u8],
+    edge_client_ca_pem: &[u8],
+) -> Result<TlsReloadCandidate<ServerConfig>, SnapshotTlsConfigError> {
+    let server_certificates = parse_certificates(server_cert_pem, CertificateKind::Identity)?;
+    let validity = certificate_validity(server_certificates[0].as_ref())
+        .map_err(|_| SnapshotTlsConfigError::InvalidCertificateValidity)?;
+    let server_key = parse_private_key(server_key_pem)?;
+    let client_authorities = parse_certificates(edge_client_ca_pem, CertificateKind::Authority)?;
+    let mut client_roots = RootCertStore::empty();
+    for certificate in client_authorities {
+        client_roots
+            .add(certificate)
+            .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
+    let mut server_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(server_certificates, server_key)
+        .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
+    server_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+    Ok(TlsReloadCandidate {
+        config: server_config,
+        validity,
+    })
+}
+
+fn build_client_tls_config(
+    control_plane_ca_pem: &[u8],
+    edge_client_cert_pem: &[u8],
+    edge_client_key_pem: &[u8],
+) -> Result<TlsReloadCandidate<ClientConfig>, SnapshotTlsConfigError> {
+    let authorities = parse_certificates(control_plane_ca_pem, CertificateKind::Authority)?;
+    let identity = parse_certificates(edge_client_cert_pem, CertificateKind::Identity)?;
+    let validity = certificate_validity(identity[0].as_ref())
+        .map_err(|_| SnapshotTlsConfigError::InvalidCertificateValidity)?;
+    let key = parse_private_key(edge_client_key_pem)?;
+    let mut roots = RootCertStore::empty();
+    for certificate in authorities {
+        roots
+            .add(certificate)
+            .map_err(|_| SnapshotTlsConfigError::InvalidAuthorityCertificate)?;
+    }
+    let mut client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(identity, key)
+        .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
+    client_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+    Ok(TlsReloadCandidate {
+        config: client_config,
+        validity,
+    })
+}
+
+const RELOAD_SERVER_CERTIFICATE: &str = "server_certificate";
+const RELOAD_SERVER_PRIVATE_KEY: &str = "server_private_key";
+const RELOAD_CLIENT_CA: &str = "client_ca";
+const RELOAD_SERVER_CA: &str = "server_ca";
+const RELOAD_CLIENT_CERTIFICATE: &str = "client_certificate";
+const RELOAD_CLIENT_PRIVATE_KEY: &str = "client_private_key";
+
+#[derive(Debug, Clone)]
+pub struct SnapshotServerTlsReloadConfig {
+    pub manifest_path: std::path::PathBuf,
+    pub server_certificate_path: std::path::PathBuf,
+    pub server_private_key_path: std::path::PathBuf,
+    pub client_ca_path: std::path::PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+}
+
+impl SnapshotServerTlsReloadConfig {
+    fn runtime_config(&self) -> TlsReloadRuntimeConfig {
+        TlsReloadRuntimeConfig {
+            manifest_path: self.manifest_path.clone(),
+            files: vec![
+                TlsReloadFile::new(
+                    RELOAD_SERVER_CERTIFICATE,
+                    self.server_certificate_path.clone(),
+                ),
+                TlsReloadFile::new(
+                    RELOAD_SERVER_PRIVATE_KEY,
+                    self.server_private_key_path.clone(),
+                ),
+                TlsReloadFile::new(RELOAD_CLIENT_CA, self.client_ca_path.clone()),
+            ],
+            poll_interval: self.poll_interval,
+            expiry_warning: self.expiry_warning,
+        }
+    }
+}
+
+type ServerBuild = fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ServerConfig>, ()>;
+
+pub struct SnapshotServerTlsReloadRuntime {
+    inner: TlsReloadRuntime<ServerConfig, ServerBuild>,
+}
+
+impl SnapshotServerTlsReloadRuntime {
+    pub async fn bootstrap(
+        reload: SnapshotServerTlsReloadConfig,
+        handshake_timeout: Duration,
+    ) -> Result<(SnapshotServerTlsConfig, Self), SnapshotTlsReloadBootstrapError> {
+        if handshake_timeout.is_zero() {
+            return Err(SnapshotTlsReloadBootstrapError::Tls(
+                SnapshotTlsConfigError::ZeroHandshakeTimeout,
+            ));
+        }
+        let runtime_config = reload.runtime_config();
+        runtime_config
+            .validate()
+            .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        let generation = load_tls_reload_generation(
+            runtime_config.manifest_path.clone(),
+            runtime_config.files.clone(),
+        )
+        .await
+        .map_err(SnapshotTlsReloadBootstrapError::Load)?;
+        let candidate = build_server_reload_generation(&generation)
+            .map_err(|()| SnapshotTlsReloadBootstrapError::Candidate)?;
+        let server_config = ReloadableConfig::new(
+            generation.generation(),
+            generation.manifest_digest(),
+            candidate.config,
+            candidate.validity,
+        )
+        .map_err(SnapshotTlsReloadBootstrapError::Generation)?;
+        let tls = SnapshotServerTlsConfig {
+            server_config: server_config.clone(),
+            handshake_timeout,
+        };
+        let inner = TlsReloadRuntime::new(
+            runtime_config,
+            server_config,
+            build_server_reload_generation as ServerBuild,
+        )
+        .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        Ok((tls, Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
+    }
+}
+
+fn build_server_reload_generation(
+    generation: &TlsReloadGeneration,
+) -> Result<TlsReloadCandidate<ServerConfig>, ()> {
+    build_server_tls_config(
+        generation.file(RELOAD_SERVER_CERTIFICATE).map_err(|_| ())?,
+        generation.file(RELOAD_SERVER_PRIVATE_KEY).map_err(|_| ())?,
+        generation.file(RELOAD_CLIENT_CA).map_err(|_| ())?,
+    )
+    .map_err(|_| ())
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotClientTlsReloadConfig {
+    pub manifest_path: std::path::PathBuf,
+    pub server_ca_path: std::path::PathBuf,
+    pub client_certificate_path: std::path::PathBuf,
+    pub client_private_key_path: std::path::PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+}
+
+impl SnapshotClientTlsReloadConfig {
+    fn runtime_config(&self) -> TlsReloadRuntimeConfig {
+        TlsReloadRuntimeConfig {
+            manifest_path: self.manifest_path.clone(),
+            files: vec![
+                TlsReloadFile::new(RELOAD_SERVER_CA, self.server_ca_path.clone()),
+                TlsReloadFile::new(
+                    RELOAD_CLIENT_CERTIFICATE,
+                    self.client_certificate_path.clone(),
+                ),
+                TlsReloadFile::new(
+                    RELOAD_CLIENT_PRIVATE_KEY,
+                    self.client_private_key_path.clone(),
+                ),
+            ],
+            poll_interval: self.poll_interval,
+            expiry_warning: self.expiry_warning,
+        }
+    }
+}
+
+type ClientBuild = fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ClientConfig>, ()>;
+
+pub struct SnapshotClientTlsReloadRuntime {
+    inner: TlsReloadRuntime<ClientConfig, ClientBuild>,
+}
+
+impl SnapshotClientTlsReloadRuntime {
+    pub async fn bootstrap(
+        server_addr: SocketAddr,
+        server_name: &str,
+        reload: SnapshotClientTlsReloadConfig,
+    ) -> Result<(SnapshotClientConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let server_name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
+            SnapshotTlsReloadBootstrapError::Tls(SnapshotTlsConfigError::InvalidServerName)
+        })?;
+        let runtime_config = reload.runtime_config();
+        runtime_config
+            .validate()
+            .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        let generation = load_tls_reload_generation(
+            runtime_config.manifest_path.clone(),
+            runtime_config.files.clone(),
+        )
+        .await
+        .map_err(SnapshotTlsReloadBootstrapError::Load)?;
+        let candidate = build_client_reload_generation(&generation)
+            .map_err(|()| SnapshotTlsReloadBootstrapError::Candidate)?;
+        let client_config = ReloadableConfig::new(
+            generation.generation(),
+            generation.manifest_digest(),
+            candidate.config,
+            candidate.validity,
+        )
+        .map_err(SnapshotTlsReloadBootstrapError::Generation)?;
+        let config = SnapshotClientConfig {
+            server_addr,
+            client_config: client_config.clone(),
+            server_name,
+            connect_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(5),
+            subscribe_timeout: Duration::from_secs(5),
+            reconnect_initial_delay: Duration::from_millis(250),
+            reconnect_max_delay: Duration::from_secs(30),
+        };
+        let inner = TlsReloadRuntime::new(
+            runtime_config,
+            client_config,
+            build_client_reload_generation as ClientBuild,
+        )
+        .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        Ok((config, Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
+    }
+}
+
+fn build_client_reload_generation(
+    generation: &TlsReloadGeneration,
+) -> Result<TlsReloadCandidate<ClientConfig>, ()> {
+    build_client_tls_config(
+        generation.file(RELOAD_SERVER_CA).map_err(|_| ())?,
+        generation.file(RELOAD_CLIENT_CERTIFICATE).map_err(|_| ())?,
+        generation.file(RELOAD_CLIENT_PRIVATE_KEY).map_err(|_| ())?,
+    )
+    .map_err(|_| ())
+}
+
+#[derive(Debug)]
+pub enum SnapshotTlsReloadBootstrapError {
+    Load(tunnelproxy_common::TlsReloadLoadError),
+    Tls(SnapshotTlsConfigError),
+    Generation(TlsGenerationError),
+    Runtime(TlsReloadRuntimeError),
+    Candidate,
+}
+
+impl std::fmt::Display for SnapshotTlsReloadBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(f),
+            Self::Tls(error) => error.fmt(f),
+            Self::Generation(error) => error.fmt(f),
+            Self::Runtime(error) => error.fmt(f),
+            Self::Candidate => f.write_str("TLS reload generation contains invalid credentials"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotTlsReloadBootstrapError {}
 
 #[derive(Debug)]
 pub enum SnapshotServerError {

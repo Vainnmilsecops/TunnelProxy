@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Edge Cold-Start Snapshot Cache** (Session 19).
+**Certificate Lifecycle & Atomic TLS Reload** (Session 20).
 
 ## Completed
 
@@ -224,12 +224,33 @@
 - TLS identity, ALPN, protocol, and server-rejection errors never fall back to
   disk. The local filesystem is an explicit trust boundary; the digest is not a
   snapshot signature.
-- 233 explicit workspace tests are present; all prior behavior is preserved.
+- Agent, Edge Agent-facing TLS, Edge snapshot-client TLS, and Control Plane
+  snapshot-server TLS can opt into polling a strict generation manifest.
+  Each manifest names the exact expected files and their SHA-256 digests;
+  unknown/missing entries, partial writes, stale/conflicting generations, and
+  invalid PEM/configuration are rejected before publication.
+- TLS handshakes take an immutable `Arc<rustls::*Config>` snapshot. A complete
+  newer generation is swapped for new handshakes without restarting the
+  process, while a rejected generation leaves the prior configuration active.
+- Static Edge authorization reloads the exact authorized Agent certificate in
+  the same Agent-facing generation and reconciles live sessions. Dynamic Edge
+  authorization remains owned by the Control Plane snapshot stream.
+- Leaf-identity validity is decoded at bootstrap/reload. Runtime status exposes
+  `Current`, `Expiring`, `ReloadFailed`, or `Expired`; structured events contain
+  generation and health only. If last-known-good credentials expire before a
+  valid replacement arrives, the owning process supervisor exits non-zero.
+- Reload manifests are optional and plaintext behavior is unchanged. Polling
+  uses skipped missed ticks and bounded blocking reads; PEM bytes, keys, file
+  contents, and paths are not emitted in status or reload events.
+- 239 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
-- Certificate issuance, CA/trust revocation, rotation, expiry monitoring, and
-  TLS-config hot reload (DEBT-017 open).
+- Automated certificate issuance, protected key custody/distribution, and
+  CA/CRL/OCSP lifecycle automation (DEBT-019 open).
+- Existing TLS connections generally retain their negotiated session until
+  reconnect; static Edge certificate authorization is the exception because
+  its snapshot update actively reconciles and revokes the old Agent session.
 - General administrative mutation API and snapshot signing/hardware-backed
   rollback protection.
 - Credit/window-based flow control and strict weighted fairness between
@@ -245,14 +266,12 @@
 
 ## Next planned session
 
-**Session 20 — Certificate Lifecycle & Atomic TLS Reload.**
+**Session 21 — Automated Certificate Issuance & Trust Distribution.**
 
 Goals:
 
-- Define certificate expiry/rotation state and secret-safe reload boundaries.
-- Atomically replace Agent, Edge, and snapshot-service TLS configurations
-  without allowing unauthenticated or partially loaded state.
-- Test overlap rotation, revocation, rollback on invalid material, and graceful
-  handling of established versus new connections.
-- Keep public ingress, general admin APIs, and multi-edge consensus outside the
-  session unless explicitly expanded.
+- Define an issuer and enrollment trust model without exposing private keys.
+- Automate short-lived identity delivery into the Session 20 generation
+  boundary and define CA overlap/revocation policy.
+- Keep public ingress, billing, and multi-edge consensus outside the session
+  unless explicitly expanded.

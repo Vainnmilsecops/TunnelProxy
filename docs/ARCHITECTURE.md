@@ -419,6 +419,27 @@ the complete Edge runtime and releases its listeners.
 The integrity digest is not a signature. Local host/filesystem compromise and
 cryptographic rollback resistance remain outside the model.
 
+### 2.19 Atomic TLS generation reload (Session 20)
+
+Every implemented mTLS role may retain its startup-only behavior or opt into a
+polling reload manifest. A manifest is the commit point for one role-specific
+bundle: Agent client (`server_ca`, `client_certificate`,
+`client_private_key`), Edge Agent-facing server (`server_certificate`,
+`server_private_key`, `client_ca`, plus
+`authorized_client_certificate` in static authorization mode), snapshot client,
+or snapshot server. It declares a non-zero generation and SHA-256 digest for
+the exact expected files.
+
+The loader performs bounded filesystem reads on a blocking worker, verifies the
+whole file set, constructs and validates a complete rustls configuration, then
+atomically swaps the immutable configuration used by future handshakes. A
+stale, conflicting, partial, corrupt, not-yet-valid, expired, or otherwise
+invalid candidate leaves last-known-good active. Leaf expiry is observable and
+becomes terminal when no replacement arrives. Reload does not renegotiate an
+established TLS session; reconnect selects the latest generation. Static Edge
+authorization is generation-coupled and its full-snapshot reconciliation
+revokes a session whose exact client leaf was removed.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

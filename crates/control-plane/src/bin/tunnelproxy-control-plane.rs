@@ -11,8 +11,9 @@ use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotCommitOutcome,
-    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotTlsConfigError,
-    SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
+    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
+    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
+    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -30,6 +31,9 @@ Serve options:
   --tls-handshake-timeout-ms <ms>    TLS timeout (default 5000)
   --request-timeout-ms <ms>          protocol I/O timeout (default 5000)
   --refresh-interval-ms <ms>         SQLite refresh interval (default 500)
+  --tls-reload-manifest <path>       atomic TLS generation manifest
+  --tls-reload-interval-ms <ms>      reload poll (default 1000)
+  --tls-expiry-warning-ms <ms>       expiry warning (default 604800000)
 
 Import options:
   --database <path>                  SQLite snapshot database (required)
@@ -69,7 +73,7 @@ async fn main() -> ExitCode {
                 error.exit_code()
             }
         },
-        ParsedCommand::Serve(args) => match run_server(args).await {
+        ParsedCommand::Serve(args) => match run_server(*args).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 error!(%error, "Control Plane runtime failed");
@@ -107,18 +111,7 @@ async fn read_manifest(path: PathBuf) -> Result<Vec<u8>, ImportError> {
 }
 
 async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
-    let (certificate, private_key, edge_client_ca) = tokio::try_join!(
-        read_pem(args.tls_cert, "server certificate"),
-        read_pem(args.tls_key, "server private key"),
-        read_pem(args.edge_client_ca, "Edge client CA"),
-    )?;
-    let tls = SnapshotServerTlsConfig::from_pem(
-        &certificate,
-        &private_key,
-        &edge_client_ca,
-        args.tls_handshake_timeout,
-    )
-    .map_err(ServeError::Tls)?;
+    let (tls, reloader) = load_server_tls(&args).await?;
     let runtime = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
         database_path: args.database,
         refresh_interval: args.refresh_interval,
@@ -137,20 +130,87 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
         "Control Plane snapshot service started"
     );
     let (trigger, signal) = shutdown_channel();
-    let runtime_future = runtime.run_until_shutdown(signal);
+    let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
+    let reload_future = run_optional_tls_reloader(reloader, signal);
+    tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
     let outcome = tokio::select! {
-        result = &mut runtime_future => result.map_err(ServeError::Runtime)?,
+        result = &mut runtime_future => {
+            trigger.shutdown();
+            let _ = reload_future.await;
+            result.map_err(ServeError::Runtime)?
+        },
+        reload = &mut reload_future => {
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            reload.map_err(ServeError::ReloadRuntime)?;
+            return Ok(());
+        },
         observed = &mut os_signal => {
             observed.map_err(|_| ServeError::Signal)?;
             trigger.shutdown();
-            runtime_future.await.map_err(ServeError::Runtime)?
+            let outcome = runtime_future.await.map_err(ServeError::Runtime)?;
+            let _ = reload_future.await;
+            outcome
         }
     };
     info!(?outcome, "Control Plane shutdown completed");
     Ok(())
+}
+
+async fn load_server_tls(
+    args: &ServeArgs,
+) -> Result<
+    (
+        SnapshotServerTlsConfig,
+        Option<SnapshotServerTlsReloadRuntime>,
+    ),
+    ServeError,
+> {
+    if let Some(manifest_path) = &args.tls_reload_manifest {
+        let (tls, runtime) = SnapshotServerTlsReloadRuntime::bootstrap(
+            SnapshotServerTlsReloadConfig {
+                manifest_path: manifest_path.clone(),
+                server_certificate_path: args.tls_cert.clone(),
+                server_private_key_path: args.tls_key.clone(),
+                client_ca_path: args.edge_client_ca.clone(),
+                poll_interval: args.tls_reload_interval,
+                expiry_warning: args.tls_expiry_warning,
+            },
+            args.tls_handshake_timeout,
+        )
+        .await
+        .map_err(ServeError::ReloadBootstrap)?;
+        return Ok((tls, Some(runtime)));
+    }
+    let (certificate, private_key, edge_client_ca) = tokio::try_join!(
+        read_pem(args.tls_cert.clone(), "server certificate"),
+        read_pem(args.tls_key.clone(), "server private key"),
+        read_pem(args.edge_client_ca.clone(), "Edge client CA"),
+    )?;
+    let tls = SnapshotServerTlsConfig::from_pem(
+        &certificate,
+        &private_key,
+        &edge_client_ca,
+        args.tls_handshake_timeout,
+    )
+    .map_err(ServeError::Tls)?;
+    Ok((tls, None))
+}
+
+async fn run_optional_tls_reloader(
+    reloader: Option<SnapshotServerTlsReloadRuntime>,
+    signal: tunnelproxy_common::ShutdownSignal,
+) -> Result<(), tunnelproxy_common::TlsReloadRuntimeError> {
+    match reloader {
+        Some(reloader) => reloader.run_until_shutdown(signal).await,
+        None => {
+            signal.cancelled().await;
+            Ok(())
+        }
+    }
 }
 
 async fn read_pem(path: PathBuf, kind: &'static str) -> Result<Vec<u8>, ServeError> {
@@ -162,7 +222,7 @@ async fn read_pem(path: PathBuf, kind: &'static str) -> Result<Vec<u8>, ServeErr
 #[derive(Debug, PartialEq, Eq)]
 enum ParsedCommand {
     Help,
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     Import(ImportArgs),
 }
 
@@ -177,6 +237,9 @@ struct ServeArgs {
     tls_handshake_timeout: Duration,
     request_timeout: Duration,
     refresh_interval: Duration,
+    tls_reload_manifest: Option<PathBuf>,
+    tls_reload_interval: Duration,
+    tls_expiry_warning: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -193,7 +256,7 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
         return Ok(ParsedCommand::Help);
     }
     match command {
-        "serve" => parse_serve(&args[1..]).map(ParsedCommand::Serve),
+        "serve" => parse_serve(&args[1..]).map(|args| ParsedCommand::Serve(Box::new(args))),
         "import" => parse_import(&args[1..]).map(ParsedCommand::Import),
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
@@ -209,6 +272,10 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut tls_handshake_timeout = Duration::from_secs(5);
     let mut request_timeout = Duration::from_secs(5);
     let mut refresh_interval = Duration::from_millis(500);
+    let mut tls_reload_manifest = None;
+    let mut tls_reload_interval = Duration::from_secs(1);
+    let mut tls_expiry_warning = Duration::from_secs(7 * 24 * 60 * 60);
+    let mut reload_tuning_present = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -224,9 +291,23 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             }
             "--request-timeout-ms" => request_timeout = parse_duration(args, index, flag)?,
             "--refresh-interval-ms" => refresh_interval = parse_duration(args, index, flag)?,
+            "--tls-reload-manifest" => {
+                tls_reload_manifest = Some(parse_path(args, index, flag)?);
+            }
+            "--tls-reload-interval-ms" => {
+                tls_reload_interval = parse_duration(args, index, flag)?;
+                reload_tuning_present = true;
+            }
+            "--tls-expiry-warning-ms" => {
+                tls_expiry_warning = parse_duration(args, index, flag)?;
+                reload_tuning_present = true;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_owned())),
         }
         index += 2;
+    }
+    if reload_tuning_present && tls_reload_manifest.is_none() {
+        return Err(ArgError::MissingRequired("--tls-reload-manifest"));
     }
     Ok(ServeArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
@@ -238,6 +319,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         tls_handshake_timeout,
         request_timeout,
         refresh_interval,
+        tls_reload_manifest,
+        tls_reload_interval,
+        tls_expiry_warning,
     })
 }
 
@@ -359,6 +443,8 @@ enum ServeError {
     Tls(SnapshotTlsConfigError),
     Runtime(tunnelproxy_control_plane::ControlPlaneRuntimeError),
     Signal,
+    ReloadBootstrap(SnapshotTlsReloadBootstrapError),
+    ReloadRuntime(tunnelproxy_common::TlsReloadRuntimeError),
 }
 
 impl std::fmt::Display for ServeError {
@@ -368,6 +454,8 @@ impl std::fmt::Display for ServeError {
             Self::Tls(error) => error.fmt(f),
             Self::Runtime(error) => error.fmt(f),
             Self::Signal => f.write_str("OS shutdown listener failed"),
+            Self::ReloadBootstrap(error) => write!(f, "TLS reload bootstrap failed: {error}"),
+            Self::ReloadRuntime(error) => write!(f, "TLS reload runtime failed: {error}"),
         }
     }
 }
@@ -375,14 +463,14 @@ impl std::fmt::Display for ServeError {
 impl ServeError {
     fn exit_code(&self) -> ExitCode {
         match self {
-            Self::ReadPem(_) | Self::Tls(_) => ExitCode::from(2),
+            Self::ReadPem(_) | Self::Tls(_) | Self::ReloadBootstrap(_) => ExitCode::from(2),
             Self::Runtime(
                 tunnelproxy_control_plane::ControlPlaneRuntimeError::InvalidConfig
                 | tunnelproxy_control_plane::ControlPlaneRuntimeError::Authority(
                     tunnelproxy_control_plane::PersistentSnapshotAuthorityError::Uninitialized,
                 ),
             ) => ExitCode::from(2),
-            Self::Runtime(_) | Self::Signal => ExitCode::from(1),
+            Self::Runtime(_) | Self::Signal | Self::ReloadRuntime(_) => ExitCode::from(1),
         }
     }
 }
@@ -417,6 +505,12 @@ mod tests {
             "200",
             "--refresh-interval-ms",
             "300",
+            "--tls-reload-manifest",
+            "control-tls.json",
+            "--tls-reload-interval-ms",
+            "400",
+            "--tls-expiry-warning-ms",
+            "500",
         ]))
         .unwrap();
         let ParsedCommand::Serve(serve) = serve else {
@@ -425,6 +519,12 @@ mod tests {
         assert_eq!(serve.listen.port(), 17200);
         assert_eq!(serve.max_edge_clients, 8);
         assert_eq!(serve.refresh_interval, Duration::from_millis(300));
+        assert_eq!(
+            serve.tls_reload_manifest,
+            Some(PathBuf::from("control-tls.json"))
+        );
+        assert_eq!(serve.tls_reload_interval, Duration::from_millis(400));
+        assert_eq!(serve.tls_expiry_warning, Duration::from_millis(500));
 
         assert_eq!(
             parse_args(&args(&[

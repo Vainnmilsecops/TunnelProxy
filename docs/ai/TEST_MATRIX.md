@@ -115,6 +115,8 @@
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
 | Agent transport mutual TLS                | ✅    | ✅           | —   | Runtime-generated PKI covers byte-exact mTLS with ALPN v2, wrong CA/name, timeout/cancellation, secret-safe Debug, and secure reconnect. |
 | Agent certificate authentication          | ✅    | ✅           | —   | Missing/untrusted certs, same-CA unassigned certs, false Agent/Tunnel claims, and disabled tunnels never become routable. |
+| Atomic TLS generation reload              | ✅    | ✅           | —   | Strict digest manifests and monotonic last-known-good publication are unit tested; real mTLS rotates Agent/Edge and snapshot client/server without restart, rejects old credentials, and retains the active generation after an invalid candidate. |
+| TLS expiry enforcement                    | ✅    | ✅           | —   | Health distinguishes expiring/reload-failed/expired without secrets, and runtime expiry terminates when no valid replacement arrives. |
 | Durable raw route offline/reconnect       | ✅    | ✅           | —   | Listener remains bound, closes sockets while offline, and resolves the fresh authenticated session without rebind or storage lookup. |
 | Plaintext transport restriction           | ✅    | ✅           | —   | Runnable plaintext is loopback-only; a non-loopback Agent listener validates only when mutual TLS is configured. |
 | Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |

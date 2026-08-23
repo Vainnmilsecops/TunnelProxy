@@ -279,3 +279,52 @@ failure never falls back. Later imports with a higher version are durably
 cached before publication. If reconnect does not succeed before the stale
 deadline, Edge shuts down and releases both listeners. Cache filesystem I/O is
 never performed on the ingress path.
+
+## 14. Rotating TLS without process restart
+
+TLS reload is opt-in. Keep the normal PEM path flags and add the matching
+manifest flag. Agent and Control Plane use `--tls-reload-manifest`; Edge uses
+that flag for Agent-facing TLS and `--snapshot-tls-reload-manifest` for its
+Control Plane client identity. All processes accept
+`--tls-reload-interval-ms` and `--tls-expiry-warning-ms`.
+
+The manifest is strict JSON. `generation` must be non-zero; a replacement must
+be greater than the active generation. Each digest is SHA-256 over the exact
+bytes at the existing PEM path. For static Edge authorization the complete
+manifest is:
+
+```json
+{
+  "generation": 2,
+  "files": {
+    "server_certificate": "<64 lowercase hex characters>",
+    "server_private_key": "<64 lowercase hex characters>",
+    "client_ca": "<64 lowercase hex characters>",
+    "authorized_client_certificate": "<64 lowercase hex characters>"
+  }
+}
+```
+
+Other exact file sets are:
+
+- Agent and snapshot client: `server_ca`, `client_certificate`,
+  `client_private_key`.
+- Dynamic Edge Agent-facing server: `server_certificate`,
+  `server_private_key`, `client_ca`.
+- Control Plane snapshot server: `server_certificate`,
+  `server_private_key`, `client_ca`.
+
+Publish material files first, calculate their digests, write the complete
+manifest to a sibling temporary file, then atomically replace the configured
+manifest path. The manifest is the commit marker. If polling observes an
+intermediate write, wrong digest, invalid key/certificate pair, stale version,
+or unknown field, it keeps last-known-good and reports `ReloadFailed`. Reusing
+the current generation is accepted only when the manifest bytes are identical.
+
+Reload affects new TLS handshakes. Existing connections normally use the
+credentials negotiated at their last connection; static Edge mode additionally
+reconciles the authorized certificate snapshot and closes a session removed by
+rotation. The runtime reports an expiry warning for the active leaf certificate
+and exits non-zero if that leaf expires before a valid newer generation is
+loaded. Manifests and local PEM permissions remain an operator trust boundary;
+this feature does not issue certificates or protect private keys.

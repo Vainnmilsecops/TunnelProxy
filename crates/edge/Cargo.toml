@@ -25,3 +25,4 @@ tunnelproxy-control-plane = { path = "../control-plane" }
 tunnelproxy-agent = { path = "../agent" }
 rcgen = { workspace = true }
 time = { workspace = true }
+sha2 = { workspace = true }
