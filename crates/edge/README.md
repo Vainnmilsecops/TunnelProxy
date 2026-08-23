@@ -27,4 +27,6 @@ and `EdgeSessionRouter` for bounded concurrent raw TCP streams routed to exact
 live Agent sessions. Session 10 adds bounded ephemeral raw ingress listeners
 with tracked completion and drain cleanup. Public HTTP ingress, TLS,
 authentication, durable routing, and credit-based flow control are not
-implemented yet.
+implemented yet. Session 12 adds `EdgeRuntime` and the runnable
+`tunnelproxy-edge` binary, composing one Agent with one loopback raw route,
+startup rollback, and ordered route-before-transport shutdown.

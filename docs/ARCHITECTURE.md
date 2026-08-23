@@ -242,8 +242,26 @@ Multiplexed Edge flips its router to a fail-closed draining state before asking
 live sessions to stop accepting stream commands. The Agent answers any later
 `OPEN_STREAM` with `SessionClosing` and lets existing local bridges finish.
 Raw-route shutdown similarly prevents new route creation and supervises every
-routed connection. OS signal handling is intentionally one layer above these
-mechanisms and remains entrypoint work for Session 12.
+routed connection. OS signal handling remains one layer above these mechanisms
+and is wired by the Session 12 process entrypoints.
+
+### 2.11 Runnable process composition (Session 12)
+
+`EdgeRuntime` is a single-tunnel process supervisor. It binds the Agent
+transport first, waits for the one permitted Agent to register, then creates a
+loopback raw route targeting that ephemeral session. A route bind failure
+triggers startup rollback and joins the transport before returning an error.
+On shutdown, raw admission and routed streams drain before the Agent transport
+is told to close.
+
+`AgentRuntime` owns one outbound connect, handshake, and multiplexed local
+bridge. Cancellation can win before connect completes or while the session is
+established. There is intentionally no reconnect loop yet.
+
+The `tunnelproxy-edge` and `tunnelproxy-agent` binaries translate Ctrl-C on all
+platforms and SIGTERM on Unix into the shared idempotent trigger. OS handlers
+never perform socket cleanup themselves. This is production-style lifecycle
+composition over a development-only loopback route; it is not public ingress.
 
 ## 3. Control plane vs data plane
 

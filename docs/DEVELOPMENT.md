@@ -140,3 +140,26 @@ Long-running runtimes expose a shutdown-aware variant accepting a cloneable
 `trigger.shutdown()` once. The default drain deadline is 10 seconds; zero is
 rejected. Runtime tests should assert the returned `RuntimeShutdownOutcome` and
 verify that listener addresses can be rebound after completion.
+
+## 11. Running the local tunnel processes
+
+Start a local service on `127.0.0.1:3000`, then run Edge and Agent in separate
+terminals:
+
+```bash
+cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
+  --agent-listen 127.0.0.1:7100 \
+  --raw-listen 127.0.0.1:7000
+
+cargo run -p tunnelproxy-agent --bin tunnelproxy-agent -- \
+  --edge 127.0.0.1:7100 \
+  --local 127.0.0.1:3000
+```
+
+TCP clients can then connect to `127.0.0.1:7000`. Press Ctrl-C to request
+ordered shutdown. Unix also observes SIGTERM. Exit code `0` means a locally
+requested graceful shutdown, `1` means runtime failure/forced drain/unexpected
+peer close, and `2` means invalid CLI or runtime configuration.
+
+This entrypoint intentionally supports one Agent and one loopback route. It
+does not provide authentication, reconnect, durable identity, or public ingress.

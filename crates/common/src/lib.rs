@@ -14,6 +14,51 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+/// Operating-system event which requested process shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessShutdownSignal {
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+}
+
+impl std::fmt::Display for ProcessShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupt => f.write_str("interrupt"),
+            #[cfg(unix)]
+            Self::Terminate => f.write_str("terminate"),
+        }
+    }
+}
+
+/// Waits for Ctrl-C on every platform and SIGTERM on Unix.
+///
+/// This function only observes the OS. Entrypoints translate the returned
+/// event into a [`ShutdownTrigger`] request so resource cleanup remains under
+/// the owning runtime supervisor.
+pub async fn wait_for_process_shutdown() -> std::io::Result<ProcessShutdownSignal> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok(ProcessShutdownSignal::Interrupt)
+            }
+            signal = terminate.recv() => signal
+                .map(|_| ProcessShutdownSignal::Terminate)
+                .ok_or_else(|| std::io::Error::other("SIGTERM listener closed")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(ProcessShutdownSignal::Interrupt)
+    }
+}
+
 /// Sends one process-local, idempotent graceful-shutdown request.
 #[derive(Debug, Clone)]
 pub struct ShutdownTrigger {
@@ -195,5 +240,12 @@ mod tests {
             RuntimeShutdownConfig::new(Duration::ZERO).validate(),
             Err(RuntimeShutdownConfigError::ZeroDrainTimeout)
         );
+    }
+
+    #[test]
+    fn process_signal_display_is_stable() {
+        assert_eq!(ProcessShutdownSignal::Interrupt.to_string(), "interrupt");
+        #[cfg(unix)]
+        assert_eq!(ProcessShutdownSignal::Terminate.to_string(), "terminate");
     }
 }
