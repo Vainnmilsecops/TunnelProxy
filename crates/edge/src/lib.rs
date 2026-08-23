@@ -1178,8 +1178,9 @@ mod runtime;
 mod tls;
 
 pub use multiplex::{
-    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
-    RouteError, RoutedStream, RoutedStreamCloseReason,
+    AuthorizationSourceStatus, EdgeAuthorizationStatus, EdgeSessionRouter, MultiplexedEdgeConfig,
+    MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RouteError, RoutedStream,
+    RoutedStreamCloseReason,
 };
 pub use raw_ingress::{
     RawIngressConfigError, RawIngressManagerConfig, RawIngressRoute, RawIngressRouteConfig,

@@ -81,6 +81,11 @@
 | Heartbeat during stream traffic | — | ✅ | — | `heartbeat_remains_live_during_active_stream` spans multiple heartbeat intervals during a slow local response. |
 | Stream lifecycle violation | — | ✅ | — | `data_before_open_is_reset_without_killing_agent_session`. |
 | Authenticated tunnel registration         | ✅   | ✅          | —   | Protocol v2 binds exact client-certificate fingerprint → AgentId → enabled TunnelId before REGISTERED/session publication. |
+| Versioned snapshot ordering               | ✅   | —           | —   | Non-zero versions, valid gaps, idempotent duplicate, stale rejection, and same-version conflict are covered in control-plane unit tests. |
+| Bounded latest-value distribution         | ✅   | —           | —   | Watch delivery skips superseded full snapshots, retains the newest value, and preserves cache after publisher close. |
+| Live grant add / enable                    | —    | ✅          | —   | `live_snapshot_add_authorizes_tunnel_without_edge_restart` starts Edge from an empty snapshot and routes after a live grant without listener rebind. |
+| Live revoke and re-enable                  | ✅   | ✅          | —   | Principal revalidation closes publication race; real mTLS proves unrelated updates preserve sessions, revoke closes active streams, and re-enable restores the same raw listener. |
+| Snapshot source health                    | —    | ✅          | —   | Runtime status reports version and Live/Stale state; cached authorization remains usable after the producer closes. |
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
 | Live session and durable tunnel routing   | ✅   | ✅          | —   | Exact session routing plus cached `TunnelId -> TransportSessionId`; duplicate claim rejects and releases after disconnect. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |

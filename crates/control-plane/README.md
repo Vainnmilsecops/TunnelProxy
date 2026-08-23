@@ -22,6 +22,9 @@ Durable tunnel authorization model and future account/configuration APIs.
 
 Session 15 implements immutable authorization snapshots that map an exact
 SHA-256 client-certificate fingerprint to `AgentId`, allowed `TunnelId` values,
-and tunnel status. Edge consumes these snapshots from memory, outside the
-ingress hot path. There is still no database, API server, persistence, or live
-snapshot distribution.
+and enabled/disabled status. Session 16 adds non-zero monotonic snapshot
+versions and a bounded latest-value publisher/subscriber. Higher full snapshots
+replace the previous authority, duplicate content is idempotent, and stale or
+same-version conflicting updates fail closed. Edge consumes the latest cached
+snapshot outside the ingress hot path. There is still no database, external API
+server, cross-process transport, or restart persistence.

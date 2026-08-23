@@ -385,3 +385,33 @@ does not recreate the raw listener or change tunnel identity. Ingress routing
 uses only cached Edge state, satisfying INV-007. Snapshot distribution,
 persistence, certificate rotation/revocation, public ingress, and multi-edge
 coordination remain future work.
+
+---
+
+## ADR-016 — Full versioned snapshots drive atomic live Edge revocation
+
+**Status:** Accepted (Session 16).
+
+**Context:** Session 15 authorizes durable tunnel intent from an immutable
+startup snapshot. Edge must accept authorization changes without restart while
+preventing stale updates, unbounded queues, storage lookups on ingress, and a
+race where a handshake authorized by an older snapshot becomes routable after
+revocation.
+
+**Decision:** The authority publishes complete snapshots carrying a non-zero
+monotonic `SnapshotVersion` over a bounded latest-value channel. Higher versions
+replace all prior grants and may skip intermediate versions. Equal version and
+equal content is idempotent; lower versions and equal-version conflicting
+content are rejected. Edge revalidates the authenticated principal immediately
+before publication. Route publication, stream enqueue, and snapshot
+reconciliation share a gate that defines their ordering. Reconciliation first
+removes every unauthorized durable and ephemeral mapping, then closes the
+affected transport and active streams. Closing the publisher marks the source
+stale but preserves the last cached complete snapshot.
+
+**Consequences:** Add, enable, disable, remove, and reassignment take effect on
+a running Edge without a protocol change, listener rebind, or per-ingress
+storage query. Revocation is fail-closed rather than graceful for active
+streams. The latest-value channel deliberately skips superseded snapshots.
+Persistence, authenticated cross-process distribution, restart bootstrap,
+certificate rotation, and multi-edge consistency remain separate work.

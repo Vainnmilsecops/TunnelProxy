@@ -19,6 +19,7 @@
 | 13      | Agent Reconnect & Route Recovery               | complete |
 | 14      | Mutual TLS & Agent Authentication              | complete |
 | 15      | Authenticated Tunnel Identity & Registration   | complete |
+| 16      | Control-Plane Snapshot Distribution & Live Revocation | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -554,3 +555,43 @@ Out of scope:
 - Certificate issuance, rotation, revocation, expiry monitoring, and hot reload.
 - Public HTTP/HTTPS or raw ingress, hostname allocation, and access policy.
 - Multiple tunnels on one transport, multi-edge routing, and stream replay.
+
+## Session 16 — Control-Plane Snapshot Distribution & Live Revocation — complete
+
+Scope delivered:
+
+- Added non-zero monotonic `SnapshotVersion` and complete
+  `VersionedAuthorizationSnapshot` values. Higher versions replace all grants;
+  equal content is idempotent, stale updates and same-version conflicts are
+  typed failures, and version gaps are valid.
+- Added a bounded Tokio watch publisher/subscriber in the control-plane crate.
+  It retains only the latest complete snapshot; source closure preserves the
+  cached value for fail-static Edge operation.
+- Converted mutual-TLS Edge authorization from a startup-only snapshot to a
+  shared live subscription while preserving the existing static CLI builder.
+  Tunnel administrative state is now only enabled/disabled; connectivity stays
+  in Edge's runtime registry.
+- Revalidated the authenticated certificate/Agent/Tunnel principal immediately
+  before session publication. One authorization gate orders publication,
+  stream enqueue, and reconciliation so older authorization cannot race back
+  into routing after an applied revoke.
+- Snapshot reconciliation removes revoked TunnelId and TransportSessionId
+  mappings before cancelling their exact Agent sessions. Active streams close,
+  raw ingress remains bound, and later authorized Agents can reconnect without
+  Edge restart or listener rebind.
+- Added observable cached authorization status: current version, static/live/
+  stale source state, and cumulative revoked-session count. A closed producer
+  keeps the last cached snapshot active and reports stale state.
+- Added eight tests for version ordering/gaps, duplicate/conflict/stale updates,
+  bounded latest-value delivery, cached state after close, publication-race
+  revalidation, live grant add, unrelated updates, active revocation, and
+  re-enable on the same raw listener. The workspace now contains 207 explicit
+  tests.
+
+Out of scope:
+
+- Persistent database/schema and restart-safe snapshot storage.
+- Authenticated cross-process control-plane API or transport.
+- Certificate issuance/rotation/hot reload and multi-edge consistency.
+- Public HTTP/HTTPS/raw ingress, hostname allocation, and access policy.
+- Protocol v3, multiple tunnels per Agent transport, and stream replay.

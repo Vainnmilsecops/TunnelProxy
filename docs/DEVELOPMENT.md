@@ -206,5 +206,34 @@ This entrypoint intentionally supports one Agent and one loopback route. The raw
 listener targets durable TunnelId, stays bound across Agent reconnect, and
 fails closed while no authorized session is live. Reconnect receives a fresh
 TransportSessionId and interrupted streams are not replayed. Snapshot
-persistence/distribution, public ingress, and certificate lifecycle automation
-are still absent.
+persistence/external service transport, public ingress, and certificate
+lifecycle automation are still absent.
+
+## 12. Exercising live authorization snapshots
+
+The library runtime can consume live in-process full snapshots. Create a
+versioned initial value, retain the publisher in the authoritative owner, and
+pass its subscription to Edge:
+
+```rust
+let (publisher, subscription) = authorization_snapshot_channel(
+    VersionedAuthorizationSnapshot::new(SnapshotVersion::FIRST, initial),
+);
+edge_config.multiplex.registration =
+    EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+
+publisher.publish(VersionedAuthorizationSnapshot::new(
+    SnapshotVersion::new(2).expect("version is non-zero"),
+    replacement,
+))?;
+```
+
+Each update is a complete replacement. Omitting a previous grant revokes it;
+an empty snapshot revokes all grants. A higher version may skip intermediate
+numbers. Reusing the current version is valid only for identical content.
+Ingress continues to use Edge's in-memory maps and never awaits this publisher.
+
+The current CLI still constructs one static version-1 snapshot from
+`--authorized-client-cert`, `--agent-id`, and `--tunnel-id`. There is no
+external administration listener or persistent snapshot source yet. Library
+tests are the supported Session 16 exercise surface for live distribution.

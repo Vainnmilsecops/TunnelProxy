@@ -12,4 +12,5 @@ workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
+tokio = { workspace = true }
 tunnelproxy-common = { path = "../common" }

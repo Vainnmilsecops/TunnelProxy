@@ -30,6 +30,9 @@ correct agent, which in turn proxies them into the local service.
 - Certificate-bound `AgentId`/`TunnelId` authorization and cached durable
   tunnel-to-live-session routing. The loopback raw listener stays bound while
   its Agent reconnects and fails closed while offline.
+- Versioned latest-value authorization snapshot distribution with atomic Edge
+  apply, stale/conflict protection, live grant revocation, and cached-state
+  operation when the producer disconnects.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -39,7 +42,7 @@ The following are **not yet implemented**:
 - Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
 - Public-ingress TLS and public-client access authorization.
-- Persistent control-plane storage and live snapshot distribution.
+- Persistent control-plane storage and an external control-plane service/API.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
 
@@ -79,9 +82,10 @@ The architecture conceptually separates:
 - **Data Plane** — live agent connections, public ingress, tunnel routing,
   request/response traffic.
 
-Today the control-plane crate provides immutable certificate/Agent/tunnel
-authorization snapshots but no database or service API. The data plane has a
-tested loopback raw-TCP reverse path but no public HTTP/TLS routing. See
+Today the control-plane crate provides versioned certificate/Agent/tunnel
+authorization snapshots and bounded in-process distribution, but no database
+or external service API. The data plane has a tested loopback raw-TCP reverse
+path but no public HTTP/TLS routing. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -109,7 +113,7 @@ tunnelproxy/
 │   ├── protocol/           # Edge ↔ Agent framing and stream contracts
 │   ├── agent/              # outbound Agent transport and local TCP bridge
 │   ├── edge/               # Agent transport and loopback raw TCP ingress
-│   └── control-plane/      # immutable authorization snapshot model
+│   └── control-plane/      # versioned authorization snapshot distribution
 │
 ├── tests/                  # cross-crate integration tests (future)
 ├── scripts/                # local developer scripts

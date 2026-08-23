@@ -10,7 +10,7 @@ use tunnelproxy_common::{
 };
 
 use crate::{
-    MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
+    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
     RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteManager,
 };
 
@@ -54,7 +54,9 @@ impl EdgeRuntimeConfig {
         if self.max_raw_connections == 0 {
             return Err(EdgeRuntimeConfigError::ZeroRawConnections);
         }
-        if !self.multiplex.registration.contains_tunnel(&self.tunnel_id) {
+        if !self.multiplex.registration.contains_tunnel(&self.tunnel_id)
+            && !self.multiplex.registration.has_live_updates()
+        {
             return Err(EdgeRuntimeConfigError::RawTunnelNotAuthorized(
                 self.tunnel_id.clone(),
             ));
@@ -199,6 +201,11 @@ impl EdgeRuntime {
 
     pub const fn agent_addr(&self) -> SocketAddr {
         self.agent_addr
+    }
+
+    /// Returns a cached-state routing and authorization observation handle.
+    pub fn router(&self) -> EdgeSessionRouter {
+        self.transport.router()
     }
 
     /// Keeps one durable raw route bound while its authenticated Agent session
