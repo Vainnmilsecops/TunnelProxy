@@ -73,8 +73,10 @@ DER and evaluates:
 certificate fingerprint -> AgentId -> TunnelId -> status
 ```
 
-The snapshot is immutable and already present in Edge memory. Registration and
-per-connection route resolution perform no database or network lookup.
+Each snapshot value is immutable and already present in Edge memory. Session 16
+can atomically replace that cached value with a higher complete version.
+Registration and per-connection route resolution perform no database or
+network lookup.
 
 Handshake rejection codes are two-byte big-endian values:
 
@@ -113,7 +115,7 @@ session. If no session exists, the socket is closed; no stale session is reused.
 ## Deliberate limits
 
 - No protocol downgrade or simultaneous v1/v2 support.
-- No database, durable snapshot storage, or live control-plane distribution.
+- No database, durable snapshot storage, or external control-plane service.
 - No certificate issuance, rotation, revocation, or hot reload.
 - No public ingress, hostname allocation, multiple tunnels per transport,
   multi-edge coordination, or interrupted-stream replay.

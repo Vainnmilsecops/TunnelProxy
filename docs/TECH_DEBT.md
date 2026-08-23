@@ -186,7 +186,7 @@
   insufficient.
 - **Tracking:** open.
 
-### DEBT-015 — Durable route snapshots are not persisted or distributed
+### DEBT-015 — Durable route snapshots are not persisted across restarts
 
 - **Introduced in:** Session 10
 - **Category:** product
@@ -194,13 +194,15 @@
 - **Rationale:** Session 15 resolves the data-plane half of this debt: runnable
   raw ingress targets durable `TunnelId`, stays bound across Agent reconnect,
   and resolves a cached live `TransportSessionId` without storage lookup.
-  However, the authorization/route snapshot is still constructed from process
-  startup configuration. It is not persisted, versioned, distributed, or
-  atomically updated from a control-plane service after Edge restart.
-- **Exit plan:** Add an authoritative versioned snapshot source, atomic Edge
-  updates, and enable/disable/removal lifecycle. Persist durable tunnel intent
-  outside Edge while keeping all per-connection routing in memory.
-- **Tracking:** narrowed by Session 15; persistence and live snapshot
+  Session 16 adds full monotonic snapshot versions, bounded latest-value
+  distribution, atomic Edge apply, live enable/disable/add/remove, revocation,
+  and cached operation after the publisher closes. The source is still
+  in-process and no snapshot survives a full control-plane/Edge restart.
+- **Exit plan:** Persist durable tunnel intent outside Edge, expose an
+  authenticated cross-process snapshot service, and bootstrap a fresh Edge
+  from the latest committed version while keeping per-connection routing in
+  memory.
+- **Tracking:** narrowed by Sessions 15–16; persistence and external
   distribution remain open before public ingress.
 
 ### DEBT-017 — TLS certificates are static process-start configuration
@@ -212,7 +214,9 @@
 - **Rationale:** Session 14 accepts certificate, key, and CA PEM files at
   process startup and proves mutual authentication. It deliberately does not
   build a CA service, key storage, certificate-to-Agent mapping, revocation,
-  rotation, expiry monitoring, or hot reload.
+  rotation, expiry monitoring, or hot reload. Session 16 can revoke an
+  authorization grant for an exact fingerprint and close its live session, but
+  rustls certificate/key/trust configuration remains static.
 - **Exit plan:** Define durable Agent identity and authorization, issue
   short-lived credentials from a controlled PKI, distribute trust snapshots,
   support atomic reload/rotation, and test revocation without querying storage

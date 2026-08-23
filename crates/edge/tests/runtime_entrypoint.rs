@@ -22,11 +22,13 @@ use tunnelproxy_agent::{
 };
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
-    AgentGrant, AuthorizationSnapshot, CertificateFingerprint, TunnelGrant, TunnelStatus,
+    authorization_snapshot_channel, AgentGrant, AuthorizationSnapshot, CertificateFingerprint,
+    SnapshotVersion, TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
 };
 use tunnelproxy_edge::{
-    shutdown_channel, EdgeRegistrationPolicy, EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError,
-    EdgeTlsConfig, EdgeTransportSecurity, RuntimeShutdownOutcome,
+    shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
+    EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTransportSecurity,
+    RuntimeShutdownOutcome,
 };
 use tunnelproxy_protocol::{
     Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest, ROLE_AGENT,
@@ -130,6 +132,45 @@ fn edge_tls_registration(pki: &TestPki) -> EdgeRegistrationPolicy {
     .unwrap()
 }
 
+fn client_fingerprint(identity: &TestIdentity) -> CertificateFingerprint {
+    let mut certificates = BufReader::new(Cursor::new(identity.certificate_pem.as_bytes()));
+    let leaf = rustls_pemfile::certs(&mut certificates)
+        .next()
+        .unwrap()
+        .unwrap();
+    CertificateFingerprint::from_certificate_der(leaf.as_ref())
+}
+
+fn versioned_snapshot(
+    pki: &TestPki,
+    version: u64,
+    status: TunnelStatus,
+    include_unrelated: bool,
+) -> VersionedAuthorizationSnapshot {
+    let mut grants = vec![AgentGrant::new(
+        client_fingerprint(&pki.client),
+        AgentId::new("agent-dev").unwrap(),
+        vec![TunnelGrant::new(
+            TunnelId::new("tunnel-dev").unwrap(),
+            status,
+        )],
+    )];
+    if include_unrelated {
+        grants.push(AgentGrant::new(
+            client_fingerprint(&pki.other_client),
+            AgentId::new("agent-other").unwrap(),
+            vec![TunnelGrant::new(
+                TunnelId::new("tunnel-other").unwrap(),
+                TunnelStatus::Enabled,
+            )],
+        ));
+    }
+    VersionedAuthorizationSnapshot::new(
+        SnapshotVersion::new(version).unwrap(),
+        AuthorizationSnapshot::new(grants).unwrap(),
+    )
+}
+
 fn agent_tls_security(
     server_ca_pem: &str,
     client: &TestIdentity,
@@ -205,6 +246,24 @@ fn agent_runtime(edge_addr: SocketAddr, local_addr: SocketAddr) -> AgentRuntime 
     config.reconnect.max_delay = Duration::from_millis(40);
     config.reconnect.jitter_percent = 0;
     config.reconnect.stable_session_reset_after = Duration::from_secs(1);
+    AgentRuntime::new(config).unwrap()
+}
+
+fn secure_agent_runtime(
+    edge_addr: SocketAddr,
+    local_addr: SocketAddr,
+    pki: &TestPki,
+) -> AgentRuntime {
+    let mut config = AgentRuntimeConfig::new(edge_addr, local_addr);
+    config.security = agent_tls_security(&pki.authority_pem, &pki.client, "edge.test");
+    config.connect_timeout = Duration::from_secs(1);
+    config.handshake_timeout = Duration::from_secs(1);
+    config.multiplex.connect_timeout = Duration::from_secs(1);
+    config.multiplex.stream_idle_timeout = Duration::from_secs(2);
+    config.shutdown = RuntimeShutdownConfig::new(Duration::from_secs(1));
+    config.reconnect.initial_delay = Duration::from_millis(10);
+    config.reconnect.max_delay = Duration::from_millis(40);
+    config.reconnect.jitter_percent = 0;
     AgentRuntime::new(config).unwrap()
 }
 
@@ -305,6 +364,24 @@ async fn wait_until_bindable(addr: SocketAddr) {
     })
     .await
     .expect("listener was not released");
+}
+
+async fn wait_for_authorization_status(
+    router: &EdgeSessionRouter,
+    version: u64,
+    source: AuthorizationSourceStatus,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = router.authorization_status();
+            if status.version == SnapshotVersion::new(version) && status.source == source {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("authorization status did not converge");
 }
 
 #[tokio::test]
@@ -564,6 +641,131 @@ async fn durable_raw_listener_fails_closed_offline_then_routes_after_registratio
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
     round_trip(raw_addr, b"online-after-registration").await;
+
+    agent_trigger.shutdown();
+    edge_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    edge_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn live_snapshot_updates_revoke_and_restore_tunnel_without_rebinding_ingress() {
+    let pki = test_pki("edge.test");
+    let (publisher, subscription) =
+        authorization_snapshot_channel(versioned_snapshot(&pki, 1, TunnelStatus::Enabled, false));
+    let (local_addr, local_task) = spawn_echo_connections(5).await;
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let (agent_one_trigger, agent_one_signal) = shutdown_channel();
+    let agent_one_task = tokio::spawn(
+        secure_agent_runtime(edge_addr, local_addr, &pki).run_until_shutdown(agent_one_signal),
+    );
+    round_trip(raw_addr, b"snapshot-v1").await;
+
+    publisher
+        .publish(versioned_snapshot(&pki, 2, TunnelStatus::Enabled, true))
+        .unwrap();
+    wait_for_authorization_status(&router, 2, AuthorizationSourceStatus::Live).await;
+    round_trip(raw_addr, b"unrelated-update-keeps-session").await;
+
+    let mut active = connect_eventually(raw_addr).await;
+    active.write_all(b"active-before-revoke").await.unwrap();
+    let mut echoed = vec![0_u8; b"active-before-revoke".len()];
+    active.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, b"active-before-revoke");
+
+    publisher
+        .publish(versioned_snapshot(&pki, 3, TunnelStatus::Disabled, true))
+        .unwrap();
+    wait_for_authorization_status(&router, 3, AuthorizationSourceStatus::Live).await;
+    assert!(router.connected_tunnels().await.is_empty());
+    assert_eq!(router.authorization_status().revoked_sessions, 1);
+    let mut byte = [0_u8; 1];
+    let revoked_read = timeout(Duration::from_secs(2), active.read(&mut byte))
+        .await
+        .expect("revoked active stream stayed open");
+    assert!(matches!(revoked_read, Ok(0) | Err(_)));
+    let mut offline = connect_eventually(raw_addr).await;
+    offline.write_all(b"offline-after-revoke").await.unwrap();
+    let offline_read = timeout(Duration::from_secs(1), offline.read(&mut byte))
+        .await
+        .expect("offline ingress stayed open");
+    assert!(matches!(offline_read, Ok(0) | Err(_)));
+    assert!(TcpListener::bind(raw_addr).await.is_err());
+
+    agent_one_trigger.shutdown();
+    let _ = timeout(Duration::from_secs(2), agent_one_task)
+        .await
+        .expect("revoked Agent did not stop");
+
+    publisher
+        .publish(versioned_snapshot(&pki, 4, TunnelStatus::Enabled, false))
+        .unwrap();
+    wait_for_authorization_status(&router, 4, AuthorizationSourceStatus::Live).await;
+    let (agent_two_trigger, agent_two_signal) = shutdown_channel();
+    let agent_two_task = tokio::spawn(
+        secure_agent_runtime(edge_addr, local_addr, &pki).run_until_shutdown(agent_two_signal),
+    );
+    round_trip(raw_addr, b"snapshot-v4-reenabled").await;
+
+    drop(publisher);
+    wait_for_authorization_status(&router, 4, AuthorizationSourceStatus::Stale).await;
+    round_trip(raw_addr, b"cached-snapshot-after-source-close").await;
+
+    agent_two_trigger.shutdown();
+    edge_trigger.shutdown();
+    agent_two_task.await.unwrap().unwrap();
+    let outcome = edge_task.await.unwrap().unwrap();
+    assert!(outcome.agent_sessions_seen >= 2);
+    assert_eq!(outcome.route_generations, 1);
+    local_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn live_snapshot_add_authorizes_tunnel_without_edge_restart() {
+    let pki = test_pki("edge.test");
+    let (publisher, subscription) =
+        authorization_snapshot_channel(VersionedAuthorizationSnapshot::new(
+            SnapshotVersion::FIRST,
+            AuthorizationSnapshot::default(),
+        ));
+    let (local_addr, local_task) = spawn_echo().await;
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let mut offline = connect_eventually(raw_addr).await;
+    offline.write_all(b"before-grant").await.unwrap();
+    let mut byte = [0_u8; 1];
+    let offline_read = timeout(Duration::from_secs(1), offline.read(&mut byte))
+        .await
+        .expect("ungranted tunnel ingress stayed open");
+    assert!(matches!(offline_read, Ok(0) | Err(_)));
+
+    publisher
+        .publish(versioned_snapshot(&pki, 2, TunnelStatus::Enabled, false))
+        .unwrap();
+    wait_for_authorization_status(&router, 2, AuthorizationSourceStatus::Live).await;
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(
+        secure_agent_runtime(edge_addr, local_addr, &pki).run_until_shutdown(agent_signal),
+    );
+    round_trip(raw_addr, b"after-live-grant").await;
 
     agent_trigger.shutdown();
     edge_trigger.shutdown();

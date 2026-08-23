@@ -8,13 +8,16 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
-use tunnelproxy_control_plane::CertificateFingerprint;
+use tunnelproxy_control_plane::{
+    AuthorizationSnapshotSubscription, CertificateFingerprint, SnapshotSourceClosed,
+    SnapshotVersion, VersionedAuthorizationSnapshot,
+};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatSequence, StreamId, StreamResetCode,
@@ -25,7 +28,10 @@ use crate::agent_transport::{
     perform_authorized_handshake, AgentListenerConfig, AgentListenerConfigError,
     AgentTransportError, TransportSessionIdAllocator, TunnelRegistrationClaims,
 };
-use crate::tls::{BoxedTransport, EdgeRegistrationPolicy, EdgeTransportSecurity, TUNNELPROXY_ALPN};
+use crate::tls::{
+    AuthorizedRegistration, BoxedTransport, EdgeRegistrationPolicy, EdgeTransportSecurity,
+    TUNNELPROXY_ALPN,
+};
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
@@ -147,15 +153,38 @@ impl std::fmt::Display for MultiplexedEdgeConfigError {
 
 impl std::error::Error for MultiplexedEdgeConfigError {}
 
-type SessionRegistry = Arc<RwLock<HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>>>;
+#[derive(Clone)]
+struct LiveSession {
+    commands: mpsc::Sender<SessionCommand>,
+    authorization: AuthorizedRegistration,
+}
+
+type SessionRegistry = Arc<RwLock<HashMap<TransportSessionId, LiveSession>>>;
 type TunnelRegistry = Arc<RwLock<HashMap<TunnelId, TransportSessionId>>>;
+type AuthorizationGate = Arc<Mutex<()>>;
 
 fn sorted_session_ids(
-    sessions: &HashMap<TransportSessionId, mpsc::Sender<SessionCommand>>,
+    sessions: &HashMap<TransportSessionId, LiveSession>,
 ) -> Vec<TransportSessionId> {
     let mut ids: Vec<_> = sessions.keys().copied().collect();
     ids.sort_unstable();
     ids
+}
+
+/// Whether Edge's current cached authorization state has a live producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationSourceStatus {
+    Static,
+    Live,
+    Stale,
+}
+
+/// Observable state of live control-plane snapshot consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeAuthorizationStatus {
+    pub version: Option<SnapshotVersion>,
+    pub source: AuthorizationSourceStatus,
+    pub revoked_sessions: u64,
 }
 
 fn sorted_tunnel_bindings(
@@ -175,8 +204,10 @@ fn sorted_tunnel_bindings(
 pub struct EdgeSessionRouter {
     sessions: SessionRegistry,
     tunnels: TunnelRegistry,
+    authorization_gate: AuthorizationGate,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    authorization_updates: watch::Sender<EdgeAuthorizationStatus>,
     accepting_streams: Arc<AtomicBool>,
 }
 
@@ -220,6 +251,14 @@ impl EdgeSessionRouter {
         self.tunnel_updates.subscribe()
     }
 
+    pub fn authorization_status(&self) -> EdgeAuthorizationStatus {
+        *self.authorization_updates.borrow()
+    }
+
+    pub fn subscribe_authorization_status(&self) -> watch::Receiver<EdgeAuthorizationStatus> {
+        self.authorization_updates.subscribe()
+    }
+
     /// Resolves a durable tunnel to its current ephemeral session and opens a
     /// tracked stream without a control-plane/storage lookup.
     pub async fn open_tunnel_stream_tracked(
@@ -227,11 +266,14 @@ impl EdgeSessionRouter {
         tunnel_id: &TunnelId,
         ingress: TcpStream,
     ) -> Result<RoutedStream, RouteError> {
+        let gate = self.authorization_gate.lock().await;
         let session_id = self
             .resolve_tunnel(tunnel_id)
             .await
             .ok_or_else(|| RouteError::TunnelNotConnected(tunnel_id.clone()))?;
-        self.open_stream_tracked(session_id, ingress).await
+        let pending = self.enqueue_stream(session_id, ingress).await?;
+        drop(gate);
+        finish_open(session_id, pending).await
     }
 
     /// Routes an already-accepted ingress socket to one exact Agent session.
@@ -254,10 +296,26 @@ impl EdgeSessionRouter {
         session_id: TransportSessionId,
         ingress: TcpStream,
     ) -> Result<RoutedStream, RouteError> {
+        let gate = self.authorization_gate.lock().await;
+        let pending = self.enqueue_stream(session_id, ingress).await?;
+        drop(gate);
+        finish_open(session_id, pending).await
+    }
+
+    async fn enqueue_stream(
+        &self,
+        session_id: TransportSessionId,
+        ingress: TcpStream,
+    ) -> Result<PendingRoutedStream, RouteError> {
         if !self.accepting_streams.load(Ordering::Acquire) {
             return Err(RouteError::RuntimeDraining);
         }
-        let sender = self.sessions.read().await.get(&session_id).cloned();
+        let sender = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|session| session.commands.clone());
         let sender = sender.ok_or(RouteError::SessionNotFound(session_id))?;
         let (response_tx, response_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -271,15 +329,31 @@ impl EdgeSessionRouter {
                 mpsc::error::TrySendError::Full(_) => RouteError::SessionBusy(session_id),
                 mpsc::error::TrySendError::Closed(_) => RouteError::SessionClosing(session_id),
             })?;
-        let stream_id = response_rx
-            .await
-            .unwrap_or(Err(RouteError::SessionClosing(session_id)))?;
-        Ok(RoutedStream {
-            session_id,
-            stream_id,
+        Ok(PendingRoutedStream {
+            response: response_rx,
             completion: completion_rx,
         })
     }
+}
+
+struct PendingRoutedStream {
+    response: oneshot::Receiver<Result<StreamId, RouteError>>,
+    completion: oneshot::Receiver<RoutedStreamCloseReason>,
+}
+
+async fn finish_open(
+    session_id: TransportSessionId,
+    pending: PendingRoutedStream,
+) -> Result<RoutedStream, RouteError> {
+    let stream_id = pending
+        .response
+        .await
+        .unwrap_or(Err(RouteError::SessionClosing(session_id)))?;
+    Ok(RoutedStream {
+        session_id,
+        stream_id,
+        completion: pending.completion,
+    })
 }
 
 /// A logical stream acknowledged by Agent plus its close notification.
@@ -360,11 +434,13 @@ pub struct MultiplexedEdgeRuntime {
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
     tunnels: TunnelRegistry,
+    authorization_gate: AuthorizationGate,
     tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     permits: Arc<Semaphore>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    authorization_updates: watch::Sender<EdgeAuthorizationStatus>,
     accepting_streams: Arc<AtomicBool>,
 }
 
@@ -378,17 +454,29 @@ impl MultiplexedEdgeRuntime {
         let permits = Arc::new(Semaphore::new(config.agent_listener.max_agent_sessions));
         let (session_updates, _) = watch::channel(Arc::new(Vec::new()));
         let (tunnel_updates, _) = watch::channel(Arc::new(Vec::new()));
+        let source = if config.registration.snapshot_subscription().is_some() {
+            AuthorizationSourceStatus::Live
+        } else {
+            AuthorizationSourceStatus::Static
+        };
+        let (authorization_updates, _) = watch::channel(EdgeAuthorizationStatus {
+            version: config.registration.snapshot_version(),
+            source,
+            revoked_sessions: 0,
+        });
         Ok(Self {
             listener,
             local_addr,
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             tunnels: Arc::new(RwLock::new(HashMap::new())),
+            authorization_gate: Arc::new(Mutex::new(())),
             tunnel_claims: Arc::new(TunnelRegistrationClaims::default()),
             session_ids: Arc::new(TransportSessionIdAllocator::new()),
             permits,
             session_updates,
             tunnel_updates,
+            authorization_updates,
             accepting_streams: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -401,8 +489,10 @@ impl MultiplexedEdgeRuntime {
         EdgeSessionRouter {
             sessions: Arc::clone(&self.sessions),
             tunnels: Arc::clone(&self.tunnels),
+            authorization_gate: Arc::clone(&self.authorization_gate),
             session_updates: self.session_updates.clone(),
             tunnel_updates: self.tunnel_updates.clone(),
+            authorization_updates: self.authorization_updates.clone(),
             accepting_streams: Arc::clone(&self.accepting_streams),
         }
     }
@@ -411,6 +501,7 @@ impl MultiplexedEdgeRuntime {
     pub async fn run(self) -> std::io::Result<()> {
         info!(addr = %self.local_addr, event = "multiplexed_edge_started");
         let mut tasks = JoinSet::new();
+        let mut snapshot_updates = self.config.registration.snapshot_subscription();
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
@@ -423,11 +514,29 @@ impl MultiplexedEdgeRuntime {
                         self.config.clone(),
                         Arc::clone(&self.sessions),
                         Arc::clone(&self.tunnels),
+                        Arc::clone(&self.authorization_gate),
                         Arc::clone(&self.tunnel_claims),
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
                         self.tunnel_updates.clone(),
                     );
+                }
+                update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
+                    match update {
+                        Ok(snapshot) => reconcile_authorization_snapshot(
+                            snapshot,
+                            &self.sessions,
+                            &self.tunnels,
+                            &self.authorization_gate,
+                            &self.session_updates,
+                            &self.tunnel_updates,
+                            &self.authorization_updates,
+                        ).await,
+                        Err(_) => {
+                            mark_snapshot_source_stale(&self.authorization_updates);
+                            snapshot_updates = None;
+                        }
+                    }
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
@@ -443,6 +552,7 @@ impl MultiplexedEdgeRuntime {
     ) -> std::io::Result<RuntimeShutdownOutcome> {
         crate::validate_shutdown(shutdown)?;
         let mut tasks = JoinSet::new();
+        let mut snapshot_updates = self.config.registration.snapshot_subscription();
         loop {
             tokio::select! {
                 biased;
@@ -457,17 +567,41 @@ impl MultiplexedEdgeRuntime {
                         self.config.clone(),
                         Arc::clone(&self.sessions),
                         Arc::clone(&self.tunnels),
+                        Arc::clone(&self.authorization_gate),
                         Arc::clone(&self.tunnel_claims),
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
                         self.tunnel_updates.clone(),
                     );
                 }
+                update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
+                    match update {
+                        Ok(snapshot) => reconcile_authorization_snapshot(
+                            snapshot,
+                            &self.sessions,
+                            &self.tunnels,
+                            &self.authorization_gate,
+                            &self.session_updates,
+                            &self.tunnel_updates,
+                            &self.authorization_updates,
+                        ).await,
+                        Err(_) => {
+                            mark_snapshot_source_stale(&self.authorization_updates);
+                            snapshot_updates = None;
+                        }
+                    }
+                }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
         self.accepting_streams.store(false, Ordering::Release);
-        let senders: Vec<_> = self.sessions.read().await.values().cloned().collect();
+        let senders: Vec<_> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|session| session.commands.clone())
+            .collect();
         for sender in senders {
             let _ = sender.try_send(SessionCommand::BeginDrain);
         }
@@ -481,6 +615,105 @@ impl MultiplexedEdgeRuntime {
     }
 }
 
+async fn next_snapshot_update(
+    updates: &mut Option<AuthorizationSnapshotSubscription>,
+) -> Result<Arc<VersionedAuthorizationSnapshot>, SnapshotSourceClosed> {
+    updates
+        .as_mut()
+        .expect("select guard only polls a configured snapshot subscription")
+        .changed()
+        .await
+}
+
+fn principal_is_authorized(
+    snapshot: &VersionedAuthorizationSnapshot,
+    principal: &AuthorizedRegistration,
+) -> bool {
+    let Some(certificate) = principal.certificate.as_ref() else {
+        return false;
+    };
+    snapshot
+        .snapshot()
+        .authorize(certificate, &principal.agent_id, &principal.tunnel_id)
+        .is_ok()
+}
+
+async fn reconcile_authorization_snapshot(
+    snapshot: Arc<VersionedAuthorizationSnapshot>,
+    sessions: &SessionRegistry,
+    tunnels: &TunnelRegistry,
+    authorization_gate: &AuthorizationGate,
+    session_updates: &watch::Sender<Arc<Vec<TransportSessionId>>>,
+    tunnel_updates: &watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    authorization_updates: &watch::Sender<EdgeAuthorizationStatus>,
+) {
+    let gate = authorization_gate.lock().await;
+    let revoked_ids: Vec<_> = sessions
+        .read()
+        .await
+        .iter()
+        .filter_map(|(session_id, session)| {
+            (!principal_is_authorized(&snapshot, &session.authorization)).then_some(*session_id)
+        })
+        .collect();
+
+    let revoked_senders = if revoked_ids.is_empty() {
+        Vec::new()
+    } else {
+        let tunnel_snapshot = {
+            let mut tunnels = tunnels.write().await;
+            tunnels.retain(|_, session_id| !revoked_ids.contains(session_id));
+            sorted_tunnel_bindings(&tunnels)
+        };
+        tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+
+        let (senders, session_snapshot) = {
+            let mut sessions = sessions.write().await;
+            let senders = revoked_ids
+                .iter()
+                .filter_map(|session_id| sessions.remove(session_id))
+                .map(|session| session.commands)
+                .collect();
+            (senders, sorted_session_ids(&sessions))
+        };
+        session_updates.send_replace(Arc::new(session_snapshot));
+        senders
+    };
+
+    let previous_status = *authorization_updates.borrow();
+    authorization_updates.send_replace(EdgeAuthorizationStatus {
+        version: Some(snapshot.version()),
+        source: AuthorizationSourceStatus::Live,
+        revoked_sessions: previous_status
+            .revoked_sessions
+            .saturating_add(revoked_ids.len() as u64),
+    });
+    drop(gate);
+
+    for sender in revoked_senders {
+        let _ = sender.send(SessionCommand::RevokeAuthorization).await;
+    }
+    info!(
+        snapshot_version = snapshot.version().get(),
+        revoked_sessions = revoked_ids.len(),
+        event = "authorization_snapshot_applied",
+        "authorization snapshot applied atomically"
+    );
+}
+
+fn mark_snapshot_source_stale(authorization_updates: &watch::Sender<EdgeAuthorizationStatus>) {
+    let previous = *authorization_updates.borrow();
+    authorization_updates.send_replace(EdgeAuthorizationStatus {
+        source: AuthorizationSourceStatus::Stale,
+        ..previous
+    });
+    warn!(
+        snapshot_version = previous.version.map(SnapshotVersion::get),
+        event = "authorization_snapshot_source_stale",
+        "authorization snapshot source closed; retaining the last cached snapshot"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_accepted_session(
     tasks: &mut JoinSet<()>,
@@ -490,6 +723,7 @@ fn spawn_accepted_session(
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
     tunnels: TunnelRegistry,
+    authorization_gate: AuthorizationGate,
     tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
@@ -510,6 +744,7 @@ fn spawn_accepted_session(
         config,
         sessions,
         tunnels,
+        authorization_gate,
         tunnel_claims,
         session_ids,
         session_updates,
@@ -524,6 +759,7 @@ enum SessionCommand {
         completion: oneshot::Sender<RoutedStreamCloseReason>,
     },
     BeginDrain,
+    RevokeAuthorization,
 }
 
 enum StreamEvent {
@@ -538,6 +774,7 @@ async fn run_accepted_session(
     config: MultiplexedEdgeConfig,
     sessions: SessionRegistry,
     tunnels: TunnelRegistry,
+    authorization_gate: AuthorizationGate,
     tunnel_claims: Arc<TunnelRegistrationClaims>,
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
@@ -606,9 +843,26 @@ async fn run_accepted_session(
     let agent_id = session.agent_id.clone();
     let tunnel_id = session.tunnel_id.clone();
     let (command_tx, command_rx) = mpsc::channel(config.session_command_capacity);
+    let gate = authorization_gate.lock().await;
+    if !config.registration.reauthorize(&session.authorization) {
+        warn!(
+            %session_id,
+            %agent_id,
+            %tunnel_id,
+            event = "multiplexed_publication_rejected",
+            "authorization changed before session publication"
+        );
+        return;
+    }
     let snapshot = {
         let mut sessions = sessions.write().await;
-        sessions.insert(session_id, command_tx);
+        sessions.insert(
+            session_id,
+            LiveSession {
+                commands: command_tx,
+                authorization: session.authorization.clone(),
+            },
+        );
         sorted_session_ids(&sessions)
     };
     session_updates.send_replace(Arc::new(snapshot));
@@ -622,6 +876,7 @@ async fn run_accepted_session(
         sorted_tunnel_bindings(&tunnels)
     };
     tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+    drop(gate);
     info!(
         %session_id,
         %agent_id,
@@ -633,12 +888,7 @@ async fn run_accepted_session(
     if let Err(error) = run_edge_session(socket, session_id, config, command_rx).await {
         warn!(%session_id, error = %error, event = "multiplexed_session_failed");
     }
-    let snapshot = {
-        let mut sessions = sessions.write().await;
-        sessions.remove(&session_id);
-        sorted_session_ids(&sessions)
-    };
-    session_updates.send_replace(Arc::new(snapshot));
+    let gate = authorization_gate.lock().await;
     let tunnel_snapshot = {
         let mut tunnels = tunnels.write().await;
         if tunnels.get(&tunnel_id) == Some(&session_id) {
@@ -647,6 +897,13 @@ async fn run_accepted_session(
         sorted_tunnel_bindings(&tunnels)
     };
     tunnel_updates.send_replace(Arc::new(tunnel_snapshot));
+    let snapshot = {
+        let mut sessions = sessions.write().await;
+        sessions.remove(&session_id);
+        sorted_session_ids(&sessions)
+    };
+    session_updates.send_replace(Arc::new(snapshot));
+    drop(gate);
     info!(%session_id, %agent_id, %tunnel_id, event = "multiplexed_session_removed");
 }
 
@@ -728,12 +985,18 @@ async fn run_edge_session(
             }
             command = command_rx.recv() => {
                 let Some(command) = command else { break };
-                let SessionCommand::Open { ingress, response, completion } = command else {
-                    draining = true;
-                    if streams.is_empty() {
-                        break;
+                let (ingress, response, completion) = match command {
+                    SessionCommand::Open { ingress, response, completion } => {
+                        (ingress, response, completion)
                     }
-                    continue;
+                    SessionCommand::BeginDrain => {
+                        draining = true;
+                        if streams.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                    SessionCommand::RevokeAuthorization => break,
                 };
                 if draining {
                     let _ = response.send(Err(RouteError::RuntimeDraining));

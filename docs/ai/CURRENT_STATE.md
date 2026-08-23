@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Authenticated Tunnel Identity & Registration** (Session 15).
+**Control-Plane Snapshot Distribution & Live Revocation** (Session 16).
 
 ## Completed
 
@@ -161,12 +161,36 @@
 - 14 new unit/real-TCP tests cover v2 codec/ID/config bounds, v1 rejection,
   authorization mismatches, disabled/duplicate tunnels, claim release, and
   durable offline/online routing.
-- 199 explicit workspace tests are present; all prior behavior is preserved.
+- Authorization snapshots now carry a non-zero monotonic `SnapshotVersion` and
+  use full-replacement semantics. Higher versions may skip intermediates;
+  duplicates are idempotent and stale/same-version-conflicting updates fail
+  before distribution.
+- Control plane publishes through a bounded latest-value channel. Subscribers
+  always see the newest complete authority without accumulating a delta queue.
+- Edge can start a durable raw listener from an empty dynamic snapshot and
+  apply add/enable/disable/remove or identity reassignment without restart.
+- REGISTER authorization is revalidated immediately before publication.
+  Publication, cached-route stream enqueue, and reconciliation share one gate,
+  closing the authorize-before-publication race.
+- Live revocation removes durable and ephemeral router entries before closing
+  the exact transport. Active streams fail closed; the raw listener remains
+  bound and can use a later authorized replacement Agent.
+- Unrelated snapshot changes preserve healthy sessions. If every publisher
+  closes, Edge reports `Stale` source state and retains the last cached snapshot.
+- `EdgeSessionRouter` exposes current/subscribed authorization status including
+  snapshot version, source health, and cumulative revoked-session count.
+- Eight new unit/real-TCP tests cover version ordering, gaps, idempotency,
+  conflicts, bounded latest-value delivery, cached state after source close,
+  publication-race revalidation, live grant add, unrelated updates, active
+  revocation, and re-enable on the same listener.
+- 207 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
-- Certificate issuance, rotation, revocation, and hot reload (DEBT-017 open).
-- Persistent authorization/route storage and live snapshot distribution.
+- Certificate issuance, CA/trust revocation, rotation, expiry monitoring, and
+  TLS-config hot reload (DEBT-017 open).
+- Persistent authorization storage, restart bootstrap, and authenticated
+  cross-process snapshot distribution.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
@@ -180,13 +204,14 @@
 
 ## Next planned session
 
-**Session 16 — Control-Plane Snapshot Distribution.**
+**Session 17 — Persistent Authorization Storage & Edge Bootstrap.**
 
 Goals:
 
-- Define a versioned authoritative snapshot update API separate from ingress.
-- Atomically apply Agent/tunnel enable, disable, add, and remove updates at Edge.
-- Drain or fail closed when an active grant is revoked without querying storage
-  on the connection hot path.
-- Keep database/schema implementation, public ingress, and certificate rotation
+- Define durable schema and repository boundaries for Agent/certificate/tunnel
+  grants without moving storage into Edge.
+- Commit and reload the latest full snapshot version across process restarts.
+- Bootstrap Edge from an authenticated external snapshot source and resume from
+  its last applied version while preserving cached-only ingress routing.
+- Keep public ingress, certificate issuance/rotation, and multi-edge ownership
   separate unless explicitly scoped into that session.

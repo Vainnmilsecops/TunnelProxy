@@ -40,5 +40,9 @@ bumps to Protocol v2/ALPN `tunnelproxy/2`, binds the exact leaf-certificate
 fingerprint to `AgentId` and `TunnelId`, rejects duplicate live claims, and
 routes through an in-memory `TunnelId -> TransportSessionId` map. The runnable
 raw listener now stays bound across Agent reconnect and closes new sockets while
-the tunnel is offline. Snapshot persistence/distribution and public ingress are
-still not implemented.
+the tunnel is offline. Session 16 consumes versioned full authorization
+snapshots while running. Applying an update atomically removes revoked tunnel
+and ephemeral-session routes before closing their active transports/streams;
+add or re-enable takes effect without restarting Edge. The raw listener remains
+bound throughout. Persistence, an external snapshot service, and public ingress
+are still not implemented.

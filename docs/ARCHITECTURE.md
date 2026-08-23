@@ -313,9 +313,30 @@ The runnable raw listener is created from TunnelId before Agent availability.
 It remains bound while the tunnel is offline, closes new sockets when there is
 no live mapping, and automatically resolves the next authenticated session.
 Existing streams remain owned by their original session and are never replayed.
-Authorization snapshots and route intent are still startup configuration; live
-distribution, persistence, revocation, and multi-edge ownership remain future
-control-plane work.
+Session 15 snapshots and route intent began as startup configuration.
+
+### 2.15 Versioned snapshot distribution and live revocation (Session 16)
+
+The control-plane model now wraps each complete authorization snapshot in a
+non-zero monotonic `SnapshotVersion` and distributes only the latest value over
+a bounded watch channel. A higher version replaces the complete authority;
+equal content at the same version is idempotent, while stale versions and
+same-version conflicts are rejected before distribution. Skipping intermediate
+versions is safe because snapshots are full replacements rather than deltas.
+
+Edge reads the current cached snapshot during REGISTER and revalidates the
+authenticated certificate/Agent/Tunnel principal immediately before route
+publication. Publication, tunnel stream enqueue, and snapshot reconciliation
+share an authorization gate. Applying a new snapshot removes revoked durable
+and ephemeral mappings before signalling their session to close, so no later
+stream can enter a revoked route. Active streams fail closed with the revoked
+transport; raw listeners remain bound and can use a newly authorized Agent
+without restart or rebind.
+
+If the in-process producer closes, Edge marks its authorization source stale
+but retains the last complete cached snapshot. There is still no external
+control-plane service, database persistence, restart bootstrap, certificate
+rotation, or multi-edge ownership.
 
 ## 3. Control plane vs data plane
 

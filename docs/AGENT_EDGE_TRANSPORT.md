@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 15.
+> **Status:** Implemented through Session 16.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
 > ingress or persisted/multi-edge routing.
@@ -40,9 +40,10 @@ handshake/session lifetime.
 
 Plaintext remains available only for an explicit loopback development
 allowlist. In mTLS mode Edge hashes the leaf certificate and authorizes its
-exact `AgentId`/`TunnelId` grant before REGISTERED. Certificate rotation,
-revocation, snapshot distribution, and future public HTTP ingress remain out of
-scope.
+exact `AgentId`/`TunnelId` grant before REGISTERED. Versioned grant updates can
+revoke a live mapping/session without changing Protocol v2. Certificate
+rotation, persisted/external snapshot services, and future public HTTP ingress
+remain out of scope.
 
 ## Handshake Sequence
 
@@ -411,10 +412,21 @@ sockets fail closed while no authorized session is live. Registration identity
 failures are terminal, while a duplicate live TunnelId retries with the
 existing bounded backoff.
 
+Session 16 keeps Protocol v2 unchanged and distributes complete authorization
+snapshots through a bounded latest-value channel. Versions are non-zero and
+monotonic; duplicate content is idempotent, stale versions cannot roll Edge
+back, and same-version conflicts are rejected by the producer. Edge revalidates
+an authenticated principal immediately before publication. Snapshot apply and
+route publication share one gate, so a revoked grant cannot race back into the
+router. Disable, removal, or reassignment first removes durable and ephemeral
+routes, then closes the affected transport and active streams. The raw listener
+remains bound. If the publisher disappears, Edge reports stale source state and
+continues with its last cached snapshot.
+
 ## What Is NOT Implemented
 
-- Certificate issuance, rotation, revocation, and hot reload
-- Persistent/live control-plane snapshot distribution
+- Certificate issuance, CA/trust revocation, rotation, and hot reload
+- Persistent storage and an external control-plane snapshot service
 - Credit/window-based flow control and weighted scheduling
 - Multiple tunnel registrations on one transport
 - Public endpoint allocation

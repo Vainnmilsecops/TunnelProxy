@@ -69,6 +69,8 @@ bounded stream multiplexing, lifecycle-managed loopback raw TCP routes, and a
 runnable single-tunnel process supervisor/CLI whose durable TunnelId route stays
 bound across replacement Agent sessions. Its Agent listener can require mutual
 TLS and exact certificate-to-Agent/Tunnel authorization before publication.
+Versioned full snapshot updates atomically unpublish and close revoked sessions
+without placing control-plane storage on the ingress hot path.
 
 **Responsibility (future)**
 
@@ -88,8 +90,9 @@ TLS and exact certificate-to-Agent/Tunnel authorization before publication.
 ## `tunnelproxy-control-plane`
 
 **Current implementation:** Immutable certificate-fingerprint → AgentId →
-TunnelId authorization snapshots and administrative tunnel status, without
-storage or network service code.
+TunnelId authorization snapshots, non-zero monotonic versions, and bounded
+latest-value in-process distribution. It has no storage or external network
+service code.
 
 **Responsibility (future)**
 

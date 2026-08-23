@@ -51,7 +51,7 @@ use tunnelproxy_protocol::{
     STREAM_RESET_PAYLOAD_SIZE,
 };
 
-use crate::tls::EdgeRegistrationPolicy;
+use crate::tls::{AuthorizedRegistration, EdgeRegistrationPolicy};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -444,6 +444,7 @@ pub struct AgentSession {
     pub peer_addr: SocketAddr,
     /// When the session was established.
     pub established_at: Instant,
+    pub(crate) authorization: AuthorizedRegistration,
     _tunnel_claim: Option<TunnelRegistrationClaim>,
 }
 
@@ -1708,18 +1709,21 @@ where
         }
     };
 
-    if let Err(code) = registration_policy.authorize(peer_certificate, &registration) {
-        info!(
-            peer = %peer,
-            agent_id = %registration.agent_id,
-            tunnel_id = %registration.tunnel_id,
-            rejection = ?code,
-            event = "agent_registration_rejected",
-            "Agent registration was not authorized"
-        );
-        send_error_and_close(socket, code).await;
-        return Err(AgentTransportError::RegistrationRejected(code));
-    }
+    let authorization = match registration_policy.authorize(peer_certificate, &registration) {
+        Ok(authorization) => authorization,
+        Err(code) => {
+            info!(
+                peer = %peer,
+                agent_id = %registration.agent_id,
+                tunnel_id = %registration.tunnel_id,
+                rejection = ?code,
+                event = "agent_registration_rejected",
+                "Agent registration was not authorized"
+            );
+            send_error_and_close(socket, code).await;
+            return Err(AgentTransportError::RegistrationRejected(code));
+        }
+    };
 
     let tunnel_claim = match tunnel_claims {
         Some(claims) => match claims.claim(&registration.tunnel_id) {
@@ -1785,6 +1789,7 @@ where
         tunnel_id: registration.tunnel_id,
         peer_addr: peer,
         established_at: Instant::now(),
+        authorization,
         _tunnel_claim: tunnel_claim,
     })
 }
