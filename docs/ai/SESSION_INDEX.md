@@ -17,6 +17,7 @@
 | 11      | Graceful Runtime Shutdown & Supervision        | complete |
 | 12      | Production Runtime Entrypoints & OS Signal Wiring | complete |
 | 13      | Agent Reconnect & Route Recovery               | complete |
+| 14      | Mutual TLS & Agent Authentication              | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -481,3 +482,38 @@ Out of scope:
 - In-flight stream replay/migration, multi-Agent route selection, and multi-edge
   operation.
 - Credit/window flow control and weighted DATA scheduling.
+
+## Session 14 — Mutual TLS & Agent Authentication — complete
+
+Scope delivered:
+
+- Added rustls/tokio-rustls transport security with ALPN `tunnelproxy/1` while
+  retaining the unchanged Protocol v1 frame and handshake contract.
+- Added safe PEM builders for Edge server identity/client CA and Agent client
+  identity/Edge CA/server name. Private-key material is omitted from Debug,
+  errors, logs, and committed test fixtures.
+- Refactored multiplexed session I/O to support either boxed plaintext TCP or
+  TLS without duplicating heartbeat, stream lifecycle, or bounded writer code.
+- Edge now authenticates the Agent certificate under a separate TLS deadline
+  while holding the existing capacity permit. A session becomes routable only
+  after TLS and Protocol v1 both succeed.
+- Agent now treats CA, server-name, ALPN, and client-auth rejection as terminal;
+  transient transport failure and TLS timeout remain reconnectable. Secure
+  Edge restart performs a fresh TLS and protocol handshake.
+- Plaintext is rejected for non-loopback runnable transport; mTLS permits a
+  non-loopback Agent listener. Raw ingress remains loopback-only.
+- Added TLS flags to both CLIs with complete-set validation and asynchronous PEM
+  loading. Partial configuration exits as invalid configuration.
+- Added 18 tests for config and CLI validation, authenticated byte forwarding,
+  wrong Edge CA/name, missing ALPN, missing/untrusted Agent certificates, TLS
+  timeout and capacity recovery, cancellation, secure reconnect, and
+  secret-safe Debug. The workspace now contains 185 explicit tests.
+- Recorded static certificate lifecycle limitations as DEBT-017.
+
+Out of scope:
+
+- Durable Agent/tunnel identity, certificate-to-Agent mapping, and tunnel
+  authorization.
+- Certificate issuance, rotation, revocation, and hot reload.
+- Public HTTP/HTTPS ingress, hostname allocation, and public raw ingress.
+- Protocol v2, token registration, multi-edge routing, and stream replay.

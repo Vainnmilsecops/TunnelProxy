@@ -1,6 +1,7 @@
 //! Runnable single-tunnel Edge process with graceful OS shutdown.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -8,7 +9,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
 use tunnelproxy_edge::{
-    EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeRuntimeOutcome, RuntimeShutdownConfig,
+    EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig,
+    EdgeTlsConfigError, EdgeTransportSecurity, RuntimeShutdownConfig,
 };
 
 const USAGE: &str = "\
@@ -20,6 +22,10 @@ Options:
   --max-streams <usize>            stream limit  (default 32)
   --max-raw-connections <usize>    ingress limit (default 32)
   --drain-timeout-ms <ms>          stage drain   (default 10000)
+  --tls-cert <path>                Edge certificate PEM
+  --tls-key <path>                 Edge private key PEM
+  --tls-client-ca <path>           trusted Agent CA PEM
+  --tls-handshake-timeout-ms <ms>  TLS timeout   (default 10000)
   --help                           print this help and exit
 ";
 
@@ -51,6 +57,13 @@ async fn main() -> ExitCode {
     config.raw_listen_addr = parsed.raw_listen;
     config.max_raw_connections = parsed.max_raw_connections;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+    config.multiplex.security = match load_transport_security(&parsed).await {
+        Ok(security) => security,
+        Err(error) => {
+            error!(%error, "failed to configure Edge TLS");
+            return ExitCode::from(2);
+        }
+    };
     let runtime = match EdgeRuntime::bind(config).await {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -118,6 +131,10 @@ struct ParsedArgs {
     max_streams: usize,
     max_raw_connections: usize,
     drain_timeout: Duration,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
+    tls_handshake_timeout: Duration,
     help: bool,
 }
 
@@ -129,6 +146,10 @@ impl Default for ParsedArgs {
             max_streams: 32,
             max_raw_connections: 32,
             drain_timeout: Duration::from_secs(10),
+            tls_cert: None,
+            tls_key: None,
+            tls_client_ca: None,
+            tls_handshake_timeout: Duration::from_secs(10),
             help: false,
         }
     }
@@ -187,10 +208,69 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.drain_timeout = Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--tls-cert" => {
+                parsed.tls_cert = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-key" => {
+                parsed.tls_key = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-client-ca" => {
+                parsed.tls_client_ca = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-handshake-timeout-ms" => {
+                parsed.tls_handshake_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
     Ok(parsed)
+}
+
+#[derive(Debug)]
+enum TlsLoadError {
+    IncompleteArguments,
+    Read(&'static str),
+    Invalid(EdgeTlsConfigError),
+}
+
+impl std::fmt::Display for TlsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteArguments => {
+                f.write_str("TLS requires --tls-cert, --tls-key, and --tls-client-ca")
+            }
+            Self::Read(kind) => write!(f, "failed to read TLS {kind} PEM file"),
+            Self::Invalid(error) => write!(f, "invalid TLS configuration: {error}"),
+        }
+    }
+}
+
+async fn load_transport_security(
+    parsed: &ParsedArgs,
+) -> Result<EdgeTransportSecurity, TlsLoadError> {
+    match (&parsed.tls_cert, &parsed.tls_key, &parsed.tls_client_ca) {
+        (None, None, None) => Ok(EdgeTransportSecurity::PlaintextLoopback),
+        (Some(cert), Some(key), Some(client_ca)) => {
+            let cert = tokio::fs::read(cert)
+                .await
+                .map_err(|_| TlsLoadError::Read("server certificate"))?;
+            let key = tokio::fs::read(key)
+                .await
+                .map_err(|_| TlsLoadError::Read("server private key"))?;
+            let client_ca = tokio::fs::read(client_ca)
+                .await
+                .map_err(|_| TlsLoadError::Read("client CA"))?;
+            EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
+                .map(EdgeTransportSecurity::MutualTls)
+                .map_err(TlsLoadError::Invalid)
+        }
+        _ => Err(TlsLoadError::IncompleteArguments),
+    }
 }
 
 fn value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ArgError> {
@@ -244,6 +324,14 @@ mod tests {
             "9",
             "--drain-timeout-ms",
             "250",
+            "--tls-cert",
+            "edge.pem",
+            "--tls-key",
+            "edge-key.pem",
+            "--tls-client-ca",
+            "ca.pem",
+            "--tls-handshake-timeout-ms",
+            "350",
         ]))
         .unwrap();
         assert_eq!(parsed.agent_listen.port(), 17100);
@@ -251,6 +339,10 @@ mod tests {
         assert_eq!(parsed.max_streams, 8);
         assert_eq!(parsed.max_raw_connections, 9);
         assert_eq!(parsed.drain_timeout, Duration::from_millis(250));
+        assert_eq!(parsed.tls_cert, Some(PathBuf::from("edge.pem")));
+        assert_eq!(parsed.tls_key, Some(PathBuf::from("edge-key.pem")));
+        assert_eq!(parsed.tls_client_ca, Some(PathBuf::from("ca.pem")));
+        assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(350));
     }
 
     #[test]
@@ -266,6 +358,18 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["--unknown"])),
             Err(ArgError::UnknownFlag(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_tls_arguments_are_rejected() {
+        let parsed = ParsedArgs {
+            tls_cert: Some(PathBuf::from("edge.pem")),
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_transport_security(&parsed).await,
+            Err(TlsLoadError::IncompleteArguments)
         ));
     }
 }

@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -18,6 +17,7 @@ use tunnelproxy_protocol::{
 };
 
 use crate::agent_transport::{AgentError, AgentSession, AgentSessionCloseReason};
+use crate::tls::BoxedTransport;
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
@@ -156,7 +156,7 @@ impl AgentSession {
                 },
             })?;
 
-        let (mut reader, writer) = self.socket.into_split();
+        let (mut reader, writer) = tokio::io::split(self.socket);
         let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
         let (data_tx, data_rx) = mpsc::channel(config.data_queue_capacity);
         let mut writer_task = tokio::spawn(writer_actor(writer, control_rx, data_rx));
@@ -412,7 +412,7 @@ async fn run_local_stream(
 }
 
 async fn writer_actor(
-    mut writer: OwnedWriteHalf,
+    mut writer: tokio::io::WriteHalf<BoxedTransport>,
     mut control_rx: mpsc::Receiver<Frame>,
     mut data_rx: mpsc::Receiver<Frame>,
 ) -> Result<(), AgentError> {

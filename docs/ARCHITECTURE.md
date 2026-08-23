@@ -278,6 +278,21 @@ Active streams are not replayed. Each handshake still receives a new ephemeral
 `TransportSessionId`; reconnect does not introduce durable Agent or tunnel
 identity, persistence, authentication, or any wire-protocol change.
 
+### 2.13 Mutual TLS Agent transport (Session 14)
+
+The runnable multiplexed transport accepts either explicit loopback-only
+plaintext for development or mutual TLS. In mTLS mode, Agent verifies the Edge
+CA and DNS server name; Edge verifies the Agent client-certificate chain. Both
+advertise ALPN `tunnelproxy/1`. Edge holds its bounded session permit while TLS
+negotiates, applies a separate TLS deadline, and publishes the session only
+after TLS and Protocol v1 both succeed.
+
+TLS wraps the byte stream below framing, so HELLO, the empty REGISTER payload,
+REGISTERED, heartbeat, and multiplex frames are unchanged. Authentication means
+only possession of a certificate signed by the configured CA. No certificate
+is mapped to durable `AgentId`/`TunnelId` or tunnel authorization yet. Private
+key material is parsed into rustls configuration and excluded from diagnostics.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

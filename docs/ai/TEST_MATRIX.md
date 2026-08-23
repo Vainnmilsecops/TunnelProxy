@@ -95,11 +95,12 @@
 | Raw route process shutdown                | ✅   | ✅          | —   | Global route drain rejects manager reuse and force-aborts an active route only after its deadline. |
 | Agent process runtime                     | ✅   | ✅          | —   | Config validation, cancellable bounded reconnect, typed retry exhaustion, and composed outbound handshake/multiplex lifecycle. |
 | Edge process runtime                      | ✅   | ✅          | —   | Creates one raw route, shuts down in route→transport order, rolls back route bind failure, and recovers after Agent replacement. |
-| Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Both binary parsers cover defaults, all supported flags, missing/invalid values, and unknown flags. |
+| Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Both binary parsers cover defaults, reconnect/TLS flags, complete TLS argument sets, missing/invalid values, and unknown flags. |
 | Composed local tunnel                     | —    | ✅          | —   | Real TCP crosses runnable Edge→Agent→local echo byte-exactly, then releases both listener ports after shutdown. |
 | OS process shutdown observation           | ✅   | —           | —   | Ctrl-C on all platforms and SIGTERM on Unix compile behind Tokio's signal feature; runtime cleanup is tested via injected shutdown signals. |
 | Reconnect                                 | ✅    | ✅           | —   | Backoff bounds/jitter are unit tested; real TCP covers cancellation, retry exhaustion, Edge restart, and same-address route recovery. |
 | Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
-| TLS                                       | —    | —           | —   | Out of foundation scope.                                                                                                    |
-| Authentication                            | —    | —           | —   | INV-003; deferred.                                                                                                          |
+| Agent transport mutual TLS                | ✅    | ✅           | —   | Runtime-generated PKI covers byte-exact mTLS forwarding, wrong CA/name, timeout/cancellation, secret-safe Debug, and secure reconnect. |
+| Agent certificate authentication          | ✅    | ✅           | —   | Missing or untrusted client certificates never register; failure releases the sole Edge capacity permit for a later trusted Agent. |
+| Plaintext transport restriction           | ✅    | ✅           | —   | Runnable plaintext is loopback-only; a non-loopback Agent listener validates only when mutual TLS is configured. |
 | Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |

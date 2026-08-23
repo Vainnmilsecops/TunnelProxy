@@ -19,8 +19,10 @@
 //! Session 07 adds Edge-initiated PING/PONG heartbeat handling. Session 08
 //! adds a loopback-tested single-stream local TCP bridge, and Session 09 adds
 //! bounded concurrent streams through `AgentSession::run_multiplexed`.
-//! Session 12 adds the runnable single-session `AgentRuntime` and CLI.
-//! Reconnect and the final `tunnelproxy http` UX remain out of scope. See
+//! Session 12 adds the runnable single-session `AgentRuntime` and CLI, Session
+//! 13 adds reconnect, and Session 14 adds mutual TLS for the runnable transport.
+//! Durable tunnel authorization and the final `tunnelproxy http` UX remain out
+//! of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 #![deny(unsafe_code)]
@@ -28,9 +30,11 @@
 mod agent_transport;
 mod multiplex;
 mod runtime;
+mod tls;
 
 pub use agent_transport::{
-    connect, AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
+    connect, connect_with_security, AgentError, AgentSession, AgentSessionCloseReason,
+    ConnectOutcome,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,
@@ -39,6 +43,7 @@ pub use runtime::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError, AgentRuntimeError,
     AgentRuntimeOutcome, ReconnectConfig, ReconnectConfigError,
 };
+pub use tls::{AgentTlsConfig, AgentTlsConfigError, AgentTransportSecurity};
 pub use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 
 use std::net::SocketAddr;

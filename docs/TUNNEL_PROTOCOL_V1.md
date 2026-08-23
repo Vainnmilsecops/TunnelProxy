@@ -283,8 +283,10 @@ RESET_STREAM uses a state-independent two-byte big-endian code:
 
 Protocol v1 framing does **not** include:
 
-- TLS or encryption.
-- Agent authentication or credentials.
+- TLS records or encryption primitives. Session 14 wraps the Protocol v1 byte
+  stream in mutual TLS without changing this framing format.
+- Authentication messages or credentials. Session 14 client-certificate
+  authentication completes before the first Protocol v1 frame.
 - Credit/window-based flow control and weighted scheduling.
 - Session resumption or reconnect signaling. Session 13 process runtimes
   reconnect by performing a completely fresh Protocol v1 handshake.

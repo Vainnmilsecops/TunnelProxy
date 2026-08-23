@@ -202,6 +202,22 @@
 - **Tracking:** open; public ingress must not use ephemeral route IDs as durable
   identity.
 
+### DEBT-017 — TLS certificates are static process-start configuration
+
+- **Introduced in:** Session 14
+- **Category:** security / ops
+- **Impact:** high for production certificate lifecycle, low for the tested
+  transport foundation
+- **Rationale:** Session 14 accepts certificate, key, and CA PEM files at
+  process startup and proves mutual authentication. It deliberately does not
+  build a CA service, key storage, certificate-to-Agent mapping, revocation,
+  rotation, expiry monitoring, or hot reload.
+- **Exit plan:** Define durable Agent identity and authorization, issue
+  short-lived credentials from a controlled PKI, distribute trust snapshots,
+  support atomic reload/rotation, and test revocation without querying storage
+  on the data-plane hot path.
+- **Tracking:** open; static files are not a production credential lifecycle.
+
 ## Resolved items
 
 ### DEBT-016 — Runnable tunnel stops after its sole Agent disconnects

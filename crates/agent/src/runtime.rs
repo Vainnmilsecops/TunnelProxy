@@ -8,8 +8,8 @@ use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
 use tunnelproxy_protocol::TransportSessionId;
 
 use crate::{
-    connect, AgentError, AgentSessionCloseReason, ConnectOutcome, MultiplexedAgentConfig,
-    MultiplexedAgentConfigError,
+    connect_with_security, AgentError, AgentSessionCloseReason, AgentTransportSecurity,
+    ConnectOutcome, MultiplexedAgentConfig, MultiplexedAgentConfigError,
 };
 
 /// Bounded exponential reconnect policy.
@@ -125,6 +125,7 @@ pub struct AgentRuntimeConfig {
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
     pub multiplex: MultiplexedAgentConfig,
+    pub security: AgentTransportSecurity,
     pub reconnect: ReconnectConfig,
     pub shutdown: RuntimeShutdownConfig,
 }
@@ -136,6 +137,7 @@ impl AgentRuntimeConfig {
             connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             multiplex: MultiplexedAgentConfig::new(local_addr),
+            security: AgentTransportSecurity::default(),
             reconnect: ReconnectConfig::default(),
             shutdown: RuntimeShutdownConfig::default(),
         }
@@ -147,6 +149,13 @@ impl AgentRuntimeConfig {
         }
         if self.handshake_timeout.is_zero() {
             return Err(AgentRuntimeConfigError::ZeroHandshakeTimeout);
+        }
+        if matches!(self.security, AgentTransportSecurity::PlaintextLoopback)
+            && !self.edge_addr.ip().is_loopback()
+        {
+            return Err(AgentRuntimeConfigError::PlaintextEdgeMustBeLoopback(
+                self.edge_addr,
+            ));
         }
         self.multiplex
             .validate()
@@ -164,6 +173,7 @@ impl AgentRuntimeConfig {
 pub enum AgentRuntimeConfigError {
     ZeroConnectTimeout,
     ZeroHandshakeTimeout,
+    PlaintextEdgeMustBeLoopback(SocketAddr),
     ZeroDrainTimeout,
     Multiplex(MultiplexedAgentConfigError),
     Reconnect(ReconnectConfigError),
@@ -175,6 +185,9 @@ impl std::fmt::Display for AgentRuntimeConfigError {
             Self::ZeroConnectTimeout => f.write_str("connect_timeout must be greater than zero"),
             Self::ZeroHandshakeTimeout => {
                 f.write_str("handshake_timeout must be greater than zero")
+            }
+            Self::PlaintextEdgeMustBeLoopback(addr) => {
+                write!(f, "plaintext Edge address must be loopback, got {addr}")
             }
             Self::ZeroDrainTimeout => f.write_str("drain_timeout must be greater than zero"),
             Self::Multiplex(error) => write!(f, "invalid multiplex config: {error}"),
@@ -278,10 +291,11 @@ impl AgentRuntime {
                 event = "reconnect_attempt_started",
                 "Agent connection attempt started"
             );
-            let connecting = connect(
+            let connecting = connect_with_security(
                 self.config.edge_addr,
                 self.config.connect_timeout,
                 self.config.handshake_timeout,
+                &self.config.security,
             );
             tokio::pin!(connecting);
             let session = tokio::select! {
@@ -397,6 +411,8 @@ fn is_retryable(error: &AgentError) -> bool {
         error,
         AgentError::Connect(_)
             | AgentError::ConnectTimeout
+            | AgentError::TlsHandshakeTimeout
+            | AgentError::TlsTransport(_)
             | AgentError::HandshakeTimeout
             | AgentError::SessionIo(_)
             | AgentError::ConnectionClosed
@@ -461,6 +477,18 @@ mod tests {
             "127.0.0.1:3000".parse().unwrap(),
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn plaintext_remote_edge_is_rejected() {
+        let config = AgentRuntimeConfig::new(
+            "192.0.2.1:7100".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(AgentRuntimeConfigError::PlaintextEdgeMustBeLoopback(_))
+        ));
     }
 
     #[test]

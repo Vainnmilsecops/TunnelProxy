@@ -1,13 +1,15 @@
 //! Runnable outbound Agent process with graceful OS shutdown.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_agent::{
-    AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, RuntimeShutdownConfig,
+    AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
+    AgentTransportSecurity, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
 
@@ -27,6 +29,11 @@ Options:
   --reconnect-jitter-percent <n> downward jitter (default 20)
   --stable-session-reset-ms <ms> reset streak  (default 30000)
   --max-reconnect-attempts <n>   failure limit (default unlimited)
+  --tls-ca <path>                trusted Edge CA PEM
+  --tls-client-cert <path>       Agent certificate PEM
+  --tls-client-key <path>        Agent private key PEM
+  --tls-server-name <name>       verified Edge DNS name
+  --tls-handshake-timeout-ms <ms> TLS timeout  (default 10000)
   --help                         print this help and exit
 ";
 
@@ -62,6 +69,13 @@ async fn main() -> ExitCode {
     config.reconnect.jitter_percent = parsed.reconnect_jitter_percent;
     config.reconnect.stable_session_reset_after = parsed.stable_session_reset;
     config.reconnect.max_attempts = parsed.max_reconnect_attempts;
+    config.security = match load_transport_security(&parsed).await {
+        Ok(security) => security,
+        Err(error) => {
+            error!(%error, "failed to configure Agent TLS");
+            return ExitCode::from(2);
+        }
+    };
     let runtime = match AgentRuntime::new(config) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -128,6 +142,11 @@ struct ParsedArgs {
     reconnect_jitter_percent: u8,
     stable_session_reset: Duration,
     max_reconnect_attempts: Option<u32>,
+    tls_ca: Option<PathBuf>,
+    tls_client_cert: Option<PathBuf>,
+    tls_client_key: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    tls_handshake_timeout: Duration,
     help: bool,
 }
 
@@ -146,6 +165,11 @@ impl Default for ParsedArgs {
             reconnect_jitter_percent: 20,
             stable_session_reset: Duration::from_secs(30),
             max_reconnect_attempts: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            tls_server_name: None,
+            tls_handshake_timeout: Duration::from_secs(10),
             help: false,
         }
     }
@@ -233,10 +257,78 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.max_reconnect_attempts = Some(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--tls-ca" => {
+                parsed.tls_ca = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-client-cert" => {
+                parsed.tls_client_cert = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-client-key" => {
+                parsed.tls_client_key = Some(PathBuf::from(value(args, index, flag)?));
+                index += 2;
+            }
+            "--tls-server-name" => {
+                parsed.tls_server_name = Some(value(args, index, flag)?.to_string());
+                index += 2;
+            }
+            "--tls-handshake-timeout-ms" => {
+                parsed.tls_handshake_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
     Ok(parsed)
+}
+
+#[derive(Debug)]
+enum TlsLoadError {
+    IncompleteArguments,
+    Read(&'static str),
+    Invalid(AgentTlsConfigError),
+}
+
+impl std::fmt::Display for TlsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteArguments => f.write_str(
+                "TLS requires --tls-ca, --tls-client-cert, --tls-client-key, and --tls-server-name",
+            ),
+            Self::Read(kind) => write!(f, "failed to read TLS {kind} PEM file"),
+            Self::Invalid(error) => write!(f, "invalid TLS configuration: {error}"),
+        }
+    }
+}
+
+async fn load_transport_security(
+    parsed: &ParsedArgs,
+) -> Result<AgentTransportSecurity, TlsLoadError> {
+    match (
+        &parsed.tls_ca,
+        &parsed.tls_client_cert,
+        &parsed.tls_client_key,
+        &parsed.tls_server_name,
+    ) {
+        (None, None, None, None) => Ok(AgentTransportSecurity::PlaintextLoopback),
+        (Some(ca), Some(cert), Some(key), Some(server_name)) => {
+            let ca = tokio::fs::read(ca)
+                .await
+                .map_err(|_| TlsLoadError::Read("CA"))?;
+            let cert = tokio::fs::read(cert)
+                .await
+                .map_err(|_| TlsLoadError::Read("client certificate"))?;
+            let key = tokio::fs::read(key)
+                .await
+                .map_err(|_| TlsLoadError::Read("client private key"))?;
+            AgentTlsConfig::from_pem(&ca, &cert, &key, server_name, parsed.tls_handshake_timeout)
+                .map(AgentTransportSecurity::MutualTls)
+                .map_err(TlsLoadError::Invalid)
+        }
+        _ => Err(TlsLoadError::IncompleteArguments),
+    }
 }
 
 fn value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ArgError> {
@@ -304,6 +396,16 @@ mod tests {
             "500",
             "--max-reconnect-attempts",
             "7",
+            "--tls-ca",
+            "ca.pem",
+            "--tls-client-cert",
+            "agent.pem",
+            "--tls-client-key",
+            "agent-key.pem",
+            "--tls-server-name",
+            "edge.test",
+            "--tls-handshake-timeout-ms",
+            "600",
         ]))
         .unwrap();
         assert_eq!(parsed.edge.port(), 17100);
@@ -318,6 +420,11 @@ mod tests {
         assert_eq!(parsed.reconnect_jitter_percent, 15);
         assert_eq!(parsed.stable_session_reset, Duration::from_millis(500));
         assert_eq!(parsed.max_reconnect_attempts, Some(7));
+        assert_eq!(parsed.tls_ca, Some(PathBuf::from("ca.pem")));
+        assert_eq!(parsed.tls_client_cert, Some(PathBuf::from("agent.pem")));
+        assert_eq!(parsed.tls_client_key, Some(PathBuf::from("agent-key.pem")));
+        assert_eq!(parsed.tls_server_name.as_deref(), Some("edge.test"));
+        assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(600));
     }
 
     #[test]
@@ -333,6 +440,18 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["--unknown"])),
             Err(ArgError::UnknownFlag(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_tls_arguments_are_rejected() {
+        let parsed = ParsedArgs {
+            tls_ca: Some(PathBuf::from("ca.pem")),
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_transport_security(&parsed).await,
+            Err(TlsLoadError::IncompleteArguments)
         ));
     }
 }

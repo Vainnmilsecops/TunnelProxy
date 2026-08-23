@@ -50,8 +50,9 @@
 //! that exist to validate the byte-stream pipeline, lifecycle, and
 //! resource discipline. The Agent transport is the first protocol-aware
 //! runtime. Session 08 implements only the loopback raw-TCP vertical slice;
-//! Session 12 composes it into a runnable single-Agent process, while public
-//! reverse-tunnel routing is still not implemented.
+//! Session 12 composes it into a runnable single-Agent process and Session 14
+//! adds mutual TLS to that Agent transport. Public reverse-tunnel routing is
+//! still not implemented.
 //! See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006, ADR-007) and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
@@ -1174,6 +1175,7 @@ pub mod agent_transport;
 pub mod multiplex;
 pub mod raw_ingress;
 mod runtime;
+mod tls;
 
 pub use multiplex::{
     EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
@@ -1187,6 +1189,7 @@ pub use raw_ingress::{
 pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,
 };
+pub use tls::{EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity};
 
 #[cfg(test)]
 mod tests {

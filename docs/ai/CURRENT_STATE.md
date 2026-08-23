@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Agent Reconnect & Route Recovery** (Session 13).
+**Mutual TLS & Agent Authentication** (Session 14).
 
 ## Completed
 
@@ -123,12 +123,27 @@
   streams. No Protocol v1 frame or payload changed.
 - Real-TCP recovery tests cover shutdown during backoff, typed retry exhaustion,
   Agent replacement on one Edge, and Agent recovery across an Edge restart.
-- 167 explicit workspace tests are present; all prior behavior is preserved.
+- The runnable/multiplexed Agent transport supports mutual TLS using rustls.
+  Agent validates the Edge CA and DNS server name; Edge requires a client
+  certificate signed by its configured Agent CA before Protocol v1 begins.
+- TunnelProxy ALPN is `tunnelproxy/1`. Missing or mismatched ALPN never reaches
+  protocol registration. TLS has its own bounded handshake deadline and Edge
+  holds the existing session-capacity permit throughout negotiation.
+- Plaintext runtime transport is restricted to loopback. TLS permits a
+  non-loopback Agent listener while raw ingress remains loopback-only.
+- TLS identity/authentication failures are terminal on Agent; transient TCP/TLS
+  transport failures and TLS timeouts remain governed by Session 13 reconnect.
+- Certificate/key PEM data is parsed into rustls configuration and omitted from
+  Debug, errors, and structured logs. Tests generate their PKI at runtime.
+- 18 new unit/real-TCP tests cover config/CLI validation, mTLS forwarding,
+  wrong CA/name, missing ALPN, missing/untrusted client certificates, capacity
+  release, timeout/cancellation, secure restart, and secret-safe diagnostics.
+- 185 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
-- TLS / encryption.
-- Agent authentication.
+- Certificate issuance, rotation, revocation, and hot reload (DEBT-017 open).
+- Durable Agent authorization or certificate-to-`AgentId` mapping.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Tunnel registration (REGISTER is ephemeral transport registration only).
@@ -142,15 +157,13 @@
 
 ## Next planned session
 
-**Session 14 — Secure Agent Transport Foundation.**
+**Session 15 — Authenticated Tunnel Identity & Registration.**
 
 Goals:
 
-- Add TLS configuration and certificate validation to the Agent ↔ Edge
-  transport without silently weakening development defaults.
-- Define and enforce an explicit Agent authentication contract before a session
-  becomes routable.
-- Keep credentials out of logs and committed fixtures, and add negative tests
-  for trust and authentication failures.
-- Preserve the Session 13 reconnect boundary: security/protocol failures remain
-  terminal rather than entering an infinite retry loop.
+- Define durable `AgentId`/`TunnelId` registration separately from ephemeral
+  `TransportSessionId` values.
+- Version the protocol explicitly before changing the empty REGISTER payload.
+- Authorize a certificate-authenticated Agent for exact tunnel intent and push
+  routable state without adding a storage lookup to the ingress hot path.
+- Preserve bounded reconnect, mTLS admission, and loopback raw-ingress scope.

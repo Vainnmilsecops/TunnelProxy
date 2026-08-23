@@ -26,6 +26,7 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "sync",
     "signal",
+    "fs",
 ] }
 # Structured logging per INV-003 (avoid leaking payloads; logs use spans/events only).
 tracing = "0.1"
@@ -37,6 +38,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "env-filter",
     "fmt",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.13"
+# rcgen's broad time requirement otherwise resolves to releases above the
+# workspace's Rust 1.75 MSRV. Keep test certificate generation MSRV-compatible.
+time = "=0.3.36"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
