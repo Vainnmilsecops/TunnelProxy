@@ -18,6 +18,9 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
 tunnelproxy-common = { path = "../common" }
 
 [dev-dependencies]

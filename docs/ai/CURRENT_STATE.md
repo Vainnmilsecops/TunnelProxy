@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Persistent Snapshot Storage & Authenticated Edge Bootstrap** (Session 17).
+**Runnable Snapshot Service & Operations Wiring** (Session 18).
 
 ## Completed
 
@@ -197,14 +197,29 @@
 - Snapshot-service loss changes source health to `Stale` without clearing the
   cached authority. Successful authenticated reconnect returns it to `Live` and
   later versions continue through Session 16 atomic reconciliation.
-- 215 explicit workspace tests are present; all prior behavior is preserved.
+- Snapshot operators can import one strict JSON full snapshot through the
+  runnable Control Plane binary. Reads stop at 1 MiB and all domain/storage
+  validation occurs before durable replacement.
+- `ControlPlaneRuntime` refuses uninitialized storage, refreshes externally
+  committed versions without blocking Tokio, owns the mTLS distribution server,
+  and shuts down its listener and connection tasks under explicit supervision.
+- `tunnelproxy-control-plane serve|import` exposes validated database, listener,
+  TLS identity/trust, capacity, deadline, and refresh configuration with stable
+  process exit classes.
+- `SnapshotAwareEdgeRuntime` authenticates and receives the initial snapshot
+  before binding Edge listeners, then supervises snapshot reconnect and the data
+  plane together.
+- The runnable Edge CLI supports three explicit authorization modes: plaintext
+  loopback development, static certificate-bound mTLS, or dynamic snapshot mTLS.
+  Partial or conflicting flag groups fail before network startup.
+- 226 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
 - Certificate issuance, CA/trust revocation, rotation, expiry monitoring, and
   TLS-config hot reload (DEBT-017 open).
-- Runnable Control Plane daemon/CLI, administrative mutation API, and Edge disk
-  cache for cold startup while the Control Plane is unavailable.
+- General administrative mutation API and Edge disk cache for cold startup
+  while the Control Plane is unavailable (DEBT-018).
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
@@ -218,15 +233,15 @@
 
 ## Next planned session
 
-**Session 18 — Runnable Snapshot Service & Operations Wiring.**
+**Session 19 — Edge Cold-Start Snapshot Cache.**
 
 Goals:
 
-- Add a supervised Control Plane process entrypoint around the SQLite authority
-  and mTLS snapshot server with validated file/address/deadline configuration.
-- Wire the snapshot client into the runnable Edge configuration while keeping
-  the existing explicit static/development modes.
-- Define safe initialization and operator-driven full-snapshot import without
-  building the broader account/billing API.
-- Add process restart, invalid configuration, shutdown, and secret-safe
-  diagnostics coverage; keep public ingress and multi-edge ownership separate.
+- Persist only the last authenticated, canonical snapshot on Edge with atomic
+  replacement, integrity metadata, and rollback protection.
+- Permit explicit stale cold startup when Control Plane is unavailable, while
+  preferring authenticated online bootstrap and never blocking ingress on disk.
+- Reconcile a newer server snapshot immediately after reconnect and retain the
+  existing `Live`/`Stale` observability contract.
+- Keep admin APIs, certificate lifecycle, public ingress, and multi-edge
+  consensus outside the session unless explicitly expanded.

@@ -89,6 +89,9 @@
 | Canonical snapshot codec                  | ✅   | —           | —   | Stable ordering/digest, versioned round-trip, malformed payloads, strict IDs/status, cardinality, and 1 MiB bounds. |
 | Persistent snapshot repository            | ✅   | —           | —   | SQLite commit/reopen preserves exact state; stale/conflicting versions fail and injected commit failure never publishes. |
 | Authenticated snapshot bootstrap          | ✅   | ✅          | —   | Real mTLS tests cover SQLite-backed bootstrap, live push, wrong server identity, disconnect `Stale`, reconnect `Live`, and shutdown cancellation. |
+| Snapshot manifest and import CLI          | ✅   | ✅          | —   | Strict JSON, unknown/invalid/oversized input, process exit codes, and durable database initialization are covered. |
+| Runnable Control Plane lifecycle          | ✅   | ✅          | —   | Uninitialized startup fails; external import refresh, same-database restart, listener shutdown, and reconnect are real-TCP tested. |
+| Snapshot-aware runnable Edge              | ✅   | ✅          | —   | Three CLI authorization modes are validated; bootstrap precedes bind and routed mTLS traffic survives Control Plane restart via stale cache. |
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
 | Live session and durable tunnel routing   | ✅   | ✅          | —   | Exact session routing plus cached `TunnelId -> TransportSessionId`; duplicate claim rejects and releases after disconnect. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |

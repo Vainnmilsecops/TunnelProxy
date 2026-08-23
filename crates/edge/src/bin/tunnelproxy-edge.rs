@@ -8,10 +8,12 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
+use tunnelproxy_control_plane::{SnapshotClientConfig, SnapshotTlsConfigError};
 use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
     EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError, EdgeTransportSecurity,
-    RuntimeShutdownConfig,
+    RuntimeShutdownConfig, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
+    SnapshotAwareEdgeRuntimeOutcome,
 };
 
 const USAGE: &str = "\
@@ -30,6 +32,16 @@ Options:
   --tls-client-ca <path>           trusted Agent CA PEM
   --authorized-client-cert <path>  exact authorized Agent certificate PEM
   --tls-handshake-timeout-ms <ms>  TLS timeout   (default 10000)
+  --snapshot-server <addr>         Control Plane snapshot service
+  --snapshot-ca <path>             trusted Control Plane CA PEM
+  --snapshot-client-cert <path>    Edge snapshot client certificate PEM
+  --snapshot-client-key <path>     Edge snapshot client private key PEM
+  --snapshot-server-name <name>    Control Plane TLS server name
+  --snapshot-connect-timeout-ms <ms>    connect timeout (default 5000)
+  --snapshot-handshake-timeout-ms <ms>  TLS timeout (default 5000)
+  --snapshot-subscribe-timeout-ms <ms>  subscribe timeout (default 5000)
+  --snapshot-reconnect-initial-ms <ms>  first retry delay (default 250)
+  --snapshot-reconnect-max-ms <ms>      maximum retry delay (default 30000)
   --help                           print this help and exit
 ";
 
@@ -62,34 +74,38 @@ async fn main() -> ExitCode {
     config.tunnel_id = parsed.tunnel_id.clone();
     config.max_raw_connections = parsed.max_raw_connections;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-    let (security, registration) = match load_transport_configuration(&parsed).await {
+    let authorization = match load_transport_configuration(&parsed).await {
         Ok(configuration) => configuration,
         Err(error) => {
             error!(%error, "failed to configure Edge transport authorization");
             return ExitCode::from(2);
         }
     };
-    config.multiplex.security = security;
-    config.multiplex.registration = registration;
+    match authorization {
+        LoadedAuthorization::Static {
+            security,
+            registration,
+        } => {
+            config.multiplex.security = security;
+            config.multiplex.registration = registration;
+            run_static_edge(config, &parsed).await
+        }
+        LoadedAuthorization::Snapshot {
+            security,
+            snapshots,
+        } => {
+            config.multiplex.security = security;
+            run_snapshot_edge(config, snapshots, &parsed).await
+        }
+    }
+}
+
+async fn run_static_edge(config: EdgeRuntimeConfig, parsed: &ParsedArgs) -> ExitCode {
     let runtime = match EdgeRuntime::bind(config).await {
         Ok(runtime) => runtime,
-        Err(error) => {
-            error!(%error, "failed to start Edge runtime");
-            return if matches!(error, EdgeRuntimeError::InvalidConfig(_)) {
-                ExitCode::from(2)
-            } else {
-                ExitCode::from(1)
-            };
-        }
+        Err(error) => return edge_start_error(error),
     };
-    info!(
-        agent_addr = %runtime.agent_addr(),
-        raw_addr = %parsed.raw_listen,
-        agent_id = %parsed.agent_id,
-        tunnel_id = %parsed.tunnel_id,
-        "Edge runtime is waiting for one Agent"
-    );
-
+    log_edge_started(runtime.agent_addr(), parsed, "static");
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal);
     tokio::pin!(runtime_future);
@@ -98,20 +114,78 @@ async fn main() -> ExitCode {
     let result = tokio::select! {
         result = &mut runtime_future => result,
         observed = &mut os_signal => {
-            match observed {
-                Ok(cause) => info!(%cause, "process shutdown requested"),
-                Err(error) => {
-                    error!(%error, "OS shutdown listener failed");
-                    trigger.shutdown();
-                    let _ = runtime_future.await;
-                    return ExitCode::from(1);
-                }
+            if let Err(error) = observed {
+                error!(%error, "OS shutdown listener failed");
+                trigger.shutdown();
+                let _ = runtime_future.await;
+                return ExitCode::from(1);
             }
             trigger.shutdown();
             runtime_future.await
         }
     };
     edge_exit_code(result)
+}
+
+async fn run_snapshot_edge(
+    config: EdgeRuntimeConfig,
+    snapshots: SnapshotClientConfig,
+    parsed: &ParsedArgs,
+) -> ExitCode {
+    let runtime = match SnapshotAwareEdgeRuntime::bind(config, snapshots).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            error!(%error, "failed to bootstrap snapshot-aware Edge runtime");
+            return if matches!(
+                error,
+                SnapshotAwareEdgeRuntimeError::Edge(EdgeRuntimeError::InvalidConfig(_))
+            ) {
+                ExitCode::from(2)
+            } else {
+                ExitCode::from(1)
+            };
+        }
+    };
+    log_edge_started(runtime.agent_addr(), parsed, "snapshot");
+    let (trigger, signal) = shutdown_channel();
+    let runtime_future = runtime.run_until_shutdown(signal);
+    tokio::pin!(runtime_future);
+    let os_signal = wait_for_process_shutdown();
+    tokio::pin!(os_signal);
+    let result = tokio::select! {
+        result = &mut runtime_future => result,
+        observed = &mut os_signal => {
+            if let Err(error) = observed {
+                error!(%error, "OS shutdown listener failed");
+                trigger.shutdown();
+                let _ = runtime_future.await;
+                return ExitCode::from(1);
+            }
+            trigger.shutdown();
+            runtime_future.await
+        }
+    };
+    snapshot_edge_exit_code(result)
+}
+
+fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: &'static str) {
+    info!(
+        %agent_addr,
+        raw_addr = %parsed.raw_listen,
+        agent_id = %parsed.agent_id,
+        tunnel_id = %parsed.tunnel_id,
+        authorization,
+        "Edge runtime is waiting for one Agent"
+    );
+}
+
+fn edge_start_error(error: EdgeRuntimeError) -> ExitCode {
+    error!(%error, "failed to start Edge runtime");
+    if matches!(error, EdgeRuntimeError::InvalidConfig(_)) {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 fn edge_exit_code(
@@ -133,6 +207,25 @@ fn edge_exit_code(
     }
 }
 
+fn snapshot_edge_exit_code(
+    result: Result<SnapshotAwareEdgeRuntimeOutcome, SnapshotAwareEdgeRuntimeError>,
+) -> ExitCode {
+    match result {
+        Ok(outcome) if outcome.was_forced() => {
+            warn!(?outcome, "Edge shutdown exceeded a drain deadline");
+            ExitCode::from(1)
+        }
+        Ok(outcome) => {
+            info!(?outcome, "Edge shutdown completed");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            error!(%error, "snapshot-aware Edge runtime failed");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedArgs {
     agent_listen: SocketAddr,
@@ -147,6 +240,17 @@ struct ParsedArgs {
     tls_client_ca: Option<PathBuf>,
     authorized_client_cert: Option<PathBuf>,
     tls_handshake_timeout: Duration,
+    snapshot_server: Option<SocketAddr>,
+    snapshot_ca: Option<PathBuf>,
+    snapshot_client_cert: Option<PathBuf>,
+    snapshot_client_key: Option<PathBuf>,
+    snapshot_server_name: Option<String>,
+    snapshot_connect_timeout: Duration,
+    snapshot_handshake_timeout: Duration,
+    snapshot_subscribe_timeout: Duration,
+    snapshot_reconnect_initial: Duration,
+    snapshot_reconnect_max: Duration,
+    snapshot_options_present: bool,
     help: bool,
 }
 
@@ -165,6 +269,17 @@ impl Default for ParsedArgs {
             tls_client_ca: None,
             authorized_client_cert: None,
             tls_handshake_timeout: Duration::from_secs(10),
+            snapshot_server: None,
+            snapshot_ca: None,
+            snapshot_client_cert: None,
+            snapshot_client_key: None,
+            snapshot_server_name: None,
+            snapshot_connect_timeout: Duration::from_secs(5),
+            snapshot_handshake_timeout: Duration::from_secs(5),
+            snapshot_subscribe_timeout: Duration::from_secs(5),
+            snapshot_reconnect_initial: Duration::from_millis(250),
+            snapshot_reconnect_max: Duration::from_secs(30),
+            snapshot_options_present: false,
             help: false,
         }
     }
@@ -256,6 +371,61 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                     Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
+            "--snapshot-server" => {
+                parsed.snapshot_server = Some(parse_addr(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-ca" => {
+                parsed.snapshot_ca = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-client-cert" => {
+                parsed.snapshot_client_cert = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-client-key" => {
+                parsed.snapshot_client_key = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-server-name" => {
+                parsed.snapshot_server_name = Some(value(args, index, flag)?.to_owned());
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-connect-timeout-ms" => {
+                parsed.snapshot_connect_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-handshake-timeout-ms" => {
+                parsed.snapshot_handshake_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-subscribe-timeout-ms" => {
+                parsed.snapshot_subscribe_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-reconnect-initial-ms" => {
+                parsed.snapshot_reconnect_initial =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
+            "--snapshot-reconnect-max-ms" => {
+                parsed.snapshot_reconnect_max =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.snapshot_options_present = true;
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -265,43 +435,77 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
 #[derive(Debug)]
 enum TlsLoadError {
     IncompleteArguments,
+    AuthorizationMode,
+    IncompleteSnapshotArguments,
     Read(&'static str),
     Invalid(EdgeTlsConfigError),
     InvalidRegistration(EdgeRegistrationPolicyError),
+    InvalidSnapshotTls(SnapshotTlsConfigError),
+    InvalidSnapshotConfig,
 }
 
 impl std::fmt::Display for TlsLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IncompleteArguments => f.write_str(
-                "TLS requires --tls-cert, --tls-key, --tls-client-ca, and --authorized-client-cert",
+                "Agent TLS requires --tls-cert, --tls-key, and --tls-client-ca",
+            ),
+            Self::AuthorizationMode => f.write_str(
+                "Agent TLS requires exactly one authorization source: --authorized-client-cert or the complete snapshot group",
+            ),
+            Self::IncompleteSnapshotArguments => f.write_str(
+                "snapshot authorization requires server, CA, client certificate/key, and server name",
             ),
             Self::Read(kind) => write!(f, "failed to read TLS {kind} PEM file"),
             Self::Invalid(error) => write!(f, "invalid TLS configuration: {error}"),
             Self::InvalidRegistration(error) => {
                 write!(f, "invalid registration authorization: {error}")
             }
+            Self::InvalidSnapshotTls(error) => {
+                write!(f, "invalid snapshot TLS configuration: {error}")
+            }
+            Self::InvalidSnapshotConfig => f.write_str("snapshot client configuration is invalid"),
         }
     }
 }
 
+enum LoadedAuthorization {
+    Static {
+        security: EdgeTransportSecurity,
+        registration: EdgeRegistrationPolicy,
+    },
+    Snapshot {
+        security: EdgeTransportSecurity,
+        snapshots: SnapshotClientConfig,
+    },
+}
+
 async fn load_transport_configuration(
     parsed: &ParsedArgs,
-) -> Result<(EdgeTransportSecurity, EdgeRegistrationPolicy), TlsLoadError> {
-    match (
-        &parsed.tls_cert,
-        &parsed.tls_key,
-        &parsed.tls_client_ca,
-        &parsed.authorized_client_cert,
-    ) {
-        (None, None, None, None) => Ok((
-            EdgeTransportSecurity::PlaintextLoopback,
-            EdgeRegistrationPolicy::loopback_development(
-                parsed.agent_id.clone(),
-                parsed.tunnel_id.clone(),
-            ),
-        )),
-        (Some(cert), Some(key), Some(client_ca), Some(authorized_client_cert)) => {
+) -> Result<LoadedAuthorization, TlsLoadError> {
+    match (&parsed.tls_cert, &parsed.tls_key, &parsed.tls_client_ca) {
+        (None, None, None) => {
+            if parsed.authorized_client_cert.is_some() || has_snapshot_arguments(parsed) {
+                return Err(TlsLoadError::AuthorizationMode);
+            }
+            Ok(LoadedAuthorization::Static {
+                security: EdgeTransportSecurity::PlaintextLoopback,
+                registration: EdgeRegistrationPolicy::loopback_development(
+                    parsed.agent_id.clone(),
+                    parsed.tunnel_id.clone(),
+                ),
+            })
+        }
+        (Some(cert), Some(key), Some(client_ca)) => {
+            let snapshot_mode = match (
+                &parsed.authorized_client_cert,
+                has_snapshot_arguments(parsed),
+            ) {
+                (Some(_), true) | (None, false) => return Err(TlsLoadError::AuthorizationMode),
+                (Some(_), false) => false,
+                (None, true) if snapshot_arguments_complete(parsed) => true,
+                (None, true) => return Err(TlsLoadError::IncompleteSnapshotArguments),
+            };
             let cert = tokio::fs::read(cert)
                 .await
                 .map_err(|_| TlsLoadError::Read("server certificate"))?;
@@ -311,23 +515,86 @@ async fn load_transport_configuration(
             let client_ca = tokio::fs::read(client_ca)
                 .await
                 .map_err(|_| TlsLoadError::Read("client CA"))?;
-            let authorized_client_cert = tokio::fs::read(authorized_client_cert)
-                .await
-                .map_err(|_| TlsLoadError::Read("authorized client certificate"))?;
             let security =
                 EdgeTlsConfig::from_pem(&cert, &key, &client_ca, parsed.tls_handshake_timeout)
                     .map(EdgeTransportSecurity::MutualTls)
                     .map_err(TlsLoadError::Invalid)?;
-            let registration = EdgeRegistrationPolicy::mutual_tls_from_client_cert_pem(
-                parsed.agent_id.clone(),
-                parsed.tunnel_id.clone(),
-                &authorized_client_cert,
-            )
-            .map_err(TlsLoadError::InvalidRegistration)?;
-            Ok((security, registration))
+            if snapshot_mode {
+                load_snapshot_configuration(parsed, security).await
+            } else {
+                let Some(authorized_client_cert) = &parsed.authorized_client_cert else {
+                    return Err(TlsLoadError::AuthorizationMode);
+                };
+                let authorized_client_cert = tokio::fs::read(authorized_client_cert)
+                    .await
+                    .map_err(|_| TlsLoadError::Read("authorized client certificate"))?;
+                let registration = EdgeRegistrationPolicy::mutual_tls_from_client_cert_pem(
+                    parsed.agent_id.clone(),
+                    parsed.tunnel_id.clone(),
+                    &authorized_client_cert,
+                )
+                .map_err(TlsLoadError::InvalidRegistration)?;
+                Ok(LoadedAuthorization::Static {
+                    security,
+                    registration,
+                })
+            }
         }
         _ => Err(TlsLoadError::IncompleteArguments),
     }
+}
+
+fn has_snapshot_arguments(parsed: &ParsedArgs) -> bool {
+    parsed.snapshot_options_present
+}
+
+fn snapshot_arguments_complete(parsed: &ParsedArgs) -> bool {
+    parsed.snapshot_server.is_some()
+        && parsed.snapshot_ca.is_some()
+        && parsed.snapshot_client_cert.is_some()
+        && parsed.snapshot_client_key.is_some()
+        && parsed.snapshot_server_name.is_some()
+}
+
+async fn load_snapshot_configuration(
+    parsed: &ParsedArgs,
+    security: EdgeTransportSecurity,
+) -> Result<LoadedAuthorization, TlsLoadError> {
+    let (Some(server), Some(ca), Some(client_cert), Some(client_key), Some(server_name)) = (
+        parsed.snapshot_server,
+        parsed.snapshot_ca.as_ref(),
+        parsed.snapshot_client_cert.as_ref(),
+        parsed.snapshot_client_key.as_ref(),
+        parsed.snapshot_server_name.as_deref(),
+    ) else {
+        return Err(TlsLoadError::IncompleteSnapshotArguments);
+    };
+    let (ca, client_cert, client_key) = tokio::try_join!(
+        read_tls_file(ca, "snapshot CA"),
+        read_tls_file(client_cert, "snapshot client certificate"),
+        read_tls_file(client_key, "snapshot client private key"),
+    )?;
+    let mut snapshots =
+        SnapshotClientConfig::from_pem(server, &ca, &client_cert, &client_key, server_name)
+            .map_err(TlsLoadError::InvalidSnapshotTls)?;
+    snapshots.connect_timeout = parsed.snapshot_connect_timeout;
+    snapshots.handshake_timeout = parsed.snapshot_handshake_timeout;
+    snapshots.subscribe_timeout = parsed.snapshot_subscribe_timeout;
+    snapshots.reconnect_initial_delay = parsed.snapshot_reconnect_initial;
+    snapshots.reconnect_max_delay = parsed.snapshot_reconnect_max;
+    snapshots
+        .validate()
+        .map_err(|_| TlsLoadError::InvalidSnapshotConfig)?;
+    Ok(LoadedAuthorization::Snapshot {
+        security,
+        snapshots,
+    })
+}
+
+async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, TlsLoadError> {
+    tokio::fs::read(path)
+        .await
+        .map_err(|_| TlsLoadError::Read(kind))
 }
 
 fn value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ArgError> {
@@ -411,6 +678,26 @@ mod tests {
             "agent.pem",
             "--tls-handshake-timeout-ms",
             "350",
+            "--snapshot-server",
+            "127.0.0.1:17200",
+            "--snapshot-ca",
+            "control-ca.pem",
+            "--snapshot-client-cert",
+            "edge-client.pem",
+            "--snapshot-client-key",
+            "edge-client-key.pem",
+            "--snapshot-server-name",
+            "control-plane.test",
+            "--snapshot-connect-timeout-ms",
+            "101",
+            "--snapshot-handshake-timeout-ms",
+            "102",
+            "--snapshot-subscribe-timeout-ms",
+            "103",
+            "--snapshot-reconnect-initial-ms",
+            "104",
+            "--snapshot-reconnect-max-ms",
+            "105",
         ]))
         .unwrap();
         assert_eq!(parsed.agent_listen.port(), 17100);
@@ -428,6 +715,15 @@ mod tests {
             Some(PathBuf::from("agent.pem"))
         );
         assert_eq!(parsed.tls_handshake_timeout, Duration::from_millis(350));
+        assert_eq!(parsed.snapshot_server.unwrap().port(), 17200);
+        assert_eq!(parsed.snapshot_ca, Some(PathBuf::from("control-ca.pem")));
+        assert_eq!(
+            parsed.snapshot_server_name.as_deref(),
+            Some("control-plane.test")
+        );
+        assert_eq!(parsed.snapshot_connect_timeout, Duration::from_millis(101));
+        assert_eq!(parsed.snapshot_reconnect_max, Duration::from_millis(105));
+        assert!(parsed.snapshot_options_present);
     }
 
     #[test]
@@ -459,6 +755,28 @@ mod tests {
         assert!(matches!(
             load_transport_configuration(&parsed).await,
             Err(TlsLoadError::IncompleteArguments)
+        ));
+
+        let partial_snapshot = ParsedArgs {
+            tls_cert: Some(PathBuf::from("edge.pem")),
+            tls_key: Some(PathBuf::from("edge-key.pem")),
+            tls_client_ca: Some(PathBuf::from("agent-ca.pem")),
+            snapshot_server: Some("127.0.0.1:7200".parse().unwrap()),
+            snapshot_options_present: true,
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_transport_configuration(&partial_snapshot).await,
+            Err(TlsLoadError::IncompleteSnapshotArguments)
+        ));
+
+        let conflicting = ParsedArgs {
+            authorized_client_cert: Some(PathBuf::from("agent.pem")),
+            ..partial_snapshot
+        };
+        assert!(matches!(
+            load_transport_configuration(&conflicting).await,
+            Err(TlsLoadError::AuthorizationMode)
         ));
     }
 }

@@ -361,6 +361,23 @@ impl PersistentSnapshotAuthority {
         }
         Ok(outcome)
     }
+
+    /// Reloads the durable head and publishes it when another trusted
+    /// control-plane operation committed a newer complete snapshot.
+    pub async fn refresh_from_repository(
+        &self,
+    ) -> Result<SnapshotPublishOutcome, PersistentSnapshotAuthorityError> {
+        let _guard = self.commit_gate.lock().await;
+        let repository = Arc::clone(&self.repository);
+        let snapshot = tokio::task::spawn_blocking(move || repository.load_latest())
+            .await
+            .map_err(|_| PersistentSnapshotAuthorityError::StorageTask)?
+            .map_err(PersistentSnapshotAuthorityError::Repository)?
+            .ok_or(PersistentSnapshotAuthorityError::Uninitialized)?;
+        self.publisher
+            .publish(snapshot)
+            .map_err(|_| PersistentSnapshotAuthorityError::PublishInvariant)
+    }
 }
 
 impl std::fmt::Debug for PersistentSnapshotAuthority {
@@ -497,5 +514,34 @@ mod tests {
             .is_err());
         assert_eq!(authority.current().as_ref(), &initial);
         assert_eq!(subscription.current().as_ref(), &initial);
+    }
+
+    #[tokio::test]
+    async fn authority_refresh_publishes_an_external_durable_commit() {
+        let (path, directory) = temp_database();
+        let repository = Arc::new(SqliteSnapshotRepository::open(&path).unwrap());
+        repository
+            .commit(&snapshot(1, TunnelStatus::Enabled))
+            .unwrap();
+        let authority = PersistentSnapshotAuthority::open(repository.clone())
+            .await
+            .unwrap();
+        let mut subscription = authority.subscribe();
+        repository
+            .commit(&snapshot(2, TunnelStatus::Disabled))
+            .unwrap();
+        assert!(matches!(
+            authority.refresh_from_repository().await.unwrap(),
+            SnapshotPublishOutcome::Applied { .. }
+        ));
+        subscription.changed().await.unwrap();
+        assert_eq!(subscription.current().version().get(), 2);
+        assert!(matches!(
+            authority.refresh_from_repository().await.unwrap(),
+            SnapshotPublishOutcome::Unchanged { .. }
+        ));
+        drop(authority);
+        drop(repository);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

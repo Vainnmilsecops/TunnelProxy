@@ -29,5 +29,7 @@ same-version conflicting updates fail closed. Edge consumes the latest cached
 snapshot outside the ingress hot path. Session 17 adds canonical encoding,
 transactional SQLite persistence, durable-before-live publication, and a
 dedicated mutually authenticated Edge bootstrap/push service with bounded
-reconnect. There is still no runnable Control Plane CLI, administrative API,
-certificate lifecycle, or multi-edge coordination.
+reconnect. Session 18 adds strict JSON full-snapshot import, repository refresh,
+and the runnable `tunnelproxy-control-plane serve|import` process. There is
+still no general administrative API, Edge cold-start disk cache, certificate
+lifecycle, or multi-edge coordination.

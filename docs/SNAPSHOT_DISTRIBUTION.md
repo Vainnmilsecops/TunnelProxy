@@ -1,7 +1,8 @@
 # Authorization Snapshot Persistence and Distribution
 
-Session 17 turns the Session 16 in-process authorization source into a durable,
-cross-process library surface. It remains entirely outside live ingress.
+Sessions 17–18 turn the Session 16 in-process authorization source into a
+durable, runnable cross-process surface. It remains entirely outside live
+ingress.
 
 ## Durable authority
 
@@ -58,5 +59,32 @@ not cleared. Reconnect sleeps and network/TLS/subscription operations are
 bounded and cancellation-aware. Reconnect sends the last in-memory version;
 `UpToDate` or a valid newer snapshot changes health back to `Live`.
 
-Session 17 does not include a runnable Control Plane daemon, admin mutation API,
-Edge disk cache, certificate rotation, or multi-edge consensus.
+## Operator workflow
+
+Initialize or replace the complete durable authority with a strict manifest:
+
+```text
+tunnelproxy-control-plane import --database snapshots.sqlite --snapshot snapshot.json
+```
+
+Then run the mutually authenticated service:
+
+```text
+tunnelproxy-control-plane serve --database snapshots.sqlite \
+  --tls-cert control-plane.pem --tls-key control-plane-key.pem \
+  --edge-client-ca edge-ca.pem
+```
+
+The manifest contains a non-zero version and a complete `agents` array. It is
+bounded to 1 MiB, rejects unknown fields and malformed fingerprints/IDs/status,
+and uses the repository's stale/conflict/idempotency rules. The runtime refuses
+uninitialized storage and periodically refreshes committed imports. There is no
+delta operation: omission is revocation.
+
+`SnapshotAwareEdgeRuntime` bootstraps before binding Edge listeners and then
+supervises both the data plane and reconnecting snapshot client. The Edge CLI
+selects exactly one authorization mode: plaintext loopback development, static
+mTLS certificate authorization, or mTLS plus the complete snapshot flag group.
+
+Session 18 does not include a general admin API, Edge cold-start disk cache,
+certificate rotation, or multi-edge consensus.

@@ -373,9 +373,33 @@ its dynamic registration policy. After disconnect, it continues using the last
 complete cached snapshot with `Stale` health and retries with bounded backoff;
 an authenticated `UpToDate` or newer full snapshot restores `Live` health.
 
-The current implementation is a library composition surface. A supervised
-Control Plane CLI, operator mutation/import interface, Edge cold-start disk
-cache, certificate lifecycle, and multi-edge consistency remain future work.
+Session 17 exposes this as a library composition surface; Session 18 adds the
+runnable ownership described next.
+
+### 2.17 Runnable snapshot operations and Edge supervision (Session 18)
+
+Operators initialize and replace authority with a strict, bounded JSON full
+snapshot. The import command validates the complete model before the Session 17
+transaction commits it. `ControlPlaneRuntime` rejects an empty repository,
+owns the mTLS listener, and periodically reloads SQLite on a blocking worker.
+Only a newly committed version advances its bounded publisher; missed timer
+ticks are skipped rather than queued.
+
+The Control Plane binary has separate `import` and `serve` commands. Serving
+requires an explicit database, server certificate/key, and trusted Edge client
+CA. There is no plaintext distribution mode and no general mutation API.
+
+The Edge CLI chooses exactly one authorization source. Development plaintext
+uses its explicit loopback grant; static mTLS uses one exact Agent certificate;
+dynamic mTLS requires the complete snapshot server/CA/client identity/server
+name group. `SnapshotAwareEdgeRuntime` finishes dynamic bootstrap before Edge
+binds Agent or raw listeners, then supervises the reconnecting snapshot client
+and data plane under one cancellation tree. Transient service loss preserves
+the in-memory snapshot as `Stale`; unexpected terminal snapshot failure stops
+the composed Edge rather than silently abandoning refresh.
+
+The Edge cache remains memory-only. A cold dynamic Edge cannot start while the
+Control Plane is unavailable; disk-backed verified cold startup is DEBT-018.
 
 ## 3. Control plane vs data plane
 

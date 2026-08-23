@@ -205,10 +205,8 @@ rejected for non-loopback Agent transport addresses.
 This entrypoint intentionally supports one Agent and one loopback route. The raw
 listener targets durable TunnelId, stays bound across Agent reconnect, and
 fails closed while no authorized session is live. Reconnect receives a fresh
-TransportSessionId and interrupted streams are not replayed. The runnable Edge
-CLI still uses static authorization; persistent snapshot libraries now exist,
-while production process wiring, public ingress, and certificate lifecycle
-automation remain absent.
+TransportSessionId and interrupted streams are not replayed. Public ingress and
+certificate lifecycle automation remain absent.
 
 ## 12. Exercising live authorization snapshots
 
@@ -234,10 +232,45 @@ an empty snapshot revokes all grants. A higher version may skip intermediate
 numbers. Reusing the current version is valid only for identical content.
 Ingress continues to use Edge's in-memory maps and never awaits this publisher.
 
-The current CLI still constructs one static version-1 snapshot from
-`--authorized-client-cert`, `--agent-id`, and `--tunnel-id`. Session 17 adds the
-SQLite repository, persistent authority, dedicated mTLS snapshot server/client,
-and `bootstrap_registration_from_snapshot_service` library helper. See
-[`SNAPSHOT_DISTRIBUTION.md`](SNAPSHOT_DISTRIBUTION.md). A runnable Control Plane
-daemon and CLI wiring remain for Session 18; library integration tests are the
-supported exercise surface today.
+The CLI retains static version-1 authorization through
+`--authorized-client-cert`, but it can instead select the external snapshot
+mode described below. See
+[`SNAPSHOT_DISTRIBUTION.md`](SNAPSHOT_DISTRIBUTION.md).
+
+## 13. Running persistent snapshot distribution
+
+Create a complete JSON manifest using the schema in
+[`SNAPSHOT_DISTRIBUTION.md`](SNAPSHOT_DISTRIBUTION.md), then initialize SQLite:
+
+```bash
+cargo run -p tunnelproxy-control-plane --bin tunnelproxy-control-plane -- \
+  import --database snapshots.sqlite --snapshot snapshot.json
+```
+
+Run the mTLS snapshot service:
+
+```bash
+cargo run -p tunnelproxy-control-plane --bin tunnelproxy-control-plane -- \
+  serve --database snapshots.sqlite --listen 127.0.0.1:7200 \
+  --tls-cert control-plane.pem --tls-key control-plane-key.pem \
+  --edge-client-ca edge-ca.pem
+```
+
+Configure Edge dynamic authorization in addition to its Agent-facing TLS:
+
+```bash
+cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- \
+  --tls-cert edge-server.pem --tls-key edge-server-key.pem \
+  --tls-client-ca agent-ca.pem --tunnel-id tunnel-prod \
+  --snapshot-server 127.0.0.1:7200 --snapshot-ca control-plane-ca.pem \
+  --snapshot-client-cert edge-client.pem \
+  --snapshot-client-key edge-client-key.pem \
+  --snapshot-server-name control-plane.internal
+```
+
+Do not also pass `--authorized-client-cert` in snapshot mode. Partial groups are
+invalid. Edge authenticates and downloads the initial full snapshot before it
+binds either listener. Later imports with a higher version are picked up by the
+Control Plane refresh interval. A running Edge retains cached authority as
+`Stale` during service restart, but a cold Edge currently needs the service
+online.

@@ -21,6 +21,7 @@
 | 15      | Authenticated Tunnel Identity & Registration   | complete |
 | 16      | Control-Plane Snapshot Distribution & Live Revocation | complete |
 | 17      | Persistent Snapshot Storage & Authenticated Edge Bootstrap | complete |
+| 18      | Runnable Snapshot Service & Operations Wiring  | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -632,3 +633,37 @@ Out of scope:
 - Administrative mutation API, accounts, quotas, and certificate issuance.
 - Edge disk cache across a Control Plane outage at cold startup.
 - Certificate rotation/hot reload, multi-edge ownership, and public ingress.
+
+## Session 18 — Runnable Snapshot Service & Operations Wiring — complete
+
+Scope delivered:
+
+- Added a strict, unknown-field-denying JSON manifest for complete snapshots.
+  Input, agent/tunnel cardinality, IDs, fingerprints, status, duplicate grants,
+  and non-zero versions are validated before storage.
+- Added `tunnelproxy-control-plane import`, which reads at most 1 MiB and uses
+  Session 17 transaction/idempotency/stale/conflict rules to initialize or
+  replace the durable authority.
+- Added `PersistentSnapshotAuthority::refresh_from_repository` and a supervised
+  `ControlPlaneRuntime`. The runtime refuses uninitialized storage, polls with
+  skipped missed ticks, publishes only committed versions, owns the mTLS server,
+  and joins it on shutdown.
+- Added `tunnelproxy-control-plane serve` with required database/server
+  certificate/key/Edge CA inputs plus bounded capacity, TLS, request, and
+  refresh settings. Ctrl-C/SIGTERM maps to owned runtime cleanup and stable exit
+  codes.
+- Added `SnapshotAwareEdgeRuntime`, which completes authenticated bootstrap
+  before binding Edge listeners and supervises Edge plus snapshot reconnect
+  under one shutdown lifecycle.
+- Extended the Edge CLI with a mutually exclusive dynamic snapshot mode while
+  preserving plaintext loopback and static mTLS authorization modes.
+- Added 11 unit, integration, and process tests for manifests, import CLI,
+  external refresh, uninitialized startup, Control Plane restart, full routed
+  Edge composition, cold-bootstrap listener rollback, CLI modes, and shutdown.
+  The workspace now contains 226 explicit tests.
+
+Out of scope:
+
+- General admin HTTP/CRUD APIs, users/accounts, quotas, and billing.
+- Edge disk cache for cold startup while Control Plane is unavailable.
+- Certificate rotation/hot reload, public ingress, and multi-edge consensus.

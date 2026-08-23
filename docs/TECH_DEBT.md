@@ -196,8 +196,8 @@
   and exposes a dedicated mutually authenticated snapshot service. A fresh Edge
   bootstraps from that service; reconnect uses its last in-memory version, and
   ingress continues to use cached memory without storage/network lookup.
-- **Tracking:** resolved in Session 17. Edge cold-start cache during simultaneous
-  Control Plane outage and production process wiring are separate future work.
+- **Tracking:** persistence resolved in Session 17 and runnable process wiring
+  completed in Session 18. Edge cold-start cache is tracked separately below.
 
 ### DEBT-017 — TLS certificates are static process-start configuration
 
@@ -216,6 +216,21 @@
   support atomic reload/rotation, and test revocation without querying storage
   on the data-plane hot path.
 - **Tracking:** open; static files are not a production credential lifecycle.
+
+### DEBT-018 — Dynamic Edge cannot cold start without Control Plane
+
+- **Introduced in:** Session 18
+- **Category:** reliability / security
+- **Impact:** medium
+- **Rationale:** A running Edge deliberately retains the last authenticated
+  in-memory snapshot while distribution reconnects, but a new process has no
+  trusted local authority. Session 18 therefore bootstraps before binding and
+  fails closed when Control Plane is unavailable.
+- **Exit plan:** Atomically persist the last authenticated canonical snapshot on
+  Edge with integrity/version metadata and rollback protection. Make stale disk
+  bootstrap explicit and observable, then reconcile immediately with a newer
+  authenticated server version.
+- **Tracking:** planned for Session 19.
 
 ## Resolved items
 

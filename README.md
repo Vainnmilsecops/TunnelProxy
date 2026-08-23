@@ -33,6 +33,9 @@ correct agent, which in turn proxies them into the local service.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
+- Transactional SQLite snapshot persistence, strict JSON full-snapshot import,
+  a runnable mutual-TLS Control Plane service, and snapshot-aware Edge CLI
+  bootstrap/reconnect supervision.
 - Real loopback integration tests for framing, forwarding, lifecycle, liveness,
   and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -42,7 +45,7 @@ The following are **not yet implemented**:
 - Credit/window-based flow control and strict weighted stream scheduling.
 - Public HTTP reverse proxy and hostname allocation.
 - Public-ingress TLS and public-client access authorization.
-- Persistent control-plane storage and an external control-plane service/API.
+- General administrative/account API and Edge cold-start disk cache.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
 
@@ -83,9 +86,9 @@ The architecture conceptually separates:
   request/response traffic.
 
 Today the control-plane crate provides versioned certificate/Agent/tunnel
-authorization snapshots and bounded in-process distribution, but no database
-or external service API. The data plane has a tested loopback raw-TCP reverse
-path but no public HTTP/TLS routing. See
+authorization snapshots, SQLite persistence, full-snapshot import, and a
+runnable authenticated distribution service. The data plane has a tested
+loopback raw-TCP reverse path but no public HTTP/TLS routing. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -163,6 +166,7 @@ and Definition of Done.
 | 13 _(complete)_ | Agent reconnect and loopback raw-route recovery |
 | 14 _(complete)_ | mutual TLS and certificate-authenticated Agent transport |
 | 15 _(complete)_ | Protocol v2 authenticated identity and durable tunnel routing |
+| 16–18 _(complete)_ | live revocation, persistent snapshots, and runnable Control Plane/Edge wiring |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
