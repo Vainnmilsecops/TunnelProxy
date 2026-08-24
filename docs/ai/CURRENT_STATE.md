@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Reproducible Builds & GitHub CI** (Session 24).
+**Bounded Public HTTPS/HTTP/1.1 Ingress** (Session 25).
 
 ## Completed
 
@@ -285,7 +285,28 @@
 - The MSRV path retains the workspace-level `forbid(unsafe_code)` policy while
   avoiding redundant crate-level lint overrides, and locks transitive
   dependencies to Cargo-1.75-readable releases.
-- 261 explicit workspace tests are present; all prior behavior is preserved.
+- Edge can replace its raw listener with bounded HTTPS/HTTP/1.1 ingress for one
+  exact configured DNS hostname and TunnelId. HTTP routing uses only cached
+  hostname and live-session state; Agent-offline requests fail closed.
+- Public HTTPS has explicit global/per-source-IP connection admission, public
+  opt-in, Agent-facing mTLS, and external dynamic snapshot requirements.
+  Loopback remains the safe default.
+- Public TLS is a separate server-only rustls configuration with bounded
+  handshake time, HTTP/1.1 ALPN, secret-safe diagnostics, expiry status, and
+  optional atomic digest-manifest generation reload.
+- Host, SNI, and absolute-form authority are normalized and compared exactly.
+  CONNECT, upgrades, unknown hosts, duplicate/missing Host, and host-fronting
+  attempts are rejected before a tunnel stream opens.
+- Edge strips hop-by-hop fields plus untrusted `Forwarded` and
+  `X-Forwarded-*`, then supplies canonical `X-Forwarded-For`,
+  `X-Forwarded-Proto`, `X-Forwarded-Host`, and Host values to the local service.
+- Header bytes/count, request-body size, header-read/full-request deadlines,
+  connection count, per-IP count, duplex capacity, and drain deadline are
+  bounded. HTTPS drains before Agent transport shutdown.
+- `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
+  the HTTP client connection can reuse the existing multiplexed Tunnel
+  Protocol v2 path without a wire-format change.
+- 270 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -301,7 +322,8 @@
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
 - Automatic public port/hostname allocation and durable endpoint catalog.
-- Public HTTP/TLS reverse proxy, hostname allocation, and signed access URLs.
+- HTTP/2, HTTP keep-alive, WebSocket/upgrade, CONNECT, custom-domain
+  administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, request-rate
   limiting, and distributed DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -312,8 +334,7 @@
 
 ## Next planned session
 
-Session 25 should add a bounded public HTTPS/HTTP/1.1 vertical slice with exact
-hostname-to-TunnelId routing, forwarding-header sanitization, public-side TLS
-termination/reload, and no Control Plane lookup on the request hot path. Signed
-access URLs, general domain administration, HTTP/2, and multi-edge ownership
-remain separate scopes.
+Session 26 has not been selected. The next plan should choose one bounded scope
+from public HTTP abuse controls/telemetry, durable hostname administration, or
+transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
+separate larger scopes.

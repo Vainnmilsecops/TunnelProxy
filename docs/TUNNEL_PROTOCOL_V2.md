@@ -122,6 +122,8 @@ session. If no session exists, the socket is closed; no stale session is reused.
 - No certificate issuance or managed PKI. Session 20 can reload operator-
   published TLS generations, and Session 16 authorization snapshots can revoke
   an exact Agent leaf.
-- No public HTTP/TLS termination, hostname allocation, multiple tunnels per
-  transport, multi-edge coordination, or interrupted-stream replay. Explicit
-  opaque public raw TCP is available under the Session 23 policy.
+- Public HTTPS/HTTP/1.1 termination and exact hostname routing are implemented
+  at Edge in Session 25 by adapting HTTP to this existing byte-stream API; no
+  frame or payload changed. Automatic hostname allocation, multiple tunnels per
+  transport, multi-edge coordination, and interrupted-stream replay remain out
+  of scope. Explicit opaque public raw TCP remains available under Session 23.

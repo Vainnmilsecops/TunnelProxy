@@ -112,6 +112,25 @@ fn fresh_addr() -> SocketAddr {
     addr
 }
 
+/// Connect after a spawned `Forwarder::run` has completed its asynchronous
+/// bind. Reserving and releasing an ephemeral port does not guarantee the
+/// listener task will be polled before the client on every Tokio/OS scheduler.
+async fn connect_eventually(addr: SocketAddr) -> TcpStream {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected forwarder connect error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("forwarder listener did not bind before the deadline")
+}
+
 /// Drain a `ReadHalf<TcpStream>` until EOF. Used to keep the read
 /// side alive across the lifetime of a relay under test.
 async fn drain_until_eof(mut stream: tokio::io::ReadHalf<TcpStream>) {
@@ -198,7 +217,7 @@ async fn forwarder_capacity_limit_one_rejects_then_releases() {
     // Connection A: open + write + keep reader alive (drains the echo
     // stream from upstream). We deliberately do NOT shut down for
     // ~500 ms so the relay holds the permit across B's attempt.
-    let stream_a = TcpStream::connect(listen_addr).await.unwrap();
+    let stream_a = connect_eventually(listen_addr).await;
     let (read_a, mut write_a) = tokio::io::split(stream_a);
     let writer_task = tokio::spawn(async move {
         write_a.write_all(b"A-payload").await.unwrap();
@@ -427,7 +446,7 @@ async fn forwarder_recoverable_failure_does_not_kill_listener() {
     let server = tokio::spawn(forwarder.run());
 
     for _ in 0..2 {
-        let mut c = TcpStream::connect(listen_addr).await.unwrap();
+        let mut c = connect_eventually(listen_addr).await;
         let mut buf = [0u8; 16];
         let r = timeout(Duration::from_secs(3), c.read(&mut buf))
             .await
@@ -488,7 +507,7 @@ async fn forwarder_failure_then_recovery_via_restart() {
     let server_bad = tokio::spawn(Forwarder::new(cfg_bad).unwrap().run());
 
     {
-        let mut c = TcpStream::connect(listen_addr_bad).await.unwrap();
+        let mut c = connect_eventually(listen_addr_bad).await;
         let mut buf = [0u8; 16];
         let r = timeout(Duration::from_secs(3), c.read(&mut buf))
             .await
@@ -511,7 +530,7 @@ async fn forwarder_failure_then_recovery_via_restart() {
     };
     let server_good = tokio::spawn(Forwarder::new(cfg_good).unwrap().run());
 
-    let mut client = TcpStream::connect(listen_addr_good).await.unwrap();
+    let mut client = connect_eventually(listen_addr_good).await;
     client.write_all(b"recovery hello").await.unwrap();
     client.shutdown().await.unwrap();
     let mut got = Vec::new();

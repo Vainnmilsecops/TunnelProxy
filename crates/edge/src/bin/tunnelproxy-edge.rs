@@ -17,8 +17,10 @@ use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
     EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
     EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
-    RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
-    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
+    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy, PublicTlsConfig,
+    PublicTlsConfigError, PublicTlsReloadBootstrapError, PublicTlsReloadConfig,
+    PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownConfig,
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
 };
 
 const USAGE: &str = "\
@@ -33,6 +35,19 @@ Options:
   --max-raw-connections <usize>    ingress limit (default 32)
   --allow-public-raw-ingress       explicitly allow a non-loopback raw listener
   --max-raw-connections-per-ip <usize> required per-IP limit in public mode
+  --https-listen <addr>            replace raw ingress with HTTPS
+  --https-host <hostname>          exact public hostname routed to Tunnel ID
+  --public-tls-cert <path>         public HTTPS certificate PEM
+  --public-tls-key <path>          public HTTPS private key PEM
+  --public-tls-reload-manifest <path> public HTTPS TLS generation manifest
+  --allow-public-https-ingress     explicitly allow non-loopback HTTPS
+  --max-http-connections <usize>   HTTPS connection limit (default 32)
+  --max-http-connections-per-ip <usize> required per-IP public HTTPS limit
+  --max-http-header-bytes <usize>  HTTP/1 buffer (default 16384)
+  --max-http-headers <usize>       header count (default 64)
+  --max-http-request-body-bytes <usize> body limit (default 10485760)
+  --http-header-timeout-ms <ms>    header deadline (default 10000)
+  --http-request-timeout-ms <ms>   full request deadline (default 60000)
   --drain-timeout-ms <ms>          stage drain   (default 10000)
   --tls-cert <path>                Edge certificate PEM
   --tls-key <path>                 Edge private key PEM
@@ -96,6 +111,14 @@ async fn main() -> ExitCode {
     config.max_raw_connections = parsed.max_raw_connections;
     config.raw_exposure = raw_exposure;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+    let (https_ingress, public_tls_reloader) = match load_https_configuration(&parsed).await {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            error!(%error, "failed to configure public HTTPS ingress");
+            return ExitCode::from(2);
+        }
+    };
+    config.https_ingress = https_ingress;
     let authorization = match load_transport_configuration(&parsed).await {
         Ok(configuration) => configuration,
         Err(error) => {
@@ -107,8 +130,9 @@ async fn main() -> ExitCode {
         LoadedAuthorization::Static {
             security,
             registration,
-            reloaders,
+            mut reloaders,
         } => {
+            reloaders.public = public_tls_reloader;
             config.multiplex.security = security;
             config.multiplex.registration = registration;
             run_static_edge(config, reloaders, &parsed).await
@@ -117,8 +141,9 @@ async fn main() -> ExitCode {
             security,
             snapshots,
             cache,
-            reloaders,
+            mut reloaders,
         } => {
+            reloaders.public = public_tls_reloader;
             config.multiplex.security = security;
             run_snapshot_edge(config, snapshots, cache, reloaders, &parsed).await
         }
@@ -245,6 +270,8 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
     info!(
         %agent_addr,
         raw_addr = %parsed.raw_listen,
+        https_addr = ?parsed.https_listen,
+        https_host = ?parsed.https_host,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
         public_raw_ingress = parsed.allow_public_raw_ingress,
@@ -311,6 +338,21 @@ struct ParsedArgs {
     max_raw_connections: usize,
     allow_public_raw_ingress: bool,
     max_raw_connections_per_ip: Option<usize>,
+    raw_options_present: bool,
+    https_options_present: bool,
+    https_listen: Option<SocketAddr>,
+    https_host: Option<HttpHostname>,
+    public_tls_cert: Option<PathBuf>,
+    public_tls_key: Option<PathBuf>,
+    public_tls_reload_manifest: Option<PathBuf>,
+    allow_public_https_ingress: bool,
+    max_http_connections: usize,
+    max_http_connections_per_ip: Option<usize>,
+    max_http_header_bytes: usize,
+    max_http_headers: usize,
+    max_http_request_body_bytes: usize,
+    http_header_timeout: Duration,
+    http_request_timeout: Duration,
     drain_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -349,6 +391,21 @@ impl Default for ParsedArgs {
             max_raw_connections: 32,
             allow_public_raw_ingress: false,
             max_raw_connections_per_ip: None,
+            raw_options_present: false,
+            https_options_present: false,
+            https_listen: None,
+            https_host: None,
+            public_tls_cert: None,
+            public_tls_key: None,
+            public_tls_reload_manifest: None,
+            allow_public_https_ingress: false,
+            max_http_connections: 32,
+            max_http_connections_per_ip: None,
+            max_http_header_bytes: 16 * 1024,
+            max_http_headers: 64,
+            max_http_request_body_bytes: 10 * 1024 * 1024,
+            http_header_timeout: Duration::from_secs(10),
+            http_request_timeout: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(10),
             tls_cert: None,
             tls_key: None,
@@ -388,6 +445,12 @@ enum ArgError {
     PublicRawPerIpLimitRequired,
     PublicRawPerIpLimitWithoutOptIn,
     PublicRawPerIpLimitInvalid,
+    InvalidHostname(String),
+    IngressModeConflict,
+    PublicHttpsOptInRequired,
+    PublicHttpsPerIpLimitRequired,
+    PublicHttpsPerIpLimitWithoutOptIn,
+    PublicHttpsPerIpLimitInvalid,
     UnknownFlag(String),
 }
 
@@ -416,6 +479,22 @@ impl std::fmt::Display for ArgError {
             Self::PublicRawPerIpLimitInvalid => f.write_str(
                 "--max-raw-connections-per-ip must be non-zero and cannot exceed --max-raw-connections",
             ),
+            Self::InvalidHostname(value) => write!(f, "invalid HTTPS hostname: {value}"),
+            Self::IngressModeConflict => {
+                f.write_str("raw-ingress options cannot be combined with --https-listen")
+            }
+            Self::PublicHttpsOptInRequired => f.write_str(
+                "a non-loopback HTTPS listener requires --allow-public-https-ingress",
+            ),
+            Self::PublicHttpsPerIpLimitRequired => f.write_str(
+                "public HTTPS ingress requires --max-http-connections-per-ip",
+            ),
+            Self::PublicHttpsPerIpLimitWithoutOptIn => f.write_str(
+                "--max-http-connections-per-ip requires --allow-public-https-ingress",
+            ),
+            Self::PublicHttpsPerIpLimitInvalid => f.write_str(
+                "--max-http-connections-per-ip must be non-zero and cannot exceed --max-http-connections",
+            ),
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
@@ -437,6 +516,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--raw-listen" => {
                 parsed.raw_listen = parse_addr(args, index, flag)?;
+                parsed.raw_options_present = true;
                 index += 2;
             }
             "--agent-id" => {
@@ -453,14 +533,88 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-raw-connections" => {
                 parsed.max_raw_connections = parse_number(args, index, flag)?;
+                parsed.raw_options_present = true;
                 index += 2;
             }
             "--allow-public-raw-ingress" => {
                 parsed.allow_public_raw_ingress = true;
+                parsed.raw_options_present = true;
                 index += 1;
             }
             "--max-raw-connections-per-ip" => {
                 parsed.max_raw_connections_per_ip = Some(parse_number(args, index, flag)?);
+                parsed.raw_options_present = true;
+                index += 2;
+            }
+            "--https-listen" => {
+                parsed.https_listen = Some(parse_addr(args, index, flag)?);
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--https-host" => {
+                let raw = value(args, index, flag)?;
+                parsed.https_host = Some(
+                    HttpHostname::new(raw)
+                        .map_err(|_| ArgError::InvalidHostname(raw.to_owned()))?,
+                );
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--public-tls-cert" => {
+                parsed.public_tls_cert = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--public-tls-key" => {
+                parsed.public_tls_key = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--public-tls-reload-manifest" => {
+                parsed.public_tls_reload_manifest = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--allow-public-https-ingress" => {
+                parsed.allow_public_https_ingress = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--max-http-connections" => {
+                parsed.max_http_connections = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-connections-per-ip" => {
+                parsed.max_http_connections_per_ip = Some(parse_number(args, index, flag)?);
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-header-bytes" => {
+                parsed.max_http_header_bytes = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-headers" => {
+                parsed.max_http_headers = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-request-body-bytes" => {
+                parsed.max_http_request_body_bytes = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-header-timeout-ms" => {
+                parsed.http_header_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-request-timeout-ms" => {
+                parsed.http_request_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.https_options_present = true;
                 index += 2;
             }
             "--drain-timeout-ms" => {
@@ -583,6 +737,12 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
 }
 
 fn raw_exposure_policy(parsed: &ParsedArgs) -> Result<RawIngressExposurePolicy, ArgError> {
+    if parsed.https_listen.is_some() {
+        if parsed.raw_options_present {
+            return Err(ArgError::IngressModeConflict);
+        }
+        return Ok(RawIngressExposurePolicy::LoopbackOnly);
+    }
     if !parsed.allow_public_raw_ingress {
         if parsed.max_raw_connections_per_ip.is_some() {
             return Err(ArgError::PublicRawPerIpLimitWithoutOptIn);
@@ -603,6 +763,33 @@ fn raw_exposure_policy(parsed: &ParsedArgs) -> Result<RawIngressExposurePolicy, 
     })
 }
 
+fn https_exposure_policy(parsed: &ParsedArgs) -> Result<HttpIngressExposurePolicy, ArgError> {
+    let Some(listen_addr) = parsed.https_listen else {
+        if parsed.max_http_connections_per_ip.is_some() {
+            return Err(ArgError::PublicHttpsPerIpLimitWithoutOptIn);
+        }
+        return Ok(HttpIngressExposurePolicy::LoopbackOnly);
+    };
+    if !parsed.allow_public_https_ingress {
+        if parsed.max_http_connections_per_ip.is_some() {
+            return Err(ArgError::PublicHttpsPerIpLimitWithoutOptIn);
+        }
+        if !listen_addr.ip().is_loopback() {
+            return Err(ArgError::PublicHttpsOptInRequired);
+        }
+        return Ok(HttpIngressExposurePolicy::LoopbackOnly);
+    }
+    let max_connections_per_ip = parsed
+        .max_http_connections_per_ip
+        .ok_or(ArgError::PublicHttpsPerIpLimitRequired)?;
+    if max_connections_per_ip == 0 || max_connections_per_ip > parsed.max_http_connections {
+        return Err(ArgError::PublicHttpsPerIpLimitInvalid);
+    }
+    Ok(HttpIngressExposurePolicy::Public {
+        max_connections_per_ip,
+    })
+}
+
 #[derive(Debug)]
 enum TlsLoadError {
     IncompleteArguments,
@@ -618,6 +805,12 @@ enum TlsLoadError {
     ReloadArguments,
     EdgeReload(EdgeTlsReloadBootstrapError),
     SnapshotReload(SnapshotTlsReloadBootstrapError),
+    IncompletePublicHttpsArguments,
+    PublicHttpsWithoutListener,
+    PublicHttpsExposure(ArgError),
+    InvalidPublicTls(PublicTlsConfigError),
+    InvalidHttpIngress(tunnelproxy_edge::HttpIngressConfigError),
+    PublicReload(PublicTlsReloadBootstrapError),
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -654,6 +847,16 @@ impl std::fmt::Display for TlsLoadError {
             Self::SnapshotReload(error) => {
                 write!(f, "snapshot-client TLS reload is invalid: {error}")
             }
+            Self::IncompletePublicHttpsArguments => f.write_str(
+                "HTTPS ingress requires --https-listen, --https-host, --public-tls-cert, and --public-tls-key",
+            ),
+            Self::PublicHttpsWithoutListener => {
+                f.write_str("public HTTPS options require --https-listen")
+            }
+            Self::PublicHttpsExposure(error) => error.fmt(f),
+            Self::InvalidPublicTls(error) => write!(f, "invalid public TLS configuration: {error}"),
+            Self::InvalidHttpIngress(error) => write!(f, "invalid HTTPS ingress: {error}"),
+            Self::PublicReload(error) => write!(f, "public TLS reload is invalid: {error}"),
         }
     }
 }
@@ -662,6 +865,7 @@ impl std::fmt::Display for TlsLoadError {
 struct LoadedTlsReloaders {
     edge: Option<EdgeTlsReloadRuntime>,
     snapshot: Option<SnapshotClientTlsReloadRuntime>,
+    public: Option<PublicTlsReloadRuntime>,
 }
 
 impl LoadedTlsReloaders {
@@ -688,6 +892,15 @@ impl LoadedTlsReloaders {
                     .map_err(TlsReloadSupervisorError::Snapshot)
             });
         }
+        if let Some(runtime) = self.public {
+            let child_signal = signal.clone();
+            tasks.spawn(async move {
+                runtime
+                    .run_until_shutdown(child_signal)
+                    .await
+                    .map_err(TlsReloadSupervisorError::Public)
+            });
+        }
         if tasks.is_empty() {
             signal.cancelled().await;
             return Ok(());
@@ -711,6 +924,7 @@ impl LoadedTlsReloaders {
 enum TlsReloadSupervisorError {
     Edge(tunnelproxy_common::TlsReloadRuntimeError),
     Snapshot(tunnelproxy_common::TlsReloadRuntimeError),
+    Public(tunnelproxy_common::TlsReloadRuntimeError),
     Task,
 }
 
@@ -719,6 +933,7 @@ impl std::fmt::Display for TlsReloadSupervisorError {
         match self {
             Self::Edge(error) => write!(f, "Agent-facing TLS reload failed: {error}"),
             Self::Snapshot(error) => write!(f, "snapshot-client TLS reload failed: {error}"),
+            Self::Public(error) => write!(f, "public TLS reload failed: {error}"),
             Self::Task => f.write_str("TLS reload task stopped unexpectedly"),
         }
     }
@@ -806,6 +1021,7 @@ async fn load_transport_configuration(
                         reloaders: LoadedTlsReloaders {
                             edge: Some(runtime),
                             snapshot: None,
+                            public: None,
                         },
                     });
                 }
@@ -862,6 +1078,7 @@ async fn load_transport_configuration(
                     reloaders: LoadedTlsReloaders {
                         edge: edge_reloader,
                         snapshot: None,
+                        public: None,
                     },
                 })
             }
@@ -940,6 +1157,7 @@ async fn load_snapshot_configuration(
         reloaders: LoadedTlsReloaders {
             edge: edge_reloader,
             snapshot: snapshot_reloader,
+            public: None,
         },
     })
 }
@@ -964,6 +1182,68 @@ fn snapshot_cache_configuration(
         }
         _ => Err(TlsLoadError::IncompleteSnapshotCacheArguments),
     }
+}
+
+async fn load_https_configuration(
+    parsed: &ParsedArgs,
+) -> Result<(Option<HttpIngressConfig>, Option<PublicTlsReloadRuntime>), TlsLoadError> {
+    let Some(listen_addr) = parsed.https_listen else {
+        if parsed.https_options_present {
+            return Err(TlsLoadError::PublicHttpsWithoutListener);
+        }
+        return Ok((None, None));
+    };
+    let (Some(hostname), Some(certificate_path), Some(private_key_path)) = (
+        parsed.https_host.clone(),
+        parsed.public_tls_cert.clone(),
+        parsed.public_tls_key.clone(),
+    ) else {
+        return Err(TlsLoadError::IncompletePublicHttpsArguments);
+    };
+    let exposure = https_exposure_policy(parsed).map_err(TlsLoadError::PublicHttpsExposure)?;
+    let (tls, reloader) = match &parsed.public_tls_reload_manifest {
+        Some(manifest_path) => {
+            let (tls, runtime) = PublicTlsReloadRuntime::bootstrap(
+                PublicTlsReloadConfig {
+                    manifest_path: manifest_path.clone(),
+                    server_certificate_path: certificate_path,
+                    server_private_key_path: private_key_path,
+                    poll_interval: parsed.tls_reload_interval,
+                    expiry_warning: parsed.tls_expiry_warning,
+                },
+                parsed.tls_handshake_timeout,
+            )
+            .await
+            .map_err(TlsLoadError::PublicReload)?;
+            (tls, Some(runtime))
+        }
+        None => {
+            let certificate = read_tls_file(&certificate_path, "public server certificate").await?;
+            let private_key = read_tls_file(&private_key_path, "public server private key").await?;
+            let tls =
+                PublicTlsConfig::from_pem(&certificate, &private_key, parsed.tls_handshake_timeout)
+                    .map_err(TlsLoadError::InvalidPublicTls)?;
+            (tls, None)
+        }
+    };
+    let config = HttpIngressConfig {
+        listen_addr,
+        routes: HttpHostRoutes::single(hostname, parsed.tunnel_id.clone()),
+        tls,
+        exposure,
+        max_concurrent_connections: parsed.max_http_connections,
+        max_header_bytes: parsed.max_http_header_bytes,
+        max_headers: parsed.max_http_headers,
+        max_request_body_bytes: parsed.max_http_request_body_bytes,
+        header_read_timeout: parsed.http_header_timeout,
+        request_timeout: parsed.http_request_timeout,
+        duplex_capacity: 64 * 1024,
+        shutdown: RuntimeShutdownConfig::new(parsed.drain_timeout),
+    };
+    config
+        .validate()
+        .map_err(TlsLoadError::InvalidHttpIngress)?;
+    Ok((Some(config), reloader))
 }
 
 async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, TlsLoadError> {
@@ -1203,6 +1483,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_https_cli_policy_is_exact_complete_and_mutually_exclusive() {
+        let parsed = parse_args(&args(&[
+            "--https-listen",
+            "0.0.0.0:443",
+            "--https-host",
+            "Demo.Example.Test.",
+            "--public-tls-cert",
+            "public.pem",
+            "--public-tls-key",
+            "public-key.pem",
+            "--public-tls-reload-manifest",
+            "public-tls.json",
+            "--allow-public-https-ingress",
+            "--max-http-connections",
+            "20",
+            "--max-http-connections-per-ip",
+            "4",
+            "--max-http-header-bytes",
+            "32768",
+            "--max-http-headers",
+            "40",
+            "--max-http-request-body-bytes",
+            "2048",
+            "--http-header-timeout-ms",
+            "301",
+            "--http-request-timeout-ms",
+            "302",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.https_listen.unwrap().port(), 443);
+        assert_eq!(
+            parsed.https_host.as_ref().unwrap().as_str(),
+            "demo.example.test"
+        );
+        assert_eq!(parsed.max_http_connections, 20);
+        assert_eq!(parsed.max_http_connections_per_ip, Some(4));
+        assert_eq!(parsed.max_http_header_bytes, 32768);
+        assert_eq!(parsed.max_http_headers, 40);
+        assert_eq!(parsed.max_http_request_body_bytes, 2048);
+        assert_eq!(
+            https_exposure_policy(&parsed),
+            Ok(HttpIngressExposurePolicy::Public {
+                max_connections_per_ip: 4
+            })
+        );
+
+        let implicit = parse_args(&args(&["--https-listen", "0.0.0.0:443"])).unwrap();
+        assert_eq!(
+            https_exposure_policy(&implicit),
+            Err(ArgError::PublicHttpsOptInRequired)
+        );
+        let conflicting = parse_args(&args(&[
+            "--https-listen",
+            "127.0.0.1:8443",
+            "--raw-listen",
+            "127.0.0.1:7000",
+        ]))
+        .unwrap();
+        assert_eq!(
+            raw_exposure_policy(&conflicting),
+            Err(ArgError::IngressModeConflict)
+        );
+        assert!(matches!(
+            parse_args(&args(&["--https-host", "bad_host"])),
+            Err(ArgError::InvalidHostname(_))
+        ));
+    }
+
     #[tokio::test]
     async fn partial_tls_arguments_are_rejected() {
         let parsed = ParsedArgs {
@@ -1252,6 +1601,23 @@ mod tests {
         assert!(matches!(
             snapshot_cache_configuration(&partial_cache),
             Err(TlsLoadError::IncompleteSnapshotCacheArguments)
+        ));
+
+        let partial_https = ParsedArgs {
+            https_listen: Some("127.0.0.1:8443".parse().unwrap()),
+            https_host: Some(HttpHostname::new("demo.example.test").unwrap()),
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_https_configuration(&partial_https).await,
+            Err(TlsLoadError::IncompletePublicHttpsArguments)
+        ));
+
+        let orphaned_https_option = parse_args(&args(&["--max-http-connections", "8"]))
+            .expect("the option value itself is valid");
+        assert!(matches!(
+            load_https_configuration(&orphaned_https_option).await,
+            Err(TlsLoadError::PublicHttpsWithoutListener)
         ));
     }
 }

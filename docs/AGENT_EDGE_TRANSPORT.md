@@ -1,9 +1,9 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 16.
+> **Status:** Implemented through Session 25.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
-> bounded multiplexed raw-TCP transport. It does not describe public HTTP/TLS
-> ingress or persisted/multi-edge routing.
+> bounded multiplexed byte-stream transport. Public HTTP/TLS termination is an
+> Edge layer over these streams; persisted/multi-edge routing is not described.
 
 ## Purpose
 
@@ -42,8 +42,9 @@ Plaintext remains available only for an explicit loopback development
 allowlist. In mTLS mode Edge hashes the leaf certificate and authorizes its
 exact `AgentId`/`TunnelId` grant before REGISTERED. Versioned grant updates can
 revoke a live mapping/session without changing Protocol v2. Certificate
-rotation, persisted/external snapshot services, and future public HTTP ingress
-remain out of scope.
+rotation and persisted/external snapshot services remain separate layers.
+Session 25 public HTTPS reuses the same authenticated stream router and does not
+change this transport handshake or framing.
 
 ## Handshake Sequence
 

@@ -530,6 +530,35 @@ Edge does not provide public-client TLS or application authentication, and a
 stale Edge cache retains the bounded availability/revocation-delay tradeoff
 defined in Session 19.
 
+### 2.23 Bounded public HTTPS/HTTP/1.1 ingress (Session 25)
+
+The runnable Edge can replace its raw listener with one explicitly configured
+HTTPS listener. Public mode requires the same Agent-facing mutual TLS and live
+dynamic snapshot authority as public raw ingress. The public side uses a
+separate server-only TLS identity with ALPN `http/1.1`; its complete
+certificate/key generation can reload atomically for new handshakes.
+
+```text
+HTTPS client -> global/per-IP admission -> TLS + SNI -> HTTP/1.1 parser
+             -> exact cached Host -> TunnelId -> live Agent stream -> local HTTP
+```
+
+Configured DNS hostnames are ASCII-normalized and matched exactly. Each request
+must carry one valid Host matching TLS SNI; an absolute-form request target must
+match as well. Unknown hosts, host-fronting attempts, offline tunnels, CONNECT,
+and upgrades fail closed. Edge removes hop-by-hop fields and all untrusted
+`Forwarded`/`X-Forwarded-*` input, then writes canonical trusted forwarding
+headers before sending origin-form HTTP to the Agent's local service.
+
+Connection, per-IP, header-buffer, header-count, body, TLS-handshake,
+header-read, full-request, and duplex-buffer bounds are explicit. HTTP ingress
+reads only the immutable hostname table and the existing in-memory
+`TunnelId -> TransportSessionId` router; it never queries the Control Plane.
+Shutdown stops HTTPS admission and drains or force-joins its connection tasks
+before Agent transport shutdown. The first slice deliberately supports one
+HTTP/1.1 request per public TLS connection, with no HTTP/2, WebSocket/upgrade,
+CONNECT, automatic hostname allocation, or public-client authentication.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
@@ -551,7 +580,7 @@ request, the system will not scale and will not survive a database
 hiccup. The control plane's job is to push authoritative state into
 the data plane so the data plane never has to ask.
 
-## 4. Golden request flow (future)
+## 4. Golden request flow
 
 ```
 Public Client                  Edge                     Agent                Local

@@ -669,3 +669,35 @@ Windows validates the MSVC path without removing the local Visual Studio Build
 Tools requirement. Branch-protection settings, release artifacts, dependency
 update bots, vulnerability auditing, and code signing remain separate operator
 or future-session work.
+
+---
+
+## ADR-025 — Public HTTPS is an exact, bounded HTTP/1.1 ingress mode
+
+**Status:** Accepted (Session 25).
+
+**Context:** The authenticated multiplexed transport and dynamic authorization
+cache can already carry public raw TCP, but an HTTP product surface must
+terminate public TLS, prevent hostname confusion and forwarding-header spoofing,
+bound parser/request resources, and preserve the rule that ingress never asks
+the Control Plane to route a request.
+
+**Decision:** The runnable single-tunnel Edge may replace raw ingress with one
+HTTPS listener and an immutable exact hostname-to-TunnelId table. Public
+exposure requires explicit opt-in, global/per-IP admission, Agent mTLS, and
+external dynamic snapshot authorization. Public TLS uses an independent
+server-only rustls configuration and optional atomic generation reload. Every
+HTTP/1.1 request must have exactly one normalized Host equal to TLS SNI and any
+absolute-form authority. Edge rejects CONNECT/upgrades, strips hop-by-hop and
+untrusted forwarding headers, writes canonical forwarding metadata, and routes
+through the existing cached TunnelId/session map over a generic bounded async
+stream. Header, body, handshake, request, buffer, connection, and drain limits
+are validated before bind.
+
+**Consequences:** A manually configured hostname can reach a local HTTP service
+through public HTTPS without a Tunnel Protocol v2 or snapshot-format change and
+without storage/network lookup on the request hot path. The initial surface
+closes after one HTTP/1.1 request and deliberately excludes HTTP/2, upgrades,
+CONNECT, automatic hostname allocation, signed access URLs, public-client auth,
+distributed rate limiting, and multi-edge ownership. A configured stale
+snapshot cache retains the existing bounded revocation-delay tradeoff.

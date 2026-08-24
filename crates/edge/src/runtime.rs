@@ -10,9 +10,10 @@ use tunnelproxy_common::{
 };
 
 use crate::{
-    EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
-    RawIngressExposurePolicy, RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError,
-    RawIngressRouteManager,
+    EdgeSessionRouter, HttpIngressConfig, HttpIngressConfigError, HttpIngressError,
+    HttpIngressExposurePolicy, HttpIngressOutcome, HttpIngressRuntime, MultiplexedEdgeConfig,
+    MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RawIngressExposurePolicy,
+    RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteManager,
 };
 
 /// Complete configuration for the runnable single-tunnel Edge process.
@@ -23,6 +24,8 @@ pub struct EdgeRuntimeConfig {
     pub tunnel_id: TunnelId,
     pub max_raw_connections: usize,
     pub raw_exposure: RawIngressExposurePolicy,
+    /// When present, HTTPS replaces the raw listener for this process.
+    pub https_ingress: Option<HttpIngressConfig>,
     pub shutdown: RuntimeShutdownConfig,
 }
 
@@ -38,6 +41,7 @@ impl EdgeRuntimeConfig {
             tunnel_id: TunnelId::new("tunnel-dev").expect("hardcoded TunnelId is valid"),
             max_raw_connections: 32,
             raw_exposure: RawIngressExposurePolicy::LoopbackOnly,
+            https_ingress: None,
             shutdown: RuntimeShutdownConfig::default(),
         }
     }
@@ -49,38 +53,57 @@ impl EdgeRuntimeConfig {
         if self.multiplex.agent_listener.max_agent_sessions != 1 {
             return Err(EdgeRuntimeConfigError::AgentCapacityMustBeOne);
         }
-        if self.max_raw_connections == 0 {
-            return Err(EdgeRuntimeConfigError::ZeroRawConnections);
-        }
-        if self.max_raw_connections > u32::MAX as usize {
-            return Err(EdgeRuntimeConfigError::RawConnectionLimitTooLarge);
-        }
-        match self.raw_exposure {
-            RawIngressExposurePolicy::LoopbackOnly => {
-                if !self.raw_listen_addr.ip().is_loopback() {
-                    return Err(EdgeRuntimeConfigError::NonLoopbackRawListener(
-                        self.raw_listen_addr,
-                    ));
-                }
+        if let Some(https) = &self.https_ingress {
+            https.validate().map_err(EdgeRuntimeConfigError::Https)?;
+            if !https.routes.contains_tunnel(&self.tunnel_id) {
+                return Err(EdgeRuntimeConfigError::HttpsTunnelNotConfigured(
+                    self.tunnel_id.clone(),
+                ));
             }
-            RawIngressExposurePolicy::Public {
-                max_connections_per_ip,
-            } => {
-                if max_connections_per_ip == 0 {
-                    return Err(EdgeRuntimeConfigError::ZeroRawConnectionsPerIp);
-                }
-                if max_connections_per_ip > self.max_raw_connections {
-                    return Err(EdgeRuntimeConfigError::RawConnectionsPerIpExceedGlobal);
-                }
+            if matches!(https.exposure, HttpIngressExposurePolicy::Public { .. }) {
                 if !self.multiplex.security.is_tls() {
-                    return Err(EdgeRuntimeConfigError::PublicRawRequiresMutualTls);
+                    return Err(EdgeRuntimeConfigError::PublicHttpsRequiresMutualTls);
                 }
                 if !self
                     .multiplex
                     .registration
                     .is_dynamic_snapshot_authorization()
                 {
-                    return Err(EdgeRuntimeConfigError::PublicRawRequiresLiveAuthorization);
+                    return Err(EdgeRuntimeConfigError::PublicHttpsRequiresLiveAuthorization);
+                }
+            }
+        } else if self.max_raw_connections == 0 {
+            return Err(EdgeRuntimeConfigError::ZeroRawConnections);
+        } else if self.max_raw_connections > u32::MAX as usize {
+            return Err(EdgeRuntimeConfigError::RawConnectionLimitTooLarge);
+        } else {
+            match self.raw_exposure {
+                RawIngressExposurePolicy::LoopbackOnly => {
+                    if !self.raw_listen_addr.ip().is_loopback() {
+                        return Err(EdgeRuntimeConfigError::NonLoopbackRawListener(
+                            self.raw_listen_addr,
+                        ));
+                    }
+                }
+                RawIngressExposurePolicy::Public {
+                    max_connections_per_ip,
+                } => {
+                    if max_connections_per_ip == 0 {
+                        return Err(EdgeRuntimeConfigError::ZeroRawConnectionsPerIp);
+                    }
+                    if max_connections_per_ip > self.max_raw_connections {
+                        return Err(EdgeRuntimeConfigError::RawConnectionsPerIpExceedGlobal);
+                    }
+                    if !self.multiplex.security.is_tls() {
+                        return Err(EdgeRuntimeConfigError::PublicRawRequiresMutualTls);
+                    }
+                    if !self
+                        .multiplex
+                        .registration
+                        .is_dynamic_snapshot_authorization()
+                    {
+                        return Err(EdgeRuntimeConfigError::PublicRawRequiresLiveAuthorization);
+                    }
                 }
             }
         }
@@ -109,6 +132,10 @@ pub enum EdgeRuntimeConfigError {
     RawConnectionsPerIpExceedGlobal,
     PublicRawRequiresMutualTls,
     PublicRawRequiresLiveAuthorization,
+    Https(HttpIngressConfigError),
+    HttpsTunnelNotConfigured(TunnelId),
+    PublicHttpsRequiresMutualTls,
+    PublicHttpsRequiresLiveAuthorization,
     RawTunnelNotAuthorized(TunnelId),
     ZeroDrainTimeout,
 }
@@ -139,6 +166,17 @@ impl std::fmt::Display for EdgeRuntimeConfigError {
             Self::PublicRawRequiresLiveAuthorization => {
                 f.write_str("public raw ingress requires dynamic snapshot authorization")
             }
+            Self::Https(error) => write!(f, "invalid HTTPS ingress: {error}"),
+            Self::HttpsTunnelNotConfigured(tunnel_id) => write!(
+                f,
+                "HTTPS routes do not contain the configured TunnelId {tunnel_id}"
+            ),
+            Self::PublicHttpsRequiresMutualTls => {
+                f.write_str("public HTTPS ingress requires mutual TLS for Agent transport")
+            }
+            Self::PublicHttpsRequiresLiveAuthorization => {
+                f.write_str("public HTTPS ingress requires dynamic snapshot authorization")
+            }
             Self::RawTunnelNotAuthorized(tunnel_id) => write!(
                 f,
                 "raw TunnelId {tunnel_id} is absent from the registration policy"
@@ -159,12 +197,16 @@ pub struct EdgeRuntimeOutcome {
     pub route_generations: u64,
     pub successful_recoveries: u64,
     pub raw_routes: RuntimeShutdownOutcome,
+    pub https_ingress: Option<HttpIngressOutcome>,
     pub agent_sessions: RuntimeShutdownOutcome,
 }
 
 impl EdgeRuntimeOutcome {
-    pub const fn was_forced(self) -> bool {
+    pub fn was_forced(self) -> bool {
         matches!(self.raw_routes, RuntimeShutdownOutcome::Forced { .. })
+            || self
+                .https_ingress
+                .is_some_and(HttpIngressOutcome::was_forced)
             || matches!(self.agent_sessions, RuntimeShutdownOutcome::Forced { .. })
     }
 }
@@ -180,6 +222,10 @@ pub enum EdgeRuntimeError {
     TransportTask(String),
     TransportStopped,
     RouteShutdown(RawIngressRouteError),
+    HttpsStartup(HttpIngressError),
+    Https(HttpIngressError),
+    HttpsTask(String),
+    HttpsStopped,
     StartupRollback {
         startup: RawIngressRouteError,
         cleanup: Box<EdgeRuntimeError>,
@@ -197,6 +243,10 @@ impl std::fmt::Display for EdgeRuntimeError {
             Self::TransportTask(error) => write!(f, "Edge transport task failed: {error}"),
             Self::TransportStopped => f.write_str("Edge transport stopped unexpectedly"),
             Self::RouteShutdown(error) => write!(f, "raw route shutdown failed: {error}"),
+            Self::HttpsStartup(error) => write!(f, "HTTPS ingress startup failed: {error}"),
+            Self::Https(error) => write!(f, "HTTPS ingress failed: {error}"),
+            Self::HttpsTask(error) => write!(f, "HTTPS ingress task failed: {error}"),
+            Self::HttpsStopped => f.write_str("HTTPS ingress stopped unexpectedly"),
             Self::StartupRollback { startup, cleanup } => write!(
                 f,
                 "raw route startup failed ({startup}) and rollback also failed ({cleanup})"
@@ -213,8 +263,12 @@ impl std::error::Error for EdgeRuntimeError {
             Self::RouteStartup(error) | Self::RouteRecovery(error) | Self::RouteShutdown(error) => {
                 Some(error)
             }
+            Self::HttpsStartup(error) | Self::Https(error) => Some(error),
             Self::StartupRollback { startup, .. } => Some(startup),
-            Self::TransportTask(_) | Self::TransportStopped => None,
+            Self::TransportTask(_)
+            | Self::TransportStopped
+            | Self::HttpsTask(_)
+            | Self::HttpsStopped => None,
         }
     }
 }
@@ -262,6 +316,9 @@ impl EdgeRuntime {
         self,
         signal: ShutdownSignal,
     ) -> Result<EdgeRuntimeOutcome, EdgeRuntimeError> {
+        if let Some(https) = self.config.https_ingress.clone() {
+            return self.run_https_until_shutdown(https, signal).await;
+        }
         let router = self.transport.router();
         let manager =
             RawIngressRouteManager::new(router.clone(), RawIngressManagerConfig { max_routes: 1 })
@@ -349,6 +406,80 @@ impl EdgeRuntime {
             }
         }
     }
+
+    async fn run_https_until_shutdown(
+        self,
+        mut https_config: HttpIngressConfig,
+        signal: ShutdownSignal,
+    ) -> Result<EdgeRuntimeOutcome, EdgeRuntimeError> {
+        let router = self.transport.router();
+        let shutdown = self.config.shutdown;
+        https_config.shutdown = shutdown;
+        let ingress = HttpIngressRuntime::bind(https_config, router.clone())
+            .await
+            .map_err(EdgeRuntimeError::HttpsStartup)?;
+        let https_addr = ingress.local_addr();
+        let (transport_trigger, transport_signal) = shutdown_channel();
+        let (https_trigger, https_signal) = shutdown_channel();
+        let mut transport_task = tokio::spawn(
+            self.transport
+                .run_until_shutdown(transport_signal, shutdown),
+        );
+        let mut https_task = tokio::spawn(ingress.run_until_shutdown(https_signal));
+        let mut tunnels = router.subscribe_tunnels();
+        let mut current_session = None;
+        let mut sessions_seen = 0_u64;
+        info!(%https_addr, tunnel_id = %self.config.tunnel_id, event = "https_ingress_bound");
+
+        loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => {
+                    https_trigger.shutdown();
+                    let https = await_https(https_task).await?;
+                    transport_trigger.shutdown();
+                    let agent_sessions = await_transport(transport_task).await?;
+                    return Ok(EdgeRuntimeOutcome {
+                        agent_addr: self.agent_addr,
+                        raw_addr: None,
+                        agent_sessions_seen: sessions_seen,
+                        route_generations: 1,
+                        successful_recoveries: sessions_seen.saturating_sub(1),
+                        raw_routes: RuntimeShutdownOutcome::Drained { completed_tasks: 0 },
+                        https_ingress: Some(https),
+                        agent_sessions,
+                    });
+                }
+                result = &mut transport_task => {
+                    let error = unexpected_transport_result(result);
+                    https_trigger.shutdown();
+                    let _ = await_https(https_task).await;
+                    return Err(error);
+                }
+                result = &mut https_task => {
+                    transport_trigger.shutdown();
+                    let _ = await_transport(transport_task).await;
+                    return Err(unexpected_https_result(result));
+                }
+                changed = tunnels.changed() => {
+                    if changed.is_err() {
+                        return Err(EdgeRuntimeError::TransportStopped);
+                    }
+                    let next_session = tunnels
+                        .borrow()
+                        .iter()
+                        .find(|(tunnel_id, _)| tunnel_id == &self.config.tunnel_id)
+                        .map(|(_, session_id)| *session_id);
+                    if next_session != current_session {
+                        if next_session.is_some() {
+                            sessions_seen = sessions_seen.saturating_add(1);
+                        }
+                        current_session = next_session;
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn shutdown_components(
@@ -372,8 +503,29 @@ async fn shutdown_components(
         route_generations: progress.route_generations,
         successful_recoveries: progress.agent_sessions_seen.saturating_sub(1),
         raw_routes: raw_routes?,
+        https_ingress: None,
         agent_sessions: agent_sessions?,
     })
+}
+
+async fn await_https(
+    task: JoinHandle<Result<HttpIngressOutcome, HttpIngressError>>,
+) -> Result<HttpIngressOutcome, EdgeRuntimeError> {
+    match task.await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(EdgeRuntimeError::Https(error)),
+        Err(error) => Err(EdgeRuntimeError::HttpsTask(error.to_string())),
+    }
+}
+
+fn unexpected_https_result(
+    result: Result<Result<HttpIngressOutcome, HttpIngressError>, tokio::task::JoinError>,
+) -> EdgeRuntimeError {
+    match result {
+        Ok(Ok(_)) => EdgeRuntimeError::HttpsStopped,
+        Ok(Err(error)) => EdgeRuntimeError::Https(error),
+        Err(error) => EdgeRuntimeError::HttpsTask(error.to_string()),
+    }
 }
 
 async fn await_transport(
@@ -457,6 +609,7 @@ mod tests {
             route_generations: 1,
             successful_recoveries: 0,
             raw_routes: RuntimeShutdownOutcome::Drained { completed_tasks: 0 },
+            https_ingress: None,
             agent_sessions: RuntimeShutdownOutcome::Forced {
                 completed_tasks: 0,
                 aborted_tasks: 1,

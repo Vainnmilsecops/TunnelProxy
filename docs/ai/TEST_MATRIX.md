@@ -44,7 +44,11 @@
 | Forwarder: half-close preserved           | —    | ✅          | —   | `forwarder_preserves_half_close`.                                                                                           |
 | Forwarder: structured error categories    | ✅   | ✅          | —   | `ForwardError::category()` returns `"capacity_exhausted"`, `"upstream_connect_failed"`, `"upstream_connect_timeout"`, `"relay_io_failed"`; logged as `error_category`. |
 | Edge: TCP forwarder CLI                   | —    | —           | —   | `edge_dev` accepts `--listen`, `--upstream`, `--max-connections`, `--connect-timeout-ms`, `--help`; manually smoke-tested.   |
-| HTTP reverse proxy                        | —    | —           | —   | Planned after Session 04.                                                                                                   |
+| HTTPS/HTTP/1.1 reverse proxy              | ✅   | ✅          | —   | Real TLS crosses exact Host/SNI routing through Edge → Agent → local HTTP and validates the returned response. |
+| HTTP host-fronting defense                | ✅   | ✅          | —   | Exact Host/SNI/absolute authority validation rejects mismatches; unknown/offline routes fail closed. |
+| HTTP forwarding-header sanitization      | ✅   | ✅          | —   | Real local HTTP capture proves spoofed forwarding and Connection-nominated headers are removed and trusted values replace them. |
+| HTTP ingress resource bounds             | ✅   | ✅          | —   | Config/CLI validate global/per-IP connections, header bytes/count, body, TLS/header/request deadlines, duplex capacity, and drain. |
+| Public HTTPS TLS generation reload       | ✅   | ✅          | —   | Typed/secret-safe config plus a real manifest runtime test prove complete monotonic public certificate/key generation publication. |
 | Tunnel protocol framing                   | ✅   | —           | —   | Protocol v2 codec covers round-trip, binary, fragmentation, truncation, invalid magic/version/frame/flags/scope, bounds, real TCP, and explicit v1 rejection. |
 | Tunnel protocol: control stream scope    | ✅   | —           | —   | `frame::tests::frame_control_scope_validation` and `frame::tests::frame_stream_scope_validation`. |
 | Tunnel protocol: binary-safe payloads     | ✅   | —           | —   | `codec::tests::roundtrip_binary_payload` exercises 0x00–0xFF byte range. |
@@ -131,4 +135,4 @@
 | Session 21 enrollment schema migration    | ✅    | —           | —   | SQLite migration test opens the legacy schema and verifies revocation, activation-deadline, terminal-time, and schema-version fields before use. |
 | Durable raw route offline/reconnect       | ✅    | ✅           | —   | Listener remains bound, closes sockets while offline, and resolves the fresh authenticated session without rebind or storage lookup. |
 | Plaintext transport restriction           | ✅    | ✅           | —   | Runnable plaintext is loopback-only; a non-loopback Agent listener validates only when mutual TLS is configured. |
-| Request inspection                        | —    | —           | —   | Deferred to V1.                                                                                                             |
+| Request inspection                        | ✅   | ✅          | —   | Session 25 inspects only routing/security metadata for HTTP/1.1; application payload inspection, access rules, and replay remain deferred. |

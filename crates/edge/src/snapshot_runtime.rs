@@ -143,7 +143,7 @@ pub struct SnapshotAwareEdgeRuntimeOutcome {
 }
 
 impl SnapshotAwareEdgeRuntimeOutcome {
-    pub const fn was_forced(self) -> bool {
+    pub fn was_forced(self) -> bool {
         self.edge.was_forced()
     }
 }

@@ -36,8 +36,10 @@ use tunnelproxy_control_plane::{
 use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
     EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTlsReloadConfig,
-    EdgeTlsReloadRuntime, EdgeTransportSecurity, RawIngressExposurePolicy, RuntimeShutdownOutcome,
-    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
+    EdgeTlsReloadRuntime, EdgeTransportSecurity, HttpHostRoutes, HttpHostname, HttpIngressConfig,
+    HttpIngressExposurePolicy, PublicTlsConfig, PublicTlsReloadConfig, PublicTlsReloadRuntime,
+    RawIngressExposurePolicy, RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime,
+    SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
@@ -421,6 +423,287 @@ async fn wait_for_authorization_status(
     })
     .await
     .expect("authorization status did not converge");
+}
+
+#[tokio::test]
+async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers() {
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+    let local_task = tokio::spawn(async move {
+        let (mut socket, _) = local_listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = captured_tx.send(String::from_utf8(request).unwrap());
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 4,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024 * 1024,
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(3),
+        duplex_capacity: 64 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let agent = agent_runtime(edge_addr, local_addr);
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Agent did not become routable");
+
+    let connector = TlsConnector::from(raw_tls_client_config(
+        &public_pki.authority_pem,
+        None,
+        false,
+    ));
+    let tcp = connect_eventually(https_addr).await;
+    let mut tls = connector
+        .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+        .await
+        .unwrap();
+    tls.write_all(
+        b"GET /hello HTTP/1.1\r\nHost: demo.example.test\r\nForwarded: for=spoofed\r\nX-Forwarded-For: spoofed\r\nX-Forwarded-Proto: http\r\nConnection: x-remove\r\nX-Remove: secret\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.ends_with("\r\n\r\nok"));
+
+    let captured = captured_rx.await.unwrap().to_ascii_lowercase();
+    assert!(captured.starts_with("get /hello http/1.1\r\n"));
+    assert!(captured.contains("host: demo.example.test\r\n"));
+    assert!(captured.contains("x-forwarded-for: 127.0.0.1\r\n"));
+    assert!(captured.contains("x-forwarded-proto: https\r\n"));
+    assert!(captured.contains("x-forwarded-host: demo.example.test\r\n"));
+    assert!(!captured.contains("spoofed"));
+    assert!(!captured.contains("x-remove"));
+
+    agent_trigger.shutdown();
+    let _ = agent_task.await.unwrap().unwrap();
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    assert_eq!(outcome.raw_addr, None);
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.completed_requests, 1);
+    assert_eq!(https.rejected_requests, 0);
+    local_task.await.unwrap();
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
+async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
+    let public_pki = test_pki("demo.example.test");
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 4,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(2),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let connector = TlsConnector::from(raw_tls_client_config(
+        &public_pki.authority_pem,
+        None,
+        false,
+    ));
+
+    let send = |host: &'static str| {
+        let connector = connector.clone();
+        async move {
+            let tcp = connect_eventually(https_addr).await;
+            let mut tls = connector
+                .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+                .await
+                .unwrap();
+            tls.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+    };
+    assert!(send("demo.example.test")
+        .await
+        .starts_with("HTTP/1.1 503 Service Unavailable"));
+    assert!(send("other.example.test")
+        .await
+        .starts_with("HTTP/1.1 421 Misdirected Request"));
+
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.completed_requests, 0);
+    assert_eq!(https.rejected_requests, 2);
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
+async fn public_https_per_ip_admission_releases_after_connection_close() {
+    let agent_pki = test_pki("edge.test");
+    let public_pki = test_pki("demo.example.test");
+    let https_addr = unused_addr().await;
+    let public_listen_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, https_addr.port()));
+    let (_publisher, subscription) = authorization_snapshot_channel(versioned_snapshot(
+        &agent_pki,
+        1,
+        TunnelStatus::Enabled,
+        false,
+    ));
+    let mut config = edge_config(unused_addr().await);
+    config.multiplex.security = edge_tls_security(&agent_pki, Duration::from_secs(1));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: public_listen_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::Public {
+            max_connections_per_ip: 1,
+        },
+        max_concurrent_connections: 2,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        header_read_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(3),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let connector = TlsConnector::from(raw_tls_client_config(
+        &public_pki.authority_pem,
+        None,
+        false,
+    ));
+
+    let first_tcp = connect_eventually(https_addr).await;
+    let first = connector
+        .connect(
+            ServerName::try_from("demo.example.test").unwrap(),
+            first_tcp,
+        )
+        .await
+        .unwrap();
+    let mut rejected = connect_eventually(https_addr).await;
+    let mut byte = [0_u8; 1];
+    let rejected_read = timeout(Duration::from_secs(1), rejected.read(&mut byte))
+        .await
+        .expect("same-IP excess HTTPS connection stayed open");
+    assert!(matches!(rejected_read, Ok(0) | Err(_)));
+    drop(first);
+
+    let mut replacement = timeout(Duration::from_secs(2), async {
+        loop {
+            let tcp = connect_eventually(https_addr).await;
+            match connector
+                .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+                .await
+            {
+                Ok(tls) => break tls,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("per-IP permit was not released");
+    replacement
+        .write_all(b"GET / HTTP/1.1\r\nHost: demo.example.test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    replacement.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8(response)
+        .unwrap()
+        .starts_with("HTTP/1.1 503 Service Unavailable"));
+
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert!(https.per_ip_capacity_rejections >= 1);
+    assert_eq!(https.rejected_requests, 1);
+    wait_until_bindable(https_addr).await;
 }
 
 #[tokio::test]
@@ -878,6 +1161,53 @@ fn public_raw_config_rejects_static_mtls_and_accepts_dynamic_authorization() {
     assert!(matches!(
         config.validate(),
         Err(tunnelproxy_edge::EdgeRuntimeConfigError::PublicRawRequiresLiveAuthorization)
+    ));
+
+    let (_publisher, subscription) =
+        authorization_snapshot_channel(versioned_snapshot(&pki, 1, TunnelStatus::Enabled, false));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn public_https_config_requires_agent_mtls_and_dynamic_authorization() {
+    let pki = test_pki("edge.test");
+    let public_pki = test_pki("demo.example.test");
+    let mut config = edge_config("127.0.0.1:7000".parse().unwrap());
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: "0.0.0.0:7443".parse().unwrap(),
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::Public {
+            max_connections_per_ip: 4,
+        },
+        max_concurrent_connections: 8,
+        max_header_bytes: 16 * 1024,
+        max_headers: 64,
+        max_request_body_bytes: 1024,
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(2),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    assert!(matches!(
+        config.validate(),
+        Err(tunnelproxy_edge::EdgeRuntimeConfigError::PublicHttpsRequiresMutualTls)
+    ));
+
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
+    assert!(matches!(
+        config.validate(),
+        Err(tunnelproxy_edge::EdgeRuntimeConfigError::PublicHttpsRequiresLiveAuthorization)
     ));
 
     let (_publisher, subscription) =
@@ -1593,6 +1923,64 @@ async fn snapshot_cache_cold_start_routes_then_expiry_releases_edge_listeners() 
     drop(agent_listener);
     drop(raw_listener);
     drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn public_tls_generation_reload_is_atomic() {
+    let first = test_pki("demo.example.test");
+    let second = test_pki("demo.example.test");
+    let (_unused_database, directory) = snapshot_temp_database();
+    let certificate = directory.join("public.pem");
+    let private_key = directory.join("public-key.pem");
+    let manifest = directory.join("public-manifest.json");
+    std::fs::write(&certificate, &first.server.certificate_pem).unwrap();
+    std::fs::write(&private_key, &first.server.private_key_pem).unwrap();
+    write_reload_manifest(
+        &manifest,
+        1,
+        &[
+            ("public_server_certificate", &certificate),
+            ("public_server_private_key", &private_key),
+        ],
+    );
+    let (tls, runtime) = PublicTlsReloadRuntime::bootstrap(
+        PublicTlsReloadConfig {
+            manifest_path: manifest.clone(),
+            server_certificate_path: certificate.clone(),
+            server_private_key_path: private_key.clone(),
+            poll_interval: Duration::from_millis(10),
+            expiry_warning: Duration::from_secs(60),
+        },
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tls.reload_status(Duration::from_secs(60)).generation, 1);
+    let status = tls.clone();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(runtime.run_until_shutdown(signal));
+
+    std::fs::write(&certificate, &second.server.certificate_pem).unwrap();
+    std::fs::write(&private_key, &second.server.private_key_pem).unwrap();
+    write_reload_manifest(
+        &manifest,
+        2,
+        &[
+            ("public_server_certificate", &certificate),
+            ("public_server_private_key", &private_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        while status.reload_status(Duration::from_secs(60)).generation != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("public TLS generation did not reload");
+
+    trigger.shutdown();
+    task.await.unwrap().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
 
