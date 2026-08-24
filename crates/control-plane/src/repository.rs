@@ -191,7 +191,7 @@ fn migrate(connection: &Connection) -> Result<(), SnapshotRepositoryError> {
         .map_err(storage)
 }
 
-fn load_latest_from_connection(
+pub(crate) fn load_latest_from_connection(
     connection: &Connection,
 ) -> Result<Option<VersionedAuthorizationSnapshot>, SnapshotRepositoryError> {
     let head = connection

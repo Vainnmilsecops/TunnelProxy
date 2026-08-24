@@ -9,17 +9,21 @@ use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
+use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
-    parse_snapshot_manifest, ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotCommitOutcome,
-    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
-    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
-    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
+    parse_snapshot_manifest, provision_bootstrap_token, AgentCertificateIssuer,
+    ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentServerConfig,
+    EnrollmentServerTlsConfig, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
+    SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
+    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
+    MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
 Usage:
   tunnelproxy-control-plane serve [OPTIONS]
   tunnelproxy-control-plane import [OPTIONS]
+  tunnelproxy-control-plane create-token [OPTIONS]
 
 Serve options:
   --database <path>                  SQLite snapshot database (required)
@@ -34,10 +38,24 @@ Serve options:
   --tls-reload-manifest <path>       atomic TLS generation manifest
   --tls-reload-interval-ms <ms>      reload poll (default 1000)
   --tls-expiry-warning-ms <ms>       expiry warning (default 604800000)
+  --enrollment-listen <addr>         opt-in Agent enrollment listener
+  --issuer-cert <path>               Agent issuer CA certificate PEM
+  --issuer-key <path>                Agent issuer CA private key PEM
+  --agent-server-ca <path>           Edge server CA returned to Agents
+  --agent-cert-validity-ms <ms>      issued leaf lifetime (default 86400000)
+  --max-enrollment-clients <usize>   enrollment limit (default 32)
+  --enrollment-request-timeout-ms <ms> request deadline (default 10000)
 
 Import options:
   --database <path>                  SQLite snapshot database (required)
   --snapshot <path>                  full snapshot JSON manifest (required)
+
+Create-token options:
+  --database <path>                  SQLite snapshot database (required)
+  --agent-id <id>                    bound Agent ID (required)
+  --tunnel-id <id>                   bound Tunnel ID (required)
+  --output <path>                    secret token output file (required)
+  --ttl-ms <ms>                      bootstrap token lifetime (default 600000)
 
   --help                             print this help and exit
 ";
@@ -80,6 +98,16 @@ async fn main() -> ExitCode {
                 error.exit_code()
             }
         },
+        ParsedCommand::CreateToken(args) => match run_create_token(args).await {
+            Ok(()) => {
+                info!("Agent enrollment bootstrap token created");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "bootstrap token creation failed");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -112,8 +140,9 @@ async fn read_manifest(path: PathBuf) -> Result<Vec<u8>, ImportError> {
 
 async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (tls, reloader) = load_server_tls(&args).await?;
-    let runtime = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
-        database_path: args.database,
+    let enrollment = load_enrollment_server_config(&args).await?;
+    let runtime_config = ControlPlaneRuntimeConfig {
+        database_path: args.database.clone(),
         refresh_interval: args.refresh_interval,
         snapshot_server: SnapshotServerConfig {
             listen_addr: args.listen,
@@ -121,14 +150,22 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
             request_timeout: args.request_timeout,
             tls,
         },
-    })
-    .await
+    };
+    let runtime = match enrollment {
+        Some(enrollment) => {
+            ControlPlaneRuntime::bind_with_enrollment(runtime_config, enrollment).await
+        }
+        None => ControlPlaneRuntime::bind(runtime_config).await,
+    }
     .map_err(ServeError::Runtime)?;
     info!(
         listen_addr = %runtime.local_addr(),
         snapshot_version = runtime.current_version().get(),
         "Control Plane snapshot service started"
     );
+    if let Some(addr) = runtime.enrollment_addr() {
+        info!(%addr, "Control Plane enrollment service started");
+    }
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
@@ -158,6 +195,58 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     };
     info!(?outcome, "Control Plane shutdown completed");
     Ok(())
+}
+
+async fn load_enrollment_server_config(
+    args: &ServeArgs,
+) -> Result<Option<EnrollmentServerConfig>, ServeError> {
+    let Some(enrollment) = &args.enrollment else {
+        return Ok(None);
+    };
+    let (server_certificate, server_private_key, issuer_certificate, issuer_private_key, agent_ca) =
+        tokio::try_join!(
+            read_pem(args.tls_cert.clone(), "enrollment server certificate"),
+            read_pem(args.tls_key.clone(), "enrollment server private key"),
+            read_pem(enrollment.issuer_cert.clone(), "Agent issuer certificate"),
+            read_pem(enrollment.issuer_key.clone(), "Agent issuer private key"),
+            read_pem(enrollment.agent_server_ca.clone(), "Agent Edge server CA"),
+        )?;
+    let tls = EnrollmentServerTlsConfig::from_pem(
+        &server_certificate,
+        &server_private_key,
+        args.tls_handshake_timeout,
+    )
+    .map_err(ServeError::EnrollmentTls)?;
+    let issuer = AgentCertificateIssuer::from_pem(
+        &issuer_certificate,
+        &issuer_private_key,
+        enrollment.agent_cert_validity,
+    )
+    .map_err(ServeError::Issuer)?;
+    Ok(Some(EnrollmentServerConfig {
+        listen_addr: enrollment.listen,
+        max_clients: enrollment.max_clients,
+        request_timeout: enrollment.request_timeout,
+        database_path: args.database.clone(),
+        tls,
+        issuer,
+        agent_server_ca_pem: agent_ca,
+    }))
+}
+
+async fn run_create_token(args: CreateTokenArgs) -> Result<(), CreateTokenError> {
+    tokio::task::spawn_blocking(move || {
+        provision_bootstrap_token(
+            args.database,
+            &args.agent_id,
+            &args.tunnel_id,
+            args.ttl,
+            &args.output,
+        )
+    })
+    .await
+    .map_err(|_| CreateTokenError::StorageTask)?
+    .map_err(CreateTokenError::Repository)
 }
 
 async fn load_server_tls(
@@ -224,6 +313,7 @@ enum ParsedCommand {
     Help,
     Serve(Box<ServeArgs>),
     Import(ImportArgs),
+    CreateToken(CreateTokenArgs),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,12 +330,33 @@ struct ServeArgs {
     tls_reload_manifest: Option<PathBuf>,
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
+    enrollment: Option<EnrollmentArgs>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EnrollmentArgs {
+    listen: SocketAddr,
+    issuer_cert: PathBuf,
+    issuer_key: PathBuf,
+    agent_server_ca: PathBuf,
+    agent_cert_validity: Duration,
+    max_clients: usize,
+    request_timeout: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ImportArgs {
     database: PathBuf,
     snapshot: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CreateTokenArgs {
+    database: PathBuf,
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
+    output: PathBuf,
+    ttl: Duration,
 }
 
 fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
@@ -258,6 +369,7 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
     match command {
         "serve" => parse_serve(&args[1..]).map(|args| ParsedCommand::Serve(Box::new(args))),
         "import" => parse_import(&args[1..]).map(ParsedCommand::Import),
+        "create-token" => parse_create_token(&args[1..]).map(ParsedCommand::CreateToken),
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
 }
@@ -276,6 +388,14 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut tls_reload_interval = Duration::from_secs(1);
     let mut tls_expiry_warning = Duration::from_secs(7 * 24 * 60 * 60);
     let mut reload_tuning_present = false;
+    let mut enrollment_listen = None;
+    let mut issuer_cert = None;
+    let mut issuer_key = None;
+    let mut agent_server_ca = None;
+    let mut agent_cert_validity = Duration::from_secs(24 * 60 * 60);
+    let mut max_enrollment_clients = 32;
+    let mut enrollment_request_timeout = Duration::from_secs(10);
+    let mut enrollment_options_present = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -302,6 +422,34 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
                 tls_expiry_warning = parse_duration(args, index, flag)?;
                 reload_tuning_present = true;
             }
+            "--enrollment-listen" => {
+                enrollment_listen = Some(parse_addr(args, index, flag)?);
+                enrollment_options_present = true;
+            }
+            "--issuer-cert" => {
+                issuer_cert = Some(parse_path(args, index, flag)?);
+                enrollment_options_present = true;
+            }
+            "--issuer-key" => {
+                issuer_key = Some(parse_path(args, index, flag)?);
+                enrollment_options_present = true;
+            }
+            "--agent-server-ca" => {
+                agent_server_ca = Some(parse_path(args, index, flag)?);
+                enrollment_options_present = true;
+            }
+            "--agent-cert-validity-ms" => {
+                agent_cert_validity = parse_duration(args, index, flag)?;
+                enrollment_options_present = true;
+            }
+            "--max-enrollment-clients" => {
+                max_enrollment_clients = parse_positive(args, index, flag)?;
+                enrollment_options_present = true;
+            }
+            "--enrollment-request-timeout-ms" => {
+                enrollment_request_timeout = parse_duration(args, index, flag)?;
+                enrollment_options_present = true;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_owned())),
         }
         index += 2;
@@ -309,6 +457,20 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     if reload_tuning_present && tls_reload_manifest.is_none() {
         return Err(ArgError::MissingRequired("--tls-reload-manifest"));
     }
+    let enrollment = if enrollment_options_present {
+        Some(EnrollmentArgs {
+            listen: enrollment_listen.ok_or(ArgError::MissingRequired("--enrollment-listen"))?,
+            issuer_cert: issuer_cert.ok_or(ArgError::MissingRequired("--issuer-cert"))?,
+            issuer_key: issuer_key.ok_or(ArgError::MissingRequired("--issuer-key"))?,
+            agent_server_ca: agent_server_ca
+                .ok_or(ArgError::MissingRequired("--agent-server-ca"))?,
+            agent_cert_validity,
+            max_clients: max_enrollment_clients,
+            request_timeout: enrollment_request_timeout,
+        })
+    } else {
+        None
+    };
     Ok(ServeArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
         listen,
@@ -322,6 +484,45 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         tls_reload_manifest,
         tls_reload_interval,
         tls_expiry_warning,
+        enrollment,
+    })
+}
+
+fn parse_create_token(args: &[String]) -> Result<CreateTokenArgs, ArgError> {
+    let mut database = None;
+    let mut agent_id = None;
+    let mut tunnel_id = None;
+    let mut output = None;
+    let mut ttl = Duration::from_secs(10 * 60);
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--agent-id" => {
+                agent_id = Some(
+                    AgentId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                )
+            }
+            "--tunnel-id" => {
+                tunnel_id = Some(
+                    TunnelId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                )
+            }
+            "--output" => output = Some(parse_path(args, index, flag)?),
+            "--ttl-ms" => ttl = parse_duration(args, index, flag)?,
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(CreateTokenArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        agent_id: agent_id.ok_or(ArgError::MissingRequired("--agent-id"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
+        output: output.ok_or(ArgError::MissingRequired("--output"))?,
+        ttl,
     })
 }
 
@@ -445,6 +646,8 @@ enum ServeError {
     Signal,
     ReloadBootstrap(SnapshotTlsReloadBootstrapError),
     ReloadRuntime(tunnelproxy_common::TlsReloadRuntimeError),
+    EnrollmentTls(tunnelproxy_control_plane::EnrollmentTlsConfigError),
+    Issuer(tunnelproxy_control_plane::CertificateIssuerError),
 }
 
 impl std::fmt::Display for ServeError {
@@ -456,6 +659,8 @@ impl std::fmt::Display for ServeError {
             Self::Signal => f.write_str("OS shutdown listener failed"),
             Self::ReloadBootstrap(error) => write!(f, "TLS reload bootstrap failed: {error}"),
             Self::ReloadRuntime(error) => write!(f, "TLS reload runtime failed: {error}"),
+            Self::EnrollmentTls(error) => error.fmt(f),
+            Self::Issuer(error) => error.fmt(f),
         }
     }
 }
@@ -463,7 +668,11 @@ impl std::fmt::Display for ServeError {
 impl ServeError {
     fn exit_code(&self) -> ExitCode {
         match self {
-            Self::ReadPem(_) | Self::Tls(_) | Self::ReloadBootstrap(_) => ExitCode::from(2),
+            Self::ReadPem(_)
+            | Self::Tls(_)
+            | Self::ReloadBootstrap(_)
+            | Self::EnrollmentTls(_)
+            | Self::Issuer(_) => ExitCode::from(2),
             Self::Runtime(
                 tunnelproxy_control_plane::ControlPlaneRuntimeError::InvalidConfig
                 | tunnelproxy_control_plane::ControlPlaneRuntimeError::Authority(
@@ -471,6 +680,21 @@ impl ServeError {
                 ),
             ) => ExitCode::from(2),
             Self::Runtime(_) | Self::Signal | Self::ReloadRuntime(_) => ExitCode::from(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CreateTokenError {
+    Repository(tunnelproxy_control_plane::EnrollmentRepositoryError),
+    StorageTask,
+}
+
+impl std::fmt::Display for CreateTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(error) => error.fmt(f),
+            Self::StorageTask => f.write_str("bootstrap token worker stopped unexpectedly"),
         }
     }
 }
@@ -567,6 +791,83 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["import", "--database"])),
             Err(ArgError::MissingValue(_))
+        ));
+    }
+
+    #[test]
+    fn enrollment_and_token_commands_require_complete_bound_inputs() {
+        let command = parse_args(&args(&[
+            "serve",
+            "--database",
+            "state.db",
+            "--tls-cert",
+            "server.pem",
+            "--tls-key",
+            "server-key.pem",
+            "--edge-client-ca",
+            "edge-client-ca.pem",
+            "--enrollment-listen",
+            "127.0.0.1:17300",
+            "--issuer-cert",
+            "issuer.pem",
+            "--issuer-key",
+            "issuer-key.pem",
+            "--agent-server-ca",
+            "edge-server-ca.pem",
+            "--agent-cert-validity-ms",
+            "1000",
+            "--max-enrollment-clients",
+            "4",
+            "--enrollment-request-timeout-ms",
+            "500",
+        ]))
+        .unwrap();
+        let ParsedCommand::Serve(serve) = command else {
+            panic!("expected serve command");
+        };
+        let enrollment = serve.enrollment.unwrap();
+        assert_eq!(enrollment.listen.port(), 17300);
+        assert_eq!(enrollment.agent_cert_validity, Duration::from_secs(1));
+        assert_eq!(enrollment.max_clients, 4);
+        assert_eq!(enrollment.request_timeout, Duration::from_millis(500));
+
+        assert_eq!(
+            parse_args(&args(&[
+                "create-token",
+                "--database",
+                "state.db",
+                "--agent-id",
+                "agent-token",
+                "--tunnel-id",
+                "tunnel-token",
+                "--output",
+                "bootstrap.token",
+                "--ttl-ms",
+                "1000",
+            ])),
+            Ok(ParsedCommand::CreateToken(CreateTokenArgs {
+                database: PathBuf::from("state.db"),
+                agent_id: AgentId::new("agent-token").unwrap(),
+                tunnel_id: TunnelId::new("tunnel-token").unwrap(),
+                output: PathBuf::from("bootstrap.token"),
+                ttl: Duration::from_secs(1),
+            }))
+        );
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server-key.pem",
+                "--edge-client-ca",
+                "edge-client-ca.pem",
+                "--enrollment-listen",
+                "127.0.0.1:17300",
+            ])),
+            Err(ArgError::MissingRequired("--issuer-cert"))
         ));
     }
 }

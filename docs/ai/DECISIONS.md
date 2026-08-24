@@ -541,3 +541,33 @@ does reconcile and close a session removed by local rotation, while dynamic
 authorization continues to use Control Plane snapshots. The manifest is an
 atomic commit marker, not a certificate issuer, key vault, signature, or defense
 against a compromised local filesystem; those remain future work.
+
+---
+
+## ADR-021 — Agent-owned keys and transactional two-phase certificate rotation
+
+**Status:** Accepted (Session 21).
+
+**Context:** Session 20 can atomically load operator-provided credentials but
+does not create them. Enrollment must not export Agent private keys, authorize a
+certificate before durable state exists, revoke a working predecessor before
+the replacement is loaded, or let retries mint inconsistent leaves.
+
+**Decision:** Agent generates an ECDSA P-256 key and CSR locally and journals the
+request before contacting a separate server-authenticated TLS service using
+ALPN `tunnelproxy-enroll/1`. A random bootstrap token is stored hashed, expires,
+and is bound to one Agent/Tunnel pair. Agent supplies the next random renewal
+token; Control Plane stores only its hash. Issuance, bootstrap consumption,
+credential metadata, and a full snapshot containing the new fingerprint commit
+in one SQLite `IMMEDIATE` transaction. Agent validates the returned
+certificate/key/fingerprint, publishes a Session 20 bundle, waits for the live
+generation, then sends an authenticated activation. Activation removes the old
+fingerprint in a later transaction. Request IDs make exact retries idempotent,
+and authorization is preflighted before CA signing.
+
+**Consequences:** Dynamic Edge can accept bootstrap and renewal without process
+restart or private-key transport, and a crash at any protocol boundary can be
+retried from durable state. There is a bounded two-fingerprint overlap until
+activation. Static Edge mode is intentionally unsupported. Issuer key custody,
+CA rollover, CRL/OCSP/emergency revocation, abandoned-overlap cleanup, hostile
+local filesystem defense, and multi-writer consensus remain future boundaries.

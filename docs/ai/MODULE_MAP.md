@@ -24,7 +24,8 @@
 ## `tunnelproxy-protocol`
 
 **Current implementation:** Version 2 framing, durable REGISTER payload,
-handshake rejection, heartbeat, and multiplexed stream payload types/codecs.
+handshake rejection, heartbeat, multiplexed stream payload types/codecs, and
+the separate bounded Enrollment Protocol v1 message codec.
 
 **Responsibility (future)**
 
@@ -45,8 +46,9 @@ handshake rejection, heartbeat, and multiplexed stream payload types/codecs.
 
 **Current implementation:** Outbound mutual-TLS-or-loopback transport,
 certificate-bound Protocol v2 registration intent, handshake/heartbeat,
-bounded multiplexed local bridging, and a runnable reconnecting single-session
-process supervisor/CLI.
+bounded multiplexed local bridging, a runnable reconnecting single-session
+process supervisor/CLI, and Agent-owned-key bootstrap/renewal that publishes
+atomic credential manifests.
 
 **Responsibility (future)**
 
@@ -96,8 +98,10 @@ snapshot client alongside the data plane without binding before bootstrap.
 TunnelId authorization snapshots, non-zero monotonic versions, canonical
 bounded encoding, transactional SQLite persistence, bounded latest-value
 distribution, and a dedicated mutual-TLS snapshot service for Edge bootstrap
-and reconnect. A runnable binary supports strict full-snapshot import and a
-supervised SQLite-refreshing distribution service.
+and reconnect. A runnable binary supports strict full-snapshot import, a
+supervised SQLite-refreshing distribution service, bound bootstrap-token
+provisioning, short-lived Agent leaf issuance, and transactional enrollment
+snapshot activation.
 
 **Responsibility (future)**
 

@@ -2,7 +2,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tunnelproxy_control_plane::{SnapshotRepository, SqliteSnapshotRepository};
+use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_control_plane::{
+    enrollment_token_hash, unix_time_now, EnrollmentRepository, SnapshotRepository,
+    SqliteSnapshotRepository,
+};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -75,5 +79,51 @@ fn import_command_initializes_a_durable_snapshot_database() {
     let loaded = repository.load_latest().unwrap().unwrap();
     assert_eq!(loaded.version().get(), 4);
     drop(repository);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn create_token_writes_a_bound_secret_file_without_printing_the_token() {
+    let directory = temp_directory();
+    let database = directory.join("snapshots.sqlite");
+    SqliteSnapshotRepository::open(&database).unwrap();
+    let token_path = directory.join("bootstrap.token");
+    let result = Command::new(binary())
+        .arg("create-token")
+        .arg("--database")
+        .arg(&database)
+        .arg("--agent-id")
+        .arg("agent-cli-token")
+        .arg("--tunnel-id")
+        .arg("tunnel-cli-token")
+        .arg("--output")
+        .arg(&token_path)
+        .arg("--ttl-ms")
+        .arg("60000")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "create-token stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let token_text = std::fs::read_to_string(&token_path).unwrap();
+    let token_text = token_text.trim();
+    assert_eq!(token_text.len(), 64);
+    assert!(!String::from_utf8_lossy(&result.stdout).contains(token_text));
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(token_text));
+    let mut token = [0_u8; 32];
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&token_text[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    EnrollmentRepository::open(&database)
+        .unwrap()
+        .validate_token(
+            enrollment_token_hash(&token),
+            &AgentId::new("agent-cli-token").unwrap(),
+            &TunnelId::new("tunnel-cli-token").unwrap(),
+            unix_time_now().unwrap(),
+        )
+        .unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

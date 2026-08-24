@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Certificate Lifecycle & Atomic TLS Reload** (Session 20).
+**Automated Agent Enrollment & Renewal** (Session 21).
 
 ## Completed
 
@@ -242,12 +242,24 @@
 - Reload manifests are optional and plaintext behavior is unchanged. Polling
   uses skipped missed ticks and bounded blocking reads; PEM bytes, keys, file
   contents, and paths are not emitted in status or reload events.
-- 239 explicit workspace tests are present; all prior behavior is preserved.
+- Agent can generate an ECDSA P-256 key and CSR locally, enroll over bounded
+  server-authenticated TLS, and publish a short-lived client credential through
+  the Session 20 manifest boundary without exporting its private key.
+- Bootstrap and renewal tokens are random 256-bit file secrets. Control Plane
+  stores only SHA-256 hashes, binds bootstrap use to exact Agent/Tunnel IDs,
+  enforces expiry, and never writes token/key bytes to logs or errors.
+- Issuance and activation use idempotent request IDs and two SQLite
+  transactions. The first adds the replacement fingerprint with overlap; the
+  second removes the predecessor only after Agent reload activation.
+- Control Plane can supervise the opt-in enrollment listener and provision a
+  bound token with `create-token`. Agent supports `--enroll-only` and an
+  automatic expiry-window renewal supervisor with a crash-recoverable journal.
+- 249 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
-- Automated certificate issuance, protected key custody/distribution, and
-  CA/CRL/OCSP lifecycle automation (DEBT-019 open).
+- Protected issuer key custody, CA rollover, CRL/OCSP/emergency revocation, and
+  abandoned-overlap cleanup (DEBT-019 open).
 - Existing TLS connections generally retain their negotiated session until
   reconnect; static Edge certificate authorization is the exception because
   its snapshot update actively reconciles and revokes the old Agent session.
@@ -266,12 +278,6 @@
 
 ## Next planned session
 
-**Session 21 — Automated Certificate Issuance & Trust Distribution.**
-
-Goals:
-
-- Define an issuer and enrollment trust model without exposing private keys.
-- Automate short-lived identity delivery into the Session 20 generation
-  boundary and define CA overlap/revocation policy.
-- Keep public ingress, billing, and multi-edge consensus outside the session
-  unless explicitly expanded.
+Not selected yet. Session 21 deliberately leaves issuer custody/CA lifecycle,
+general administration, public ingress, and multi-edge coordination as separate
+future scopes.

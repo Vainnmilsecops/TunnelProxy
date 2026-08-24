@@ -8,11 +8,14 @@ use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tunnelproxy_agent::{
-    AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
-    AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, RuntimeShutdownConfig,
+    bootstrap_agent_credentials, AgentEnrollmentConfig, AgentEnrollmentError,
+    AgentEnrollmentRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig,
+    AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
+    AgentTransportSecurity, EnrollmentClientConfig, RuntimeShutdownConfig,
 };
-use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
+use tunnelproxy_common::{
+    shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths, AgentId, TunnelId,
+};
 use tunnelproxy_protocol::RegistrationRequest;
 
 const USAGE: &str = "\
@@ -41,6 +44,18 @@ Options:
   --tls-reload-manifest <path>   atomic TLS generation manifest
   --tls-reload-interval-ms <ms>  reload poll   (default 1000)
   --tls-expiry-warning-ms <ms>   expiry warning(default 604800000)
+  --enroll-only                  enroll/renew credentials and exit
+  --enrollment-server <addr>     Control Plane enrollment address
+  --enrollment-ca <path>         trusted enrollment server CA PEM
+  --enrollment-server-name <name> verified enrollment DNS name
+  --enrollment-token <path>      bootstrap/current renewal token file
+  --enrollment-pending <path>    durable enrollment journal file
+  --renew-before-ms <ms>         renew before expiry (default 604800000)
+  --enrollment-poll-ms <ms>      renewal poll interval (default 60000)
+  --enrollment-connect-timeout-ms <ms> TCP timeout (default 5000)
+  --enrollment-handshake-timeout-ms <ms> TLS timeout (default 10000)
+  --enrollment-request-timeout-ms <ms> request timeout (default 30000)
+  --enrollment-activation-timeout-ms <ms> reload wait (default 30000)
   --help                         print this help and exit
 ";
 
@@ -65,6 +80,30 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let enrollment_config = match load_enrollment_config(&parsed).await {
+        Ok(config) => config,
+        Err(error) => {
+            error!(%error, "failed to configure Agent enrollment");
+            return ExitCode::from(2);
+        }
+    };
+    if parsed.enroll_only {
+        let Some(config) = enrollment_config.as_ref() else {
+            error!("--enroll-only requires complete enrollment arguments");
+            return ExitCode::from(2);
+        };
+        return match bootstrap_agent_credentials(config).await {
+            Ok(generation) => {
+                info!(generation, "Agent credential enrollment completed");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "Agent credential enrollment failed");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let mut config = AgentRuntimeConfig::new(parsed.edge, parsed.local);
     config.connect_timeout = parsed.connect_timeout;
     config.handshake_timeout = parsed.handshake_timeout;
@@ -85,6 +124,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let enrollment_runtime = match (&enrollment_config, &loaded_tls.security) {
+        (Some(enrollment), AgentTransportSecurity::MutualTls(tls)) => {
+            match AgentEnrollmentRuntime::new(enrollment.clone(), tls.clone()) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    error!(%error, "failed to configure Agent renewal runtime");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        (Some(_), AgentTransportSecurity::PlaintextLoopback) => {
+            error!("automatic renewal requires Agent mutual TLS");
+            return ExitCode::from(2);
+        }
+        (None, _) => None,
+    };
     config.security = loaded_tls.security;
     let runtime = match AgentRuntime::new(config) {
         Ok(runtime) => runtime,
@@ -104,23 +159,39 @@ async fn main() -> ExitCode {
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
-    let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal);
+    let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
     tokio::pin!(reload_future);
+    let enrollment_future = run_optional_enrollment(enrollment_runtime, signal.clone());
+    tokio::pin!(enrollment_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
     return tokio::select! {
         result = &mut runtime_future => {
             trigger.shutdown();
             let _ = reload_future.await;
+            let _ = enrollment_future.await;
             agent_exit_code(result)
         },
         reload = &mut reload_future => {
             trigger.shutdown();
             let _ = runtime_future.await;
+            let _ = enrollment_future.await;
             match reload {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     error!(%error, "Agent TLS reload runtime failed");
+                    ExitCode::from(1)
+                }
+            }
+        },
+        enrollment = &mut enrollment_future => {
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            match enrollment {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(%error, "Agent enrollment runtime failed");
                     ExitCode::from(1)
                 }
             }
@@ -132,15 +203,31 @@ async fn main() -> ExitCode {
                     error!(%error, "OS shutdown listener failed");
                     trigger.shutdown();
                     let _ = runtime_future.await;
+                    let _ = reload_future.await;
+                    let _ = enrollment_future.await;
                     return ExitCode::from(1);
                 }
             }
             trigger.shutdown();
             let result = runtime_future.await;
             let _ = reload_future.await;
+            let _ = enrollment_future.await;
             agent_exit_code(result)
         }
     };
+}
+
+async fn run_optional_enrollment(
+    runtime: Option<AgentEnrollmentRuntime>,
+    signal: tunnelproxy_common::ShutdownSignal,
+) -> Result<(), AgentEnrollmentError> {
+    match runtime {
+        Some(runtime) => runtime.run_until_shutdown(signal).await,
+        None => {
+            signal.cancelled().await;
+            Ok(())
+        }
+    }
 }
 
 async fn run_optional_tls_reloader(
@@ -200,6 +287,19 @@ struct ParsedArgs {
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
     tls_reload_options_present: bool,
+    enroll_only: bool,
+    enrollment_server: Option<SocketAddr>,
+    enrollment_ca: Option<PathBuf>,
+    enrollment_server_name: Option<String>,
+    enrollment_token: Option<PathBuf>,
+    enrollment_pending: Option<PathBuf>,
+    renew_before: Duration,
+    enrollment_poll: Duration,
+    enrollment_connect_timeout: Duration,
+    enrollment_handshake_timeout: Duration,
+    enrollment_request_timeout: Duration,
+    enrollment_activation_timeout: Duration,
+    enrollment_options_present: bool,
     help: bool,
 }
 
@@ -229,6 +329,19 @@ impl Default for ParsedArgs {
             tls_reload_interval: Duration::from_secs(1),
             tls_expiry_warning: Duration::from_secs(7 * 24 * 60 * 60),
             tls_reload_options_present: false,
+            enroll_only: false,
+            enrollment_server: None,
+            enrollment_ca: None,
+            enrollment_server_name: None,
+            enrollment_token: None,
+            enrollment_pending: None,
+            renew_before: Duration::from_secs(7 * 24 * 60 * 60),
+            enrollment_poll: Duration::from_secs(60),
+            enrollment_connect_timeout: Duration::from_secs(5),
+            enrollment_handshake_timeout: Duration::from_secs(10),
+            enrollment_request_timeout: Duration::from_secs(30),
+            enrollment_activation_timeout: Duration::from_secs(30),
+            enrollment_options_present: false,
             help: false,
         }
     }
@@ -365,6 +478,70 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.tls_reload_options_present = true;
                 index += 2;
             }
+            "--enroll-only" => {
+                parsed.enroll_only = true;
+                parsed.enrollment_options_present = true;
+                index += 1;
+            }
+            "--enrollment-server" => {
+                parsed.enrollment_server = Some(parse_addr(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-ca" => {
+                parsed.enrollment_ca = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-server-name" => {
+                parsed.enrollment_server_name = Some(value(args, index, flag)?.to_string());
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-token" => {
+                parsed.enrollment_token = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-pending" => {
+                parsed.enrollment_pending = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--renew-before-ms" => {
+                parsed.renew_before = Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-poll-ms" => {
+                parsed.enrollment_poll = Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-connect-timeout-ms" => {
+                parsed.enrollment_connect_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-handshake-timeout-ms" => {
+                parsed.enrollment_handshake_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-request-timeout-ms" => {
+                parsed.enrollment_request_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
+            "--enrollment-activation-timeout-ms" => {
+                parsed.enrollment_activation_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.enrollment_options_present = true;
+                index += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -458,6 +635,98 @@ async fn load_transport_security(
         }
         _ => Err(TlsLoadError::IncompleteArguments),
     }
+}
+
+#[derive(Debug)]
+enum EnrollmentLoadError {
+    IncompleteArguments,
+    ReloadManifestRequired,
+    ReadCa,
+    Invalid(AgentEnrollmentError),
+}
+
+impl std::fmt::Display for EnrollmentLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteArguments => f.write_str(
+                "enrollment requires --enrollment-server, --enrollment-ca, \
+                 --enrollment-server-name, --enrollment-token, --enrollment-pending, complete \
+                 Agent TLS paths, --tls-server-name, and --tls-reload-manifest",
+            ),
+            Self::ReloadManifestRequired => {
+                f.write_str("automatic enrollment requires --tls-reload-manifest")
+            }
+            Self::ReadCa => f.write_str("failed to read enrollment server CA PEM file"),
+            Self::Invalid(error) => write!(f, "invalid enrollment configuration: {error}"),
+        }
+    }
+}
+
+async fn load_enrollment_config(
+    parsed: &ParsedArgs,
+) -> Result<Option<AgentEnrollmentConfig>, EnrollmentLoadError> {
+    if !parsed.enrollment_options_present {
+        return Ok(None);
+    }
+    let (
+        Some(server_addr),
+        Some(enrollment_ca),
+        Some(enrollment_server_name),
+        Some(token_path),
+        Some(pending_path),
+        Some(server_ca_path),
+        Some(client_certificate_path),
+        Some(client_private_key_path),
+        Some(edge_server_name),
+        Some(manifest_path),
+    ) = (
+        parsed.enrollment_server,
+        parsed.enrollment_ca.as_ref(),
+        parsed.enrollment_server_name.as_ref(),
+        parsed.enrollment_token.as_ref(),
+        parsed.enrollment_pending.as_ref(),
+        parsed.tls_ca.as_ref(),
+        parsed.tls_client_cert.as_ref(),
+        parsed.tls_client_key.as_ref(),
+        parsed.tls_server_name.as_ref(),
+        parsed.tls_reload_manifest.as_ref(),
+    )
+    else {
+        if !parsed.enroll_only && parsed.tls_reload_manifest.is_none() {
+            return Err(EnrollmentLoadError::ReloadManifestRequired);
+        }
+        return Err(EnrollmentLoadError::IncompleteArguments);
+    };
+    let server_ca_pem = tokio::fs::read(enrollment_ca)
+        .await
+        .map_err(|_| EnrollmentLoadError::ReadCa)?;
+    let config = AgentEnrollmentConfig {
+        client: EnrollmentClientConfig {
+            server_addr,
+            server_name: enrollment_server_name.clone(),
+            server_ca_pem,
+            connect_timeout: parsed.enrollment_connect_timeout,
+            handshake_timeout: parsed.enrollment_handshake_timeout,
+            request_timeout: parsed.enrollment_request_timeout,
+        },
+        agent_id: parsed.agent_id.clone(),
+        tunnel_id: parsed.tunnel_id.clone(),
+        token_path: token_path.clone(),
+        pending_path: pending_path.clone(),
+        credentials: AgentCredentialPaths {
+            server_ca: server_ca_path.clone(),
+            client_certificate: client_certificate_path.clone(),
+            client_private_key: client_private_key_path.clone(),
+            reload_manifest: manifest_path.clone(),
+        },
+        edge_server_name: edge_server_name.clone(),
+        edge_tls_handshake_timeout: parsed.tls_handshake_timeout,
+        renew_before: parsed.renew_before,
+        poll_interval: parsed.enrollment_poll,
+        activation_timeout: parsed.enrollment_activation_timeout,
+    };
+    config.validate().map_err(EnrollmentLoadError::Invalid)?;
+    Ok(Some(config))
 }
 
 fn value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ArgError> {
@@ -608,6 +877,52 @@ mod tests {
             parse_args(&args(&["--agent-id", "bad/id"])),
             Err(ArgError::InvalidIdentifier { .. })
         ));
+    }
+
+    #[test]
+    fn enrollment_flags_parse_without_secret_values_on_command_line() {
+        let parsed = parse_args(&args(&[
+            "--enroll-only",
+            "--enrollment-server",
+            "127.0.0.1:17300",
+            "--enrollment-ca",
+            "enrollment-ca.pem",
+            "--enrollment-server-name",
+            "enrollment.test",
+            "--enrollment-token",
+            "renewal.token",
+            "--enrollment-pending",
+            "enrollment.pending",
+            "--renew-before-ms",
+            "100",
+            "--enrollment-poll-ms",
+            "200",
+            "--enrollment-connect-timeout-ms",
+            "300",
+            "--enrollment-handshake-timeout-ms",
+            "400",
+            "--enrollment-request-timeout-ms",
+            "500",
+            "--enrollment-activation-timeout-ms",
+            "600",
+        ]))
+        .unwrap();
+        assert!(parsed.enroll_only);
+        assert_eq!(parsed.enrollment_server.unwrap().port(), 17300);
+        assert_eq!(
+            parsed.enrollment_ca,
+            Some(PathBuf::from("enrollment-ca.pem"))
+        );
+        assert_eq!(
+            parsed.enrollment_server_name.as_deref(),
+            Some("enrollment.test")
+        );
+        assert_eq!(parsed.renew_before, Duration::from_millis(100));
+        assert_eq!(parsed.enrollment_poll, Duration::from_millis(200));
+        assert_eq!(
+            parsed.enrollment_activation_timeout,
+            Duration::from_millis(600)
+        );
     }
 
     #[tokio::test]

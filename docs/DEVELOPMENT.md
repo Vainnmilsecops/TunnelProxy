@@ -328,3 +328,26 @@ rotation. The runtime reports an expiry warning for the active leaf certificate
 and exits non-zero if that leaf expires before a valid newer generation is
 loaded. Manifests and local PEM permissions remain an operator trust boundary;
 this feature does not issue certificates or protect private keys.
+
+## 15. Enrolling and renewing Agent credentials
+
+Session 21 adds issuance for dynamic Edge authorization. Read
+[`AGENT_ENROLLMENT.md`](AGENT_ENROLLMENT.md) before configuring production-like
+credentials. The minimum workflow is:
+
+1. Initialize the snapshot database with `tunnelproxy-control-plane import`.
+2. Create a short-lived, Agent/Tunnel-bound token with
+   `tunnelproxy-control-plane create-token`; its value is written only to the
+   requested secret file.
+3. Start `serve` with the complete `--enrollment-*`, `--issuer-*`, and
+   `--agent-server-ca` group.
+4. Run `tunnelproxy-agent --enroll-only` with the token/pending paths, target
+   credential paths, and reload manifest path.
+5. Start the normal Agent with the same enrollment group to enable automatic
+   renewal inside `--renew-before-ms`.
+
+Do not place tokens or private-key contents in command-line arguments, logs, or
+version control. The Agent private key and pending journal are local secret
+files. Automated enrollment requires the Agent TLS reload manifest and a
+dynamic Control Plane snapshot; static Edge authorization cannot follow these
+snapshot mutations.

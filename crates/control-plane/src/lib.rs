@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tunnelproxy_common::{AgentId, TunnelId};
 
+mod certificate_issuer;
+mod enrollment_repository;
+mod enrollment_service;
 mod repository;
 mod runtime;
 mod snapshot_cache;
@@ -24,6 +27,15 @@ mod snapshot_manifest;
 mod snapshot_protocol;
 mod snapshot_service;
 
+pub use certificate_issuer::{AgentCertificateIssuer, CertificateIssuerError, IssuedCertificate};
+pub use enrollment_repository::{
+    provision_bootstrap_token, token_hash as enrollment_token_hash, unix_time_now, DurableIssuance,
+    EnrollmentRepository, EnrollmentRepositoryError, EnrollmentTokenBinding, IssuanceCandidate,
+};
+pub use enrollment_service::{
+    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,
+    EnrollmentTlsConfigError,
+};
 pub use repository::{
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotCommitOutcome,
     SnapshotRepository, SnapshotRepositoryError, SqliteSnapshotRepository,

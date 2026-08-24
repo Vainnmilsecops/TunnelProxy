@@ -14,7 +14,13 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+mod credential_bundle;
 mod tls_reload;
+
+pub use credential_bundle::{
+    publish_agent_credential_bundle, replace_secret_file, AgentCredentialPaths,
+    CredentialBundleError,
+};
 
 pub use tls_reload::{
     certificate_validity, load_tls_reload_generation, ReloadableConfig, TlsCertificateValidity,

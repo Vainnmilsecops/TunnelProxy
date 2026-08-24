@@ -24,6 +24,7 @@
 #![deny(unsafe_code)]
 
 mod codec;
+mod enrollment;
 mod error;
 mod frame;
 mod handshake;
@@ -31,6 +32,11 @@ mod stream;
 mod wire;
 
 pub use codec::{FrameDecoder, FrameEncoder};
+pub use enrollment::{
+    read_enrollment_message, write_enrollment_message, EnrollmentErrorCode, EnrollmentMessage,
+    EnrollmentProtocolError, EnrollmentRequestId, EnrollmentToken, ENROLLMENT_PROTOCOL_ALPN,
+    ENROLLMENT_PROTOCOL_MAGIC, ENROLLMENT_PROTOCOL_VERSION, MAX_ENROLLMENT_MESSAGE_BYTES,
+};
 pub use error::ProtocolError;
 pub use frame::{Frame, FrameType, Scope, StreamId};
 pub use handshake::{
