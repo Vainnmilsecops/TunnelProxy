@@ -11,8 +11,8 @@ use tracing_subscriber::EnvFilter;
 use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown};
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
-    parse_snapshot_manifest, provision_bootstrap_token, AgentCertificateIssuer,
-    ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentServerConfig,
+    parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
+    ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentRepository, EnrollmentServerConfig,
     EnrollmentServerTlsConfig, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
     SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
     SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
@@ -24,6 +24,8 @@ Usage:
   tunnelproxy-control-plane serve [OPTIONS]
   tunnelproxy-control-plane import [OPTIONS]
   tunnelproxy-control-plane create-token [OPTIONS]
+  tunnelproxy-control-plane revoke-agent [OPTIONS]
+  tunnelproxy-control-plane credential-status [OPTIONS]
 
 Serve options:
   --database <path>                  SQLite snapshot database (required)
@@ -45,6 +47,8 @@ Serve options:
   --agent-cert-validity-ms <ms>      issued leaf lifetime (default 86400000)
   --max-enrollment-clients <usize>   enrollment limit (default 32)
   --enrollment-request-timeout-ms <ms> request deadline (default 10000)
+  --enrollment-activation-grace-ms <ms> activation grace, minimum 1000 (default 600000)
+  --enrollment-reconcile-interval-ms <ms> reconciliation poll (default 30000)
 
 Import options:
   --database <path>                  SQLite snapshot database (required)
@@ -56,6 +60,11 @@ Create-token options:
   --tunnel-id <id>                   bound Tunnel ID (required)
   --output <path>                    secret token output file (required)
   --ttl-ms <ms>                      bootstrap token lifetime (default 600000)
+
+Credential command options:
+  --database <path>                  SQLite snapshot database (required)
+  --agent-id <id>                    exact Agent ID (required)
+  --tunnel-id <id>                   exact Tunnel ID (required)
 
   --help                             print this help and exit
 ";
@@ -105,6 +114,29 @@ async fn main() -> ExitCode {
             }
             Err(error) => {
                 error!(%error, "bootstrap token creation failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::RevokeAgent(args) => match run_revoke_agent(&args).await {
+            Ok(outcome) => {
+                info!(
+                    agent_id = %args.agent_id,
+                    tunnel_id = %args.tunnel_id,
+                    affected_credentials = outcome.affected_credentials,
+                    snapshot_version = outcome.snapshot_version.get(),
+                    event = "credential_revoked"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "Agent credential revocation failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::CredentialStatus(args) => match run_credential_status(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                error!(%error, "credential status query failed");
                 ExitCode::from(1)
             }
         },
@@ -227,6 +259,8 @@ async fn load_enrollment_server_config(
         listen_addr: enrollment.listen,
         max_clients: enrollment.max_clients,
         request_timeout: enrollment.request_timeout,
+        activation_grace: enrollment.activation_grace,
+        reconcile_interval: enrollment.reconcile_interval,
         database_path: args.database.clone(),
         tls,
         issuer,
@@ -314,6 +348,8 @@ enum ParsedCommand {
     Serve(Box<ServeArgs>),
     Import(ImportArgs),
     CreateToken(CreateTokenArgs),
+    RevokeAgent(CredentialTargetArgs),
+    CredentialStatus(CredentialTargetArgs),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -342,6 +378,47 @@ struct EnrollmentArgs {
     agent_cert_validity: Duration,
     max_clients: usize,
     request_timeout: Duration,
+    activation_grace: Duration,
+    reconcile_interval: Duration,
+}
+
+async fn run_revoke_agent(
+    args: &CredentialTargetArgs,
+) -> Result<tunnelproxy_control_plane::CredentialMutationOutcome, CredentialCommandError> {
+    let database = args.database.clone();
+    let agent_id = args.agent_id.clone();
+    let tunnel_id = args.tunnel_id.clone();
+    tokio::task::spawn_blocking(move || {
+        EnrollmentRepository::open(database)?.revoke_agent(&agent_id, &tunnel_id, unix_time_now()?)
+    })
+    .await
+    .map_err(|_| CredentialCommandError::StorageTask)?
+    .map_err(CredentialCommandError::Repository)
+}
+
+async fn run_credential_status(args: CredentialTargetArgs) -> Result<(), CredentialCommandError> {
+    let report = tokio::task::spawn_blocking(move || {
+        EnrollmentRepository::open(args.database)?
+            .credential_status(&args.agent_id, &args.tunnel_id)
+    })
+    .await
+    .map_err(|_| CredentialCommandError::StorageTask)?
+    .map_err(CredentialCommandError::Repository)?;
+    println!("snapshot_version={}", report.snapshot_version.get());
+    for credential in report.credentials {
+        println!(
+            "fingerprint={} generation={} state={} not_after_unix={} activation_deadline_unix={} terminal_at_unix={}",
+            credential.fingerprint,
+            credential.generation.get(),
+            credential.state,
+            credential.not_after_unix,
+            credential.activation_deadline_unix,
+            credential
+                .terminal_at_unix
+                .map_or_else(|| "-".to_owned(), |value| value.to_string())
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -359,6 +436,13 @@ struct CreateTokenArgs {
     ttl: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialTargetArgs {
+    database: PathBuf,
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
+}
+
 fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(ArgError::MissingCommand);
@@ -370,6 +454,10 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
         "serve" => parse_serve(&args[1..]).map(|args| ParsedCommand::Serve(Box::new(args))),
         "import" => parse_import(&args[1..]).map(ParsedCommand::Import),
         "create-token" => parse_create_token(&args[1..]).map(ParsedCommand::CreateToken),
+        "revoke-agent" => parse_credential_target(&args[1..]).map(ParsedCommand::RevokeAgent),
+        "credential-status" => {
+            parse_credential_target(&args[1..]).map(ParsedCommand::CredentialStatus)
+        }
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
 }
@@ -395,6 +483,8 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut agent_cert_validity = Duration::from_secs(24 * 60 * 60);
     let mut max_enrollment_clients = 32;
     let mut enrollment_request_timeout = Duration::from_secs(10);
+    let mut enrollment_activation_grace = Duration::from_secs(10 * 60);
+    let mut enrollment_reconcile_interval = Duration::from_secs(30);
     let mut enrollment_options_present = false;
     let mut index = 0;
     while index < args.len() {
@@ -450,6 +540,14 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
                 enrollment_request_timeout = parse_duration(args, index, flag)?;
                 enrollment_options_present = true;
             }
+            "--enrollment-activation-grace-ms" => {
+                enrollment_activation_grace = parse_duration(args, index, flag)?;
+                enrollment_options_present = true;
+            }
+            "--enrollment-reconcile-interval-ms" => {
+                enrollment_reconcile_interval = parse_duration(args, index, flag)?;
+                enrollment_options_present = true;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_owned())),
         }
         index += 2;
@@ -467,6 +565,8 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             agent_cert_validity,
             max_clients: max_enrollment_clients,
             request_timeout: enrollment_request_timeout,
+            activation_grace: enrollment_activation_grace,
+            reconcile_interval: enrollment_reconcile_interval,
         })
     } else {
         None
@@ -523,6 +623,38 @@ fn parse_create_token(args: &[String]) -> Result<CreateTokenArgs, ArgError> {
         tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
         output: output.ok_or(ArgError::MissingRequired("--output"))?,
         ttl,
+    })
+}
+
+fn parse_credential_target(args: &[String]) -> Result<CredentialTargetArgs, ArgError> {
+    let mut database = None;
+    let mut agent_id = None;
+    let mut tunnel_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--agent-id" => {
+                agent_id = Some(
+                    AgentId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            "--tunnel-id" => {
+                tunnel_id = Some(
+                    TunnelId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(CredentialTargetArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        agent_id: agent_id.ok_or(ArgError::MissingRequired("--agent-id"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
     })
 }
 
@@ -595,7 +727,7 @@ enum ArgError {
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingCommand => f.write_str("serve or import command is required"),
+            Self::MissingCommand => f.write_str("a Control Plane command is required"),
             Self::UnknownCommand(command) => write!(f, "unknown command: {command}"),
             Self::MissingRequired(flag) => write!(f, "required argument {flag} is missing"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
@@ -695,6 +827,21 @@ impl std::fmt::Display for CreateTokenError {
         match self {
             Self::Repository(error) => error.fmt(f),
             Self::StorageTask => f.write_str("bootstrap token worker stopped unexpectedly"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CredentialCommandError {
+    Repository(tunnelproxy_control_plane::EnrollmentRepositoryError),
+    StorageTask,
+}
+
+impl std::fmt::Display for CredentialCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(error) => error.fmt(f),
+            Self::StorageTask => f.write_str("credential storage worker stopped unexpectedly"),
         }
     }
 }
@@ -820,6 +967,10 @@ mod tests {
             "4",
             "--enrollment-request-timeout-ms",
             "500",
+            "--enrollment-activation-grace-ms",
+            "1000",
+            "--enrollment-reconcile-interval-ms",
+            "100",
         ]))
         .unwrap();
         let ParsedCommand::Serve(serve) = command else {
@@ -830,6 +981,8 @@ mod tests {
         assert_eq!(enrollment.agent_cert_validity, Duration::from_secs(1));
         assert_eq!(enrollment.max_clients, 4);
         assert_eq!(enrollment.request_timeout, Duration::from_millis(500));
+        assert_eq!(enrollment.activation_grace, Duration::from_secs(1));
+        assert_eq!(enrollment.reconcile_interval, Duration::from_millis(100));
 
         assert_eq!(
             parse_args(&args(&[
@@ -869,5 +1022,34 @@ mod tests {
             ])),
             Err(ArgError::MissingRequired("--issuer-cert"))
         ));
+        let target = CredentialTargetArgs {
+            database: PathBuf::from("state.db"),
+            agent_id: AgentId::new("agent-token").unwrap(),
+            tunnel_id: TunnelId::new("tunnel-token").unwrap(),
+        };
+        assert_eq!(
+            parse_args(&args(&[
+                "revoke-agent",
+                "--database",
+                "state.db",
+                "--agent-id",
+                "agent-token",
+                "--tunnel-id",
+                "tunnel-token",
+            ])),
+            Ok(ParsedCommand::RevokeAgent(target.clone()))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "credential-status",
+                "--database",
+                "state.db",
+                "--agent-id",
+                "agent-token",
+                "--tunnel-id",
+                "tunnel-token",
+            ])),
+            Ok(ParsedCommand::CredentialStatus(target))
+        );
     }
 }

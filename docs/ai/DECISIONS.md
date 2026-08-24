@@ -571,3 +571,34 @@ retried from durable state. There is a bounded two-fingerprint overlap until
 activation. Static Edge mode is intentionally unsupported. Issuer key custody,
 CA rollover, CRL/OCSP/emergency revocation, abandoned-overlap cleanup, hostile
 local filesystem defense, and multi-writer consensus remain future boundaries.
+
+---
+
+## ADR-022 — Snapshot revocation and terminal tombstones reconcile credentials
+
+**Status:** Accepted (Session 22).
+
+**Context:** Session 21 overlaps old and new Agent fingerprints until explicit
+activation. An Agent that disappears can leave the pending fingerprint
+authorized indefinitely, while operators have no durable emergency mechanism
+to invalidate an active renewal token and close its live Edge session.
+
+**Decision:** Credential state is persisted as `Pending`, `Active`, `Retired`,
+`Revoked`, or `Expired`. Issuance stores a bounded activation deadline. The
+supervised enrollment service periodically expires a bounded batch of overdue
+pending rows, removes only their fingerprints in the same SQLite transaction,
+and publishes afterward; a renewal predecessor remains active. Expired request
+IDs remain terminal tombstones so replay cannot mint another leaf. An offline
+`revoke-agent` transaction marks all pending/active credentials for one exact
+Agent/Tunnel pair revoked, invalidates matching bootstrap and renewal tokens,
+and removes that tunnel from the complete snapshot. Dynamic Edge's existing
+reconciliation closes the exact live session. Repeated expiry/revoke is
+idempotent. Agent treats revocation as terminal but discards an expired pending
+journal so a still-active predecessor token may begin a fresh request.
+
+**Consequences:** Emergency application-level revocation and abandoned-overlap
+cleanup are durable, bounded, restart-safe, and require no Edge database lookup
+or Tunnel Protocol change. A CA-valid revoked leaf may still complete the TLS
+layer before snapshot authorization rejects it; CRL/OCSP is not added. The
+issuer filesystem boundary, HSM/KMS, CA rollover, general admin API, and
+multi-writer consensus remain future work.

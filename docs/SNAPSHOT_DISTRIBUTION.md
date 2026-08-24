@@ -103,6 +103,9 @@ selects exactly one authorization mode: plaintext loopback development, static
 mTLS certificate authorization, or mTLS plus the complete snapshot flag group.
 
 Session 21 may transactionally add and activate Agent certificate fingerprints
-through the enrollment workflow. It uses the same complete snapshot repository
-and publication channel. There is still no general admin API, snapshot signing,
-CA lifecycle automation, or multi-edge consensus.
+through the enrollment workflow. Session 22 uses that same durable path for
+bounded expiry reconciliation and exact Agent/Tunnel emergency revocation.
+Those mutations remove fingerprints and grants in SQLite before advancing and
+publishing a new complete snapshot, so dynamic Edge revokes live mTLS sessions
+without a storage lookup on ingress. There is still no general admin API,
+snapshot signing, CRL/OCSP, CA lifecycle automation, or multi-edge consensus.

@@ -29,8 +29,10 @@ mod snapshot_service;
 
 pub use certificate_issuer::{AgentCertificateIssuer, CertificateIssuerError, IssuedCertificate};
 pub use enrollment_repository::{
-    provision_bootstrap_token, token_hash as enrollment_token_hash, unix_time_now, DurableIssuance,
-    EnrollmentRepository, EnrollmentRepositoryError, EnrollmentTokenBinding, IssuanceCandidate,
+    provision_bootstrap_token, token_hash as enrollment_token_hash, unix_time_now,
+    CredentialMutationOutcome, CredentialState, CredentialStatus, CredentialStatusReport,
+    DurableIssuance, EnrollmentRepository, EnrollmentRepositoryError, EnrollmentTokenBinding,
+    IssuanceCandidate,
 };
 pub use enrollment_service::{
     EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,

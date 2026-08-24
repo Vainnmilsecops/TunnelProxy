@@ -462,6 +462,34 @@ This mutation path feeds the existing snapshot publisher; Edge ingress still
 uses only cached immutable state. See
 [`AGENT_ENROLLMENT.md`](AGENT_ENROLLMENT.md) for trust boundaries and commands.
 
+### 2.21 Emergency credential revocation and reconciliation (Session 22)
+
+Enrollment credentials now have explicit `pending`, `active`, `retired`,
+`revoked`, and `expired` states. Each issuance records a bounded activation
+deadline. Activation at or after that deadline atomically expires the pending
+credential, removes only its temporary fingerprint from the full snapshot,
+and preserves a durable tombstone so an exact request replay receives
+`RequestExpired` instead of creating another logical issuance.
+
+The supervised enrollment runtime periodically reconciles abandoned pending
+credentials in bounded batches. State transition, snapshot mutation, and
+snapshot-version advancement share one SQLite transaction; publication occurs
+only after commit. A terminal reconciliation or publication failure stops the
+Control Plane runtime instead of silently leaving authority stale.
+
+`revoke-agent` performs the emergency path for one exact Agent/Tunnel pair. It
+revokes pending and active credentials, invalidates their renewal and bootstrap
+tokens, removes that pair's grants while preserving unrelated tunnels, and
+advances the snapshot only when authority changed. The operation is idempotent.
+Dynamic Edge reconciliation then closes matching live mTLS sessions and active
+streams without adding database access to the data-plane hot path.
+
+The Agent treats revocation and other policy/authentication rejections as
+terminal. An expired pending request is retryable after its local pending
+journal is removed, allowing renewal from the still-active predecessor. This
+is application-level authorization revocation; it is not CRL/OCSP or general
+PKI revocation.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

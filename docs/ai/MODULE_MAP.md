@@ -101,7 +101,11 @@ distribution, and a dedicated mutual-TLS snapshot service for Edge bootstrap
 and reconnect. A runnable binary supports strict full-snapshot import, a
 supervised SQLite-refreshing distribution service, bound bootstrap-token
 provisioning, short-lived Agent leaf issuance, and transactional enrollment
-snapshot activation.
+snapshot activation. Credential persistence includes activation deadlines and
+terminal tombstones; a bounded supervised reconciler expires abandoned
+overlaps. Operator commands expose secret-safe credential status and an
+idempotent Agent/Tunnel emergency revoke that invalidates tokens and commits
+through the same complete-snapshot authority path.
 
 **Responsibility (future)**
 

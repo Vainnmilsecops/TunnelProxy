@@ -56,6 +56,8 @@ pub enum EnrollmentErrorCode {
     InvalidCsr = 5,
     Conflict = 6,
     Internal = 7,
+    CredentialRevoked = 8,
+    RequestExpired = 9,
 }
 
 impl EnrollmentErrorCode {
@@ -68,6 +70,8 @@ impl EnrollmentErrorCode {
             5 => Ok(Self::InvalidCsr),
             6 => Ok(Self::Conflict),
             7 => Ok(Self::Internal),
+            8 => Ok(Self::CredentialRevoked),
+            9 => Ok(Self::RequestExpired),
             _ => Err(EnrollmentProtocolError::InvalidPayload),
         }
     }
@@ -454,6 +458,12 @@ mod tests {
             },
             EnrollmentMessage::Error {
                 code: EnrollmentErrorCode::Unauthorized,
+            },
+            EnrollmentMessage::Error {
+                code: EnrollmentErrorCode::CredentialRevoked,
+            },
+            EnrollmentMessage::Error {
+                code: EnrollmentErrorCode::RequestExpired,
             },
         ];
         for message in messages {

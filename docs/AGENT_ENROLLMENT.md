@@ -21,6 +21,12 @@ Plane snapshots. It does not change Tunnel Protocol v2 or the snapshot protocol.
   the running Agent observes the new TLS generation.
 - During renewal, old and new fingerprints overlap until activation. Activation
   removes the predecessor in a later snapshot. Exact retries are idempotent.
+- Every issuance has a bounded activation deadline. A supervised reconciler
+  marks overdue requests expired and removes only the pending fingerprint; an
+  active renewal predecessor and its token remain usable.
+- Emergency revocation targets one exact Agent/Tunnel pair, invalidates its
+  bootstrap and active renewal tokens, and removes its authorization through a
+  durable full-snapshot transaction.
 
 Bootstrap and renewal secrets are supplied only through files. `Debug`, errors,
 and structured events do not include token or key bytes.
@@ -66,7 +72,9 @@ tunnelproxy-control-plane serve \
   --edge-client-ca edge-ca.pem \
   --enrollment-listen 0.0.0.0:7300 \
   --issuer-cert agent-issuer-ca.pem --issuer-key agent-issuer-ca-key.pem \
-  --agent-server-ca edge-server-ca.pem
+  --agent-server-ca edge-server-ca.pem \
+  --enrollment-activation-grace-ms 600000 \
+  --enrollment-reconcile-interval-ms 30000
 ```
 
 The enrollment listener reuses the Control Plane server certificate/key for
@@ -95,9 +103,29 @@ runtime polls certificate health and rotates when the active leaf enters the
 configured `--renew-before-ms` window. Dynamic Edge authorization is required;
 static Edge mode cannot consume these Control Plane snapshot mutations.
 
+Inspect or revoke one exact identity without exposing token/certificate
+material:
+
+```text
+tunnelproxy-control-plane credential-status \
+  --database snapshots.sqlite \
+  --agent-id agent-prod --tunnel-id tunnel-prod
+
+tunnelproxy-control-plane revoke-agent \
+  --database snapshots.sqlite \
+  --agent-id agent-prod --tunnel-id tunnel-prod
+```
+
+The status command prints fingerprint, generation, lifecycle state, expiry,
+activation deadline, terminal time, and snapshot version only. Repeating
+revocation is safe. A running Control Plane observes the durable snapshot and
+Dynamic Edge closes a matching active Agent session through normal snapshot
+reconciliation.
+
 ## Deliberate boundaries
 
 Issuer keys and token/output directories are trusted operator filesystem
-boundaries. HSM/KMS custody, CA rollover, CRL/OCSP, emergency revocation,
-multi-Control-Plane consensus, and automatic cleanup of a pending overlap when
-an Agent never activates are not implemented.
+boundaries. HSM/KMS custody, CA rollover, CRL/OCSP,
+multi-Control-Plane consensus, and hostile local-filesystem defense are not
+implemented. Emergency revocation here is snapshot/application authorization;
+a CA-valid revoked leaf may still complete TLS before Edge rejects registration.

@@ -26,8 +26,9 @@ use tunnelproxy_agent::{
 };
 use tunnelproxy_common::{AgentId, TlsConfigHealth, TunnelId};
 use tunnelproxy_control_plane::{
-    authorization_snapshot_channel, AgentGrant, AuthorizationSnapshot, CertificateFingerprint,
-    ControlPlaneRuntime, ControlPlaneRuntimeConfig, SnapshotBootstrapSource, SnapshotCacheConfig,
+    authorization_snapshot_channel, enrollment_token_hash, AgentGrant, AuthorizationSnapshot,
+    CertificateFingerprint, ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentRepository,
+    IssuanceCandidate, PersistentSnapshotAuthority, SnapshotBootstrapSource, SnapshotCacheConfig,
     SnapshotClientConfig, SnapshotClientError, SnapshotRepository, SnapshotServerConfig,
     SnapshotServerTlsConfig, SnapshotVersion, SqliteSnapshotRepository, TunnelGrant, TunnelStatus,
     VersionedAuthorizationSnapshot,
@@ -39,7 +40,8 @@ use tunnelproxy_edge::{
     SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
-    Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest, ROLE_AGENT,
+    EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
+    ROLE_AGENT,
 };
 
 struct TestIdentity {
@@ -765,6 +767,99 @@ async fn live_snapshot_updates_revoke_and_restore_tunnel_without_rebinding_ingre
     assert!(outcome.agent_sessions_seen >= 2);
     assert_eq!(outcome.route_generations, 1);
     local_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_emergency_revoke_closes_the_exact_live_mtls_agent_session() {
+    let pki = test_pki("edge.test");
+    let (database, directory) = snapshot_temp_database();
+    let snapshots = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
+    snapshots
+        .commit(&VersionedAuthorizationSnapshot::new(
+            SnapshotVersion::FIRST,
+            AuthorizationSnapshot::default(),
+        ))
+        .unwrap();
+    let credentials = EnrollmentRepository::open(&database).unwrap();
+    let agent_id = AgentId::new("agent-dev").unwrap();
+    let tunnel_id = TunnelId::new("tunnel-dev").unwrap();
+    let bootstrap = [61; 32];
+    let renewal = [62; 32];
+    credentials
+        .create_bootstrap_token(
+            enrollment_token_hash(&bootstrap),
+            &agent_id,
+            &tunnel_id,
+            1_000,
+        )
+        .unwrap();
+    let issuance = IssuanceCandidate {
+        request_id: EnrollmentRequestId::from_bytes([63; 16]),
+        presented_token_hash: enrollment_token_hash(&bootstrap),
+        next_token_hash: enrollment_token_hash(&renewal),
+        agent_id: agent_id.clone(),
+        tunnel_id: tunnel_id.clone(),
+        csr_digest: [64; 32],
+        certificate_pem: pki.client.certificate_pem.as_bytes().to_vec(),
+        fingerprint: client_fingerprint(&pki.client),
+        not_after_unix: 10_000,
+        activation_deadline_unix: 9_000,
+    };
+    credentials.commit_issuance(&issuance, 100).unwrap();
+    credentials
+        .activate(
+            issuance.request_id,
+            enrollment_token_hash(&renewal),
+            issuance.fingerprint,
+            110,
+        )
+        .unwrap();
+    let authority = PersistentSnapshotAuthority::open(snapshots.clone())
+        .await
+        .unwrap();
+
+    let (local_addr, local_task) = spawn_echo_connections(2).await;
+    let raw_addr = unused_addr().await;
+    let mut config = edge_config(raw_addr);
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration =
+        EdgeRegistrationPolicy::mutual_tls_updates(authority.subscribe());
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(
+        secure_agent_runtime(edge_addr, local_addr, &pki).run_until_shutdown(agent_signal),
+    );
+    round_trip(raw_addr, b"before-durable-revoke").await;
+
+    let mut active = connect_eventually(raw_addr).await;
+    active.write_all(b"active-durable-revoke").await.unwrap();
+    let mut echoed = vec![0_u8; b"active-durable-revoke".len()];
+    active.read_exact(&mut echoed).await.unwrap();
+    credentials
+        .revoke_agent(&agent_id, &tunnel_id, 120)
+        .unwrap();
+    authority.refresh_from_repository().await.unwrap();
+    wait_for_authorization_status(&router, 3, AuthorizationSourceStatus::Live).await;
+    assert!(router.connected_tunnels().await.is_empty());
+    let mut byte = [0_u8; 1];
+    let closed = timeout(Duration::from_secs(2), active.read(&mut byte))
+        .await
+        .expect("durably revoked active stream stayed open");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+
+    agent_trigger.shutdown();
+    edge_trigger.shutdown();
+    let _ = agent_task.await;
+    edge_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+    drop(credentials);
+    drop(authority);
+    drop(snapshots);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
