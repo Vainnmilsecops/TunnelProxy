@@ -20,6 +20,10 @@ tokio-rustls = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
 tunnelproxy-common = { path = "../common" }
 tunnelproxy-control-plane = { path = "../control-plane" }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 
 [dev-dependencies]
 tunnelproxy-agent = { path = "../agent" }

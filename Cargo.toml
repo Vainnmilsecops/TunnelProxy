@@ -51,6 +51,12 @@ rusqlite = { version = "0.31", default-features = false, features = ["bundled"] 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 x509-parser = "0.16"
+bytes = "1"
+# Session 25 pins the HTTP stack to releases whose declared MSRV remains below
+# the workspace Rust 1.75 floor. CI verifies this independently.
+hyper = { version = "=1.6.0", default-features = false, features = ["client", "server", "http1"] }
+hyper-util = { version = "=0.1.10", default-features = false, features = ["tokio"] }
+http-body-util = "=0.1.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

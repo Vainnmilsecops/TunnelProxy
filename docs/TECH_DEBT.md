@@ -20,6 +20,22 @@
 
 ## Open items
 
+### DEBT-020 — Public HTTP ingress is HTTP/1.1 single-request only
+
+- **Introduced in:** Session 25
+- **Category:** product / performance
+- **Impact:** medium for production HTTP workloads, low for the bounded slice
+- **Rationale:** The first public HTTPS surface disables keep-alive and supports
+  exactly one HTTP/1.1 request per TLS connection. It rejects HTTP upgrade,
+  WebSocket, CONNECT, and does not negotiate HTTP/2. This keeps request
+  ownership, timeout, body bounds, drain, and tunnel-stream completion explicit
+  while hostname and forwarding-header security are established.
+- **Exit plan:** Add measured connection reuse and HTTP/2 only with explicit
+  per-connection/per-stream admission, fair tunnel scheduling, independent body
+  deadlines, graceful drain tests, and equivalent host-fronting/header
+  sanitization coverage. Treat upgrades/CONNECT as separate policy surfaces.
+- **Tracking:** open.
+
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 
 - **Introduced in:** Session 02

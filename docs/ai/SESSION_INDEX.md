@@ -856,3 +856,35 @@ Out of scope:
   automated dependency updates, and vulnerability/license auditing.
 - Public HTTP/HTTPS termination, hostname allocation, signed access URLs, and
   multi-edge ownership.
+
+## Session 25 — Bounded Public HTTPS/HTTP/1.1 Ingress — complete
+
+Scope delivered:
+
+- Added a runnable HTTPS ingress mode that replaces raw ingress and routes one
+  exact normalized hostname to the configured durable TunnelId through the
+  existing cached multiplexed Agent transport.
+- Added independent public server TLS with HTTP/1.1 ALPN, handshake deadline,
+  secret-safe typed failures, certificate validity status, and optional atomic
+  generation-manifest reload for new handshakes.
+- Required exact Host/SNI/absolute-authority agreement and rejected missing or
+  duplicate Host, host fronting, unknown hosts, CONNECT, and upgrades before
+  opening a logical tunnel stream.
+- Removed hop-by-hop and client-supplied forwarding headers and emitted trusted
+  canonical forwarding metadata. Requests are converted to origin form and
+  response hop-by-hop fields are removed.
+- Bounded global and public per-IP connections, header bytes/count, request
+  body size, header/TLS/request deadlines, duplex buffering, and shutdown drain.
+  Public mode requires explicit opt-in plus Agent mTLS and dynamic snapshots.
+- Generalized the internal router ingress from `TcpStream` to bounded async I/O
+  without changing existing APIs or Tunnel Protocol v2, and shared the RAII
+  per-IP admission implementation with public raw ingress.
+- Added unit, CLI, real TLS/HTTP, offline/fronting policy, security-policy, and
+  public TLS reload coverage. The workspace now contains 270 explicit tests.
+
+Out of scope:
+
+- Automatic hostname allocation/catalog, custom domains, signed access URLs,
+  and public-client authentication.
+- HTTP/2, public keep-alive, WebSocket/upgrade, CONNECT, request-rate limiting,
+  distributed DDoS controls, and multi-edge ownership.

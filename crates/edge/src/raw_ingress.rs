@@ -1,9 +1,9 @@
 //! Raw-ingress listeners with explicit exposure, admission, and drain lifecycle.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, TunnelId};
 use tunnelproxy_protocol::TransportSessionId;
 
+use crate::admission::{PeerAdmission, PeerAdmissionPermit};
 use crate::multiplex::{EdgeSessionRouter, RouteError};
 
 /// Process-local identifier for one raw ingress listener.
@@ -734,59 +735,6 @@ fn spawn_routed_connection(connections: &mut JoinSet<()>, task: RoutedConnection
         drop(peer_permit);
         drop(global_permit);
     });
-}
-
-#[derive(Debug)]
-struct PeerAdmission {
-    max_connections_per_ip: usize,
-    active: StdMutex<HashMap<IpAddr, usize>>,
-}
-
-impl PeerAdmission {
-    fn new(max_connections_per_ip: usize) -> Self {
-        Self {
-            max_connections_per_ip,
-            active: StdMutex::new(HashMap::new()),
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>, peer: IpAddr) -> Option<PeerAdmissionPermit> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if active.get(&peer).copied().unwrap_or(0) >= self.max_connections_per_ip {
-            return None;
-        }
-        *active.entry(peer).or_default() += 1;
-        Some(PeerAdmissionPermit {
-            admission: Arc::clone(self),
-            peer,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct PeerAdmissionPermit {
-    admission: Arc<PeerAdmission>,
-    peer: IpAddr,
-}
-
-impl Drop for PeerAdmissionPermit {
-    fn drop(&mut self) {
-        let mut active = self
-            .admission
-            .active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(count) = active.get_mut(&self.peer) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            active.remove(&self.peer);
-        }
-    }
 }
 
 fn log_route_open_failure(

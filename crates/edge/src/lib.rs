@@ -1170,13 +1170,25 @@ async fn drain_tasks<T: 'static>(
     RuntimeShutdownOutcome::Drained { completed_tasks }
 }
 
+mod admission;
 pub mod agent_transport;
+pub mod http_ingress;
+mod http_tls;
 pub mod multiplex;
 pub mod raw_ingress;
 mod runtime;
 mod snapshot_runtime;
 mod tls;
 
+pub use http_ingress::{
+    HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError, HttpIngressConfig,
+    HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy, HttpIngressOutcome,
+    HttpIngressRuntime, MAX_HTTP_HEADER_BYTES, MAX_HTTP_HOST_ROUTES, MIN_HTTP_HEADER_BYTES,
+};
+pub use http_tls::{
+    PublicTlsConfig, PublicTlsConfigError, PublicTlsReloadBootstrapError, PublicTlsReloadConfig,
+    PublicTlsReloadRuntime, PUBLIC_HTTP1_ALPN,
+};
 pub use multiplex::{
     AuthorizationSourceStatus, EdgeAuthorizationStatus, EdgeSessionRouter, MultiplexedEdgeConfig,
     MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RouteError, RoutedStream,

@@ -73,9 +73,11 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-Public HTTP reverse proxying, custom domains, dashboard, billing, request-rate
-limiting, request inspection, stream replay, protected issuer custody,
-multi-edge ownership, and cloud deployment are explicitly **not implemented**.
-The implemented public surface is only opt-in opaque raw TCP with per-IP
-concurrency admission and authenticated dynamic Agent authority; presenting it
-as the future HTTPS product surface is a bug.
+Automatic hostname allocation, custom domains, dashboard, billing,
+request-rate limiting, request inspection, stream replay, protected issuer
+custody, multi-edge ownership, and cloud deployment are explicitly **not
+implemented**. The implemented public surfaces are opt-in opaque raw TCP and a
+bounded operator-configured HTTPS/HTTP/1.1 route. Both use per-IP concurrency
+admission and authenticated dynamic Agent authority; the HTTPS slice also
+terminates reloadable public TLS and enforces exact Host/SNI routing, but it is
+not yet the automatic future product UX.

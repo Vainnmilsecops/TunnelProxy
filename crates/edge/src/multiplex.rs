@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
@@ -35,6 +35,12 @@ use crate::tls::{
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
+
+trait IngressIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> IngressIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedIngress = Box<dyn IngressIo>;
 
 /// Limits for the Session 09 Edge runtime.
 #[derive(Debug, Clone)]
@@ -266,12 +272,28 @@ impl EdgeSessionRouter {
         tunnel_id: &TunnelId,
         ingress: TcpStream,
     ) -> Result<RoutedStream, RouteError> {
+        self.open_tunnel_io_tracked(tunnel_id, ingress).await
+    }
+
+    /// Resolves a durable tunnel and routes any owned asynchronous byte stream.
+    ///
+    /// This is used by protocol-aware ingress such as public HTTPS, where the
+    /// tunneled side is a bounded in-memory duplex stream rather than a raw
+    /// accepted TCP socket.
+    pub async fn open_tunnel_io_tracked<T>(
+        &self,
+        tunnel_id: &TunnelId,
+        ingress: T,
+    ) -> Result<RoutedStream, RouteError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let gate = self.authorization_gate.lock().await;
         let session_id = self
             .resolve_tunnel(tunnel_id)
             .await
             .ok_or_else(|| RouteError::TunnelNotConnected(tunnel_id.clone()))?;
-        let pending = self.enqueue_stream(session_id, ingress).await?;
+        let pending = self.enqueue_io(session_id, Box::new(ingress)).await?;
         drop(gate);
         finish_open(session_id, pending).await
     }
@@ -306,6 +328,14 @@ impl EdgeSessionRouter {
         &self,
         session_id: TransportSessionId,
         ingress: TcpStream,
+    ) -> Result<PendingRoutedStream, RouteError> {
+        self.enqueue_io(session_id, Box::new(ingress)).await
+    }
+
+    async fn enqueue_io(
+        &self,
+        session_id: TransportSessionId,
+        ingress: BoxedIngress,
     ) -> Result<PendingRoutedStream, RouteError> {
         if !self.accepting_streams.load(Ordering::Acquire) {
             return Err(RouteError::RuntimeDraining);
@@ -786,7 +816,7 @@ fn spawn_accepted_session(
 
 enum SessionCommand {
     Open {
-        ingress: TcpStream,
+        ingress: BoxedIngress,
         response: oneshot::Sender<Result<StreamId, RouteError>>,
         completion: oneshot::Sender<RoutedStreamCloseReason>,
     },
@@ -1100,7 +1130,7 @@ async fn run_edge_session(
 async fn run_ingress_stream(
     session_id: TransportSessionId,
     stream_id: StreamId,
-    mut ingress: TcpStream,
+    mut ingress: BoxedIngress,
     response: oneshot::Sender<Result<StreamId, RouteError>>,
     completion: oneshot::Sender<RoutedStreamCloseReason>,
     config: MultiplexedEdgeConfig,

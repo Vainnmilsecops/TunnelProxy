@@ -436,3 +436,44 @@ and apply host firewall policy appropriate for the deployment. Snapshot-cache
 cold start retains its configured stale deadline: traffic may continue from
 cached authority during a Control Plane outage, and revocation delivery waits
 for authenticated reconnect or stale-deadline shutdown.
+
+## 17. Running bounded public HTTPS ingress
+
+HTTPS ingress replaces raw ingress for the runnable single-tunnel Edge. A
+public listener requires the complete Agent mTLS and dynamic snapshot groups,
+an explicit public opt-in, and a per-source-IP connection bound:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-host demo.example.test \
+  --public-tls-cert public-server.pem \
+  --public-tls-key public-server-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --tls-cert edge-server.pem \
+  --tls-key edge-server-key.pem \
+  --tls-client-ca agent-ca.pem \
+  --snapshot-server 127.0.0.1:7200 \
+  --snapshot-ca control-plane-ca.pem \
+  --snapshot-client-cert edge-client.pem \
+  --snapshot-client-key edge-client-key.pem \
+  --snapshot-server-name control-plane.internal
+```
+
+`--https-host` is one exact DNS hostname for the configured TunnelId. Host and
+TLS SNI must match; wildcard allocation is not implemented. Raw-ingress flags
+and HTTPS mode are mutually exclusive. The listener speaks HTTP/1.1 only,
+closes after one request, rejects CONNECT/upgrades, and replaces client-supplied
+forwarding headers. Header bytes/count, request body, TLS handshake, header
+read, complete request, global connection, and public per-IP limits are all
+configurable and validated before bind.
+
+Optional public certificate reload uses `--public-tls-reload-manifest` and the
+same monotonic digest-bound generation rules as the other TLS surfaces. The
+manifest must contain exactly `public_server_certificate` and
+`public_server_private_key`. A rejected generation leaves the last-known-good
+configuration active; expiry without a valid replacement terminates the
+supervisor. Public TLS authenticates the endpoint to clients but does not add
+signed access URLs or end-user authentication.

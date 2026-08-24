@@ -34,6 +34,9 @@ correct agent, which in turn proxies them into the local service.
 - Explicit public raw TCP exposure that requires Agent-facing mTLS, dynamic
   snapshot authorization, operator opt-in, and a bounded per-IP concurrency
   limit; loopback remains the default.
+- Bounded public HTTPS/HTTP/1.1 ingress for one operator-configured exact
+  hostname, including public TLS termination/reload, Host/SNI validation,
+  forwarding-header sanitization, and cached TunnelId routing.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
@@ -50,10 +53,10 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Credit/window-based flow control and strict weighted stream scheduling.
-- Public HTTP reverse proxy and hostname allocation.
-- Public-ingress TLS and public-client access authorization.
-- General administrative/account API and automated certificate issuance/key
-  custody.
+- Automatic hostname allocation, custom-domain administration, and HTTP/2.
+- Public-client access authorization, signed URLs, and request-rate limiting.
+- General administrative/account API and protected issuer-key custody/CA
+  rollover.
 - Request inspection, replay, and webhook debugging.
 - Multi-tenant or multi-edge runtime.
 
@@ -95,8 +98,9 @@ The architecture conceptually separates:
 
 Today the control-plane crate provides versioned certificate/Agent/tunnel
 authorization snapshots, SQLite persistence, full-snapshot import, and a
-runnable authenticated distribution service. The data plane has a tested
-opt-in public raw-TCP reverse path but no public HTTP/TLS routing. See
+runnable authenticated distribution service. The data plane has tested
+opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
+slice with exact configured hostname routing and public TLS reload. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -108,7 +112,8 @@ $ tunnelproxy http 3000
 https://blue-cat.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
-This is the **target** experience. It does not work yet.
+This automatic hostname-allocation UX does not work yet. Session 25 provides
+the underlying operator-configured HTTPS route, not this developer CLI.
 
 ## Repository structure
 
@@ -178,6 +183,7 @@ and Definition of Done.
 | 19–20 _(complete)_ | bounded Edge cold-start cache and atomic TLS generation reload |
 | 21–23 _(complete)_ | Agent enrollment/revocation and explicit public raw ingress |
 | 24 _(complete)_ | reproducible dependency locking and cross-platform GitHub CI |
+| 25 _(complete)_ | bounded public HTTPS/HTTP/1.1 ingress and exact hostname routing |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
