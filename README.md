@@ -177,6 +177,7 @@ and Definition of Done.
 | 16–18 _(complete)_ | live revocation, persistent snapshots, and runnable Control Plane/Edge wiring |
 | 19–20 _(complete)_ | bounded Edge cold-start cache and atomic TLS generation reload |
 | 21–23 _(complete)_ | Agent enrollment/revocation and explicit public raw ingress |
+| 24 _(complete)_ | reproducible dependency locking and cross-platform GitHub CI |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

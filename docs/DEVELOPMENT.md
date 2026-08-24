@@ -55,6 +55,31 @@ cargo build --workspace
 cargo build --workspace --release
 ```
 
+### 3.1 Reproducible dependency resolution and CI
+
+TunnelProxy ships application binaries, so the workspace commits `Cargo.lock`.
+Do not remove or regenerate the lockfile casually. CI uses `--locked`; a
+manifest change whose resolved dependencies are not committed fails before
+compilation.
+
+GitHub Actions runs on every pull request and push to `main`. The quality job
+checks formatting, all targets, and Clippy on Ubuntu. Test/build jobs run on
+both Ubuntu and Windows MSVC, and a separate job checks the declared Rust 1.75
+MSRV. Run the equivalent stable-toolchain gates locally before opening a PR:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --locked
+```
+
+The hosted Windows runner includes the MSVC native build toolchain. A local
+native Windows build still requires Visual Studio Build Tools with the
+"Desktop development with C++" workload; alternatively run the Linux gates in
+WSL.
+
 ## 4. Formatting
 
 - We use the default `rustfmt` configuration. There is no custom

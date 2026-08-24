@@ -826,3 +826,33 @@ Out of scope:
 - Request-rate limiting, distributed DDoS mitigation, and multi-edge ownership.
 - Multiple tunnels per Agent transport, inspection/replay, and public-client
   authentication for arbitrary raw protocols.
+
+## Session 24 — Reproducible Builds & GitHub CI — complete
+
+Scope delivered:
+
+- Changed the application-workspace policy to track `Cargo.lock`, retaining its
+  Rust-1.75-readable version-3 format and requiring hosted Cargo commands to use
+  `--locked`.
+- Added a least-privilege GitHub Actions workflow for pull requests, pushes to
+  `main`, and manual dispatch, with immutable checkout action pinning, no
+  persisted credentials, bounded job timeouts, and cancellation of superseded
+  runs.
+- Added an Ubuntu quality job for format, all-target checking, and warning-free
+  Clippy; a non-fail-fast Ubuntu/Windows MSVC matrix for all workspace tests and
+  builds; and an explicit Rust 1.75 all-target MSRV check.
+- Exercised the MSRV gate locally, locked `zeroize` to a Cargo-1.75-compatible
+  release, and removed redundant crate-level `deny(unsafe_code)` attributes
+  while preserving the stronger workspace `forbid(unsafe_code)` policy.
+- Documented how to reproduce the locked gates locally and clarified that the
+  hosted Windows image supplies MSVC while native local Windows builds still
+  require the Visual Studio C++ workload.
+- Closed DEBT-002 and DEBT-003 without changing Tunnel Protocol v2, runtime
+  behavior, ingress policy, or the existing count of 261 explicit tests.
+
+Out of scope:
+
+- GitHub branch-protection configuration, release artifacts, code signing,
+  automated dependency updates, and vulnerability/license auditing.
+- Public HTTP/HTTPS termination, hostname allocation, signed access URLs, and
+  multi-edge ownership.

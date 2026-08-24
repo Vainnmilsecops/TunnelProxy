@@ -4,8 +4,6 @@
 //! dedicated authenticated channel. Edge still consumes immutable cached
 //! snapshots without querying a database on the ingress hot path (INV-007).
 
-#![deny(unsafe_code)]
-
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;

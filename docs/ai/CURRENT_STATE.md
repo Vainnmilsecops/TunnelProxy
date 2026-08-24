@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Public Raw TCP Ingress & Per-IP Admission** (Session 23).
+**Reproducible Builds & GitHub CI** (Session 24).
 
 ## Completed
 
@@ -277,6 +277,14 @@
   revocation without a database or Control Plane lookup on ingress.
 - Route status and structured events expose accepted, global-capacity,
   per-IP-capacity, and unavailable-target outcomes without payload bytes.
+- The application workspace commits `Cargo.lock`; CI uses `--locked` so
+  manifest and dependency-resolution changes must land atomically.
+- GitHub Actions checks format, all targets, and warning-free Clippy on Ubuntu;
+  runs the full test/build suite on Ubuntu and Windows MSVC; and checks the
+  declared Rust 1.75 MSRV under least-privilege, cancellable workflows.
+- The MSRV path retains the workspace-level `forbid(unsafe_code)` policy while
+  avoiding redundant crate-level lint overrides, and locks transitive
+  dependencies to Cargo-1.75-readable releases.
 - 261 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
@@ -304,6 +312,8 @@
 
 ## Next planned session
 
-Not selected yet. Session 23 deliberately exposes only opaque raw TCP. Public
-HTTP/TLS hostname routing, issuer custody/CA lifecycle, general administration,
-and multi-edge coordination remain separate future scopes.
+Session 25 should add a bounded public HTTPS/HTTP/1.1 vertical slice with exact
+hostname-to-TunnelId routing, forwarding-header sanitization, public-side TLS
+termination/reload, and no Control Plane lookup on the request hot path. Signed
+access URLs, general domain administration, HTTP/2, and multi-edge ownership
+remain separate scopes.

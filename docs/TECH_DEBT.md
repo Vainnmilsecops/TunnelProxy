@@ -20,32 +20,6 @@
 
 ## Open items
 
-### DEBT-002 — No CI configuration
-
-- **Introduced in:** Session 01
-- **Category:** ops
-- **Impact:** medium
-- **Rationale:** Foundation work is local-only by intent. CI selection
-  (GitHub Actions vs. another provider) is deferred until the
-  project's hosting is decided.
-- **Exit plan:** Add a CI workflow that runs `cargo fmt --check`,
-  `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace`, and `cargo build --workspace` on every
-  PR.
-- **Tracking:** open.
-
-### DEBT-003 — `Cargo.lock` not yet committed intentionally is undecided
-
-- **Introduced in:** Session 01
-- **Category:** foundation
-- **Impact:** low
-- **Rationale:** For a workspace that will ship application binaries,
-  `Cargo.lock` should be committed. We have not yet produced a
-  `Cargo.lock` because no build has been run in this environment.
-- **Exit plan:** Commit `Cargo.lock` on the first build that
-  successfully resolves dependencies.
-- **Tracking:** open.
-
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 
 - **Introduced in:** Session 02
@@ -223,6 +197,30 @@
   remains open; dynamic Edge enrollment is not a complete PKI.
 
 ## Resolved items
+
+### DEBT-002 — No CI configuration — resolved
+
+- **Introduced in:** Session 01
+- **Resolved in:** Session 24
+- **Category:** ops
+- **Impact:** medium
+- **Resolution:** Added a least-privilege GitHub Actions workflow for pull
+  requests, pushes to `main`, and manual runs. It checks format, all targets,
+  and Clippy on Ubuntu; tests and builds on Ubuntu plus Windows MSVC; and checks
+  the declared Rust 1.75 MSRV. Commands use the committed dependency lock and
+  concurrent runs for superseded revisions are cancelled.
+- **Tracking:** resolved in Session 24.
+
+### DEBT-003 — `Cargo.lock` not yet committed intentionally is undecided — resolved
+
+- **Introduced in:** Session 01
+- **Resolved in:** Session 24
+- **Category:** foundation
+- **Impact:** low
+- **Resolution:** TunnelProxy ships binaries, so `Cargo.lock` is now tracked.
+  CI uses `--locked` to reject uncommitted dependency-resolution drift, while
+  the version-3 lock format remains readable by the Rust 1.75 toolchain.
+- **Tracking:** resolved in Session 24.
 
 ### DEBT-017 — TLS certificates are static process-start configuration
 

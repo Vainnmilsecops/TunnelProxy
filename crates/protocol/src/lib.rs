@@ -21,8 +21,6 @@
 //!
 //! All multi-byte integers use big-endian / network byte order.
 
-#![deny(unsafe_code)]
-
 mod codec;
 mod enrollment;
 mod error;
