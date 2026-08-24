@@ -107,7 +107,9 @@ reattaches the same `TunnelId` only after the prior claim is gone.
 
 ## Raw ingress behavior
 
-The current runnable raw listener remains loopback-only. It is configured with
+The runnable raw listener defaults to loopback-only. Session 23 permits an
+explicit public policy only with Agent mTLS, dynamic snapshot authorization,
+and bounded global/per-IP active connection admission. It is configured with
 `TunnelId`, binds before Agent availability, and stays bound across Agent
 disconnect/reconnect. Each accepted socket resolves the current in-memory live
 session. If no session exists, the socket is closed; no stale session is reused.
@@ -120,5 +122,6 @@ session. If no session exists, the socket is closed; no stale session is reused.
 - No certificate issuance or managed PKI. Session 20 can reload operator-
   published TLS generations, and Session 16 authorization snapshots can revoke
   an exact Agent leaf.
-- No public ingress, hostname allocation, multiple tunnels per transport,
-  multi-edge coordination, or interrupted-stream replay.
+- No public HTTP/TLS termination, hostname allocation, multiple tunnels per
+  transport, multi-edge coordination, or interrupted-stream replay. Explicit
+  opaque public raw TCP is available under the Session 23 policy.

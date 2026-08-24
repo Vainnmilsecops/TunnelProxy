@@ -2,7 +2,7 @@
 
 > Status: **pre-MVP data-path foundation.** Local TCP primitives, protocol
 > framing, Agent → Edge handshake, heartbeat, bounded multiplexing, and
-> durable-identity loopback raw-ingress routes, persistent authorization, and
+> durable-identity raw-ingress routes, persistent authorization, and
 > authenticated Edge snapshot bootstrap are implemented. Public TLS/HTTP
 > ingress and multi-edge routing are not.
 
@@ -489,6 +489,46 @@ terminal. An expired pending request is retryable after its local pending
 journal is removed, allowing renewal from the still-active predecessor. This
 is application-level authorization revocation; it is not CRL/OCSP or general
 PKI revocation.
+
+### 2.22 Explicit public raw ingress and per-IP admission (Session 23)
+
+The durable raw route may now opt into `Public` exposure; `LoopbackOnly`
+remains the default. A non-loopback runnable listener is valid only when the
+operator supplies the public flag and a non-zero per-IP active-connection bound
+that does not exceed the existing global route bound. Public mode also requires
+Agent-facing mutual TLS and authorization owned by the external dynamic
+snapshot stream. Static certificate policy and plaintext development mode fail
+configuration before the raw listener binds.
+
+```text
+public TCP client
+       |
+       v
+global route semaphore
+       |
+       v
+per-source-IP RAII permit
+       |
+       v
+cached TunnelId -> live TransportSessionId -> Agent local service
+```
+
+The per-IP map stores only admitted active peers, so its cardinality cannot
+exceed the global connection limit. The permit is held through logical stream
+completion and released after every open failure, disconnect, revocation,
+drain, or forced task abort. Capacity rejection closes only that accepted
+socket. Route status keeps cumulative accepted/global/per-IP/unavailable
+counters, and structured events include peer address and outcome but never
+traffic bytes.
+
+Public exposure does not change Tunnel Protocol v2 or the snapshot format.
+Ingress still reads only immutable cached routing state. When a tunnel is
+offline the socket closes fail-closed; a valid reconnect is used without
+listener rebind. Dynamic snapshot removal closes the Agent session and active
+public streams through the existing authorization gate. Raw TCP is opaque: the
+Edge does not provide public-client TLS or application authentication, and a
+stale Edge cache retains the bounded availability/revocation-delay tradeoff
+defined in Session 19.
 
 ## 3. Control plane vs data plane
 

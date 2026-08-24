@@ -49,10 +49,11 @@
 //! The echo baseline and relay primitives are **layer-4 TCP** primitives
 //! that exist to validate the byte-stream pipeline, lifecycle, and
 //! resource discipline. The Agent transport is the first protocol-aware
-//! runtime. Session 08 implements only the loopback raw-TCP vertical slice;
-//! Session 12 composes it into a runnable single-Agent process and Session 14
-//! adds mutual TLS to that Agent transport. Public reverse-tunnel routing is
-//! still not implemented.
+//! runtime. Session 08 implements the loopback raw-TCP vertical slice;
+//! Session 12 composes it into a runnable single-Agent process, Session 14
+//! adds mutual TLS to that Agent transport, and Session 23 adds explicit
+//! public raw TCP exposure backed by dynamic authorization and per-IP
+//! admission. Public HTTP/TLS routing is not implemented.
 //! See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006, ADR-007) and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
@@ -1184,9 +1185,9 @@ pub use multiplex::{
     RoutedStreamCloseReason,
 };
 pub use raw_ingress::{
-    RawIngressConfigError, RawIngressManagerConfig, RawIngressRoute, RawIngressRouteConfig,
-    RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager, RawIngressRouteState,
-    RawIngressRouteStatus, RawIngressRouteTarget,
+    RawIngressConfigError, RawIngressExposurePolicy, RawIngressManagerConfig, RawIngressRoute,
+    RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager,
+    RawIngressRouteState, RawIngressRouteStatus, RawIngressRouteTarget,
 };
 pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,

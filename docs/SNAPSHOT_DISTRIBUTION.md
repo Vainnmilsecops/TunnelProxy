@@ -109,3 +109,9 @@ Those mutations remove fingerprints and grants in SQLite before advancing and
 publishing a new complete snapshot, so dynamic Edge revokes live mTLS sessions
 without a storage lookup on ingress. There is still no general admin API,
 snapshot signing, CRL/OCSP, CA lifecycle automation, or multi-edge consensus.
+
+Session 23 public raw ingress is accepted only with this external dynamic
+snapshot mode plus Agent-facing mTLS. Static certificate policy cannot expose a
+public raw listener. Ingress continues to route from cached state; an opted-in
+Session 19 stale cache may therefore delay a newly committed revocation until
+authenticated reconnect or its configured stale deadline.

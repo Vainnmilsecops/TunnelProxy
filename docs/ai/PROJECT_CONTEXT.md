@@ -56,6 +56,8 @@ localhost:<port>
 9. Client-supplied forwarding headers are never trusted blindly
    (INV-009).
 10. Meaningful features come with automated tests (INV-010).
+11. Public listener exposure is explicit, authenticated where required, and
+    bounded globally and per source (INV-011).
 
 ## Engineering priorities (in order)
 
@@ -71,8 +73,9 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-Public HTTP reverse proxying, custom domains, dashboard, billing, rate limiting,
-request inspection, stream replay, certificate lifecycle automation,
+Public HTTP reverse proxying, custom domains, dashboard, billing, request-rate
+limiting, request inspection, stream replay, protected issuer custody,
 multi-edge ownership, and cloud deployment are explicitly **not implemented**.
-The implemented surface is still loopback raw TCP plus authenticated Agent and
-snapshot transports; presenting it as the public product surface is a bug.
+The implemented public surface is only opt-in opaque raw TCP with per-IP
+concurrency admission and authenticated dynamic Agent authority; presenting it
+as the future HTTPS product surface is a bug.

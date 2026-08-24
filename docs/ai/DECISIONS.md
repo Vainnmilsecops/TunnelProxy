@@ -602,3 +602,36 @@ or Tunnel Protocol change. A CA-valid revoked leaf may still complete the TLS
 layer before snapshot authorization rejects it; CRL/OCSP is not added. The
 issuer filesystem boundary, HSM/KMS, CA rollover, general admin API, and
 multi-writer consensus remain future work.
+
+---
+
+## ADR-023 — Public raw ingress is explicit and requires dynamic mTLS authority
+
+**Status:** Accepted (Session 23).
+
+**Context:** The durable raw listener was deliberately restricted to loopback.
+The transport, snapshot, and credential layers can now authenticate an Agent,
+reconcile live authorization, and revoke an exact session, but allowing an
+arbitrary non-loopback bind without an explicit policy would turn a safe
+development default into an accidental public exposure. The existing global
+connection semaphore also lets one source IP occupy every route permit.
+
+**Decision:** Raw routes carry an explicit exposure policy. `LoopbackOnly`
+remains the default and rejects non-loopback addresses. `Public` requires a
+non-zero per-source-IP limit no greater than the route's global connection
+limit. The runnable Edge additionally requires Agent-facing mutual TLS and an
+external dynamic authorization snapshot; plaintext and static-certificate
+authorization cannot enable public raw ingress. A bounded per-IP map counts
+only admitted active connections, is bounded by the global semaphore, and is
+released through RAII on every close and failure path. Ingress still resolves
+only cached `TunnelId` state and performs no Control Plane lookup.
+
+**Consequences:** An operator may explicitly expose an opaque TCP service while
+retaining bounded admission, offline fail-close, reconnect, drain, and Session
+22 revocation behavior. The Edge does not encrypt or authenticate the public
+client side of an arbitrary raw protocol; the tunneled service must provide
+those properties when required. Public HTTP/TLS termination, hostname routing,
+request-rate limiting, DDoS protection, and multi-edge ownership remain
+separate work. A configured stale snapshot cache may continue serving within
+its existing bounded stale window, so revocation delivery can be delayed while
+the Control Plane is unavailable.

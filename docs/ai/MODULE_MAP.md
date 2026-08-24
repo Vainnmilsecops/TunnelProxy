@@ -67,15 +67,19 @@ atomic credential manifests.
 ## `tunnelproxy-edge`
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
-bounded stream multiplexing, lifecycle-managed loopback raw TCP routes, and a
-runnable single-tunnel process supervisor/CLI whose durable TunnelId route stays
-bound across replacement Agent sessions. Its Agent listener can require mutual
-TLS and exact certificate-to-Agent/Tunnel authorization before publication.
+bounded stream multiplexing, and lifecycle-managed raw TCP routes. The runnable
+single-tunnel process keeps its durable TunnelId listener bound across
+replacement Agent sessions. Loopback is the default; explicit public raw mode
+requires Agent mTLS, dynamic snapshot authority, global admission, and a
+bounded per-source-IP active-connection permit. Its Agent listener requires
+exact certificate-to-Agent/Tunnel authorization before publication.
 Versioned full snapshot updates atomically unpublish and close revoked sessions
 without placing control-plane storage on the ingress hot path. Edge can
 bootstrap that cache from the dedicated authenticated snapshot service and
 retain it as stale during reconnect. The runnable CLI can supervise this
 snapshot client alongside the data plane without binding before bootstrap.
+Public raw ingress remains opaque TCP: Edge does not terminate public TLS or
+authenticate the public protocol client.
 
 **Responsibility (future)**
 

@@ -1,7 +1,7 @@
 //! Session 13 real-TCP coverage for process-level Edge/Agent recovery.
 
 use std::io::{BufReader, Cursor};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -36,8 +36,8 @@ use tunnelproxy_control_plane::{
 use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
     EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTlsReloadConfig,
-    EdgeTlsReloadRuntime, EdgeTransportSecurity, RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime,
-    SnapshotAwareEdgeRuntimeError,
+    EdgeTlsReloadRuntime, EdgeTransportSecurity, RawIngressExposurePolicy, RuntimeShutdownOutcome,
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
@@ -770,7 +770,7 @@ async fn live_snapshot_updates_revoke_and_restore_tunnel_without_rebinding_ingre
 }
 
 #[tokio::test]
-async fn durable_emergency_revoke_closes_the_exact_live_mtls_agent_session() {
+async fn durable_emergency_revoke_closes_the_exact_live_public_mtls_agent_session() {
     let pki = test_pki("edge.test");
     let (database, directory) = snapshot_temp_database();
     let snapshots = Arc::new(SqliteSnapshotRepository::open(&database).unwrap());
@@ -820,10 +820,14 @@ async fn durable_emergency_revoke_closes_the_exact_live_mtls_agent_session() {
 
     let (local_addr, local_task) = spawn_echo_connections(2).await;
     let raw_addr = unused_addr().await;
-    let mut config = edge_config(raw_addr);
+    let public_listen_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, raw_addr.port()));
+    let mut config = edge_config(public_listen_addr);
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
     config.multiplex.registration =
         EdgeRegistrationPolicy::mutual_tls_updates(authority.subscribe());
+    config.raw_exposure = RawIngressExposurePolicy::Public {
+        max_connections_per_ip: 4,
+    };
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let router = edge.router();
@@ -862,6 +866,26 @@ async fn durable_emergency_revoke_closes_the_exact_live_mtls_agent_session() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn public_raw_config_rejects_static_mtls_and_accepts_dynamic_authorization() {
+    let pki = test_pki("edge.test");
+    let mut config = edge_config("0.0.0.0:7000".parse().unwrap());
+    config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
+    config.multiplex.registration = edge_tls_registration(&pki);
+    config.raw_exposure = RawIngressExposurePolicy::Public {
+        max_connections_per_ip: 4,
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(tunnelproxy_edge::EdgeRuntimeConfigError::PublicRawRequiresLiveAuthorization)
+    ));
+
+    let (_publisher, subscription) =
+        authorization_snapshot_channel(versioned_snapshot(&pki, 1, TunnelStatus::Enabled, false));
+    config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    assert!(config.validate().is_ok());
+}
+
 #[tokio::test]
 async fn live_snapshot_add_authorizes_tunnel_without_edge_restart() {
     let pki = test_pki("edge.test");
@@ -872,9 +896,13 @@ async fn live_snapshot_add_authorizes_tunnel_without_edge_restart() {
         ));
     let (local_addr, local_task) = spawn_echo().await;
     let raw_addr = unused_addr().await;
-    let mut config = edge_config(raw_addr);
+    let public_listen_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, raw_addr.port()));
+    let mut config = edge_config(public_listen_addr);
     config.multiplex.security = edge_tls_security(&pki, Duration::from_secs(1));
     config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(subscription);
+    config.raw_exposure = RawIngressExposurePolicy::Public {
+        max_connections_per_ip: 4,
+    };
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let edge_addr = edge.agent_addr();
     let router = edge.router();

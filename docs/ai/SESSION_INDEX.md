@@ -797,3 +797,32 @@ Out of scope:
 - General remote admin API, roles/audit retention, public ingress, and
   multi-Control-Plane consensus.
 - Static Edge enrollment and hostile local-filesystem defense.
+
+## Session 23 — Public Raw TCP Ingress & Per-IP Admission — complete
+
+Scope delivered:
+
+- Added explicit `LoopbackOnly` and `Public` raw-ingress exposure policies;
+  loopback remains the default and non-loopback binds require operator opt-in.
+- Required Agent-facing mutual TLS and external dynamic snapshot authorization
+  for the runnable public mode. Plaintext, static-certificate authorization,
+  incomplete public flags, and invalid per-IP bounds fail before listener use.
+- Added a per-source-IP active-connection limiter alongside the existing global
+  semaphore. Its admitted-IP map is bounded by global capacity and RAII releases
+  counts after route/open/session/shutdown failures.
+- Added secret-safe public admission events and cumulative route counters for
+  accepted connections, global rejection, per-IP rejection, and unavailable
+  targets without logging traffic bytes.
+- Preserved exact cached `TunnelId` routing, offline fail-close, listener
+  continuity across reconnect, half-close, drain, and zero Control Plane lookup
+  on the ingress hot path.
+- Added config/CLI, wildcard-listener real TCP, per-IP rejection/release, static
+  policy rejection, and dynamic mTLS durable-revocation coverage. The workspace
+  now contains 261 explicit tests.
+
+Out of scope:
+
+- Public HTTP/HTTPS termination, hostname allocation, and signed access URLs.
+- Request-rate limiting, distributed DDoS mitigation, and multi-edge ownership.
+- Multiple tunnels per Agent transport, inspection/replay, and public-client
+  authentication for arbitrary raw protocols.
