@@ -1,9 +1,9 @@
-//! Loopback raw-ingress listeners with explicit route and drain lifecycle.
+//! Raw-ingress listeners with explicit exposure, admission, and drain lifecycle.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -62,6 +62,26 @@ pub enum RawIngressRouteTarget {
     Tunnel(TunnelId),
 }
 
+/// Explicit network exposure policy for one raw ingress listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RawIngressExposurePolicy {
+    /// Development-safe default. The listener must bind a loopback address.
+    #[default]
+    LoopbackOnly,
+    /// Allows a non-loopback listener with a bounded active connection count
+    /// for each source IP address.
+    Public { max_connections_per_ip: usize },
+}
+
+impl std::fmt::Display for RawIngressExposurePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LoopbackOnly => f.write_str("loopback"),
+            Self::Public { .. } => f.write_str("public"),
+        }
+    }
+}
+
 impl std::fmt::Display for RawIngressRouteTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -71,12 +91,13 @@ impl std::fmt::Display for RawIngressRouteTarget {
     }
 }
 
-/// Configuration for one loopback ingress route.
+/// Configuration for one raw ingress route. Loopback-only is the default.
 #[derive(Debug, Clone)]
 pub struct RawIngressRouteConfig {
     pub listen_addr: SocketAddr,
     pub target: RawIngressRouteTarget,
     pub max_concurrent_connections: usize,
+    pub exposure: RawIngressExposurePolicy,
     pub drain_timeout: Duration,
 }
 
@@ -86,6 +107,7 @@ impl RawIngressRouteConfig {
             listen_addr,
             target: RawIngressRouteTarget::TransportSession(target_session_id),
             max_concurrent_connections: 32,
+            exposure: RawIngressExposurePolicy::LoopbackOnly,
             drain_timeout: Duration::from_secs(10),
         }
     }
@@ -95,13 +117,25 @@ impl RawIngressRouteConfig {
             listen_addr,
             target: RawIngressRouteTarget::Tunnel(tunnel_id),
             max_concurrent_connections: 32,
+            exposure: RawIngressExposurePolicy::LoopbackOnly,
             drain_timeout: Duration::from_secs(10),
         }
     }
 
     pub fn validate(&self) -> Result<(), RawIngressConfigError> {
-        if !self.listen_addr.ip().is_loopback() {
-            return Err(RawIngressConfigError::NonLoopbackListener(self.listen_addr));
+        match self.exposure {
+            RawIngressExposurePolicy::LoopbackOnly if !self.listen_addr.ip().is_loopback() => {
+                return Err(RawIngressConfigError::NonLoopbackListener(self.listen_addr));
+            }
+            RawIngressExposurePolicy::Public {
+                max_connections_per_ip: 0,
+            } => return Err(RawIngressConfigError::ZeroMaxConnectionsPerIp),
+            RawIngressExposurePolicy::Public {
+                max_connections_per_ip,
+            } if max_connections_per_ip > self.max_concurrent_connections => {
+                return Err(RawIngressConfigError::PerIpLimitExceedsGlobal);
+            }
+            RawIngressExposurePolicy::LoopbackOnly | RawIngressExposurePolicy::Public { .. } => {}
         }
         if matches!(
             self.target,
@@ -130,6 +164,8 @@ pub enum RawIngressConfigError {
     InvalidTargetSession,
     ZeroMaxConnections,
     ConnectionLimitTooLarge,
+    ZeroMaxConnectionsPerIp,
+    PerIpLimitExceedsGlobal,
     ZeroDrainTimeout,
 }
 
@@ -146,6 +182,12 @@ impl std::fmt::Display for RawIngressConfigError {
             }
             Self::ConnectionLimitTooLarge => {
                 f.write_str("max_concurrent_connections must fit in u32")
+            }
+            Self::ZeroMaxConnectionsPerIp => {
+                f.write_str("max_connections_per_ip must be greater than zero")
+            }
+            Self::PerIpLimitExceedsGlobal => {
+                f.write_str("max_connections_per_ip cannot exceed the global connection limit")
             }
             Self::ZeroDrainTimeout => f.write_str("drain_timeout must be greater than zero"),
         }
@@ -171,6 +213,10 @@ pub struct RawIngressRouteStatus {
     pub target: RawIngressRouteTarget,
     pub state: RawIngressRouteState,
     pub active_connections: usize,
+    pub accepted_connections: u64,
+    pub global_capacity_rejections: u64,
+    pub per_ip_capacity_rejections: u64,
+    pub target_unavailable_rejections: u64,
 }
 
 /// Handle returned when a route listener is successfully bound.
@@ -238,7 +284,7 @@ struct ManagerState {
     shutting_down: bool,
 }
 
-/// Creates, observes, and drains bounded loopback ingress routes.
+/// Creates, observes, and drains bounded raw ingress routes.
 #[derive(Clone)]
 pub struct RawIngressRouteManager {
     router: EdgeSessionRouter,
@@ -289,6 +335,10 @@ impl RawIngressRouteManager {
             target: config.target.clone(),
             state: RawIngressRouteState::Active,
             active_connections: 0,
+            accepted_connections: 0,
+            global_capacity_rejections: 0,
+            per_ip_capacity_rejections: 0,
+            target_unavailable_rejections: 0,
         };
         let (stop, stop_rx) = watch::channel(false);
         let (status_tx, status) = watch::channel(initial_status);
@@ -313,6 +363,7 @@ impl RawIngressRouteManager {
         }
 
         let target = config.target.clone();
+        let exposure = config.exposure;
         let route_task = tokio::spawn(run_route(
             route_id,
             listener,
@@ -325,7 +376,13 @@ impl RawIngressRouteManager {
         if let Some(route) = self.state.lock().await.routes.get_mut(&route_id) {
             route.task = Some(route_task);
         }
-        info!(%route_id, %local_addr, target = %target, event = "raw_route_added");
+        info!(
+            %route_id,
+            %local_addr,
+            target = %target,
+            exposure = %exposure,
+            event = "raw_route_added"
+        );
         Ok(RawIngressRoute {
             route_id,
             local_addr,
@@ -513,6 +570,12 @@ async fn run_route(
     manager: Weak<Mutex<ManagerState>>,
 ) {
     let permits = Arc::new(Semaphore::new(config.max_concurrent_connections));
+    let peer_admission = match config.exposure {
+        RawIngressExposurePolicy::LoopbackOnly => None,
+        RawIngressExposurePolicy::Public {
+            max_connections_per_ip,
+        } => Some(Arc::new(PeerAdmission::new(max_connections_per_ip))),
+    };
     let mut connections = JoinSet::new();
     let mut session_ids = router.subscribe_session_ids();
     let target_session_id = match &config.target {
@@ -553,20 +616,53 @@ async fn run_route(
                 let permit = match Arc::clone(&permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
+                        status.send_modify(|route| {
+                            route.global_capacity_rejections =
+                                route.global_capacity_rejections.saturating_add(1);
+                        });
                         warn!(%route_id, %peer, event = "raw_route_capacity_rejected");
                         drop(ingress);
                         continue;
                     }
                 };
-                status.send_modify(|route| route.active_connections += 1);
+                let peer_permit = match &peer_admission {
+                    Some(admission) => match admission.try_acquire(peer.ip()) {
+                        Some(permit) => Some(permit),
+                        None => {
+                            status.send_modify(|route| {
+                                route.per_ip_capacity_rejections =
+                                    route.per_ip_capacity_rejections.saturating_add(1);
+                            });
+                            warn!(%route_id, %peer, event = "raw_route_per_ip_capacity_rejected");
+                            drop(permit);
+                            drop(ingress);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                status.send_modify(|route| {
+                    route.active_connections += 1;
+                    route.accepted_connections = route.accepted_connections.saturating_add(1);
+                });
+                info!(
+                    %route_id,
+                    %peer,
+                    exposure = %config.exposure,
+                    event = "raw_route_connection_accepted"
+                );
                 spawn_routed_connection(
                     &mut connections,
-                    route_id,
-                    config.target.clone(),
-                    ingress,
-                    router.clone(),
-                    permit,
-                    status.clone(),
+                    RoutedConnectionTask {
+                        route_id,
+                        target: config.target.clone(),
+                        ingress,
+                        router: router.clone(),
+                        global_permit: permit,
+                        peer_permit,
+                        peer,
+                        status: status.clone(),
+                    },
                 );
             }
             _ = connections.join_next(), if !connections.is_empty() => {}
@@ -582,16 +678,29 @@ async fn run_route(
     info!(%route_id, event = "raw_route_removed");
 }
 
-fn spawn_routed_connection(
-    connections: &mut JoinSet<()>,
+struct RoutedConnectionTask {
     route_id: RawIngressRouteId,
     target: RawIngressRouteTarget,
     ingress: tokio::net::TcpStream,
     router: EdgeSessionRouter,
-    permit: OwnedSemaphorePermit,
+    global_permit: OwnedSemaphorePermit,
+    peer_permit: Option<PeerAdmissionPermit>,
+    peer: SocketAddr,
     status: watch::Sender<RawIngressRouteStatus>,
-) {
+}
+
+fn spawn_routed_connection(connections: &mut JoinSet<()>, task: RoutedConnectionTask) {
     connections.spawn(async move {
+        let RoutedConnectionTask {
+            route_id,
+            target,
+            ingress,
+            router,
+            global_permit,
+            peer_permit,
+            peer,
+            status,
+        } = task;
         let opened = match &target {
             RawIngressRouteTarget::TransportSession(session_id) => {
                 router.open_stream_tracked(*session_id, ingress).await
@@ -606,14 +715,78 @@ fn spawn_routed_connection(
                 info!(%route_id, %target, ?reason, event = "raw_route_stream_closed");
             }
             Err(error) => {
+                if matches!(
+                    error,
+                    RouteError::SessionNotFound(_) | RouteError::TunnelNotConnected(_)
+                ) {
+                    status.send_modify(|route| {
+                        route.target_unavailable_rejections =
+                            route.target_unavailable_rejections.saturating_add(1);
+                    });
+                }
                 log_route_open_failure(route_id, &target, error);
             }
         }
         status.send_modify(|route| {
             route.active_connections = route.active_connections.saturating_sub(1);
         });
-        drop(permit);
+        info!(%route_id, %peer, event = "raw_route_connection_released");
+        drop(peer_permit);
+        drop(global_permit);
     });
+}
+
+#[derive(Debug)]
+struct PeerAdmission {
+    max_connections_per_ip: usize,
+    active: StdMutex<HashMap<IpAddr, usize>>,
+}
+
+impl PeerAdmission {
+    fn new(max_connections_per_ip: usize) -> Self {
+        Self {
+            max_connections_per_ip,
+            active: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, peer: IpAddr) -> Option<PeerAdmissionPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active.get(&peer).copied().unwrap_or(0) >= self.max_connections_per_ip {
+            return None;
+        }
+        *active.entry(peer).or_default() += 1;
+        Some(PeerAdmissionPermit {
+            admission: Arc::clone(self),
+            peer,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PeerAdmissionPermit {
+    admission: Arc<PeerAdmission>,
+    peer: IpAddr,
+}
+
+impl Drop for PeerAdmissionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .admission
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(count) = active.get_mut(&self.peer) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(&self.peer);
+        }
+    }
 }
 
 fn log_route_open_failure(
@@ -639,7 +812,7 @@ mod tests {
 
     #[test]
     fn public_route_listener_is_rejected() {
-        let config = RawIngressRouteConfig::new(
+        let mut config = RawIngressRouteConfig::new(
             "0.0.0.0:7000".parse().unwrap(),
             TransportSessionId::new(1).unwrap(),
         );
@@ -647,6 +820,33 @@ mod tests {
             config.validate(),
             Err(RawIngressConfigError::NonLoopbackListener(_))
         ));
+        config.exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 4,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn public_route_per_ip_limit_is_bounded_by_the_global_limit() {
+        let mut config = RawIngressRouteConfig::new(
+            "0.0.0.0:7000".parse().unwrap(),
+            TransportSessionId::new(1).unwrap(),
+        );
+        config.max_concurrent_connections = 4;
+        config.exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 0,
+        };
+        assert_eq!(
+            config.validate(),
+            Err(RawIngressConfigError::ZeroMaxConnectionsPerIp)
+        );
+        config.exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 5,
+        };
+        assert_eq!(
+            config.validate(),
+            Err(RawIngressConfigError::PerIpLimitExceedsGlobal)
+        );
     }
 
     #[test]

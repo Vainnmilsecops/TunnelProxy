@@ -375,3 +375,39 @@ Control Plane publishes the committed version through its normal repository
 refresh, after which dynamic Edge instances close the revoked live session.
 Creating a new bootstrap token later is an explicit operator decision to
 re-enroll the identity.
+
+## 16. Running explicit public raw TCP ingress
+
+Loopback raw ingress remains the default. A non-loopback listener requires
+both explicit exposure and a per-source-IP active-connection limit:
+
+```text
+tunnelproxy-edge \
+  --raw-listen 0.0.0.0:7000 \
+  --allow-public-raw-ingress \
+  --max-raw-connections 32 \
+  --max-raw-connections-per-ip 4 \
+  --tls-cert edge-server.pem \
+  --tls-key edge-server-key.pem \
+  --tls-client-ca agent-ca.pem \
+  --snapshot-server 127.0.0.1:7200 \
+  --snapshot-ca control-plane-ca.pem \
+  --snapshot-client-cert edge-client.pem \
+  --snapshot-client-key edge-client-key.pem \
+  --snapshot-server-name control-plane.internal
+```
+
+Public mode requires the complete Agent mTLS and dynamic snapshot groups.
+Plaintext, static `--authorized-client-cert`, a missing public opt-in, a missing
+per-IP limit, zero, or a per-IP value greater than the global limit all fail
+configuration. The per-IP bound counts active accepted connections and releases
+after stream completion or failure; it is concurrency admission, not a
+requests-per-second rate limiter.
+
+The exposed protocol is opaque TCP. TunnelProxy does not terminate public TLS,
+assign a hostname, or authenticate arbitrary public raw clients. Run a
+TLS/authenticated local service when the raw endpoint requires those properties
+and apply host firewall policy appropriate for the deployment. Snapshot-cache
+cold start retains its configured stale deadline: traffic may continue from
+cached authority during a Control Plane outage, and revocation delivery waits
+for authenticated reconnect or stale-deadline shutdown.

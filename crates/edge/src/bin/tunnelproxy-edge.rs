@@ -17,8 +17,8 @@ use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
     EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
     EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
-    RuntimeShutdownConfig, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
-    SnapshotAwareEdgeRuntimeOutcome,
+    RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
+    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
 };
 
 const USAGE: &str = "\
@@ -31,6 +31,8 @@ Options:
   --tunnel-id <id>                 authorized Tunnel ID (default tunnel-dev)
   --max-streams <usize>            stream limit  (default 32)
   --max-raw-connections <usize>    ingress limit (default 32)
+  --allow-public-raw-ingress       explicitly allow a non-loopback raw listener
+  --max-raw-connections-per-ip <usize> required per-IP limit in public mode
   --drain-timeout-ms <ms>          stage drain   (default 10000)
   --tls-cert <path>                Edge certificate PEM
   --tls-key <path>                 Edge private key PEM
@@ -77,6 +79,14 @@ async fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    let raw_exposure = match raw_exposure_policy(&parsed) {
+        Ok(exposure) => exposure,
+        Err(error) => {
+            error!(%error, "invalid raw ingress exposure policy");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
 
     let mut config = EdgeRuntimeConfig::dev_defaults();
     config.multiplex.agent_listener.listen_addr = parsed.agent_listen;
@@ -84,6 +94,7 @@ async fn main() -> ExitCode {
     config.raw_listen_addr = parsed.raw_listen;
     config.tunnel_id = parsed.tunnel_id.clone();
     config.max_raw_connections = parsed.max_raw_connections;
+    config.raw_exposure = raw_exposure;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
     let authorization = match load_transport_configuration(&parsed).await {
         Ok(configuration) => configuration,
@@ -236,6 +247,8 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         raw_addr = %parsed.raw_listen,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
+        public_raw_ingress = parsed.allow_public_raw_ingress,
+        max_raw_connections_per_ip = ?parsed.max_raw_connections_per_ip,
         authorization,
         "Edge runtime is waiting for one Agent"
     );
@@ -296,6 +309,8 @@ struct ParsedArgs {
     tunnel_id: TunnelId,
     max_streams: usize,
     max_raw_connections: usize,
+    allow_public_raw_ingress: bool,
+    max_raw_connections_per_ip: Option<usize>,
     drain_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -332,6 +347,8 @@ impl Default for ParsedArgs {
             tunnel_id: TunnelId::new("tunnel-dev").unwrap(),
             max_streams: 32,
             max_raw_connections: 32,
+            allow_public_raw_ingress: false,
+            max_raw_connections_per_ip: None,
             drain_timeout: Duration::from_secs(10),
             tls_cert: None,
             tls_key: None,
@@ -367,6 +384,10 @@ enum ArgError {
     InvalidAddress { flag: String, value: String },
     InvalidNumber { flag: String, value: String },
     InvalidIdentifier { flag: String, value: String },
+    PublicRawOptInRequired,
+    PublicRawPerIpLimitRequired,
+    PublicRawPerIpLimitWithoutOptIn,
+    PublicRawPerIpLimitInvalid,
     UnknownFlag(String),
 }
 
@@ -383,6 +404,18 @@ impl std::fmt::Display for ArgError {
             Self::InvalidIdentifier { flag, value } => {
                 write!(f, "{flag}={value} is not a valid durable identifier")
             }
+            Self::PublicRawOptInRequired => {
+                f.write_str("a non-loopback raw listener requires --allow-public-raw-ingress")
+            }
+            Self::PublicRawPerIpLimitRequired => {
+                f.write_str("public raw ingress requires --max-raw-connections-per-ip")
+            }
+            Self::PublicRawPerIpLimitWithoutOptIn => {
+                f.write_str("--max-raw-connections-per-ip requires --allow-public-raw-ingress")
+            }
+            Self::PublicRawPerIpLimitInvalid => f.write_str(
+                "--max-raw-connections-per-ip must be non-zero and cannot exceed --max-raw-connections",
+            ),
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
@@ -420,6 +453,14 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-raw-connections" => {
                 parsed.max_raw_connections = parse_number(args, index, flag)?;
+                index += 2;
+            }
+            "--allow-public-raw-ingress" => {
+                parsed.allow_public_raw_ingress = true;
+                index += 1;
+            }
+            "--max-raw-connections-per-ip" => {
+                parsed.max_raw_connections_per_ip = Some(parse_number(args, index, flag)?);
                 index += 2;
             }
             "--drain-timeout-ms" => {
@@ -539,6 +580,27 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
         }
     }
     Ok(parsed)
+}
+
+fn raw_exposure_policy(parsed: &ParsedArgs) -> Result<RawIngressExposurePolicy, ArgError> {
+    if !parsed.allow_public_raw_ingress {
+        if parsed.max_raw_connections_per_ip.is_some() {
+            return Err(ArgError::PublicRawPerIpLimitWithoutOptIn);
+        }
+        if !parsed.raw_listen.ip().is_loopback() {
+            return Err(ArgError::PublicRawOptInRequired);
+        }
+        return Ok(RawIngressExposurePolicy::LoopbackOnly);
+    }
+    let max_connections_per_ip = parsed
+        .max_raw_connections_per_ip
+        .ok_or(ArgError::PublicRawPerIpLimitRequired)?;
+    if max_connections_per_ip == 0 || max_connections_per_ip > parsed.max_raw_connections {
+        return Err(ArgError::PublicRawPerIpLimitInvalid);
+    }
+    Ok(RawIngressExposurePolicy::Public {
+        max_connections_per_ip,
+    })
 }
 
 #[derive(Debug)]
@@ -979,6 +1041,9 @@ mod tests {
             "8",
             "--max-raw-connections",
             "9",
+            "--allow-public-raw-ingress",
+            "--max-raw-connections-per-ip",
+            "3",
             "--drain-timeout-ms",
             "250",
             "--tls-cert",
@@ -1031,6 +1096,8 @@ mod tests {
         assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
         assert_eq!(parsed.max_streams, 8);
         assert_eq!(parsed.max_raw_connections, 9);
+        assert!(parsed.allow_public_raw_ingress);
+        assert_eq!(parsed.max_raw_connections_per_ip, Some(3));
         assert_eq!(parsed.drain_timeout, Duration::from_millis(250));
         assert_eq!(parsed.tls_cert, Some(PathBuf::from("edge.pem")));
         assert_eq!(parsed.tls_key, Some(PathBuf::from("edge-key.pem")));
@@ -1084,6 +1151,56 @@ mod tests {
             parse_args(&args(&["--tunnel-id", "bad/id"])),
             Err(ArgError::InvalidIdentifier { .. })
         ));
+    }
+
+    #[test]
+    fn public_raw_cli_policy_is_explicit_and_complete() {
+        let non_loopback = parse_args(&args(&["--raw-listen", "0.0.0.0:7000"])).unwrap();
+        assert_eq!(
+            raw_exposure_policy(&non_loopback),
+            Err(ArgError::PublicRawOptInRequired)
+        );
+
+        let per_ip_without_opt_in =
+            parse_args(&args(&["--max-raw-connections-per-ip", "2"])).unwrap();
+        assert_eq!(
+            raw_exposure_policy(&per_ip_without_opt_in),
+            Err(ArgError::PublicRawPerIpLimitWithoutOptIn)
+        );
+
+        let missing_per_ip = parse_args(&args(&["--allow-public-raw-ingress"])).unwrap();
+        assert_eq!(
+            raw_exposure_policy(&missing_per_ip),
+            Err(ArgError::PublicRawPerIpLimitRequired)
+        );
+
+        let invalid_per_ip = parse_args(&args(&[
+            "--max-raw-connections",
+            "1",
+            "--allow-public-raw-ingress",
+            "--max-raw-connections-per-ip",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            raw_exposure_policy(&invalid_per_ip),
+            Err(ArgError::PublicRawPerIpLimitInvalid)
+        );
+
+        let public = parse_args(&args(&[
+            "--raw-listen",
+            "0.0.0.0:7000",
+            "--allow-public-raw-ingress",
+            "--max-raw-connections-per-ip",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            raw_exposure_policy(&public),
+            Ok(RawIngressExposurePolicy::Public {
+                max_connections_per_ip: 2
+            })
+        );
     }
 
     #[tokio::test]

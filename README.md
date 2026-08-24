@@ -16,20 +16,24 @@ correct agent, which in turn proxies them into the local service.
 - Tunnel Protocol v2 binary framing with bounded durable registration and a
   64 KiB frame payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
-- A loopback-only multiplexed reverse TCP data path with bounded queues,
+- A multiplexed reverse TCP data path with bounded queues,
   half-close, typed reset, open/idle deadlines, and per-session routing.
-- Ephemeral loopback raw-ingress routes with bounded connection admission,
-  tracked stream completion, graceful drain, and Agent-disconnect cleanup.
+- Lifecycle-managed raw-ingress routes with bounded global and per-source-IP
+  connection admission, tracked stream completion, graceful drain, and
+  Agent-disconnect cleanup.
 - Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries for one local
   tunnel, with Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
 - Cancellable bounded exponential Agent reconnect and automatic Edge raw-route
-  recovery on the same loopback address after a replacement session arrives.
+  recovery on the same address after a replacement session arrives.
 - Optional mutual TLS on the Agent transport with Edge server-name validation,
   required Agent client certificates, ALPN, and plaintext restricted to
   loopback development.
 - Certificate-bound `AgentId`/`TunnelId` authorization and cached durable
-  tunnel-to-live-session routing. The loopback raw listener stays bound while
-  its Agent reconnects and fails closed while offline.
+  tunnel-to-live-session routing. The raw listener stays bound while its Agent
+  reconnects and fails closed while offline.
+- Explicit public raw TCP exposure that requires Agent-facing mTLS, dynamic
+  snapshot authorization, operator opt-in, and a bounded per-IP concurrency
+  limit; loopback remains the default.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
@@ -39,8 +43,8 @@ correct agent, which in turn proxies them into the local service.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, and snapshot
   transports with last-known-good rollback, expiry enforcement, and static
   Agent-certificate authorization rotation.
-- Real loopback integration tests for framing, forwarding, lifecycle, liveness,
-  and the reverse data path.
+- Real TCP/mTLS integration tests for framing, forwarding, lifecycle, liveness,
+  public admission, revocation, and the reverse data path.
 - Product, architecture, development, and AI context documentation.
 
 The following are **not yet implemented**:
@@ -92,7 +96,7 @@ The architecture conceptually separates:
 Today the control-plane crate provides versioned certificate/Agent/tunnel
 authorization snapshots, SQLite persistence, full-snapshot import, and a
 runnable authenticated distribution service. The data plane has a tested
-loopback raw-TCP reverse path but no public HTTP/TLS routing. See
+opt-in public raw-TCP reverse path but no public HTTP/TLS routing. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -119,7 +123,7 @@ tunnelproxy/
 │   ├── common/             # shared strongly typed primitives
 │   ├── protocol/           # Edge ↔ Agent framing and stream contracts
 │   ├── agent/              # outbound Agent transport and local TCP bridge
-│   ├── edge/               # Agent transport and loopback raw TCP ingress
+│   ├── edge/               # Agent transport and bounded raw TCP ingress
 │   └── control-plane/      # versioned authorization snapshot distribution
 │
 ├── tests/                  # cross-crate integration tests (future)
@@ -172,6 +176,7 @@ and Definition of Done.
 | 15 _(complete)_ | Protocol v2 authenticated identity and durable tunnel routing |
 | 16–18 _(complete)_ | live revocation, persistent snapshots, and runnable Control Plane/Edge wiring |
 | 19–20 _(complete)_ | bounded Edge cold-start cache and atomic TLS generation reload |
+| 21–23 _(complete)_ | Agent enrollment/revocation and explicit public raw ingress |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

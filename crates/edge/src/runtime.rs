@@ -1,4 +1,4 @@
-//! Process-level composition for one loopback raw tunnel and one Agent.
+//! Process-level composition for one durable raw tunnel and one Agent.
 
 use std::net::SocketAddr;
 
@@ -11,7 +11,8 @@ use tunnelproxy_common::{
 
 use crate::{
     EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeConfigError, MultiplexedEdgeRuntime,
-    RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteManager,
+    RawIngressExposurePolicy, RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError,
+    RawIngressRouteManager,
 };
 
 /// Complete configuration for the runnable single-tunnel Edge process.
@@ -21,6 +22,7 @@ pub struct EdgeRuntimeConfig {
     pub raw_listen_addr: SocketAddr,
     pub tunnel_id: TunnelId,
     pub max_raw_connections: usize,
+    pub raw_exposure: RawIngressExposurePolicy,
     pub shutdown: RuntimeShutdownConfig,
 }
 
@@ -35,6 +37,7 @@ impl EdgeRuntimeConfig {
                 .expect("hardcoded raw listener is valid"),
             tunnel_id: TunnelId::new("tunnel-dev").expect("hardcoded TunnelId is valid"),
             max_raw_connections: 32,
+            raw_exposure: RawIngressExposurePolicy::LoopbackOnly,
             shutdown: RuntimeShutdownConfig::default(),
         }
     }
@@ -46,13 +49,40 @@ impl EdgeRuntimeConfig {
         if self.multiplex.agent_listener.max_agent_sessions != 1 {
             return Err(EdgeRuntimeConfigError::AgentCapacityMustBeOne);
         }
-        if !self.raw_listen_addr.ip().is_loopback() {
-            return Err(EdgeRuntimeConfigError::NonLoopbackRawListener(
-                self.raw_listen_addr,
-            ));
-        }
         if self.max_raw_connections == 0 {
             return Err(EdgeRuntimeConfigError::ZeroRawConnections);
+        }
+        if self.max_raw_connections > u32::MAX as usize {
+            return Err(EdgeRuntimeConfigError::RawConnectionLimitTooLarge);
+        }
+        match self.raw_exposure {
+            RawIngressExposurePolicy::LoopbackOnly => {
+                if !self.raw_listen_addr.ip().is_loopback() {
+                    return Err(EdgeRuntimeConfigError::NonLoopbackRawListener(
+                        self.raw_listen_addr,
+                    ));
+                }
+            }
+            RawIngressExposurePolicy::Public {
+                max_connections_per_ip,
+            } => {
+                if max_connections_per_ip == 0 {
+                    return Err(EdgeRuntimeConfigError::ZeroRawConnectionsPerIp);
+                }
+                if max_connections_per_ip > self.max_raw_connections {
+                    return Err(EdgeRuntimeConfigError::RawConnectionsPerIpExceedGlobal);
+                }
+                if !self.multiplex.security.is_tls() {
+                    return Err(EdgeRuntimeConfigError::PublicRawRequiresMutualTls);
+                }
+                if !self
+                    .multiplex
+                    .registration
+                    .is_dynamic_snapshot_authorization()
+                {
+                    return Err(EdgeRuntimeConfigError::PublicRawRequiresLiveAuthorization);
+                }
+            }
         }
         if !self.multiplex.registration.contains_tunnel(&self.tunnel_id)
             && !self.multiplex.registration.has_live_updates()
@@ -74,6 +104,11 @@ pub enum EdgeRuntimeConfigError {
     AgentCapacityMustBeOne,
     NonLoopbackRawListener(SocketAddr),
     ZeroRawConnections,
+    RawConnectionLimitTooLarge,
+    ZeroRawConnectionsPerIp,
+    RawConnectionsPerIpExceedGlobal,
+    PublicRawRequiresMutualTls,
+    PublicRawRequiresLiveAuthorization,
     RawTunnelNotAuthorized(TunnelId),
     ZeroDrainTimeout,
 }
@@ -90,6 +125,19 @@ impl std::fmt::Display for EdgeRuntimeConfigError {
             }
             Self::ZeroRawConnections => {
                 f.write_str("max_raw_connections must be greater than zero")
+            }
+            Self::RawConnectionLimitTooLarge => f.write_str("max_raw_connections must fit in u32"),
+            Self::ZeroRawConnectionsPerIp => {
+                f.write_str("max_raw_connections_per_ip must be greater than zero")
+            }
+            Self::RawConnectionsPerIpExceedGlobal => {
+                f.write_str("max_raw_connections_per_ip cannot exceed max_raw_connections")
+            }
+            Self::PublicRawRequiresMutualTls => {
+                f.write_str("public raw ingress requires mutual TLS for Agent transport")
+            }
+            Self::PublicRawRequiresLiveAuthorization => {
+                f.write_str("public raw ingress requires dynamic snapshot authorization")
             }
             Self::RawTunnelNotAuthorized(tunnel_id) => write!(
                 f,
@@ -224,6 +272,7 @@ impl EdgeRuntime {
             self.config.tunnel_id.clone(),
         );
         route_config.max_concurrent_connections = self.config.max_raw_connections;
+        route_config.exposure = self.config.raw_exposure;
         route_config.drain_timeout = shutdown.drain_timeout;
         let route = manager
             .add_route(route_config)
@@ -359,12 +408,33 @@ mod tests {
     }
 
     #[test]
-    fn public_raw_listener_is_rejected() {
+    fn public_raw_listener_requires_explicit_secure_dynamic_policy() {
         let mut config = EdgeRuntimeConfig::dev_defaults();
         config.raw_listen_addr = "0.0.0.0:7000".parse().unwrap();
         assert!(matches!(
             config.validate(),
             Err(EdgeRuntimeConfigError::NonLoopbackRawListener(_))
+        ));
+        config.raw_exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 1,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::PublicRawRequiresMutualTls)
+        ));
+        config.raw_exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 0,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::ZeroRawConnectionsPerIp)
+        ));
+        config.raw_exposure = RawIngressExposurePolicy::Public {
+            max_connections_per_ip: 33,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::RawConnectionsPerIpExceedGlobal)
         ));
     }
 

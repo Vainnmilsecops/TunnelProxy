@@ -128,7 +128,9 @@
   `Forwarder` and reject connections that exceed a per-IP cap, or
   layer a per-IP semaphore in front of the global one. Document
   the chosen policy before implementing it.
-- **Tracking:** Session 05+ plan, `docs/ai/SESSION_INDEX.md`.
+- **Tracking:** Session 23 adds bounded per-IP RAII admission to the explicit
+  public raw-ingress production path. This debt remains open only for the
+  legacy standalone `Forwarder`, which is not used by that public route.
 
 ### DEBT-010 — No production telemetry backend
 

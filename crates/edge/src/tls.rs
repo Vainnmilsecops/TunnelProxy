@@ -245,6 +245,19 @@ impl EdgeRegistrationPolicy {
             EdgeRegistrationMode::LoopbackDevelopment { .. } => false,
         }
     }
+
+    /// True only when authorization is owned by the external Control Plane
+    /// snapshot stream. Local static-certificate reload is deliberately not
+    /// sufficient for public ingress.
+    pub fn is_dynamic_snapshot_authorization(&self) -> bool {
+        matches!(
+            self.mode,
+            EdgeRegistrationMode::MutualTls {
+                static_source: None,
+                ..
+            }
+        )
+    }
 }
 
 /// Bootstraps the first durable authorization snapshot over the dedicated mTLS

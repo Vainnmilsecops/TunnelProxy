@@ -1,6 +1,6 @@
 //! Session 10 real-TCP coverage for raw ingress route lifecycle.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,8 +15,8 @@ use tunnelproxy_agent::{
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeSessionRouter, MultiplexedEdgeConfig, MultiplexedEdgeRuntime,
-    RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteId,
-    RawIngressRouteManager, RawIngressRouteState,
+    RawIngressExposurePolicy, RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError,
+    RawIngressRouteId, RawIngressRouteManager, RawIngressRouteState,
 };
 use tunnelproxy_protocol::{RegistrationRequest, TransportSessionId};
 
@@ -398,8 +398,66 @@ async fn route_capacity_rejects_only_the_extra_connection() {
         manager.get_route(route.route_id).await.unwrap().state,
         RawIngressRouteState::Active
     );
+    assert_eq!(
+        manager
+            .get_route(route.route_id)
+            .await
+            .unwrap()
+            .global_capacity_rejections,
+        1
+    );
     drop(first);
     local.abort();
+}
+
+#[tokio::test]
+async fn public_route_enforces_per_ip_capacity_and_releases_the_permit() {
+    let (local_addr, local) = spawn_echo_service(2).await;
+    let harness = spawn_harness(local_addr).await;
+    let manager = manager(&harness.router);
+    let mut config = route_config(harness.session_id);
+    config.listen_addr = "0.0.0.0:0".parse().unwrap();
+    config.max_concurrent_connections = 2;
+    config.exposure = RawIngressExposurePolicy::Public {
+        max_connections_per_ip: 1,
+    };
+    let route = manager.add_route(config).await.unwrap();
+    let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, route.local_addr.port()));
+
+    let mut first = TcpStream::connect(client_addr).await.unwrap();
+    first.write_all(b"first-public-stream").await.unwrap();
+    let mut echoed = [0_u8; 19];
+    first.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"first-public-stream");
+    wait_for_active(&manager, route.route_id, 1).await;
+
+    let mut rejected = TcpStream::connect(client_addr).await.unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(1), rejected.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received.is_empty());
+    assert_eq!(
+        manager
+            .get_route(route.route_id)
+            .await
+            .unwrap()
+            .per_ip_capacity_rejections,
+        1
+    );
+
+    drop(first);
+    wait_for_active(&manager, route.route_id, 0).await;
+    assert_eq!(
+        round_trip(client_addr, b"replacement-public-stream".to_vec()).await,
+        b"replacement-public-stream"
+    );
+    let status = manager.get_route(route.route_id).await.unwrap();
+    assert_eq!(status.accepted_connections, 2);
+    assert_eq!(status.per_ip_capacity_rejections, 1);
+    manager.drain_route(route.route_id).await.unwrap();
+    local.await.unwrap();
 }
 
 #[tokio::test]

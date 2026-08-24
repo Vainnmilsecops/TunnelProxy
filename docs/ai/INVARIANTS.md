@@ -126,3 +126,17 @@ capability is not "done" until its tests are written and pass.
 **Rationale:** TunnelProxy is a security-sensitive developer tool.
 Untested code is unsafe code. The TEST_MATRIX exists to make this
 rule auditable.
+
+---
+
+## INV-011 — Public listener exposure must be explicit and bounded
+
+A runnable listener must not move from loopback to a non-loopback address by
+accident. Public exposure requires an explicit policy, bounded global and
+per-source admission, and the authentication/authorization mode defined for
+that ingress type. Configuration must fail before listener use when any part is
+missing.
+
+**Rationale:** a permissive bind flag can expose a developer's local service to
+the internet. Public reachability changes the threat model and must be a
+conscious, auditable operator action with resource bounds already in place.

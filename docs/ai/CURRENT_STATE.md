@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Emergency Credential Revocation & Reconciliation** (Session 22).
+**Public Raw TCP Ingress & Per-IP Admission** (Session 23).
 
 ## Completed
 
@@ -96,9 +96,9 @@
   `OPEN_STREAM` frames with `SessionClosing` while current streams finish.
 - Raw ingress shutdown is process-wide, prevents route reuse, joins connection
   tasks, and force-aborts remaining routes only after the deadline.
-- `EdgeRuntime` composes one multiplexed Agent listener with one loopback raw
-  ingress route. It waits for the sole Agent before binding ingress and rolls
-  the transport back if route startup fails.
+- `EdgeRuntime` composes one multiplexed Agent listener with one durable raw
+  ingress route. Loopback is the default; it binds before Agent availability
+  and rolls the transport back if route startup fails.
 - `AgentRuntime` composes outbound connect/handshake with the multiplexed local
   bridge and accepts cancellation even before connection completes.
 - Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries expose validated
@@ -130,7 +130,8 @@
   never reaches protocol registration. TLS has its own bounded handshake deadline and Edge
   holds the existing session-capacity permit throughout negotiation.
 - Plaintext runtime transport is restricted to loopback. TLS permits a
-  non-loopback Agent listener while raw ingress remains loopback-only.
+  non-loopback Agent listener; Session 23 public raw ingress additionally
+  requires explicit exposure and dynamic snapshot authorization.
 - TLS identity/authentication failures are terminal on Agent; transient TCP/TLS
   transport failures and TLS timeouts remain governed by Session 13 reconnect.
 - Certificate/key PEM data is parsed into rustls configuration and omitted from
@@ -265,7 +266,18 @@
 - `credential-status` exposes only fingerprint, generation, state and times.
   Agent stops on terminal revocation/authentication failures, but clears an
   expired request journal so renewal can restart with a valid predecessor.
-- 257 explicit workspace tests are present; all prior behavior is preserved.
+- Raw ingress has explicit `LoopbackOnly` and `Public` exposure policies.
+  Public mode requires operator opt-in, a bounded per-IP active-connection
+  limit, Agent-facing mutual TLS, and external dynamic snapshot authorization.
+- The per-IP admission map contains only admitted active peers, is bounded by
+  the existing global connection semaphore, and releases through RAII on every
+  connection/open/session/shutdown path.
+- Public raw listeners retain cached exact-TunnelId routing, offline
+  fail-close, reconnect continuity, drain semantics, and live credential
+  revocation without a database or Control Plane lookup on ingress.
+- Route status and structured events expose accepted, global-capacity,
+  per-IP-capacity, and unavailable-target outcomes without payload bytes.
+- 261 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -280,8 +292,10 @@
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
-- Public tunnel endpoints / hostname allocation.
-- Public HTTP/TLS reverse proxy and raw public ingress.
+- Automatic public port/hostname allocation and durable endpoint catalog.
+- Public HTTP/TLS reverse proxy, hostname allocation, and signed access URLs.
+- Public-client authentication for arbitrary raw protocols, request-rate
+  limiting, and distributed DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
@@ -290,6 +304,6 @@
 
 ## Next planned session
 
-Not selected yet. Session 22 deliberately leaves issuer custody/CA lifecycle,
-general administration, public ingress, and multi-edge coordination as separate
-future scopes.
+Not selected yet. Session 23 deliberately exposes only opaque raw TCP. Public
+HTTP/TLS hostname routing, issuer custody/CA lifecycle, general administration,
+and multi-edge coordination remain separate future scopes.

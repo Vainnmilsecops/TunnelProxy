@@ -423,6 +423,13 @@ routes, then closes the affected transport and active streams. The raw listener
 remains bound. If the publisher disappears, Edge reports stale source state and
 continues with its last cached snapshot.
 
+Session 23 also keeps Protocol v2 unchanged. `EdgeRuntime` may explicitly bind
+its durable raw listener to a non-loopback address only when Agent transport is
+mutual TLS and authorization comes from the external dynamic snapshot stream.
+Global and per-source-IP active connection permits are acquired before routing
+and released through stream completion. This is opaque public TCP; it adds no
+HTTP hostname routing or public-client TLS/authentication.
+
 ## What Is NOT Implemented
 
 - Certificate issuance, CA/trust revocation, rotation, and hot reload
