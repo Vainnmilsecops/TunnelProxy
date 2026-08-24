@@ -57,8 +57,6 @@
 //! See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006, ADR-007) and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
-#![deny(unsafe_code)]
-
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

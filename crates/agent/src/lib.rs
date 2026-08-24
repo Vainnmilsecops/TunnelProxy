@@ -25,8 +25,6 @@
 //! `tunnelproxy http` UX remains out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
-#![deny(unsafe_code)]
-
 mod agent_transport;
 mod enrollment;
 mod multiplex;

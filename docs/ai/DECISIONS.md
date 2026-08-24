@@ -635,3 +635,37 @@ request-rate limiting, DDoS protection, and multi-edge ownership remain
 separate work. A configured stale snapshot cache may continue serving within
 its existing bounded stale window, so revocation delivery can be delayed while
 the Control Plane is unavailable.
+
+---
+
+## ADR-024 — Binary workspace dependencies are locked and PRs receive CI checks
+
+**Status:** Accepted (Session 24).
+
+**Context:** TunnelProxy ships three runnable application binaries and now has
+261 security-sensitive tests, but dependency resolution remained local-only and
+no hosted check ran before merge. The workspace declares Rust 1.75 while local
+development follows stable, and native Windows dependencies require the MSVC
+toolchain. A change could therefore pass on one developer machine while
+breaking the declared MSRV or another supported platform.
+
+**Decision:** Commit the workspace `Cargo.lock` and use `--locked` for hosted
+Cargo commands. GitHub Actions runs for pull requests, pushes to `main`, and
+manual dispatch. One Ubuntu job enforces format, all-target checking, and
+warning-free Clippy; a non-fail-fast Ubuntu/Windows matrix runs all tests and a
+workspace build; and a separate Ubuntu job checks all targets with Rust 1.75.
+Transitive releases that Cargo 1.75 cannot parse remain pinned in the lockfile,
+and the workspace-level `forbid(unsafe_code)` lint is the single authority
+rather than being redundantly weakened or restated in each crate.
+The workflow has read-only repository permissions, pins its checkout action to
+an immutable commit, does not persist checkout credentials, sets explicit job
+timeouts, and cancels superseded runs for the same ref or pull request.
+
+**Consequences:** Dependency changes must update their manifests and lockfile
+atomically, and the main supported build paths receive automatic regression
+coverage before merge. Stable remains the normal development toolchain while
+the explicit MSRV job prevents accidental compiler-version drift. Hosted
+Windows validates the MSVC path without removing the local Visual Studio Build
+Tools requirement. Branch-protection settings, release artifacts, dependency
+update bots, vulnerability auditing, and code signing remain separate operator
+or future-session work.

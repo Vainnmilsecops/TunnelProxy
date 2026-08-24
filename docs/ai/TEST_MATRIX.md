@@ -13,6 +13,7 @@
 | Capability                                | Unit | Integration | E2E | Notes                                                                                                                       |
 | ----------------------------------------- | ---- | ----------- | --- | --------------------------------------------------------------------------------------------------------------------------- |
 | Workspace compiles and lints              | ✅   | —           | —   | Foundation checks; Session 04 keeps networking deps and lint-clean code.                                                    |
+| Reproducible cross-platform CI             | ✅   | ✅          | —   | GitHub Actions enforces locked format/check/Clippy on Ubuntu, test/build on Ubuntu and Windows MSVC, plus a Rust 1.75 MSRV check. |
 | Per-crate placeholder unit tests          | ✅   | —           | —   | Identifiers / status enums.                                                                                                 |
 | Edge: bind async TCP listener (echo)      | ✅   | ✅          | —   | `run_listener`; integration test binds via `127.0.0.1:0`, asserts `TcpStream::connect` succeeds.                             |
 | Edge: accept connections                  | ✅   | ✅          | —   | Each connection is spawned via `tokio::spawn`.                                                                              |

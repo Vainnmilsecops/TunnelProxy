@@ -7,8 +7,6 @@
 //! This crate must remain small. If a type is only useful inside one other
 //! crate, it does not belong here.
 
-#![deny(unsafe_code)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
