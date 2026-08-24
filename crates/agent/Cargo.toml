@@ -17,6 +17,9 @@ tracing-subscriber = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
 tunnelproxy-common = { path = "../common" }
 

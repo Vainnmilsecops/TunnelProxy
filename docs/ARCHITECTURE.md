@@ -440,6 +440,28 @@ established TLS session; reconnect selects the latest generation. Static Edge
 authorization is generation-coupled and its full-snapshot reconciliation
 revokes a session whose exact client leaf was removed.
 
+### 2.20 Agent enrollment and two-phase renewal (Session 21)
+
+Dynamic authorization mode may run a separate server-authenticated enrollment
+listener using ALPN `tunnelproxy-enroll/1`. Agent creates and retains an ECDSA
+P-256 private key, journals the CSR and request ID, and authenticates with a
+file-delivered bootstrap or renewal token. Control Plane stores only token
+hashes and signs a client-auth-only short-lived leaf after token preflight.
+
+Issuance is one SQLite transaction that records credential state, consumes the
+bootstrap token when applicable, and advances the complete authorization
+snapshot with the new fingerprint. The previous fingerprint remains during
+renewal. Agent verifies the returned fingerprint and key pair, writes the three
+credential files, publishes the strict Session 20 manifest, and waits for that
+generation to become live. A second authenticated activation transaction then
+removes the predecessor and retires it. Exact request replay returns durable
+state, so either process may crash between phases without generating a second
+logical issuance.
+
+This mutation path feeds the existing snapshot publisher; Edge ingress still
+uses only cached immutable state. See
+[`AGENT_ENROLLMENT.md`](AGENT_ENROLLMENT.md) for trust boundaries and commands.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

@@ -28,6 +28,7 @@
 #![deny(unsafe_code)]
 
 mod agent_transport;
+mod enrollment;
 mod multiplex;
 mod runtime;
 mod tls;
@@ -35,6 +36,11 @@ mod tls;
 pub use agent_transport::{
     connect, connect_registered_with_security, connect_with_security, development_registration,
     AgentError, AgentSession, AgentSessionCloseReason, ConnectOutcome,
+};
+pub use enrollment::{
+    bootstrap_agent_credentials, read_token as read_enrollment_token,
+    write_token as write_enrollment_token, AgentEnrollmentClient, AgentEnrollmentConfig,
+    AgentEnrollmentError, AgentEnrollmentRuntime, EnrollmentClientConfig, IssuedEnrollment,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,

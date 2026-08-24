@@ -735,3 +735,35 @@ Out of scope:
 - Forced renegotiation of arbitrary established TLS connections. New
   handshakes use the new generation; static Edge authorization additionally
   closes sessions removed by its local snapshot update.
+
+## Session 21 — Automated Agent Enrollment & Renewal — complete
+
+Scope delivered:
+
+- Added bounded Enrollment Protocol v1 over server-authenticated TLS and ALPN
+  `tunnelproxy-enroll/1`, with redacted tokens and typed failures.
+- Added 256-bit bootstrap/renewal tokens stored only as hashes, expiry and
+  Agent/Tunnel binding, plus `create-token` secret-file CLI provisioning.
+- Added a short-lived client-auth certificate issuer. Agent generates and keeps
+  its ECDSA P-256 private key and submits only a signed CSR.
+- Made issuance, token consumption, credential state, and new fingerprint
+  snapshot publication one SQLite transaction. Exact request retries return the
+  original durable certificate.
+- Added two-phase renewal: publish the new fingerprint with overlap, atomically
+  publish the Agent credential manifest, observe live reload, then activate and
+  remove the predecessor in a later full snapshot.
+- Added a durable Agent pending journal and recovery for crashes before/after
+  issuance, activation, token replacement, or journal cleanup.
+- Integrated optional enrollment service supervision into Control Plane and
+  `--enroll-only` plus automatic expiry-window renewal into the Agent CLI.
+- Added unit, CLI, repository, and real-TLS integration coverage for strict
+  protocol parsing, token binding/expiry/idempotency, secret-safe provisioning,
+  bootstrap, renewal, overlap, activation, and old-fingerprint revocation. The
+  workspace now contains 249 explicit tests.
+
+Out of scope:
+
+- HSM/KMS issuer custody, CA rollover, CRL/OCSP, and emergency revocation.
+- Automatic expiry cleanup for an issued credential whose Agent never sends
+  activation, static Edge enrollment, and multi-Control-Plane consensus.
+- Public ingress, accounts, billing, and general administrative CRUD APIs.

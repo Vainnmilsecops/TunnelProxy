@@ -102,5 +102,7 @@ supervises both the data plane and reconnecting snapshot client. The Edge CLI
 selects exactly one authorization mode: plaintext loopback development, static
 mTLS certificate authorization, or mTLS plus the complete snapshot flag group.
 
-Sessions 18–19 do not include a general admin API, snapshot signing,
-certificate rotation, or multi-edge consensus.
+Session 21 may transactionally add and activate Agent certificate fingerprints
+through the enrollment workflow. It uses the same complete snapshot repository
+and publication channel. There is still no general admin API, snapshot signing,
+CA lifecycle automation, or multi-edge consensus.

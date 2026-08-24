@@ -7,9 +7,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tunnelproxy_common::{shutdown_channel, ShutdownSignal};
 
 use crate::{
-    PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotDistributionServer,
-    SnapshotPublishOutcome, SnapshotServerConfig, SnapshotServerError, SnapshotVersion,
-    SqliteSnapshotRepository,
+    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, PersistentSnapshotAuthority,
+    PersistentSnapshotAuthorityError, SnapshotDistributionServer, SnapshotPublishOutcome,
+    SnapshotServerConfig, SnapshotServerError, SnapshotVersion, SqliteSnapshotRepository,
 };
 
 #[derive(Debug, Clone)]
@@ -36,11 +36,26 @@ impl ControlPlaneRuntimeConfig {
 pub struct ControlPlaneRuntime {
     authority: PersistentSnapshotAuthority,
     server: SnapshotDistributionServer,
+    enrollment_server: Option<EnrollmentServer>,
     refresh_interval: Duration,
 }
 
 impl ControlPlaneRuntime {
     pub async fn bind(config: ControlPlaneRuntimeConfig) -> Result<Self, ControlPlaneRuntimeError> {
+        Self::bind_inner(config, None).await
+    }
+
+    pub async fn bind_with_enrollment(
+        config: ControlPlaneRuntimeConfig,
+        enrollment: EnrollmentServerConfig,
+    ) -> Result<Self, ControlPlaneRuntimeError> {
+        Self::bind_inner(config, Some(enrollment)).await
+    }
+
+    async fn bind_inner(
+        config: ControlPlaneRuntimeConfig,
+        enrollment: Option<EnrollmentServerConfig>,
+    ) -> Result<Self, ControlPlaneRuntimeError> {
         config.validate()?;
         let database_path = config.database_path;
         let repository = tokio::task::spawn_blocking(move || {
@@ -56,9 +71,18 @@ impl ControlPlaneRuntime {
             SnapshotDistributionServer::bind(config.snapshot_server, authority.subscribe())
                 .await
                 .map_err(ControlPlaneRuntimeError::Server)?;
+        let enrollment_server = match enrollment {
+            Some(config) => Some(
+                EnrollmentServer::bind(config, authority.clone())
+                    .await
+                    .map_err(ControlPlaneRuntimeError::Enrollment)?,
+            ),
+            None => None,
+        };
         Ok(Self {
             authority,
             server,
+            enrollment_server,
             refresh_interval: config.refresh_interval,
         })
     }
@@ -71,13 +95,24 @@ impl ControlPlaneRuntime {
         self.authority.current().version()
     }
 
+    pub fn enrollment_addr(&self) -> Option<std::net::SocketAddr> {
+        self.enrollment_server
+            .as_ref()
+            .map(EnrollmentServer::local_addr)
+    }
+
     pub async fn run_until_shutdown(
         self,
         signal: ShutdownSignal,
     ) -> Result<ControlPlaneRuntimeOutcome, ControlPlaneRuntimeError> {
         let local_addr = self.server.local_addr();
+        let enrollment_addr = self.enrollment_addr();
         let (server_trigger, server_signal) = shutdown_channel();
         let mut server_task = tokio::spawn(self.server.run_until_shutdown(server_signal));
+        let (enrollment_trigger, enrollment_signal) = shutdown_channel();
+        let mut enrollment_task = self
+            .enrollment_server
+            .map(|server| tokio::spawn(server.run_until_shutdown(enrollment_signal)));
         let mut refresh = tokio::time::interval_at(
             Instant::now() + self.refresh_interval,
             self.refresh_interval,
@@ -89,17 +124,32 @@ impl ControlPlaneRuntime {
                 biased;
                 () = signal.cancelled() => {
                     server_trigger.shutdown();
+                    enrollment_trigger.shutdown();
                     await_server(server_task).await?;
+                    await_enrollment(&mut enrollment_task).await?;
                     return Ok(ControlPlaneRuntimeOutcome {
                         listen_addr: local_addr,
+                        enrollment_addr,
                         applied_refreshes,
                     });
                 }
                 result = &mut server_task => {
+                    enrollment_trigger.shutdown();
+                    let _ = await_enrollment(&mut enrollment_task).await;
                     return match result {
                         Ok(Ok(())) => Err(ControlPlaneRuntimeError::ServerStopped),
                         Ok(Err(error)) => Err(ControlPlaneRuntimeError::Server(error)),
                         Err(error) => Err(ControlPlaneRuntimeError::ServerTask(error.to_string())),
+                    };
+                }
+                result = next_enrollment(&mut enrollment_task), if enrollment_task.is_some() => {
+                    server_trigger.shutdown();
+                    let _ = await_server(server_task).await;
+                    return match result {
+                        Some(Ok(Ok(()))) => Err(ControlPlaneRuntimeError::EnrollmentStopped),
+                        Some(Ok(Err(error))) => Err(ControlPlaneRuntimeError::Enrollment(error)),
+                        Some(Err(error)) => Err(ControlPlaneRuntimeError::EnrollmentTask(error.to_string())),
+                        None => Err(ControlPlaneRuntimeError::EnrollmentStopped),
                     };
                 }
                 _ = refresh.tick() => {
@@ -110,13 +160,37 @@ impl ControlPlaneRuntime {
                         Ok(SnapshotPublishOutcome::Unchanged { .. }) => {}
                         Err(error) => {
                             server_trigger.shutdown();
+                            enrollment_trigger.shutdown();
                             let _ = await_server(server_task).await;
+                            let _ = await_enrollment(&mut enrollment_task).await;
                             return Err(ControlPlaneRuntimeError::Authority(error));
                         }
                     }
                 }
             }
         }
+    }
+}
+
+async fn next_enrollment(
+    task: &mut Option<JoinHandle<Result<(), EnrollmentServerError>>>,
+) -> Option<Result<Result<(), EnrollmentServerError>, tokio::task::JoinError>> {
+    match task {
+        Some(task) => Some(task.await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn await_enrollment(
+    task: &mut Option<JoinHandle<Result<(), EnrollmentServerError>>>,
+) -> Result<(), ControlPlaneRuntimeError> {
+    let Some(task) = task.take() else {
+        return Ok(());
+    };
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ControlPlaneRuntimeError::Enrollment(error)),
+        Err(error) => Err(ControlPlaneRuntimeError::EnrollmentTask(error.to_string())),
     }
 }
 
@@ -133,6 +207,7 @@ async fn await_server(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneRuntimeOutcome {
     pub listen_addr: std::net::SocketAddr,
+    pub enrollment_addr: Option<std::net::SocketAddr>,
     pub applied_refreshes: u64,
 }
 
@@ -142,9 +217,12 @@ pub enum ControlPlaneRuntimeError {
     Repository(crate::SnapshotRepositoryError),
     Authority(PersistentSnapshotAuthorityError),
     Server(SnapshotServerError),
+    Enrollment(EnrollmentServerError),
     StorageTask,
     ServerTask(String),
     ServerStopped,
+    EnrollmentTask(String),
+    EnrollmentStopped,
 }
 
 impl std::fmt::Display for ControlPlaneRuntimeError {
@@ -154,9 +232,12 @@ impl std::fmt::Display for ControlPlaneRuntimeError {
             Self::Repository(error) => error.fmt(f),
             Self::Authority(error) => error.fmt(f),
             Self::Server(error) => error.fmt(f),
+            Self::Enrollment(error) => error.fmt(f),
             Self::StorageTask => f.write_str("snapshot storage worker stopped unexpectedly"),
             Self::ServerTask(_) => f.write_str("snapshot server task stopped unexpectedly"),
             Self::ServerStopped => f.write_str("snapshot server stopped unexpectedly"),
+            Self::EnrollmentTask(_) => f.write_str("enrollment server task stopped unexpectedly"),
+            Self::EnrollmentStopped => f.write_str("enrollment server stopped unexpectedly"),
         }
     }
 }

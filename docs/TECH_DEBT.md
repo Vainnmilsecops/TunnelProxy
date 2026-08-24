@@ -199,20 +199,24 @@
 - **Tracking:** persistence resolved in Session 17 and runnable process wiring
   completed in Session 18. Edge cold-start cache is tracked separately below.
 
-### DEBT-019 — Certificate issuance and key custody remain manual
+### DEBT-019 — Issuer custody and CA/emergency revocation remain manual
 
 - **Introduced in:** Session 20
 - **Category:** security / ops
 - **Impact:** high for production credential operations, low for the tested
   operator-managed reload boundary
-- **Rationale:** Session 20 reloads digest-bound local generations and enforces
-  leaf expiry, but an operator or external system must still issue credentials,
-  protect/write private keys, publish manifests, coordinate CA overlap, and
-  distribute CRL/OCSP or emergency trust revocation.
-- **Exit plan:** Define authenticated enrollment and renewal, short-lived
-  identities, protected key custody, issuer/audit boundaries, and explicit CA
-  overlap/revocation semantics that publish through the Session 20 manifest.
-- **Tracking:** open; local manifest publication is not a managed PKI.
+- **Rationale:** Session 21 now provides authenticated Agent-owned-key
+  enrollment, short-lived leaf issuance, hashed bootstrap/renewal tokens,
+  manifest publication, and old/new leaf overlap with explicit activation.
+  The issuer key and local secret directories still rely on operator filesystem
+  protection. There is no HSM/KMS integration, CA rollover, CRL/OCSP,
+  emergency revocation workflow, or automatic cleanup when an Agent never
+  activates an issued replacement.
+- **Exit plan:** Add protected issuer custody and audit boundaries, explicit CA
+  overlap/trust distribution, emergency revocation, and expiry-based cleanup of
+  abandoned pending credentials.
+- **Tracking:** partially reduced in Session 21; production CA lifecycle remains
+  open. Dynamic Edge enrollment is a managed leaf lifecycle, not a complete PKI.
 
 ## Resolved items
 
