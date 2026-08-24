@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tunnelproxy_common::ShutdownSignal;
@@ -67,6 +68,8 @@ pub struct EnrollmentServerConfig {
     pub listen_addr: SocketAddr,
     pub max_clients: usize,
     pub request_timeout: Duration,
+    pub activation_grace: Duration,
+    pub reconcile_interval: Duration,
     pub database_path: PathBuf,
     pub tls: EnrollmentServerTlsConfig,
     pub issuer: AgentCertificateIssuer,
@@ -79,6 +82,10 @@ impl EnrollmentServerConfig {
     pub fn validate(&self) -> Result<(), EnrollmentServerError> {
         if self.max_clients == 0
             || self.request_timeout.is_zero()
+            || self.activation_grace.is_zero()
+            || self.activation_grace.as_secs() == 0
+            || self.reconcile_interval.is_zero()
+            || self.activation_grace > self.issuer.validity()
             || self.database_path.as_os_str().is_empty()
             || self.agent_server_ca_pem.is_empty()
         {
@@ -138,10 +145,43 @@ impl EnrollmentServer {
     ) -> Result<(), EnrollmentServerError> {
         info!(addr = %self.local_addr, event = "enrollment_server_started");
         let mut tasks = JoinSet::new();
+        let mut reconcile = tokio::time::interval_at(
+            Instant::now() + self.config.reconcile_interval,
+            self.config.reconcile_interval,
+        );
+        reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 () = signal.cancelled() => break,
+                _ = reconcile.tick() => {
+                    let _guard = self.mutation_gate.lock().await;
+                    let repository = self.repository.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        repository.reconcile_expired(unix_time_now()?)
+                    })
+                    .await
+                    .map_err(|_| EnrollmentServerError::StorageTask)?
+                    .map_err(EnrollmentServerError::Repository)?;
+                    if outcome.snapshot_changed {
+                        self.authority
+                            .refresh_from_repository()
+                            .await
+                            .map_err(|_| EnrollmentServerError::Authority)?;
+                    }
+                    if outcome.affected_credentials != 0 {
+                        info!(
+                            affected_credentials = outcome.affected_credentials,
+                            snapshot_version = outcome.snapshot_version.get(),
+                            event = "pending_credential_expired"
+                        );
+                        info!(
+                            affected_credentials = outcome.affected_credentials,
+                            snapshot_version = outcome.snapshot_version.get(),
+                            event = "credential_reconciliation_completed"
+                        );
+                    }
+                }
                 accepted = self.listener.accept() => {
                     let (socket, peer) = accepted.map_err(EnrollmentServerError::Accept)?;
                     let permit = match Arc::clone(&self.permits).try_acquire_owned() {
@@ -257,6 +297,16 @@ async fn serve_connection(
                         return;
                     }
                 };
+                let activation_deadline_unix = match unix_time_now().and_then(|now| {
+                    now.checked_add(config.activation_grace.as_secs())
+                        .ok_or(EnrollmentRepositoryError::InvalidTime)
+                }) {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        let _ = write_error(&mut stream, EnrollmentErrorCode::Internal).await;
+                        return;
+                    }
+                };
                 let candidate = IssuanceCandidate {
                     request_id,
                     presented_token_hash,
@@ -267,6 +317,7 @@ async fn serve_connection(
                     certificate_pem: issued.certificate_pem,
                     fingerprint: issued.fingerprint,
                     not_after_unix: issued.not_after_unix,
+                    activation_deadline_unix,
                 };
                 let commit_repository = repository.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -314,16 +365,24 @@ async fn serve_connection(
             let _guard = mutation_gate.lock().await;
             let activate_repository = repository.clone();
             let version = match tokio::task::spawn_blocking(move || {
+                let now = unix_time_now()?;
                 activate_repository.activate(
                     request_id,
                     enrollment_token_hash(renewal_token.as_bytes()),
                     CertificateFingerprint::from_bytes(fingerprint),
+                    now,
                 )
             })
             .await
             {
                 Ok(Ok(version)) => version,
                 Ok(Err(error)) => {
+                    if error == EnrollmentRepositoryError::RequestExpired
+                        && authority.refresh_from_repository().await.is_err()
+                    {
+                        let _ = write_error(&mut stream, EnrollmentErrorCode::Internal).await;
+                        return;
+                    }
                     let _ = write_error(&mut stream, repository_error_code(error)).await;
                     return;
                 }
@@ -367,6 +426,8 @@ fn repository_error_code(error: EnrollmentRepositoryError) -> EnrollmentErrorCod
     match error {
         EnrollmentRepositoryError::Unauthorized => EnrollmentErrorCode::Unauthorized,
         EnrollmentRepositoryError::TokenExpired => EnrollmentErrorCode::TokenExpired,
+        EnrollmentRepositoryError::CredentialRevoked => EnrollmentErrorCode::CredentialRevoked,
+        EnrollmentRepositoryError::RequestExpired => EnrollmentErrorCode::RequestExpired,
         EnrollmentRepositoryError::IdentityMismatch => EnrollmentErrorCode::IdentityMismatch,
         EnrollmentRepositoryError::Conflict => EnrollmentErrorCode::Conflict,
         EnrollmentRepositoryError::Storage
@@ -375,7 +436,8 @@ fn repository_error_code(error: EnrollmentRepositoryError) -> EnrollmentErrorCod
         | EnrollmentRepositoryError::InvalidTime
         | EnrollmentRepositoryError::VersionExhausted
         | EnrollmentRepositoryError::Random
-        | EnrollmentRepositoryError::TokenOutput => EnrollmentErrorCode::Internal,
+        | EnrollmentRepositoryError::TokenOutput
+        | EnrollmentRepositoryError::ResourceLimit => EnrollmentErrorCode::Internal,
     }
 }
 
@@ -427,6 +489,7 @@ pub enum EnrollmentServerError {
     Accept(std::io::Error),
     Repository(EnrollmentRepositoryError),
     StorageTask,
+    Authority,
 }
 
 impl std::fmt::Display for EnrollmentServerError {
@@ -437,6 +500,7 @@ impl std::fmt::Display for EnrollmentServerError {
             Self::Accept(_) => "enrollment server accept failed",
             Self::Repository(_) => "enrollment repository initialization failed",
             Self::StorageTask => "enrollment repository worker stopped unexpectedly",
+            Self::Authority => "enrollment snapshot publication failed",
         };
         f.write_str(message)
     }

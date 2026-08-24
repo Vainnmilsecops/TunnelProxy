@@ -767,3 +767,33 @@ Out of scope:
 - Automatic expiry cleanup for an issued credential whose Agent never sends
   activation, static Edge enrollment, and multi-Control-Plane consensus.
 - Public ingress, accounts, billing, and general administrative CRUD APIs.
+
+## Session 22 — Emergency Credential Revocation & Reconciliation — complete
+
+Scope delivered:
+
+- Migrated Session 21 SQLite state to explicit pending, active, retired,
+  revoked, and expired states with activation deadlines and terminal times.
+- Added terminal `CredentialRevoked` and recoverable `RequestExpired`
+  enrollment errors without changing the bounded wire framing.
+- Added idempotent Agent/Tunnel revocation that invalidates bootstrap/renewal
+  tokens and removes exact authorization through the same durable full-snapshot
+  transaction.
+- Added a bounded supervised reconciler that tombstones abandoned pending
+  requests and removes only replacement fingerprints, preserving an active
+  renewal predecessor.
+- Added Agent retry classification: authentication/revocation/configuration
+  failures stop; network/internal failures retry; expired journals are cleared
+  so a valid predecessor token can create a fresh request.
+- Added `revoke-agent` and secret-safe `credential-status` operator commands,
+  plus activation-grace and reconciliation-interval service controls.
+- Added migration, state-machine, idempotency, token invalidation, CLI secrecy,
+  real enrollment TLS, supervised expiry, and real Agent/Edge mTLS session
+  revocation tests. The workspace now contains 257 explicit tests.
+
+Out of scope:
+
+- HSM/KMS issuer custody, CA rollover, CRL/OCSP, and multi-CA trust overlap.
+- General remote admin API, roles/audit retention, public ingress, and
+  multi-Control-Plane consensus.
+- Static Edge enrollment and hostile local-filesystem defense.

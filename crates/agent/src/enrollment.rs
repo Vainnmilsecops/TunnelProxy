@@ -267,6 +267,9 @@ impl AgentEnrollmentRuntime {
             let status = self.tls.reload_status(self.config.renew_before);
             if self.config.pending_path.exists() || status.health == TlsConfigHealth::Expiring {
                 if let Err(error) = self.rotate_once().await {
+                    if error.is_terminal() {
+                        return Err(error);
+                    }
                     warn!(%error, generation = status.generation, event = "agent_renewal_failed");
                 }
             }
@@ -314,7 +317,7 @@ async fn rotate(
             .map(|active| active.reload_status(Duration::from_secs(1)).generation)
             .unwrap_or(1));
     }
-    let issued = client
+    let issued = match client
         .issue(
             pending.request_id,
             token,
@@ -323,7 +326,16 @@ async fn rotate(
             config.tunnel_id.clone(),
             pending.csr_der.clone(),
         )
-        .await?;
+        .await
+    {
+        Err(AgentEnrollmentError::Rejected(EnrollmentErrorCode::RequestExpired)) => {
+            replace_expired_pending(config).await?;
+            return Err(AgentEnrollmentError::Rejected(
+                EnrollmentErrorCode::RequestExpired,
+            ));
+        }
+        result => result?,
+    };
     verify_issued_fingerprint(&issued.certificate_pem, issued.fingerprint)?;
     AgentTlsConfig::from_pem(
         &issued.server_ca_pem,
@@ -365,9 +377,18 @@ async fn rotate(
         .await
         .map_err(|_| AgentEnrollmentError::ActivationTimeout)?;
     }
-    let snapshot_version = client
+    let snapshot_version = match client
         .activate(issued.request_id, pending.next_token, issued.fingerprint)
-        .await?;
+        .await
+    {
+        Err(AgentEnrollmentError::Rejected(EnrollmentErrorCode::RequestExpired)) => {
+            replace_expired_pending(config).await?;
+            return Err(AgentEnrollmentError::Rejected(
+                EnrollmentErrorCode::RequestExpired,
+            ));
+        }
+        result => result?,
+    };
     let next_token_path = config.token_path.clone();
     let next_token = pending.next_token;
     let completed_pending = config.pending_path.clone();
@@ -384,6 +405,17 @@ async fn rotate(
         event = "agent_credential_rotation_completed"
     );
     Ok(issued.generation)
+}
+
+async fn replace_expired_pending(
+    config: &AgentEnrollmentConfig,
+) -> Result<(), AgentEnrollmentError> {
+    let path = config.pending_path.clone();
+    let agent_id = config.agent_id.clone();
+    let tunnel_id = config.tunnel_id.clone();
+    tokio::task::spawn_blocking(move || create_pending(&path, &agent_id, &tunnel_id).map(drop))
+        .await
+        .map_err(|_| AgentEnrollmentError::StorageTask)?
 }
 
 fn verify_issued_fingerprint(
@@ -418,6 +450,14 @@ fn load_or_create_pending(
     if path.exists() {
         return decode_pending(&std::fs::read(path).map_err(|_| AgentEnrollmentError::Storage)?);
     }
+    create_pending(path, agent_id, tunnel_id)
+}
+
+fn create_pending(
+    path: &Path,
+    agent_id: &AgentId,
+    tunnel_id: &TunnelId,
+) -> Result<PendingEnrollment, AgentEnrollmentError> {
     let mut request_id = [0_u8; 16];
     let mut next_token = [0_u8; 32];
     getrandom::getrandom(&mut request_id).map_err(|_| AgentEnrollmentError::Random)?;
@@ -591,4 +631,84 @@ impl std::fmt::Display for AgentEnrollmentError {
     }
 }
 
+impl AgentEnrollmentError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::ConnectTimeout
+            | Self::Connect
+            | Self::HandshakeTimeout
+            | Self::RequestTimeout
+            | Self::ActivationTimeout
+            | Self::Rejected(EnrollmentErrorCode::Internal)
+            | Self::Rejected(EnrollmentErrorCode::RequestExpired) => false,
+            Self::InvalidConfig
+            | Self::InvalidServerCa
+            | Self::InvalidServerName
+            | Self::InvalidToken
+            | Self::Tls
+            | Self::Alpn
+            | Self::Protocol(_)
+            | Self::Rejected(_)
+            | Self::UnexpectedResponse
+            | Self::Random
+            | Self::KeyGeneration
+            | Self::PendingState
+            | Self::IssuedCredential(_)
+            | Self::IssuedFingerprint
+            | Self::Publish(_)
+            | Self::Storage
+            | Self::StorageTask => true,
+        }
+    }
+}
+
 impl std::error::Error for AgentEnrollmentError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tunnelproxy-agent-enrollment-{label}-{}-{}.pending",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn terminal_rejections_stop_but_expired_requests_and_internal_failures_retry() {
+        for code in [
+            EnrollmentErrorCode::Unauthorized,
+            EnrollmentErrorCode::TokenExpired,
+            EnrollmentErrorCode::IdentityMismatch,
+            EnrollmentErrorCode::InvalidCsr,
+            EnrollmentErrorCode::Conflict,
+            EnrollmentErrorCode::CredentialRevoked,
+        ] {
+            assert!(AgentEnrollmentError::Rejected(code).is_terminal());
+        }
+        assert!(!AgentEnrollmentError::Rejected(EnrollmentErrorCode::RequestExpired).is_terminal());
+        assert!(!AgentEnrollmentError::Rejected(EnrollmentErrorCode::Internal).is_terminal());
+        assert!(!AgentEnrollmentError::ConnectTimeout.is_terminal());
+    }
+
+    #[test]
+    fn expired_pending_is_replaced_with_a_fresh_retry_request() {
+        let path = test_path("expired-retry");
+        let agent_id = AgentId::new("agent-retry").unwrap();
+        let tunnel_id = TunnelId::new("tunnel-retry").unwrap();
+        let expired = load_or_create_pending(&path, &agent_id, &tunnel_id).unwrap();
+        let replacement = create_pending(&path, &agent_id, &tunnel_id).unwrap();
+        let durable = load_or_create_pending(&path, &agent_id, &tunnel_id).unwrap();
+
+        assert_ne!(replacement.request_id, expired.request_id);
+        assert_eq!(durable.request_id, replacement.request_id);
+        assert_eq!(durable.next_token, replacement.next_token);
+
+        let _ = std::fs::remove_file(path);
+    }
+}

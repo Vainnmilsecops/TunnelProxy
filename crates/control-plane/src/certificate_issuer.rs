@@ -26,12 +26,16 @@ struct IssuerInner {
 }
 
 impl AgentCertificateIssuer {
+    pub fn validity(&self) -> Duration {
+        self.inner.validity
+    }
+
     pub fn from_pem(
         issuer_certificate_pem: &[u8],
         issuer_private_key_pem: &[u8],
         validity: Duration,
     ) -> Result<Self, CertificateIssuerError> {
-        if validity.is_zero() || validity > Duration::from_secs(30 * 24 * 60 * 60) {
+        if validity.as_secs() == 0 || validity > Duration::from_secs(30 * 24 * 60 * 60) {
             return Err(CertificateIssuerError::InvalidValidity);
         }
         let certificate_text = std::str::from_utf8(issuer_certificate_pem)
@@ -186,6 +190,15 @@ mod tests {
     #[test]
     fn issuer_enforces_ca_identity_policy_and_client_auth_leaf_profile() {
         let (ca, ca_key) = test_ca();
+        assert_eq!(
+            AgentCertificateIssuer::from_pem(
+                ca.pem().as_bytes(),
+                ca_key.serialize_pem().as_bytes(),
+                Duration::from_millis(999),
+            )
+            .unwrap_err(),
+            CertificateIssuerError::InvalidValidity
+        );
         assert_eq!(
             AgentCertificateIssuer::from_pem(
                 ca.pem().as_bytes(),

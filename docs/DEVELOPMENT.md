@@ -340,7 +340,10 @@ credentials. The minimum workflow is:
    `tunnelproxy-control-plane create-token`; its value is written only to the
    requested secret file.
 3. Start `serve` with the complete `--enrollment-*`, `--issuer-*`, and
-   `--agent-server-ca` group.
+   `--agent-server-ca` group. `--enrollment-activation-grace-ms` bounds the
+   issue-to-activate window (minimum 1000 ms), and
+   `--enrollment-reconcile-interval-ms` controls the supervised
+   abandoned-request sweep.
 4. Run `tunnelproxy-agent --enroll-only` with the token/pending paths, target
    credential paths, and reload manifest path.
 5. Start the normal Agent with the same enrollment group to enable automatic
@@ -351,3 +354,24 @@ version control. The Agent private key and pending journal are local secret
 files. Automated enrollment requires the Agent TLS reload manifest and a
 dynamic Control Plane snapshot; static Edge authorization cannot follow these
 snapshot mutations.
+
+Inspect only non-secret credential metadata for one identity:
+
+```text
+tunnelproxy-control-plane credential-status --database snapshots.sqlite \
+  --agent-id agent-1 --tunnel-id tunnel-1
+```
+
+Emergency-revoke that exact Agent/Tunnel identity:
+
+```text
+tunnelproxy-control-plane revoke-agent --database snapshots.sqlite \
+  --agent-id agent-1 --tunnel-id tunnel-1
+```
+
+Revocation is durable and idempotent. It invalidates enrollment tokens and
+removes the identity from the complete authorization snapshot. A running
+Control Plane publishes the committed version through its normal repository
+refresh, after which dynamic Edge instances close the revoked live session.
+Creating a new bootstrap token later is an explicit operator decision to
+re-enroll the identity.

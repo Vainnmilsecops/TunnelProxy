@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
-    enrollment_token_hash, unix_time_now, EnrollmentRepository, SnapshotRepository,
-    SqliteSnapshotRepository,
+    enrollment_token_hash, unix_time_now, AuthorizationSnapshot, EnrollmentRepository,
+    EnrollmentRepositoryError, SnapshotRepository, SnapshotVersion, SqliteSnapshotRepository,
+    VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -125,5 +126,86 @@ fn create_token_writes_a_bound_secret_file_without_printing_the_token() {
             unix_time_now().unwrap(),
         )
         .unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn revoke_and_status_commands_are_idempotent_and_secret_safe() {
+    let directory = temp_directory();
+    let database = directory.join("snapshots.sqlite");
+    SqliteSnapshotRepository::open(&database)
+        .unwrap()
+        .commit(&VersionedAuthorizationSnapshot::new(
+            SnapshotVersion::FIRST,
+            AuthorizationSnapshot::default(),
+        ))
+        .unwrap();
+    let token_path = directory.join("bootstrap.token");
+    let create = Command::new(binary())
+        .args([
+            "create-token",
+            "--database",
+            database.to_str().unwrap(),
+            "--agent-id",
+            "agent-revoke-cli",
+            "--tunnel-id",
+            "tunnel-revoke-cli",
+            "--output",
+            token_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+    let token_text = std::fs::read_to_string(&token_path).unwrap();
+    let token_text = token_text.trim();
+    let mut token = [0_u8; 32];
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&token_text[index * 2..index * 2 + 2], 16).unwrap();
+    }
+
+    for _ in 0..2 {
+        let revoke = Command::new(binary())
+            .args([
+                "revoke-agent",
+                "--database",
+                database.to_str().unwrap(),
+                "--agent-id",
+                "agent-revoke-cli",
+                "--tunnel-id",
+                "tunnel-revoke-cli",
+            ])
+            .output()
+            .unwrap();
+        assert!(revoke.status.success());
+        assert!(!String::from_utf8_lossy(&revoke.stdout).contains(token_text));
+        assert!(!String::from_utf8_lossy(&revoke.stderr).contains(token_text));
+    }
+    assert!(matches!(
+        EnrollmentRepository::open(&database)
+            .unwrap()
+            .validate_token(
+                enrollment_token_hash(&token),
+                &AgentId::new("agent-revoke-cli").unwrap(),
+                &TunnelId::new("tunnel-revoke-cli").unwrap(),
+                unix_time_now().unwrap(),
+            ),
+        Err(EnrollmentRepositoryError::CredentialRevoked)
+    ));
+
+    let status = Command::new(binary())
+        .args([
+            "credential-status",
+            "--database",
+            database.to_str().unwrap(),
+            "--agent-id",
+            "agent-revoke-cli",
+            "--tunnel-id",
+            "tunnel-revoke-cli",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("snapshot_version=1"));
+    assert!(!String::from_utf8_lossy(&status.stdout).contains(token_text));
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Automated Agent Enrollment & Renewal** (Session 21).
+**Emergency Credential Revocation & Reconciliation** (Session 22).
 
 ## Completed
 
@@ -254,12 +254,24 @@
 - Control Plane can supervise the opt-in enrollment listener and provision a
   bound token with `create-token`. Agent supports `--enroll-only` and an
   automatic expiry-window renewal supervisor with a crash-recoverable journal.
-- 249 explicit workspace tests are present; all prior behavior is preserved.
+- Credential records now migrate to explicit `Pending`, `Active`, `Retired`,
+  `Revoked`, and `Expired` states with an issuance-time activation deadline.
+- A bounded reconciler runs inside the supervised enrollment service. It
+  tombstones overdue requests and atomically removes pending fingerprints while
+  preserving an active renewal predecessor.
+- `revoke-agent` durably invalidates matching bootstrap/renewal tokens and
+  removes one exact Agent/Tunnel authorization. Dynamic Edge reconciliation
+  closes its live session and active streams after snapshot publication.
+- `credential-status` exposes only fingerprint, generation, state and times.
+  Agent stops on terminal revocation/authentication failures, but clears an
+  expired request journal so renewal can restart with a valid predecessor.
+- 257 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
-- Protected issuer key custody, CA rollover, CRL/OCSP/emergency revocation, and
-  abandoned-overlap cleanup (DEBT-019 open).
+- Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
+  the TLS layer (DEBT-019 open). Snapshot-level emergency revocation and
+  abandoned-overlap cleanup are implemented.
 - Existing TLS connections generally retain their negotiated session until
   reconnect; static Edge certificate authorization is the exception because
   its snapshot update actively reconciles and revokes the old Agent session.
@@ -278,6 +290,6 @@
 
 ## Next planned session
 
-Not selected yet. Session 21 deliberately leaves issuer custody/CA lifecycle,
+Not selected yet. Session 22 deliberately leaves issuer custody/CA lifecycle,
 general administration, public ingress, and multi-edge coordination as separate
 future scopes.

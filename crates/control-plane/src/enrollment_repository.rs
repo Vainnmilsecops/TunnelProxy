@@ -11,6 +11,9 @@ use crate::{
     TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
 };
 
+const MAX_RECONCILE_BATCH: usize = 256;
+const MAX_CREDENTIAL_STATUS_ROWS: u64 = 1_024;
+
 #[derive(Debug, Clone)]
 pub struct EnrollmentRepository {
     path: PathBuf,
@@ -33,6 +36,7 @@ pub struct IssuanceCandidate {
     pub certificate_pem: Vec<u8>,
     pub fingerprint: CertificateFingerprint,
     pub not_after_unix: u64,
+    pub activation_deadline_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +45,63 @@ pub struct DurableIssuance {
     pub certificate_pem: Vec<u8>,
     pub fingerprint: CertificateFingerprint,
     pub not_after_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialState {
+    Pending,
+    Active,
+    Retired,
+    Revoked,
+    Expired,
+}
+
+impl CredentialState {
+    const fn from_raw(value: i64) -> Result<Self, EnrollmentRepositoryError> {
+        match value {
+            1 => Ok(Self::Pending),
+            2 => Ok(Self::Active),
+            3 => Ok(Self::Retired),
+            4 => Ok(Self::Revoked),
+            5 => Ok(Self::Expired),
+            _ => Err(EnrollmentRepositoryError::Corrupt),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Retired => "retired",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialStatus {
+    pub fingerprint: CertificateFingerprint,
+    pub generation: SnapshotVersion,
+    pub state: CredentialState,
+    pub not_after_unix: u64,
+    pub activation_deadline_unix: u64,
+    pub terminal_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialStatusReport {
+    pub snapshot_version: SnapshotVersion,
+    pub credentials: Vec<CredentialStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialMutationOutcome {
+    pub snapshot_version: SnapshotVersion,
+    pub affected_credentials: u64,
+    pub snapshot_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,8 +145,8 @@ impl EnrollmentRepository {
         self.connect()?
             .execute(
                 "INSERT INTO enrollment_bootstrap_tokens(
-                    token_hash, agent_id, tunnel_id, expires_at, consumed
-                 ) VALUES (?1, ?2, ?3, ?4, 0)",
+                    token_hash, agent_id, tunnel_id, expires_at, consumed, revoked
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 0)",
                 params![
                     token_hash.as_slice(),
                     agent_id.as_str(),
@@ -123,6 +184,11 @@ impl EnrollmentRepository {
         candidate: &IssuanceCandidate,
         now_unix: u64,
     ) -> Result<DurableIssuance, EnrollmentRepositoryError> {
+        if candidate.activation_deadline_unix <= now_unix
+            || candidate.activation_deadline_unix > candidate.not_after_unix
+        {
+            return Err(EnrollmentRepositoryError::InvalidTime);
+        }
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -130,6 +196,7 @@ impl EnrollmentRepository {
 
         if let Some(existing) = load_issuance(&transaction, candidate.request_id)? {
             verify_idempotent_candidate(&existing, candidate)?;
+            ensure_retryable_state(existing.state)?;
             transaction.commit().map_err(storage)?;
             return Ok(existing.issuance);
         }
@@ -173,8 +240,9 @@ impl EnrollmentRepository {
                 "INSERT INTO agent_credentials(
                     fingerprint, request_id, agent_id, tunnel_id, csr_digest,
                     auth_token_hash, renewal_token_hash, certificate_pem,
-                    not_after, generation, state, previous_fingerprint
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11)",
+                    not_after, generation, state, previous_fingerprint,
+                    activation_deadline, terminal_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, NULL)",
                 params![
                     candidate.fingerprint.as_bytes().as_slice(),
                     candidate.request_id.as_bytes().as_slice(),
@@ -188,6 +256,8 @@ impl EnrollmentRepository {
                         .map_err(|_| EnrollmentRepositoryError::InvalidTime)?,
                     generation.get().to_be_bytes().as_slice(),
                     previous.map(|value| value.as_bytes().to_vec()),
+                    i64::try_from(candidate.activation_deadline_unix)
+                        .map_err(|_| EnrollmentRepositoryError::InvalidTime)?,
                 ],
             )
             .map_err(storage)?;
@@ -233,6 +303,7 @@ impl EnrollmentRepository {
                 tunnel_id,
                 csr_digest,
             )?;
+            ensure_retryable_state(existing.state)?;
             return Ok(Some(existing.issuance));
         }
         authenticate_token(
@@ -250,6 +321,7 @@ impl EnrollmentRepository {
         request_id: EnrollmentRequestId,
         renewal_token_hash: [u8; 32],
         fingerprint: CertificateFingerprint,
+        now_unix: u64,
     ) -> Result<SnapshotVersion, EnrollmentRepositoryError> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -257,7 +329,8 @@ impl EnrollmentRepository {
             .map_err(storage)?;
         let row = transaction
             .query_row(
-                "SELECT state, previous_fingerprint FROM agent_credentials
+                "SELECT state, previous_fingerprint, activation_deadline
+                 FROM agent_credentials
                  WHERE request_id = ?1 AND fingerprint = ?2
                    AND renewal_token_hash = ?3",
                 params![
@@ -265,18 +338,33 @@ impl EnrollmentRepository {
                     fingerprint.as_bytes().as_slice(),
                     renewal_token_hash.as_slice()
                 ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(storage)?
             .ok_or(EnrollmentRepositoryError::Unauthorized)?;
-        if row.0 == 2 {
+        let state = CredentialState::from_raw(row.0)?;
+        if state == CredentialState::Active {
             let version = load_snapshot(&transaction)?.version();
             transaction.commit().map_err(storage)?;
             return Ok(version);
         }
-        if row.0 != 1 {
-            return Err(EnrollmentRepositoryError::Conflict);
+        match state {
+            CredentialState::Revoked => return Err(EnrollmentRepositoryError::CredentialRevoked),
+            CredentialState::Expired => return Err(EnrollmentRepositoryError::RequestExpired),
+            CredentialState::Retired => return Err(EnrollmentRepositoryError::Conflict),
+            CredentialState::Pending | CredentialState::Active => {}
+        }
+        if row.2 < 0 || row.2 as u64 <= now_unix {
+            expire_pending_credential(&transaction, fingerprint, now_unix)?;
+            transaction.commit().map_err(storage)?;
+            return Err(EnrollmentRepositoryError::RequestExpired);
         }
         let previous = row.1.map(|bytes| decode_fingerprint(&bytes)).transpose()?;
         let current = load_snapshot(&transaction)?;
@@ -312,6 +400,196 @@ impl EnrollmentRepository {
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
         Ok(version)
+    }
+
+    pub fn revoke_agent(
+        &self,
+        agent_id: &AgentId,
+        tunnel_id: &TunnelId,
+        now_unix: u64,
+    ) -> Result<CredentialMutationOutcome, EnrollmentRepositoryError> {
+        let terminal_at =
+            i64::try_from(now_unix).map_err(|_| EnrollmentRepositoryError::InvalidTime)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "UPDATE enrollment_bootstrap_tokens
+                 SET consumed = 1, revoked = 1
+                 WHERE agent_id = ?1 AND tunnel_id = ?2",
+                params![agent_id.as_str(), tunnel_id.as_str()],
+            )
+            .map_err(storage)?;
+        let affected = transaction
+            .execute(
+                "UPDATE agent_credentials SET state = 4, terminal_at = ?1
+                 WHERE agent_id = ?2 AND tunnel_id = ?3 AND state IN (1, 2)",
+                params![terminal_at, agent_id.as_str(), tunnel_id.as_str()],
+            )
+            .map_err(storage)? as u64;
+        let current = load_snapshot(&transaction)?;
+        let grants = remove_agent_tunnel(current.snapshot().grants(), agent_id, tunnel_id);
+        let snapshot_changed = grants != current.snapshot().grants();
+        let snapshot_version = if snapshot_changed {
+            let version = next_version(current.version())?;
+            replace_snapshot(
+                &transaction,
+                &VersionedAuthorizationSnapshot::new(
+                    version,
+                    AuthorizationSnapshot::new(grants)
+                        .map_err(|_| EnrollmentRepositoryError::Corrupt)?,
+                ),
+            )?;
+            version
+        } else {
+            current.version()
+        };
+        transaction.commit().map_err(storage)?;
+        Ok(CredentialMutationOutcome {
+            snapshot_version,
+            affected_credentials: affected,
+            snapshot_changed,
+        })
+    }
+
+    pub fn reconcile_expired(
+        &self,
+        now_unix: u64,
+    ) -> Result<CredentialMutationOutcome, EnrollmentRepositoryError> {
+        let terminal_at =
+            i64::try_from(now_unix).map_err(|_| EnrollmentRepositoryError::InvalidTime)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT fingerprint FROM agent_credentials
+                 WHERE state = 1 AND activation_deadline <= ?1
+                 ORDER BY fingerprint LIMIT ?2",
+            )
+            .map_err(storage)?;
+        let fingerprints: Vec<CertificateFingerprint> = statement
+            .query_map(params![terminal_at, MAX_RECONCILE_BATCH as i64], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(storage)?
+            .map(|row| {
+                row.map_err(storage)
+                    .and_then(|bytes| decode_fingerprint(&bytes))
+            })
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        let current = load_snapshot(&transaction)?;
+        if fingerprints.is_empty() {
+            let version = current.version();
+            transaction.commit().map_err(storage)?;
+            return Ok(CredentialMutationOutcome {
+                snapshot_version: version,
+                affected_credentials: 0,
+                snapshot_changed: false,
+            });
+        }
+        let grants: Vec<_> = current
+            .snapshot()
+            .grants()
+            .into_iter()
+            .filter(|grant| !fingerprints.contains(&grant.certificate))
+            .collect();
+        let snapshot_changed = grants != current.snapshot().grants();
+        let snapshot_version = if snapshot_changed {
+            let version = next_version(current.version())?;
+            replace_snapshot(
+                &transaction,
+                &VersionedAuthorizationSnapshot::new(
+                    version,
+                    AuthorizationSnapshot::new(grants)
+                        .map_err(|_| EnrollmentRepositoryError::Corrupt)?,
+                ),
+            )?;
+            version
+        } else {
+            current.version()
+        };
+        for fingerprint in &fingerprints {
+            transaction
+                .execute(
+                    "UPDATE agent_credentials SET state = 5, terminal_at = ?1
+                     WHERE fingerprint = ?2 AND state = 1",
+                    params![terminal_at, fingerprint.as_bytes().as_slice()],
+                )
+                .map_err(storage)?;
+        }
+        transaction.commit().map_err(storage)?;
+        Ok(CredentialMutationOutcome {
+            snapshot_version,
+            affected_credentials: fingerprints.len() as u64,
+            snapshot_changed,
+        })
+    }
+
+    pub fn credential_status(
+        &self,
+        agent_id: &AgentId,
+        tunnel_id: &TunnelId,
+    ) -> Result<CredentialStatusReport, EnrollmentRepositoryError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction().map_err(storage)?;
+        let snapshot_version = load_snapshot(&transaction)?.version();
+        let mut statement = transaction
+            .prepare(
+                "SELECT fingerprint, generation, state, not_after,
+                        activation_deadline, terminal_at
+                 FROM agent_credentials
+                 WHERE agent_id = ?1 AND tunnel_id = ?2
+                 ORDER BY generation, fingerprint LIMIT ?3",
+            )
+            .map_err(storage)?;
+        let credentials = statement
+            .query_map(
+                params![
+                    agent_id.as_str(),
+                    tunnel_id.as_str(),
+                    (MAX_CREDENTIAL_STATUS_ROWS + 1) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .map_err(storage)?
+            .map(|row| {
+                let row = row.map_err(storage)?;
+                if row.3 < 0 || row.4 < 0 || row.5.is_some_and(|value| value < 0) {
+                    return Err(EnrollmentRepositoryError::Corrupt);
+                }
+                Ok(CredentialStatus {
+                    fingerprint: decode_fingerprint(&row.0)?,
+                    generation: decode_version(&row.1)?,
+                    state: CredentialState::from_raw(row.2)?,
+                    not_after_unix: row.3 as u64,
+                    activation_deadline_unix: row.4 as u64,
+                    terminal_at_unix: row.5.map(|value| value as u64),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if credentials.len() as u64 > MAX_CREDENTIAL_STATUS_ROWS {
+            return Err(EnrollmentRepositoryError::ResourceLimit);
+        }
+        transaction.commit().map_err(storage)?;
+        Ok(CredentialStatusReport {
+            snapshot_version,
+            credentials,
+        })
     }
 }
 
@@ -358,7 +636,8 @@ fn migrate(connection: &Connection) -> Result<(), EnrollmentRepositoryError> {
                 agent_id TEXT NOT NULL,
                 tunnel_id TEXT NOT NULL,
                 expires_at INTEGER NOT NULL,
-                consumed INTEGER NOT NULL CHECK(consumed IN (0, 1))
+                consumed INTEGER NOT NULL CHECK(consumed IN (0, 1)),
+                revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0, 1))
             );
             CREATE TABLE IF NOT EXISTS agent_credentials (
                 fingerprint BLOB PRIMARY KEY CHECK(length(fingerprint) = 32),
@@ -371,13 +650,87 @@ fn migrate(connection: &Connection) -> Result<(), EnrollmentRepositoryError> {
                 certificate_pem BLOB NOT NULL,
                 not_after INTEGER NOT NULL,
                 generation BLOB NOT NULL CHECK(length(generation) = 8),
-                state INTEGER NOT NULL CHECK(state IN (1, 2, 3)),
+                state INTEGER NOT NULL CHECK(state IN (1, 2, 3, 4, 5)),
                 previous_fingerprint BLOB NULL CHECK(
                     previous_fingerprint IS NULL OR length(previous_fingerprint) = 32
-                )
+                ),
+                activation_deadline INTEGER NOT NULL,
+                terminal_at INTEGER NULL
             );",
         )
-        .map_err(storage)
+        .map_err(storage)?;
+    if !has_column(connection, "enrollment_bootstrap_tokens", "revoked")? {
+        connection
+            .execute(
+                "ALTER TABLE enrollment_bootstrap_tokens
+                 ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0, 1))",
+                [],
+            )
+            .map_err(storage)?;
+    }
+    if !has_column(connection, "agent_credentials", "activation_deadline")? {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE agent_credentials RENAME TO agent_credentials_session21;
+                 CREATE TABLE agent_credentials (
+                    fingerprint BLOB PRIMARY KEY CHECK(length(fingerprint) = 32),
+                    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16),
+                    agent_id TEXT NOT NULL,
+                    tunnel_id TEXT NOT NULL,
+                    csr_digest BLOB NOT NULL CHECK(length(csr_digest) = 32),
+                    auth_token_hash BLOB NOT NULL CHECK(length(auth_token_hash) = 32),
+                    renewal_token_hash BLOB NOT NULL CHECK(length(renewal_token_hash) = 32),
+                    certificate_pem BLOB NOT NULL,
+                    not_after INTEGER NOT NULL,
+                    generation BLOB NOT NULL CHECK(length(generation) = 8),
+                    state INTEGER NOT NULL CHECK(state IN (1, 2, 3, 4, 5)),
+                    previous_fingerprint BLOB NULL CHECK(
+                        previous_fingerprint IS NULL OR length(previous_fingerprint) = 32
+                    ),
+                    activation_deadline INTEGER NOT NULL,
+                    terminal_at INTEGER NULL
+                 );
+                 INSERT INTO agent_credentials(
+                    fingerprint, request_id, agent_id, tunnel_id, csr_digest,
+                    auth_token_hash, renewal_token_hash, certificate_pem,
+                    not_after, generation, state, previous_fingerprint,
+                    activation_deadline, terminal_at
+                 ) SELECT fingerprint, request_id, agent_id, tunnel_id, csr_digest,
+                          auth_token_hash, renewal_token_hash, certificate_pem,
+                          not_after, generation, state, previous_fingerprint,
+                          not_after, NULL
+                   FROM agent_credentials_session21;
+                 DROP TABLE agent_credentials_session21;
+                 PRAGMA user_version = 22;
+                 COMMIT;",
+            )
+            .map_err(storage)?;
+    } else {
+        connection
+            .pragma_update(None, "user_version", 22)
+            .map_err(storage)?;
+    }
+    Ok(())
+}
+
+fn has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, EnrollmentRepositoryError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(storage)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage)?;
+    for candidate in columns {
+        if candidate.map_err(storage)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn authenticate_token(
@@ -389,7 +742,7 @@ fn authenticate_token(
 ) -> Result<PresentedTokenKind, EnrollmentRepositoryError> {
     let bootstrap = connection
         .query_row(
-            "SELECT agent_id, tunnel_id, expires_at, consumed
+            "SELECT agent_id, tunnel_id, expires_at, consumed, revoked
              FROM enrollment_bootstrap_tokens WHERE token_hash = ?1",
             [token_hash.as_slice()],
             |row| {
@@ -398,14 +751,18 @@ fn authenticate_token(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(storage)?;
-    if let Some((bound_agent, bound_tunnel, expires, consumed)) = bootstrap {
+    if let Some((bound_agent, bound_tunnel, expires, consumed, revoked)) = bootstrap {
         if bound_agent != agent_id.as_str() || bound_tunnel != tunnel_id.as_str() {
             return Err(EnrollmentRepositoryError::IdentityMismatch);
+        }
+        if revoked != 0 {
+            return Err(EnrollmentRepositoryError::CredentialRevoked);
         }
         if consumed != 0 {
             return Err(EnrollmentRepositoryError::Unauthorized);
@@ -416,26 +773,33 @@ fn authenticate_token(
         return Ok(PresentedTokenKind::Bootstrap);
     }
 
-    let active = connection
+    let credential = connection
         .query_row(
-            "SELECT fingerprint, agent_id, tunnel_id FROM agent_credentials
-             WHERE renewal_token_hash = ?1 AND state = 2",
+            "SELECT fingerprint, agent_id, tunnel_id, state FROM agent_credentials
+             WHERE renewal_token_hash = ?1 AND state IN (2, 4)
+             ORDER BY state DESC LIMIT 1",
             [token_hash.as_slice()],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(storage)?
         .ok_or(EnrollmentRepositoryError::Unauthorized)?;
-    if active.1 != agent_id.as_str() || active.2 != tunnel_id.as_str() {
+    if credential.1 != agent_id.as_str() || credential.2 != tunnel_id.as_str() {
         return Err(EnrollmentRepositoryError::IdentityMismatch);
     }
-    Ok(PresentedTokenKind::Renewal(decode_fingerprint(&active.0)?))
+    if CredentialState::from_raw(credential.3)? == CredentialState::Revoked {
+        return Err(EnrollmentRepositoryError::CredentialRevoked);
+    }
+    Ok(PresentedTokenKind::Renewal(decode_fingerprint(
+        &credential.0,
+    )?))
 }
 
 struct ExistingIssuance {
@@ -445,6 +809,7 @@ struct ExistingIssuance {
     agent_id: String,
     tunnel_id: String,
     csr_digest: [u8; 32],
+    state: CredentialState,
 }
 
 fn load_issuance(
@@ -454,7 +819,7 @@ fn load_issuance(
     connection
         .query_row(
             "SELECT generation, certificate_pem, fingerprint, not_after,
-                    auth_token_hash, renewal_token_hash, agent_id, tunnel_id, csr_digest
+                    auth_token_hash, renewal_token_hash, agent_id, tunnel_id, csr_digest, state
              FROM agent_credentials WHERE request_id = ?1",
             [request_id.as_bytes().as_slice()],
             |row| {
@@ -468,6 +833,7 @@ fn load_issuance(
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         )
@@ -489,6 +855,7 @@ fn load_issuance(
                 agent_id: row.6,
                 tunnel_id: row.7,
                 csr_digest: decode_array(&row.8)?,
+                state: CredentialState::from_raw(row.9)?,
             })
         })
         .transpose()
@@ -525,6 +892,72 @@ fn verify_idempotent_fields(
         return Err(EnrollmentRepositoryError::Conflict);
     }
     Ok(())
+}
+
+fn ensure_retryable_state(state: CredentialState) -> Result<(), EnrollmentRepositoryError> {
+    match state {
+        CredentialState::Pending | CredentialState::Active => Ok(()),
+        CredentialState::Revoked => Err(EnrollmentRepositoryError::CredentialRevoked),
+        CredentialState::Expired => Err(EnrollmentRepositoryError::RequestExpired),
+        CredentialState::Retired => Err(EnrollmentRepositoryError::Conflict),
+    }
+}
+
+fn expire_pending_credential(
+    transaction: &Transaction<'_>,
+    fingerprint: CertificateFingerprint,
+    now_unix: u64,
+) -> Result<SnapshotVersion, EnrollmentRepositoryError> {
+    let current = load_snapshot(transaction)?;
+    let grants: Vec<_> = current
+        .snapshot()
+        .grants()
+        .into_iter()
+        .filter(|grant| grant.certificate != fingerprint)
+        .collect();
+    let version = if grants != current.snapshot().grants() {
+        let version = next_version(current.version())?;
+        replace_snapshot(
+            transaction,
+            &VersionedAuthorizationSnapshot::new(
+                version,
+                AuthorizationSnapshot::new(grants)
+                    .map_err(|_| EnrollmentRepositoryError::Corrupt)?,
+            ),
+        )?;
+        version
+    } else {
+        current.version()
+    };
+    transaction
+        .execute(
+            "UPDATE agent_credentials SET state = 5, terminal_at = ?1
+             WHERE fingerprint = ?2 AND state = 1",
+            params![
+                i64::try_from(now_unix).map_err(|_| EnrollmentRepositoryError::InvalidTime)?,
+                fingerprint.as_bytes().as_slice(),
+            ],
+        )
+        .map_err(storage)?;
+    Ok(version)
+}
+
+fn remove_agent_tunnel(
+    grants: Vec<AgentGrant>,
+    agent_id: &AgentId,
+    tunnel_id: &TunnelId,
+) -> Vec<AgentGrant> {
+    grants
+        .into_iter()
+        .filter_map(|mut grant| {
+            if &grant.agent_id == agent_id {
+                grant
+                    .tunnels
+                    .retain(|tunnel| &tunnel.tunnel_id != tunnel_id);
+            }
+            (!grant.tunnels.is_empty()).then_some(grant)
+        })
+        .collect()
 }
 
 fn load_snapshot(
@@ -628,6 +1061,8 @@ pub enum EnrollmentRepositoryError {
     Uninitialized,
     Unauthorized,
     TokenExpired,
+    CredentialRevoked,
+    RequestExpired,
     IdentityMismatch,
     Conflict,
     Corrupt,
@@ -635,6 +1070,7 @@ pub enum EnrollmentRepositoryError {
     VersionExhausted,
     Random,
     TokenOutput,
+    ResourceLimit,
 }
 
 impl std::fmt::Display for EnrollmentRepositoryError {
@@ -644,6 +1080,8 @@ impl std::fmt::Display for EnrollmentRepositoryError {
             Self::Uninitialized => "authorization snapshot is not initialized",
             Self::Unauthorized => "enrollment token is not authorized",
             Self::TokenExpired => "enrollment token has expired",
+            Self::CredentialRevoked => "Agent credential has been revoked",
+            Self::RequestExpired => "enrollment activation request has expired",
             Self::IdentityMismatch => "enrollment token identity does not match the request",
             Self::Conflict => "enrollment request conflicts with durable state",
             Self::Corrupt => "enrollment repository contains invalid state",
@@ -651,6 +1089,7 @@ impl std::fmt::Display for EnrollmentRepositoryError {
             Self::VersionExhausted => "authorization snapshot version is exhausted",
             Self::Random => "secure enrollment token generation failed",
             Self::TokenOutput => "enrollment token output could not be written",
+            Self::ResourceLimit => "credential query exceeds its bounded result limit",
         };
         f.write_str(message)
     }
@@ -692,6 +1131,7 @@ mod tests {
             certificate_pem: vec![request; 16],
             fingerprint: CertificateFingerprint::from_bytes([fingerprint; 32]),
             not_after_unix: 10_000,
+            activation_deadline_unix: 9_000,
         }
     }
 
@@ -738,6 +1178,7 @@ mod tests {
                 first.request_id,
                 token_hash(&renewal_one),
                 first.fingerprint,
+                110,
             )
             .unwrap();
         assert_eq!(version.get(), 2);
@@ -746,7 +1187,8 @@ mod tests {
                 .activate(
                     first.request_id,
                     token_hash(&renewal_one),
-                    first.fingerprint
+                    first.fingerprint,
+                    110,
                 )
                 .unwrap(),
             version
@@ -773,7 +1215,7 @@ mod tests {
             .is_ok());
 
         assert_eq!(
-            repository.activate(second.request_id, [9; 32], second.fingerprint),
+            repository.activate(second.request_id, [9; 32], second.fingerprint, 210),
             Err(EnrollmentRepositoryError::Unauthorized)
         );
         assert_eq!(
@@ -782,6 +1224,7 @@ mod tests {
                     second.request_id,
                     token_hash(&renewal_two),
                     second.fingerprint,
+                    210,
                 )
                 .unwrap()
                 .get(),
@@ -800,6 +1243,251 @@ mod tests {
             .authorize(&second.fingerprint, &agent_id, &tunnel_id)
             .is_ok());
 
+        drop(repository);
+        drop(snapshots);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_renewal_removes_only_pending_fingerprint_and_tombstones_request() {
+        let path = test_path("expired-renewal");
+        let snapshots = SqliteSnapshotRepository::open(&path).unwrap();
+        snapshots
+            .commit(&VersionedAuthorizationSnapshot::new(
+                SnapshotVersion::FIRST,
+                AuthorizationSnapshot::default(),
+            ))
+            .unwrap();
+        let repository = EnrollmentRepository::open(&path).unwrap();
+        let agent_id = AgentId::new("agent-expired").unwrap();
+        let tunnel_id = TunnelId::new("tunnel-expired").unwrap();
+        let bootstrap = [31; 32];
+        let renewal_one = [32; 32];
+        let renewal_two = [33; 32];
+        repository
+            .create_bootstrap_token(token_hash(&bootstrap), &agent_id, &tunnel_id, 1_000)
+            .unwrap();
+        let first = candidate(31, bootstrap, renewal_one, 41, &agent_id, &tunnel_id);
+        repository.commit_issuance(&first, 100).unwrap();
+        repository
+            .activate(
+                first.request_id,
+                token_hash(&renewal_one),
+                first.fingerprint,
+                110,
+            )
+            .unwrap();
+        let mut pending = candidate(32, renewal_one, renewal_two, 42, &agent_id, &tunnel_id);
+        pending.activation_deadline_unix = 250;
+        repository.commit_issuance(&pending, 200).unwrap();
+
+        let outcome = repository.reconcile_expired(250).unwrap();
+        assert_eq!(outcome.affected_credentials, 1);
+        assert!(outcome.snapshot_changed);
+        assert_eq!(outcome.snapshot_version.get(), 4);
+        let snapshot = snapshots.load_latest().unwrap().unwrap();
+        assert!(snapshot
+            .snapshot()
+            .authorize(&first.fingerprint, &agent_id, &tunnel_id)
+            .is_ok());
+        assert_eq!(
+            snapshot
+                .snapshot()
+                .authorize(&pending.fingerprint, &agent_id, &tunnel_id),
+            Err(AuthorizationError::UnknownCertificate)
+        );
+        assert!(repository
+            .validate_token(token_hash(&renewal_one), &agent_id, &tunnel_id, 251)
+            .is_ok());
+        assert_eq!(
+            repository.preflight_issuance(
+                pending.request_id,
+                pending.presented_token_hash,
+                pending.next_token_hash,
+                &agent_id,
+                &tunnel_id,
+                pending.csr_digest,
+                251,
+            ),
+            Err(EnrollmentRepositoryError::RequestExpired)
+        );
+        let report = repository.credential_status(&agent_id, &tunnel_id).unwrap();
+        assert_eq!(report.credentials.len(), 2);
+        assert_eq!(report.credentials[0].state, CredentialState::Active);
+        assert_eq!(report.credentials[1].state, CredentialState::Expired);
+        assert_eq!(report.credentials[1].terminal_at_unix, Some(250));
+
+        drop(repository);
+        drop(snapshots);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn activation_at_deadline_expires_the_pending_credential_atomically() {
+        let path = test_path("activation-deadline");
+        let snapshots = SqliteSnapshotRepository::open(&path).unwrap();
+        snapshots
+            .commit(&VersionedAuthorizationSnapshot::new(
+                SnapshotVersion::FIRST,
+                AuthorizationSnapshot::default(),
+            ))
+            .unwrap();
+        let repository = EnrollmentRepository::open(&path).unwrap();
+        let agent_id = AgentId::new("agent-deadline").unwrap();
+        let tunnel_id = TunnelId::new("tunnel-deadline").unwrap();
+        let bootstrap = [41; 32];
+        let renewal = [42; 32];
+        repository
+            .create_bootstrap_token(token_hash(&bootstrap), &agent_id, &tunnel_id, 1_000)
+            .unwrap();
+        let mut issued = candidate(41, bootstrap, renewal, 43, &agent_id, &tunnel_id);
+        issued.activation_deadline_unix = 150;
+        repository.commit_issuance(&issued, 100).unwrap();
+
+        assert_eq!(
+            repository.activate(
+                issued.request_id,
+                token_hash(&renewal),
+                issued.fingerprint,
+                150,
+            ),
+            Err(EnrollmentRepositoryError::RequestExpired)
+        );
+        let snapshot = snapshots.load_latest().unwrap().unwrap();
+        assert_eq!(snapshot.version().get(), 3);
+        assert_eq!(
+            snapshot
+                .snapshot()
+                .authorize(&issued.fingerprint, &agent_id, &tunnel_id),
+            Err(AuthorizationError::UnknownCertificate)
+        );
+        assert_eq!(
+            repository.preflight_issuance(
+                issued.request_id,
+                issued.presented_token_hash,
+                issued.next_token_hash,
+                &agent_id,
+                &tunnel_id,
+                issued.csr_digest,
+                151,
+            ),
+            Err(EnrollmentRepositoryError::RequestExpired)
+        );
+
+        drop(repository);
+        drop(snapshots);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revocation_is_idempotent_removes_authority_and_invalidates_tokens() {
+        let path = test_path("revoke");
+        let snapshots = SqliteSnapshotRepository::open(&path).unwrap();
+        snapshots
+            .commit(&VersionedAuthorizationSnapshot::new(
+                SnapshotVersion::FIRST,
+                AuthorizationSnapshot::default(),
+            ))
+            .unwrap();
+        let repository = EnrollmentRepository::open(&path).unwrap();
+        let agent_id = AgentId::new("agent-revoked").unwrap();
+        let tunnel_id = TunnelId::new("tunnel-revoked").unwrap();
+        let bootstrap = [51; 32];
+        let renewal = [52; 32];
+        repository
+            .create_bootstrap_token(token_hash(&bootstrap), &agent_id, &tunnel_id, 1_000)
+            .unwrap();
+        let issued = candidate(51, bootstrap, renewal, 53, &agent_id, &tunnel_id);
+        repository.commit_issuance(&issued, 100).unwrap();
+        repository
+            .activate(
+                issued.request_id,
+                token_hash(&renewal),
+                issued.fingerprint,
+                110,
+            )
+            .unwrap();
+
+        let revoked = repository.revoke_agent(&agent_id, &tunnel_id, 120).unwrap();
+        assert_eq!(revoked.affected_credentials, 1);
+        assert!(revoked.snapshot_changed);
+        assert_eq!(revoked.snapshot_version.get(), 3);
+        assert_eq!(
+            snapshots
+                .load_latest()
+                .unwrap()
+                .unwrap()
+                .snapshot()
+                .authorize(&issued.fingerprint, &agent_id, &tunnel_id),
+            Err(AuthorizationError::UnknownCertificate)
+        );
+        assert!(matches!(
+            repository.validate_token(token_hash(&renewal), &agent_id, &tunnel_id, 121),
+            Err(EnrollmentRepositoryError::CredentialRevoked)
+        ));
+        let repeated = repository.revoke_agent(&agent_id, &tunnel_id, 122).unwrap();
+        assert_eq!(repeated.affected_credentials, 0);
+        assert!(!repeated.snapshot_changed);
+        assert_eq!(repeated.snapshot_version, revoked.snapshot_version);
+        let report = repository.credential_status(&agent_id, &tunnel_id).unwrap();
+        assert_eq!(report.credentials[0].state, CredentialState::Revoked);
+        assert_eq!(report.credentials[0].terminal_at_unix, Some(120));
+
+        drop(repository);
+        drop(snapshots);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_21_schema_migrates_before_revocation_state_is_used() {
+        let path = test_path("migration");
+        let snapshots = SqliteSnapshotRepository::open(&path).unwrap();
+        snapshots
+            .commit(&VersionedAuthorizationSnapshot::new(
+                SnapshotVersion::FIRST,
+                AuthorizationSnapshot::default(),
+            ))
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE enrollment_bootstrap_tokens (
+                    token_hash BLOB PRIMARY KEY CHECK(length(token_hash) = 32),
+                    agent_id TEXT NOT NULL, tunnel_id TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    consumed INTEGER NOT NULL CHECK(consumed IN (0, 1))
+                 );
+                 CREATE TABLE agent_credentials (
+                    fingerprint BLOB PRIMARY KEY CHECK(length(fingerprint) = 32),
+                    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16),
+                    agent_id TEXT NOT NULL, tunnel_id TEXT NOT NULL,
+                    csr_digest BLOB NOT NULL CHECK(length(csr_digest) = 32),
+                    auth_token_hash BLOB NOT NULL CHECK(length(auth_token_hash) = 32),
+                    renewal_token_hash BLOB NOT NULL CHECK(length(renewal_token_hash) = 32),
+                    certificate_pem BLOB NOT NULL, not_after INTEGER NOT NULL,
+                    generation BLOB NOT NULL CHECK(length(generation) = 8),
+                    state INTEGER NOT NULL CHECK(state IN (1, 2, 3)),
+                    previous_fingerprint BLOB NULL CHECK(
+                        previous_fingerprint IS NULL OR length(previous_fingerprint) = 32
+                    )
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = EnrollmentRepository::open(&path).unwrap();
+        let connection = repository.connect().unwrap();
+        assert!(has_column(&connection, "agent_credentials", "activation_deadline").unwrap());
+        assert!(has_column(&connection, "agent_credentials", "terminal_at").unwrap());
+        assert!(has_column(&connection, "enrollment_bootstrap_tokens", "revoked").unwrap());
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+
+        drop(connection);
         drop(repository);
         drop(snapshots);
         let _ = std::fs::remove_file(path);

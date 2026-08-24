@@ -11,16 +11,16 @@ use rcgen::{
 use sha2::{Digest, Sha256};
 use tunnelproxy_agent::{
     bootstrap_agent_credentials, read_enrollment_token, write_enrollment_token,
-    AgentEnrollmentConfig, EnrollmentClientConfig,
+    AgentEnrollmentConfig, AgentEnrollmentError, EnrollmentClientConfig,
 };
 use tunnelproxy_common::{shutdown_channel, AgentCredentialPaths, AgentId, TunnelId};
 use tunnelproxy_control_plane::{
     AgentCertificateIssuer, AuthorizationError, AuthorizationSnapshot, EnrollmentRepository,
-    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerTlsConfig,
+    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerTlsConfig, IssuanceCandidate,
     PersistentSnapshotAuthority, SnapshotRepository, SnapshotVersion, SqliteSnapshotRepository,
     VersionedAuthorizationSnapshot,
 };
-use tunnelproxy_protocol::EnrollmentToken;
+use tunnelproxy_protocol::{EnrollmentErrorCode, EnrollmentRequestId, EnrollmentToken};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -115,6 +115,8 @@ async fn real_tls_bootstrap_and_renewal_publish_and_activate_credentials() {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             max_clients: 4,
             request_timeout: Duration::from_secs(3),
+            activation_grace: Duration::from_secs(60),
+            reconcile_interval: Duration::from_millis(20),
             database_path: database.clone(),
             tls: EnrollmentServerTlsConfig::from_pem(
                 enrollment_server.certificate_pem.as_bytes(),
@@ -204,6 +206,76 @@ async fn real_tls_bootstrap_and_renewal_publish_and_activate_credentials() {
         .snapshot()
         .authorize(&second_fingerprint, &agent_id, &tunnel_id)
         .is_ok());
+
+    let now = tunnelproxy_control_plane::unix_time_now().unwrap();
+    let abandoned_fingerprint =
+        tunnelproxy_control_plane::CertificateFingerprint::from_bytes([91; 32]);
+    EnrollmentRepository::open(&database)
+        .unwrap()
+        .commit_issuance(
+            &IssuanceCandidate {
+                request_id: EnrollmentRequestId::from_bytes([92; 16]),
+                presented_token_hash: tunnelproxy_control_plane::enrollment_token_hash(
+                    second_token.as_bytes(),
+                ),
+                next_token_hash: tunnelproxy_control_plane::enrollment_token_hash(&[93; 32]),
+                agent_id: agent_id.clone(),
+                tunnel_id: tunnel_id.clone(),
+                csr_digest: [94; 32],
+                certificate_pem: b"abandoned-certificate".to_vec(),
+                fingerprint: abandoned_fingerprint,
+                not_after_unix: now + 120,
+                activation_deadline_unix: now + 1,
+            },
+            now,
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if authority_runtime.current().version().get() >= 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let reconciled = authority_runtime.current();
+    assert!(reconciled
+        .snapshot()
+        .authorize(&second_fingerprint, &agent_id, &tunnel_id)
+        .is_ok());
+    assert_eq!(
+        reconciled
+            .snapshot()
+            .authorize(&abandoned_fingerprint, &agent_id, &tunnel_id),
+        Err(AuthorizationError::UnknownCertificate)
+    );
+
+    let revoked = EnrollmentRepository::open(&database)
+        .unwrap()
+        .revoke_agent(
+            &agent_id,
+            &tunnel_id,
+            tunnelproxy_control_plane::unix_time_now().unwrap(),
+        )
+        .unwrap();
+    assert!(revoked.snapshot_changed);
+    authority_runtime.refresh_from_repository().await.unwrap();
+    assert_eq!(
+        authority_runtime.current().snapshot().authorize(
+            &second_fingerprint,
+            &agent_id,
+            &tunnel_id
+        ),
+        Err(AuthorizationError::UnknownCertificate)
+    );
+    assert!(matches!(
+        bootstrap_agent_credentials(&config).await,
+        Err(AgentEnrollmentError::Rejected(
+            EnrollmentErrorCode::CredentialRevoked
+        ))
+    ));
 
     shutdown.shutdown();
     task.await.unwrap().unwrap();
