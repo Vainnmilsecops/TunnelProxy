@@ -34,12 +34,12 @@ use tunnelproxy_control_plane::{
     VersionedAuthorizationSnapshot,
 };
 use tunnelproxy_edge::{
-    shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
-    EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTlsReloadConfig,
-    EdgeTlsReloadRuntime, EdgeTransportSecurity, HttpHostRoutes, HttpHostname, HttpIngressConfig,
-    HttpIngressExposurePolicy, HttpRequestRateLimitConfig, PublicTlsConfig, PublicTlsReloadConfig,
-    PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownOutcome,
-    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
+    shutdown_channel, AuthorizationSourceStatus, EdgeOperationsConfig, EdgeRegistrationPolicy,
+    EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig,
+    EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity, HttpHostRoutes, HttpHostname,
+    HttpIngressConfig, HttpIngressExposurePolicy, HttpRequestRateLimitConfig, PublicTlsConfig,
+    PublicTlsReloadConfig, PublicTlsReloadRuntime, RawIngressExposurePolicy,
+    RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
@@ -321,6 +321,33 @@ async fn connect_eventually(addr: SocketAddr) -> TcpStream {
     .expect("raw route was not bound")
 }
 
+async fn operations_request(addr: SocketAddr, method: &str, path: &str) -> String {
+    try_operations_request(addr, method, path)
+        .await
+        .expect("operations endpoint closed without a response")
+}
+
+async fn try_operations_request(addr: SocketAddr, method: &str, path: &str) -> Option<String> {
+    let mut socket = connect_eventually(addr).await;
+    if socket
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    let mut response = Vec::new();
+    if socket.read_to_end(&mut response).await.is_err() && response.is_empty() {
+        return None;
+    }
+    String::from_utf8(response)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
 async fn spawn_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     spawn_echo_connections(1).await
 }
@@ -423,6 +450,216 @@ async fn wait_for_authorization_status(
     })
     .await
     .expect("authorization status did not converge");
+}
+
+#[tokio::test]
+async fn operations_endpoint_tracks_raw_readiness_metrics_and_lifecycle() {
+    let raw_addr = unused_addr().await;
+    let operations_addr = unused_addr().await;
+    let (local_addr, local_task) = spawn_echo().await;
+    let mut config = edge_config(raw_addr);
+    config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let health = operations_request(operations_addr, "GET", "/healthz").await;
+    assert!(health.starts_with("HTTP/1.1 200 OK"));
+    assert!(health.ends_with("ok\n"));
+    assert_eq!(
+        operations_request(operations_addr, "GET", "/readyz")
+            .await
+            .split("\r\n")
+            .next(),
+        Some("HTTP/1.1 503 Service Unavailable")
+    );
+    assert!(operations_request(operations_addr, "POST", "/metrics")
+        .await
+        .starts_with("HTTP/1.1 405 Method Not Allowed"));
+    assert!(operations_request(operations_addr, "GET", "/missing")
+        .await
+        .starts_with("HTTP/1.1 404 Not Found"));
+
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    timeout(Duration::from_secs(2), async {
+        while router
+            .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+            .await
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Agent did not become routable");
+    assert!(operations_request(operations_addr, "GET", "/readyz")
+        .await
+        .starts_with("HTTP/1.1 200 OK"));
+    round_trip(raw_addr, b"operations-metrics").await;
+
+    let metrics = operations_request(operations_addr, "GET", "/metrics").await;
+    assert!(metrics.starts_with("HTTP/1.1 200 OK"));
+    assert!(metrics.contains("content-type: text/plain; version=0.0.4; charset=utf-8"));
+    assert!(metrics.contains("tunnelproxy_edge_ready 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_ingress_mode_raw 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_raw_accepted_connections_total 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_authorization_source{source=\"static\"} 1\n"));
+    assert!(!metrics.contains("tunnel-dev"));
+    assert!(!metrics.contains("127.0.0.1"));
+    assert!(!metrics.contains("agent-dev"));
+
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let ready = operations_request(operations_addr, "GET", "/readyz").await;
+            if ready.starts_with("HTTP/1.1 503 Service Unavailable") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operations readiness did not observe Agent disconnect");
+
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let operations = outcome.operations.expect("operations outcome");
+    assert!(!operations.was_forced());
+    assert!(operations.accepted_connections >= 7);
+    assert_eq!(operations.rejected_requests, 2);
+    local_task.await.unwrap();
+    wait_until_bindable(raw_addr).await;
+    wait_until_bindable(operations_addr).await;
+}
+
+#[tokio::test]
+async fn operations_connection_capacity_rejects_then_releases_with_raii() {
+    let raw_addr = unused_addr().await;
+    let operations_addr = unused_addr().await;
+    let mut operations = EdgeOperationsConfig::loopback(operations_addr);
+    operations.max_concurrent_connections = 1;
+    let mut config = edge_config(raw_addr);
+    config.operations = Some(operations);
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let held = connect_eventually(operations_addr).await;
+    let mut rejected = TcpStream::connect(operations_addr).await.unwrap();
+    rejected
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = rejected.read_to_end(&mut response).await;
+    assert!(response.is_empty());
+
+    drop(held);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let response = try_operations_request(operations_addr, "GET", "/healthz").await;
+            if response.is_some_and(|value| value.starts_with("HTTP/1.1 200 OK")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operations connection permit was not released");
+
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let operations = outcome.operations.unwrap();
+    assert!(operations.capacity_rejections >= 1);
+    assert_eq!(operations.accepted_connections, 2);
+    wait_until_bindable(raw_addr).await;
+    wait_until_bindable(operations_addr).await;
+}
+
+#[tokio::test]
+async fn operations_readiness_turns_false_and_remains_observable_during_raw_drain() {
+    let raw_addr = unused_addr().await;
+    let operations_addr = unused_addr().await;
+    let (local_addr, local_task) = spawn_echo().await;
+    let mut config = edge_config(raw_addr);
+    config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    timeout(Duration::from_secs(2), async {
+        while router
+            .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+            .await
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Agent did not become routable");
+
+    let mut raw = connect_eventually(raw_addr).await;
+    raw.write_all(b"x").await.unwrap();
+    let mut echoed = [0_u8; 1];
+    raw.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"x");
+    assert!(operations_request(operations_addr, "GET", "/readyz")
+        .await
+        .starts_with("HTTP/1.1 200 OK"));
+
+    edge_trigger.shutdown();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(response) = try_operations_request(operations_addr, "GET", "/readyz").await
+            {
+                if response.starts_with("HTTP/1.1 503 Service Unavailable") {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operations endpoint did not remain observable during ingress drain");
+
+    drop(raw);
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    let outcome = edge_task.await.unwrap().unwrap();
+    assert!(!outcome.was_forced());
+    assert!(outcome.operations.is_some());
+    local_task.await.unwrap();
+    wait_until_bindable(raw_addr).await;
+    wait_until_bindable(operations_addr).await;
+}
+
+#[tokio::test]
+async fn operations_bind_failure_rolls_back_raw_and_agent_listeners() {
+    let raw_addr = unused_addr().await;
+    let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let operations_addr = blocker.local_addr().unwrap();
+    let mut config = edge_config(raw_addr);
+    config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let agent_addr = edge.agent_addr();
+    let (_, signal) = shutdown_channel();
+    assert!(matches!(
+        edge.run_until_shutdown(signal).await,
+        Err(EdgeRuntimeError::OperationsStartup(_))
+    ));
+    drop(blocker);
+    wait_until_bindable(raw_addr).await;
+    wait_until_bindable(agent_addr).await;
 }
 
 #[tokio::test]
@@ -547,6 +784,7 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
 #[tokio::test]
 async fn https_request_rate_limit_returns_429_before_local_service_and_refills() {
     let public_pki = test_pki("demo.example.test");
+    let operations_addr = unused_addr().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = local_listener.local_addr().unwrap();
     let local_requests = Arc::new(AtomicUsize::new(0));
@@ -577,6 +815,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
 
     let https_addr = unused_addr().await;
     let mut config = edge_config(unused_addr().await);
+    config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
         routes: HttpHostRoutes::single(
@@ -658,6 +897,27 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert!(limited.contains("retry-after: 1\r\n"));
     assert_eq!(local_requests.load(Ordering::Relaxed), 1);
 
+    let mut invalid_tls = connect_eventually(https_addr).await;
+    invalid_tls.write_all(b"not tls").await.unwrap();
+    invalid_tls.shutdown().await.unwrap();
+    let metrics = timeout(Duration::from_secs(2), async {
+        loop {
+            let metrics = operations_request(operations_addr, "GET", "/metrics").await;
+            if metrics.contains("tunnelproxy_edge_https_tls_rejections_total 1\n") {
+                break metrics;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operations metrics did not observe TLS rejection");
+    assert!(metrics.contains("tunnelproxy_edge_ingress_mode_https 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_https_admitted_requests_total 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_https_per_ip_rate_limit_rejections_total 1\n"));
+    assert!(metrics.contains("tunnelproxy_edge_https_tracked_rate_limit_peers 1\n"));
+    assert!(!metrics.contains("demo.example.test"));
+    assert!(!metrics.contains("tunnel-dev"));
+
     tokio::time::sleep(Duration::from_millis(1_050)).await;
     assert!(request().await.starts_with("HTTP/1.1 200 OK"));
 
@@ -674,8 +934,10 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert_eq!(https.rate_limit_peer_capacity_rejections, 0);
     assert_eq!(https.tracked_rate_limit_peers, 1);
     assert_eq!(https.peak_tracked_rate_limit_peers, 1);
+    assert!(outcome.operations.unwrap().completed_requests >= 1);
     local_task.await.unwrap();
     wait_until_bindable(https_addr).await;
+    wait_until_bindable(operations_addr).await;
 }
 
 #[tokio::test]

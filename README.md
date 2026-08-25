@@ -38,6 +38,9 @@ correct agent, which in turn proxies them into the local service.
   hostname, including public TLS termination/reload, Host/SNI validation,
   forwarding-header sanitization, cached TunnelId routing, and bounded global
   plus per-source-IP request-rate admission with explicit `429` responses.
+- An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
+  admission, liveness/readiness probes, and fixed-cardinality Prometheus
+  metrics for authorization, raw ingress, HTTPS, and rate limiting.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
@@ -60,6 +63,8 @@ The following are **not yet implemented**:
 - General administrative/account API and protected issuer-key custody/CA
   rollover.
 - Request inspection, replay, and webhook debugging.
+- Public/authenticated operations access, metrics persistence/remote write,
+  dashboards, and Agent/Control Plane metrics.
 - Multi-tenant or multi-edge runtime.
 
 Any README, comment, or doc that suggests these features work today is a bug.
@@ -103,7 +108,8 @@ authorization snapshots, SQLite persistence, full-snapshot import, and a
 runnable authenticated distribution service. The data plane has tested
 opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
 slice with exact configured hostname routing, public TLS reload, and local
-global/per-IP request-rate enforcement. See
+global/per-IP request-rate enforcement. Edge can optionally export bounded
+loopback health/readiness and Prometheus metrics. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -188,6 +194,7 @@ and Definition of Done.
 | 24 _(complete)_ | reproducible dependency locking and cross-platform GitHub CI |
 | 25 _(complete)_ | bounded public HTTPS/HTTP/1.1 ingress and exact hostname routing |
 | 26 _(complete)_ | bounded global/per-IP HTTP request-rate limiting and observability |
+| 27 _(complete)_ | bounded loopback Edge operations endpoint and Prometheus metrics |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

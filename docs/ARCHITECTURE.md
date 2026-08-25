@@ -587,6 +587,38 @@ process and resets on restart; it is a bounded local abuse control, not shared
 quota enforcement or distributed DDoS protection. Tunnel Protocol v2 and the
 authorization snapshot format are unchanged.
 
+### 2.25 Bounded Edge operations endpoint (Session 27)
+
+The runnable Edge may bind a separate opt-in loopback-only HTTP/1.1 listener
+for `GET`/`HEAD /healthz`, `/readyz`, and `/metrics`. It has explicit global
+connection, header bytes/count, header-read, full-request, and drain bounds;
+keep-alive is disabled. Non-loopback configuration fails before listener use,
+and no public opt-in exists for this surface.
+
+Readiness is computed only from cached Edge state: the configured durable
+TunnelId must currently resolve to a live Agent session and process drain must
+not have begun. Metrics read the same in-memory router plus raw-route or HTTPS
+status handles. They never query the Control Plane or storage and never place
+external backend I/O on ingress routing:
+
+```text
+loopback collector -> operations HTTP -> cached router/authorization status
+                                    \-> raw or HTTPS atomic/watch counters
+```
+
+The Prometheus text schema has a fixed metric/label set. It reports liveness,
+readiness, authorization source/version/revocations, operations admission, and
+raw or HTTPS ingress counters including rate-limit state. Peer addresses,
+hostnames, TunnelIds, AgentIds, session IDs, certificates, secrets, and traffic
+payloads are never metric values or labels.
+
+On shutdown, Edge first marks readiness false, then drains public ingress while
+operations remains observable. It next drains operations and finally stops the
+Agent transport. The endpoint and counters are process-local and non-durable;
+public/authenticated operations, remote write, dashboards, alerting, and
+Agent/Control Plane exporters remain separate work. Tunnel Protocol v2 and the
+snapshot format are unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

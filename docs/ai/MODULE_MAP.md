@@ -85,6 +85,9 @@ sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane
 access. Its rate-limit peer state and live counters are explicitly bounded.
+An optional loopback-only operations listener reads these in-memory snapshots
+for health/readiness and fixed-cardinality Prometheus output, remains available
+during ingress drain, and performs no Control Plane or storage lookup.
 
 **Responsibility (future)**
 

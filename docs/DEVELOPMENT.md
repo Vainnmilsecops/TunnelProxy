@@ -492,3 +492,32 @@ manifest must contain exactly `public_server_certificate` and
 configuration active; expiry without a valid replacement terminates the
 supervisor. Public TLS authenticates the endpoint to clients but does not add
 signed access URLs or end-user authentication.
+
+## 18. Running the Edge operations endpoint
+
+The runnable Edge can expose opt-in health, readiness, and Prometheus metrics
+on a separate loopback-only listener:
+
+```text
+tunnelproxy-edge \
+  --ops-listen 127.0.0.1:9090 \
+  --max-ops-connections 8 \
+  --ops-header-timeout-ms 2000 \
+  --ops-request-timeout-ms 5000
+```
+
+`GET /healthz` reports process liveness while the operations listener is
+running. `GET /readyz` returns `200` only while the configured TunnelId resolves
+to a live Agent session and shutdown drain has not started; otherwise it
+returns `503`. `GET /metrics` uses Prometheus text format and exports only
+fixed-cardinality Edge authorization, raw/HTTPS ingress, operations, and HTTP
+rate-limit state. `HEAD` is also accepted; other methods return `405` and
+unknown paths return `404`.
+
+The endpoint is disabled unless `--ops-listen` is supplied and rejects every
+non-loopback bind. It has explicit connection/header/time/drain bounds, closes
+after one HTTP/1.1 request, and is intentionally unauthenticated because it is
+local-only. Do not expose it through a public port forward. Metric labels never
+contain peer IPs, hostnames, TunnelIds, AgentIds, session IDs, certificates, or
+payload data. Remote write, persistence, dashboards, alerts, and Agent/Control
+Plane exporters are not implemented.

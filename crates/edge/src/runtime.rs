@@ -9,7 +9,9 @@ use tunnelproxy_common::{
     ShutdownTrigger, TunnelId,
 };
 
+use crate::operations::{EdgeIngressMetricsSource, EdgeOperationsControl, EdgeOperationsRuntime};
 use crate::{
+    EdgeOperationsConfig, EdgeOperationsConfigError, EdgeOperationsError, EdgeOperationsOutcome,
     EdgeSessionRouter, HttpIngressConfig, HttpIngressConfigError, HttpIngressError,
     HttpIngressExposurePolicy, HttpIngressOutcome, HttpIngressRuntime, MultiplexedEdgeConfig,
     MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RawIngressExposurePolicy,
@@ -26,6 +28,8 @@ pub struct EdgeRuntimeConfig {
     pub raw_exposure: RawIngressExposurePolicy,
     /// When present, HTTPS replaces the raw listener for this process.
     pub https_ingress: Option<HttpIngressConfig>,
+    /// Optional loopback-only health, readiness, and Prometheus endpoint.
+    pub operations: Option<EdgeOperationsConfig>,
     pub shutdown: RuntimeShutdownConfig,
 }
 
@@ -42,6 +46,7 @@ impl EdgeRuntimeConfig {
             max_raw_connections: 32,
             raw_exposure: RawIngressExposurePolicy::LoopbackOnly,
             https_ingress: None,
+            operations: None,
             shutdown: RuntimeShutdownConfig::default(),
         }
     }
@@ -114,6 +119,11 @@ impl EdgeRuntimeConfig {
                 self.tunnel_id.clone(),
             ));
         }
+        if let Some(operations) = self.operations {
+            operations
+                .validate()
+                .map_err(EdgeRuntimeConfigError::Operations)?;
+        }
         self.shutdown
             .validate()
             .map_err(|_| EdgeRuntimeConfigError::ZeroDrainTimeout)
@@ -136,6 +146,7 @@ pub enum EdgeRuntimeConfigError {
     HttpsTunnelNotConfigured(TunnelId),
     PublicHttpsRequiresMutualTls,
     PublicHttpsRequiresLiveAuthorization,
+    Operations(EdgeOperationsConfigError),
     RawTunnelNotAuthorized(TunnelId),
     ZeroDrainTimeout,
 }
@@ -177,6 +188,7 @@ impl std::fmt::Display for EdgeRuntimeConfigError {
             Self::PublicHttpsRequiresLiveAuthorization => {
                 f.write_str("public HTTPS ingress requires dynamic snapshot authorization")
             }
+            Self::Operations(error) => write!(f, "invalid operations endpoint: {error}"),
             Self::RawTunnelNotAuthorized(tunnel_id) => write!(
                 f,
                 "raw TunnelId {tunnel_id} is absent from the registration policy"
@@ -198,6 +210,7 @@ pub struct EdgeRuntimeOutcome {
     pub successful_recoveries: u64,
     pub raw_routes: RuntimeShutdownOutcome,
     pub https_ingress: Option<HttpIngressOutcome>,
+    pub operations: Option<EdgeOperationsOutcome>,
     pub agent_sessions: RuntimeShutdownOutcome,
 }
 
@@ -207,6 +220,9 @@ impl EdgeRuntimeOutcome {
             || self
                 .https_ingress
                 .is_some_and(HttpIngressOutcome::was_forced)
+            || self
+                .operations
+                .is_some_and(EdgeOperationsOutcome::was_forced)
             || matches!(self.agent_sessions, RuntimeShutdownOutcome::Forced { .. })
     }
 }
@@ -226,6 +242,14 @@ pub enum EdgeRuntimeError {
     Https(HttpIngressError),
     HttpsTask(String),
     HttpsStopped,
+    OperationsStartup(EdgeOperationsError),
+    Operations(EdgeOperationsError),
+    OperationsTask(String),
+    OperationsStopped,
+    OperationsStartupRollback {
+        startup: EdgeOperationsError,
+        cleanup: RawIngressRouteError,
+    },
     StartupRollback {
         startup: RawIngressRouteError,
         cleanup: Box<EdgeRuntimeError>,
@@ -247,6 +271,16 @@ impl std::fmt::Display for EdgeRuntimeError {
             Self::Https(error) => write!(f, "HTTPS ingress failed: {error}"),
             Self::HttpsTask(error) => write!(f, "HTTPS ingress task failed: {error}"),
             Self::HttpsStopped => f.write_str("HTTPS ingress stopped unexpectedly"),
+            Self::OperationsStartup(error) => {
+                write!(f, "operations endpoint startup failed: {error}")
+            }
+            Self::Operations(error) => write!(f, "operations endpoint failed: {error}"),
+            Self::OperationsTask(error) => write!(f, "operations endpoint task failed: {error}"),
+            Self::OperationsStopped => f.write_str("operations endpoint stopped unexpectedly"),
+            Self::OperationsStartupRollback { startup, cleanup } => write!(
+                f,
+                "operations endpoint startup failed ({startup}) and raw-route rollback also failed ({cleanup})"
+            ),
             Self::StartupRollback { startup, cleanup } => write!(
                 f,
                 "raw route startup failed ({startup}) and rollback also failed ({cleanup})"
@@ -264,11 +298,15 @@ impl std::error::Error for EdgeRuntimeError {
                 Some(error)
             }
             Self::HttpsStartup(error) | Self::Https(error) => Some(error),
+            Self::OperationsStartup(error) | Self::Operations(error) => Some(error),
+            Self::OperationsStartupRollback { startup, .. } => Some(startup),
             Self::StartupRollback { startup, .. } => Some(startup),
             Self::TransportTask(_)
             | Self::TransportStopped
             | Self::HttpsTask(_)
-            | Self::HttpsStopped => None,
+            | Self::HttpsStopped
+            | Self::OperationsTask(_)
+            | Self::OperationsStopped => None,
         }
     }
 }
@@ -285,6 +323,40 @@ struct RuntimeProgress {
     raw_addr: Option<SocketAddr>,
     agent_sessions_seen: u64,
     route_generations: u64,
+}
+
+struct RunningOperations {
+    control: EdgeOperationsControl,
+    trigger: ShutdownTrigger,
+    task: JoinHandle<Result<EdgeOperationsOutcome, EdgeOperationsError>>,
+}
+
+fn spawn_operations(runtime: EdgeOperationsRuntime) -> RunningOperations {
+    let local_addr = runtime.local_addr();
+    let control = runtime.control();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(runtime.run_until_shutdown(signal));
+    info!(%local_addr, event = "operations_endpoint_bound");
+    RunningOperations {
+        control,
+        trigger,
+        task,
+    }
+}
+
+fn mark_operations_draining(operations: &Option<RunningOperations>) {
+    if let Some(operations) = operations {
+        operations.control.begin_draining();
+    }
+}
+
+async fn poll_operations(
+    operations: &mut Option<RunningOperations>,
+) -> Result<Result<EdgeOperationsOutcome, EdgeOperationsError>, tokio::task::JoinError> {
+    match operations {
+        Some(operations) => (&mut operations.task).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl EdgeRuntime {
@@ -335,11 +407,40 @@ impl EdgeRuntime {
             .add_route(route_config)
             .await
             .map_err(EdgeRuntimeError::RouteStartup)?;
+        let operations_runtime = match self.config.operations {
+            Some(mut operations_config) => {
+                operations_config.shutdown = shutdown;
+                match EdgeOperationsRuntime::bind(
+                    operations_config,
+                    router.clone(),
+                    self.config.tunnel_id.clone(),
+                    EdgeIngressMetricsSource::Raw {
+                        manager: manager.clone(),
+                        route_id: route.route_id,
+                    },
+                )
+                .await
+                {
+                    Ok(runtime) => Some(runtime),
+                    Err(startup) => {
+                        return match manager.shutdown(shutdown).await {
+                            Ok(_) => Err(EdgeRuntimeError::OperationsStartup(startup)),
+                            Err(cleanup) => Err(EdgeRuntimeError::OperationsStartupRollback {
+                                startup,
+                                cleanup,
+                            }),
+                        };
+                    }
+                }
+            }
+            None => None,
+        };
         let (transport_trigger, transport_signal) = shutdown_channel();
         let mut transport_task = tokio::spawn(
             self.transport
                 .run_until_shutdown(transport_signal, shutdown),
         );
+        let mut operations = operations_runtime.map(spawn_operations);
         let mut tunnels = router.subscribe_tunnels();
         let mut current_session = None;
         let mut progress = RuntimeProgress {
@@ -357,8 +458,10 @@ impl EdgeRuntime {
             tokio::select! {
                 biased;
                 () = signal.cancelled() => {
+                    mark_operations_draining(&operations);
                     return shutdown_components(
                         manager,
+                        operations,
                         transport_trigger,
                         transport_task,
                         shutdown,
@@ -368,11 +471,26 @@ impl EdgeRuntime {
                 }
                 result = &mut transport_task => {
                     let transport_error = unexpected_transport_result(result);
-                    manager
+                    mark_operations_draining(&operations);
+                    let route_shutdown = manager
                         .shutdown(shutdown)
                         .await
-                        .map_err(EdgeRuntimeError::RouteShutdown)?;
+                        .map_err(EdgeRuntimeError::RouteShutdown);
+                    let operations_shutdown = shutdown_operations(operations).await;
+                    route_shutdown?;
+                    operations_shutdown?;
                     return Err(transport_error);
+                }
+                result = poll_operations(&mut operations) => {
+                    let operations_error = unexpected_operations_result(result);
+                    let route_shutdown = manager
+                        .shutdown(shutdown)
+                        .await
+                        .map_err(EdgeRuntimeError::RouteShutdown);
+                    transport_trigger.shutdown();
+                    let _ = await_transport(transport_task).await;
+                    route_shutdown?;
+                    return Err(operations_error);
                 }
                 changed = tunnels.changed() => {
                     if changed.is_err() {
@@ -419,6 +537,23 @@ impl EdgeRuntime {
             .await
             .map_err(EdgeRuntimeError::HttpsStartup)?;
         let https_addr = ingress.local_addr();
+        let https_status = ingress.status_handle();
+        let operations_runtime = match self.config.operations {
+            Some(mut operations_config) => {
+                operations_config.shutdown = shutdown;
+                Some(
+                    EdgeOperationsRuntime::bind(
+                        operations_config,
+                        router.clone(),
+                        self.config.tunnel_id.clone(),
+                        EdgeIngressMetricsSource::Https(https_status),
+                    )
+                    .await
+                    .map_err(EdgeRuntimeError::OperationsStartup)?,
+                )
+            }
+            None => None,
+        };
         let (transport_trigger, transport_signal) = shutdown_channel();
         let (https_trigger, https_signal) = shutdown_channel();
         let mut transport_task = tokio::spawn(
@@ -426,6 +561,7 @@ impl EdgeRuntime {
                 .run_until_shutdown(transport_signal, shutdown),
         );
         let mut https_task = tokio::spawn(ingress.run_until_shutdown(https_signal));
+        let mut operations = operations_runtime.map(spawn_operations);
         let mut tunnels = router.subscribe_tunnels();
         let mut current_session = None;
         let mut sessions_seen = 0_u64;
@@ -435,10 +571,12 @@ impl EdgeRuntime {
             tokio::select! {
                 biased;
                 () = signal.cancelled() => {
+                    mark_operations_draining(&operations);
                     https_trigger.shutdown();
-                    let https = await_https(https_task).await?;
+                    let https = await_https(https_task).await;
+                    let operations = shutdown_operations(operations).await;
                     transport_trigger.shutdown();
-                    let agent_sessions = await_transport(transport_task).await?;
+                    let agent_sessions = await_transport(transport_task).await;
                     return Ok(EdgeRuntimeOutcome {
                         agent_addr: self.agent_addr,
                         raw_addr: None,
@@ -446,20 +584,33 @@ impl EdgeRuntime {
                         route_generations: 1,
                         successful_recoveries: sessions_seen.saturating_sub(1),
                         raw_routes: RuntimeShutdownOutcome::Drained { completed_tasks: 0 },
-                        https_ingress: Some(https),
-                        agent_sessions,
+                        https_ingress: Some(https?),
+                        operations: operations?,
+                        agent_sessions: agent_sessions?,
                     });
                 }
                 result = &mut transport_task => {
                     let error = unexpected_transport_result(result);
+                    mark_operations_draining(&operations);
                     https_trigger.shutdown();
                     let _ = await_https(https_task).await;
+                    let _ = shutdown_operations(operations).await;
                     return Err(error);
                 }
                 result = &mut https_task => {
+                    mark_operations_draining(&operations);
+                    let _ = shutdown_operations(operations).await;
                     transport_trigger.shutdown();
                     let _ = await_transport(transport_task).await;
                     return Err(unexpected_https_result(result));
+                }
+                result = poll_operations(&mut operations) => {
+                    let operations_error = unexpected_operations_result(result);
+                    https_trigger.shutdown();
+                    let _ = await_https(https_task).await;
+                    transport_trigger.shutdown();
+                    let _ = await_transport(transport_task).await;
+                    return Err(operations_error);
                 }
                 changed = tunnels.changed() => {
                     if changed.is_err() {
@@ -484,6 +635,7 @@ impl EdgeRuntime {
 
 async fn shutdown_components(
     manager: RawIngressRouteManager,
+    operations: Option<RunningOperations>,
     transport_trigger: ShutdownTrigger,
     transport_task: JoinHandle<std::io::Result<RuntimeShutdownOutcome>>,
     shutdown: RuntimeShutdownConfig,
@@ -494,6 +646,7 @@ async fn shutdown_components(
         .shutdown(shutdown)
         .await
         .map_err(EdgeRuntimeError::RouteShutdown);
+    let operations = shutdown_operations(operations).await;
     transport_trigger.shutdown();
     let agent_sessions = await_transport(transport_task).await;
     Ok(EdgeRuntimeOutcome {
@@ -504,8 +657,39 @@ async fn shutdown_components(
         successful_recoveries: progress.agent_sessions_seen.saturating_sub(1),
         raw_routes: raw_routes?,
         https_ingress: None,
+        operations: operations?,
         agent_sessions: agent_sessions?,
     })
+}
+
+async fn shutdown_operations(
+    operations: Option<RunningOperations>,
+) -> Result<Option<EdgeOperationsOutcome>, EdgeRuntimeError> {
+    let Some(operations) = operations else {
+        return Ok(None);
+    };
+    operations.trigger.shutdown();
+    await_operations(operations.task).await.map(Some)
+}
+
+async fn await_operations(
+    task: JoinHandle<Result<EdgeOperationsOutcome, EdgeOperationsError>>,
+) -> Result<EdgeOperationsOutcome, EdgeRuntimeError> {
+    match task.await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(EdgeRuntimeError::Operations(error)),
+        Err(error) => Err(EdgeRuntimeError::OperationsTask(error.to_string())),
+    }
+}
+
+fn unexpected_operations_result(
+    result: Result<Result<EdgeOperationsOutcome, EdgeOperationsError>, tokio::task::JoinError>,
+) -> EdgeRuntimeError {
+    match result {
+        Ok(Ok(_)) => EdgeRuntimeError::OperationsStopped,
+        Ok(Err(error)) => EdgeRuntimeError::Operations(error),
+        Err(error) => EdgeRuntimeError::OperationsTask(error.to_string()),
+    }
 }
 
 async fn await_https(
@@ -610,6 +794,7 @@ mod tests {
             successful_recoveries: 0,
             raw_routes: RuntimeShutdownOutcome::Drained { completed_tasks: 0 },
             https_ingress: None,
+            operations: None,
             agent_sessions: RuntimeShutdownOutcome::Forced {
                 completed_tasks: 0,
                 aborted_tasks: 1,

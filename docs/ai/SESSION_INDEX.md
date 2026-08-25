@@ -916,3 +916,30 @@ Out of scope:
   account billing quotas, and DDoS mitigation.
 - HTTP/2, public keep-alive, WebSocket/upgrade, CONNECT, signed access URLs,
   public-client authentication, and multi-edge ownership.
+
+## Session 27 — Bounded Edge Operations Endpoint & Prometheus Metrics — complete
+
+Scope delivered:
+
+- Added an opt-in loopback-only HTTP/1.1 operations runtime with typed config,
+  startup/runtime failures, bounded connections/headers/timeouts/drain, and
+  `/healthz`, `/readyz`, and `/metrics` for `GET`/`HEAD`.
+- Defined readiness as a live configured TunnelId binding while the Edge is not
+  draining. Authorization source/version/revocation and raw/HTTPS ingress state
+  are read only from existing in-memory caches and status handles.
+- Added fixed-cardinality Prometheus output for operations admission, raw
+  ingress, HTTPS, TLS rejection, and request-rate limiting without identity,
+  peer, certificate, secret, or payload labels.
+- Integrated CLI opt-in and ordered lifecycle: readiness turns false, ingress
+  drains while operations remains observable, operations drains next, and
+  Agent transport stops last. Operations bind failure rolls back raw startup.
+- Added unit, CLI, real TCP lifecycle/capacity/readiness, raw metrics, and real
+  TLS HTTPS/rate-limit metrics coverage. The workspace now contains 286
+  explicit tests.
+
+Out of scope:
+
+- Public or authenticated operations access, TLS for the operations listener,
+  metrics persistence/remote write, dashboards, alerts, and JSON log output.
+- Agent/Control Plane exporters, distributed rate limiting, hostname
+  administration, HTTP/2, and multi-edge ownership.

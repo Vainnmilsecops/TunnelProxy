@@ -81,4 +81,6 @@ opaque raw TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
 routing, and applies process-local global/per-IP request token buckets, but it
-is not yet the automatic future product UX.
+is not yet the automatic future product UX. Edge also has an opt-in bounded
+loopback operations endpoint; public/authenticated operations access, durable
+metrics storage, and Agent/Control Plane exporters are not implemented.
