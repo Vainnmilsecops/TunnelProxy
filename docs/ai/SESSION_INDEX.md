@@ -888,3 +888,31 @@ Out of scope:
   and public-client authentication.
 - HTTP/2, public keep-alive, WebSocket/upgrade, CONNECT, request-rate limiting,
   distributed DDoS controls, and multi-edge ownership.
+
+## Session 26 — Bounded HTTP Request Rate Limiting & Observability — complete
+
+Scope delivered:
+
+- Added integer fixed-point token buckets that atomically enforce global and
+  socket-source-IP request rates after authority validation and before request
+  body forwarding or logical tunnel-stream creation.
+- Added strict rate/burst validation, deterministic integer refill and retry
+  calculation, and `429 Too Many Requests` responses with `Retry-After`.
+- Bounded per-IP state by configured cardinality, idle TTL, and fixed-size
+  cleanup batches. A full table fails closed and client forwarding headers are
+  never used as source identity.
+- Added live ingress status for admitted requests, global/per-IP/peer-capacity
+  rejections, and current/peak tracked peers, plus payload-free structured
+  rejection events and abort-safe active-connection accounting.
+- Added runnable Edge CLI controls for global/per-IP rate and burst, maximum
+  tracked peers, and idle TTL, all validated before TLS file loading or bind.
+- Added token-bucket boundary tests, status/response tests, CLI validation, and
+  a real TLS integration test proving rejection occurs before the local service
+  and refill restores admission. The workspace now contains 279 explicit tests.
+
+Out of scope:
+
+- Distributed/shared quota coordination, durable limiter state, authoritative
+  account billing quotas, and DDoS mitigation.
+- HTTP/2, public keep-alive, WebSocket/upgrade, CONNECT, signed access URLs,
+  public-client authentication, and multi-edge ownership.

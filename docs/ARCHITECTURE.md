@@ -559,6 +559,34 @@ before Agent transport shutdown. The first slice deliberately supports one
 HTTP/1.1 request per public TLS connection, with no HTTP/2, WebSocket/upgrade,
 CONNECT, automatic hostname allocation, or public-client authentication.
 
+### 2.24 Bounded HTTP request-rate admission (Session 26)
+
+After TLS and exact Host/SNI/absolute-authority validation, but before reading
+the request body or opening a tunnel stream, HTTPS ingress atomically admits a
+request against both a process-wide token bucket and a source-IP token bucket:
+
+```text
+validated request -> global bucket + socket-peer-IP bucket
+                  -> admitted -> request body -> Agent stream
+                  -> rejected -> 429 + integer Retry-After -> close
+```
+
+Buckets use integer fixed-point refill accounting, so admission is deterministic
+and does not depend on floating-point rounding. One lock covers the global and
+peer decisions; a per-IP rejection does not consume a global token. The peer
+table is bounded, idle entries expire after a configured TTL, and admission
+performs only a fixed-size cleanup batch when capacity is needed. A full table
+fails closed with `429` instead of allocating unbounded state. Source identity
+comes only from the accepted socket address, never from client-supplied
+forwarding headers.
+
+Live status exposes admitted requests, each rejection category, and current and
+peak tracked-peer counts. Structured rejection events contain only peer,
+hostname, category, and retry delay. State is deliberately local to one Edge
+process and resets on restart; it is a bounded local abuse control, not shared
+quota enforcement or distributed DDoS protection. Tunnel Protocol v2 and the
+authorization snapshot format are unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

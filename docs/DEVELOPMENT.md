@@ -452,6 +452,12 @@ tunnelproxy-edge \
   --allow-public-https-ingress \
   --max-http-connections 32 \
   --max-http-connections-per-ip 4 \
+  --http-requests-per-second 100 \
+  --http-request-burst 200 \
+  --http-requests-per-ip-per-second 20 \
+  --http-request-burst-per-ip 40 \
+  --max-http-rate-limit-peers 4096 \
+  --http-rate-limit-idle-ms 300000 \
   --tls-cert edge-server.pem \
   --tls-key edge-server-key.pem \
   --tls-client-ca agent-ca.pem \
@@ -469,6 +475,15 @@ closes after one request, rejects CONNECT/upgrades, and replaces client-supplied
 forwarding headers. Header bytes/count, request body, TLS handshake, header
 read, complete request, global connection, and public per-IP limits are all
 configurable and validated before bind.
+
+Request admission additionally uses global and socket-peer-IP token buckets.
+Rates are tokens per second and bursts are token capacities; each burst must be
+at least its rate, and per-IP values cannot exceed the global values. The peer
+table has an explicit cardinality bound and reclaims idle entries after the
+configured TTL. A depleted bucket or full peer table returns `429 Too Many
+Requests` with an integer `Retry-After`, before the request body is forwarded or
+a local-service stream is opened. These counters and buckets are per Edge
+process, reset on restart, and do not provide distributed DDoS protection.
 
 Optional public certificate reload uses `--public-tls-reload-manifest` and the
 same monotonic digest-bound generation rules as the other TLS surfaces. The

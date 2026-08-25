@@ -17,10 +17,11 @@ use tunnelproxy_edge::{
     EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
     EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
     EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
-    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy, PublicTlsConfig,
-    PublicTlsConfigError, PublicTlsReloadBootstrapError, PublicTlsReloadConfig,
-    PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownConfig,
-    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
+    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
+    HttpRequestRateLimitConfig, PublicTlsConfig, PublicTlsConfigError,
+    PublicTlsReloadBootstrapError, PublicTlsReloadConfig, PublicTlsReloadRuntime,
+    RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
+    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
 };
 
 const USAGE: &str = "\
@@ -46,6 +47,12 @@ Options:
   --max-http-header-bytes <usize>  HTTP/1 buffer (default 16384)
   --max-http-headers <usize>       header count (default 64)
   --max-http-request-body-bytes <usize> body limit (default 10485760)
+  --http-requests-per-second <u64> global request rate (default 100)
+  --http-request-burst <u64>       global burst capacity (default 200)
+  --http-requests-per-ip-per-second <u64> per-IP rate (default 20)
+  --http-request-burst-per-ip <u64> per-IP burst capacity (default 40)
+  --max-http-rate-limit-peers <usize> tracked peer bound (default 4096)
+  --http-rate-limit-idle-ms <ms> peer bucket TTL (default 300000)
   --http-header-timeout-ms <ms>    header deadline (default 10000)
   --http-request-timeout-ms <ms>   full request deadline (default 60000)
   --drain-timeout-ms <ms>          stage drain   (default 10000)
@@ -351,6 +358,12 @@ struct ParsedArgs {
     max_http_header_bytes: usize,
     max_http_headers: usize,
     max_http_request_body_bytes: usize,
+    http_requests_per_second: u64,
+    http_request_burst: u64,
+    http_requests_per_ip_per_second: u64,
+    http_request_burst_per_ip: u64,
+    max_http_rate_limit_peers: usize,
+    http_rate_limit_idle: Duration,
     http_header_timeout: Duration,
     http_request_timeout: Duration,
     drain_timeout: Duration,
@@ -404,6 +417,12 @@ impl Default for ParsedArgs {
             max_http_header_bytes: 16 * 1024,
             max_http_headers: 64,
             max_http_request_body_bytes: 10 * 1024 * 1024,
+            http_requests_per_second: 100,
+            http_request_burst: 200,
+            http_requests_per_ip_per_second: 20,
+            http_request_burst_per_ip: 40,
+            max_http_rate_limit_peers: 4_096,
+            http_rate_limit_idle: Duration::from_secs(5 * 60),
             http_header_timeout: Duration::from_secs(10),
             http_request_timeout: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(10),
@@ -602,6 +621,37 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-http-request-body-bytes" => {
                 parsed.max_http_request_body_bytes = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-requests-per-second" => {
+                parsed.http_requests_per_second = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-request-burst" => {
+                parsed.http_request_burst = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-requests-per-ip-per-second" => {
+                parsed.http_requests_per_ip_per_second = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-request-burst-per-ip" => {
+                parsed.http_request_burst_per_ip = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-rate-limit-peers" => {
+                parsed.max_http_rate_limit_peers = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http-rate-limit-idle-ms" => {
+                parsed.http_rate_limit_idle =
+                    Duration::from_millis(parse_number(args, index, flag)?);
                 parsed.https_options_present = true;
                 index += 2;
             }
@@ -1201,6 +1251,19 @@ async fn load_https_configuration(
         return Err(TlsLoadError::IncompletePublicHttpsArguments);
     };
     let exposure = https_exposure_policy(parsed).map_err(TlsLoadError::PublicHttpsExposure)?;
+    let request_rate_limit = HttpRequestRateLimitConfig {
+        global_requests_per_second: parsed.http_requests_per_second,
+        global_burst: parsed.http_request_burst,
+        per_ip_requests_per_second: parsed.http_requests_per_ip_per_second,
+        per_ip_burst: parsed.http_request_burst_per_ip,
+        max_tracked_ips: parsed.max_http_rate_limit_peers,
+        peer_idle_ttl: parsed.http_rate_limit_idle,
+    };
+    request_rate_limit.validate().map_err(|error| {
+        TlsLoadError::InvalidHttpIngress(
+            tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(error),
+        )
+    })?;
     let (tls, reloader) = match &parsed.public_tls_reload_manifest {
         Some(manifest_path) => {
             let (tls, runtime) = PublicTlsReloadRuntime::bootstrap(
@@ -1235,6 +1298,7 @@ async fn load_https_configuration(
         max_header_bytes: parsed.max_http_header_bytes,
         max_headers: parsed.max_http_headers,
         max_request_body_bytes: parsed.max_http_request_body_bytes,
+        request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
         duplex_capacity: 64 * 1024,
@@ -1507,6 +1571,18 @@ mod tests {
             "40",
             "--max-http-request-body-bytes",
             "2048",
+            "--http-requests-per-second",
+            "50",
+            "--http-request-burst",
+            "100",
+            "--http-requests-per-ip-per-second",
+            "10",
+            "--http-request-burst-per-ip",
+            "20",
+            "--max-http-rate-limit-peers",
+            "512",
+            "--http-rate-limit-idle-ms",
+            "1500",
             "--http-header-timeout-ms",
             "301",
             "--http-request-timeout-ms",
@@ -1523,6 +1599,12 @@ mod tests {
         assert_eq!(parsed.max_http_header_bytes, 32768);
         assert_eq!(parsed.max_http_headers, 40);
         assert_eq!(parsed.max_http_request_body_bytes, 2048);
+        assert_eq!(parsed.http_requests_per_second, 50);
+        assert_eq!(parsed.http_request_burst, 100);
+        assert_eq!(parsed.http_requests_per_ip_per_second, 10);
+        assert_eq!(parsed.http_request_burst_per_ip, 20);
+        assert_eq!(parsed.max_http_rate_limit_peers, 512);
+        assert_eq!(parsed.http_rate_limit_idle, Duration::from_millis(1500));
         assert_eq!(
             https_exposure_policy(&parsed),
             Ok(HttpIngressExposurePolicy::Public {
@@ -1618,6 +1700,21 @@ mod tests {
         assert!(matches!(
             load_https_configuration(&orphaned_https_option).await,
             Err(TlsLoadError::PublicHttpsWithoutListener)
+        ));
+
+        let invalid_rate_limit = ParsedArgs {
+            https_listen: Some("127.0.0.1:8443".parse().unwrap()),
+            https_host: Some(HttpHostname::new("demo.example.test").unwrap()),
+            public_tls_cert: Some(PathBuf::from("public.pem")),
+            public_tls_key: Some(PathBuf::from("public-key.pem")),
+            http_requests_per_second: 0,
+            ..ParsedArgs::default()
+        };
+        assert!(matches!(
+            load_https_configuration(&invalid_rate_limit).await,
+            Err(TlsLoadError::InvalidHttpIngress(
+                tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(_)
+            ))
         ));
     }
 }

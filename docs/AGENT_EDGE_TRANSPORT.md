@@ -1,6 +1,6 @@
 # TunnelProxy Agent ↔ Edge Transport
 
-> **Status:** Implemented through Session 25.
+> **Status:** Implemented through Session 26.
 > **Scope:** This document describes the Agent ↔ Edge control transport and the
 > bounded multiplexed byte-stream transport. Public HTTP/TLS termination is an
 > Edge layer over these streams; persisted/multi-edge routing is not described.

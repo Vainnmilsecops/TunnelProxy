@@ -1173,6 +1173,7 @@ async fn drain_tasks<T: 'static>(
 mod admission;
 pub mod agent_transport;
 pub mod http_ingress;
+mod http_rate_limit;
 mod http_tls;
 pub mod multiplex;
 pub mod raw_ingress;
@@ -1183,7 +1184,13 @@ mod tls;
 pub use http_ingress::{
     HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError, HttpIngressConfig,
     HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy, HttpIngressOutcome,
-    HttpIngressRuntime, MAX_HTTP_HEADER_BYTES, MAX_HTTP_HOST_ROUTES, MIN_HTTP_HEADER_BYTES,
+    HttpIngressRuntime, HttpIngressStatus, HttpIngressStatusHandle, MAX_HTTP_HEADER_BYTES,
+    MAX_HTTP_HOST_ROUTES, MIN_HTTP_HEADER_BYTES,
+};
+pub use http_rate_limit::{
+    HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError, MAX_HTTP_RATE_LIMIT_IDLE,
+    MAX_HTTP_RATE_LIMIT_PEERS, MAX_HTTP_REQUESTS_PER_SECOND, MAX_HTTP_REQUEST_BURST,
+    MIN_HTTP_RATE_LIMIT_IDLE,
 };
 pub use http_tls::{
     PublicTlsConfig, PublicTlsConfigError, PublicTlsReloadBootstrapError, PublicTlsReloadConfig,

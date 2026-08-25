@@ -701,3 +701,30 @@ closes after one HTTP/1.1 request and deliberately excludes HTTP/2, upgrades,
 CONNECT, automatic hostname allocation, signed access URLs, public-client auth,
 distributed rate limiting, and multi-edge ownership. A configured stale
 snapshot cache retains the existing bounded revocation-delay tradeoff.
+
+---
+
+## ADR-026 — HTTP request admission uses bounded process-local token buckets
+
+**Status:** Accepted (Session 26).
+
+**Context:** Session 25 bounded concurrent HTTPS connections, but a client could
+still issue an unlimited sequence of short connections and repeatedly open
+logical streams toward an Agent. The abuse control must remain deterministic,
+memory-bounded, observable, and independent of the Control Plane hot path.
+
+**Decision:** After TLS and exact request-authority validation, Edge atomically
+checks integer fixed-point token buckets for the whole process and the accepted
+socket's source IP before reading the body or opening a tunnel stream. The peer
+table has a configured cardinality cap, idle TTL, and fixed-size reclamation
+batch; exhaustion fails closed. Rejections use `429 Too Many Requests` and an
+integer `Retry-After`. Live status and structured events distinguish global,
+per-IP, and peer-table-capacity rejection without recording payload data or
+trusting forwarded client identity.
+
+**Consequences:** One Edge protects its local request and tunnel capacity with
+bounded memory and no database/network lookup. The global and per-IP decisions
+are consistent, and rejected requests cannot reach the local service. State is
+not durable or coordinated, resets at process restart, and is not a substitute
+for distributed DDoS protection or authoritative account quotas. No Tunnel
+Protocol v2 or authorization snapshot change is required.

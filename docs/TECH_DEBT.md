@@ -20,6 +20,22 @@
 
 ## Open items
 
+### DEBT-021 — HTTP request-rate state is per-Edge and non-durable
+
+- **Introduced in:** Session 26
+- **Category:** reliability / security
+- **Impact:** medium for multi-edge or externally metered quotas, low for the
+  current single-Edge bounded ingress
+- **Rationale:** Global and per-source-IP token buckets are intentionally held
+  in one Edge process. They reset on restart and are not coordinated between
+  Edge nodes. This protects the local Agent/tunnel path with bounded memory and
+  no hot-path dependency, but it is not an authoritative account quota or
+  distributed DDoS control.
+- **Exit plan:** Introduce shared or hierarchically leased quota state only when
+  multi-edge ownership is implemented, retaining a fail-closed local limiter
+  and explicit behavior during coordination outages.
+- **Tracking:** open.
+
 ### DEBT-020 — Public HTTP ingress is HTTP/1.1 single-request only
 
 - **Introduced in:** Session 25
