@@ -138,20 +138,21 @@
   public raw-ingress production path. This debt remains open only for the
   legacy standalone `Forwarder`, which is not used by that public route.
 
-### DEBT-010 — No production telemetry backend
+### DEBT-010 — Production telemetry coverage is Edge-local and non-durable
 
 - **Introduced in:** Session 04
 - **Category:** ops
 - **Impact:** low
-- **Rationale:** Forwarder observability is implemented entirely as
-  structured `tracing` events. There is no metrics backend, no
-  Prometheus exporter, and no persisted counters. This is
-  deliberate for the foundation: pushing to a metrics backend
-  before the protocol is real would optimise the wrong thing.
-- **Exit plan:** Wire a real metrics backend (and the
-  `tracing-subscriber` JSON sink) once the V1 protocol exists and
-  there are real production workloads to measure.
-- **Tracking:** open.
+- **Rationale:** Session 27 adds a bounded loopback Prometheus exporter for the
+  Edge production data path, including readiness, authorization source, raw and
+  HTTPS ingress, and rate limiting. Counters remain process-local and reset on
+  restart; Agent and Control Plane have structured tracing only. There is no
+  remote write, durable history, dashboard/alert policy, or JSON log sink.
+- **Exit plan:** Add bounded Agent and Control Plane metrics, JSON log output,
+  and operator-owned collection/retention guidance before claiming complete
+  production observability. Keep external backend I/O off request routing.
+- **Tracking:** partially resolved for Edge in Session 27; open for the
+  remaining components and durable backend integration.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 

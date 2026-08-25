@@ -1176,6 +1176,7 @@ pub mod http_ingress;
 mod http_rate_limit;
 mod http_tls;
 pub mod multiplex;
+mod operations;
 pub mod raw_ingress;
 mod runtime;
 mod snapshot_runtime;
@@ -1200,6 +1201,11 @@ pub use multiplex::{
     AuthorizationSourceStatus, EdgeAuthorizationStatus, EdgeSessionRouter, MultiplexedEdgeConfig,
     MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RouteError, RoutedStream,
     RoutedStreamCloseReason,
+};
+pub use operations::{
+    EdgeOperationsConfig, EdgeOperationsConfigError, EdgeOperationsError, EdgeOperationsOutcome,
+    MAX_OPERATIONS_CONNECTIONS, MAX_OPERATIONS_HEADERS, MAX_OPERATIONS_HEADER_BYTES,
+    MIN_OPERATIONS_HEADER_BYTES,
 };
 pub use raw_ingress::{
     RawIngressConfigError, RawIngressExposurePolicy, RawIngressManagerConfig, RawIngressRoute,

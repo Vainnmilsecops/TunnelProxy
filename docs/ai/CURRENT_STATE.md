@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded HTTP Request Rate Limiting & Observability** (Session 26).
+**Bounded Edge Operations Endpoint & Prometheus Metrics** (Session 27).
 
 ## Completed
 
@@ -315,7 +315,15 @@
   category-specific rejection totals plus current/peak tracked peers.
 - The runnable Edge exposes validated request-rate, burst, peer-capacity, and
   idle-TTL flags. Rate state is process-local and resets on restart.
-- 279 explicit workspace tests are present; all prior behavior is preserved.
+- The runnable Edge optionally binds a loopback-only, connection/header/time
+  bounded HTTP/1.1 operations endpoint. `/healthz`, `/readyz`, and `/metrics`
+  expose liveness, live-tunnel readiness, and Prometheus text metrics.
+- Operations metrics use only fixed labels and contain no peer, hostname,
+  durable identity, session, certificate, secret, or payload values. Raw and
+  HTTPS counters remain process-local and reset on restart.
+- Shutdown marks readiness false before ingress drain, keeps operations
+  observable during that drain, then drains operations before Agent transport.
+- 286 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -339,11 +347,12 @@
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
-- Production telemetry / metrics backend (DEBT-010 open).
+- Agent/Control Plane metrics, durable/remote-write telemetry, JSON log sink,
+  dashboards, and alerting (DEBT-010 partially resolved for Edge).
 
 ## Next planned session
 
-Session 27 has not been selected. The next plan should choose one bounded scope
-from durable hostname administration, production metrics export, or transport
-fairness; HTTP/2, signed access URLs, and multi-edge ownership remain separate
-larger scopes.
+Session 28 has not been selected. The next plan should choose one bounded scope
+from durable hostname administration, structured JSON operations logs, or
+transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
+separate larger scopes.

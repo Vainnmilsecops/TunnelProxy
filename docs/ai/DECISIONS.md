@@ -728,3 +728,31 @@ are consistent, and rejected requests cannot reach the local service. State is
 not durable or coordinated, resets at process restart, and is not a substitute
 for distributed DDoS protection or authoritative account quotas. No Tunnel
 Protocol v2 or authorization snapshot change is required.
+
+---
+
+## ADR-027 — Edge operations use a bounded loopback-only pull endpoint
+
+**Status:** Accepted (Session 27).
+
+**Context:** Edge now owns meaningful live authorization, ingress, and
+rate-limit state, but operators can observe it only through structured events
+or final shutdown outcomes. Exporting metrics must not add unbounded labels,
+publicly expose internal topology, or introduce backend I/O into request
+routing. Readiness must also distinguish a live process from a tunnel that can
+currently serve traffic.
+
+**Decision:** The runnable Edge may opt into a separate loopback-only bounded
+HTTP/1.1 operations listener. It serves liveness, live-tunnel readiness, and
+Prometheus text metrics by reading cached router/authorization state plus raw
+or HTTPS in-memory counters. Metric names and labels are fixed and exclude all
+peer, hostname, durable identity, session, certificate, secret, and payload
+values. Shutdown marks readiness false before ingress drain, keeps the endpoint
+available during that drain, then drains operations before Agent transport.
+
+**Consequences:** A local Prometheus collector and process supervisor can
+observe the production Edge data path without storage/Control Plane lookup or
+new wire protocol. The listener has no public mode, authentication, or TLS and
+must not be port-forwarded externally. Counters reset on restart; remote write,
+durable history, dashboards/alerts, JSON logging, and Agent/Control Plane
+exporters remain out of scope. Tunnel Protocol v2 and snapshots are unchanged.

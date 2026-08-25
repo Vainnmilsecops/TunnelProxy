@@ -14,8 +14,8 @@ use tunnelproxy_control_plane::{
     SnapshotTlsReloadBootstrapError,
 };
 use tunnelproxy_edge::{
-    EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime, EdgeRuntimeConfig,
-    EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
+    EdgeOperationsConfig, EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime,
+    EdgeRuntimeConfig, EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
     EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
     HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
     HttpRequestRateLimitConfig, PublicTlsConfig, PublicTlsConfigError,
@@ -55,6 +55,10 @@ Options:
   --http-rate-limit-idle-ms <ms> peer bucket TTL (default 300000)
   --http-header-timeout-ms <ms>    header deadline (default 10000)
   --http-request-timeout-ms <ms>   full request deadline (default 60000)
+  --ops-listen <loopback-addr>     enable health/readiness/metrics endpoint
+  --max-ops-connections <usize>    operations connection limit (default 8)
+  --ops-header-timeout-ms <ms>     operations header deadline (default 2000)
+  --ops-request-timeout-ms <ms>    operations request deadline (default 5000)
   --drain-timeout-ms <ms>          stage drain   (default 10000)
   --tls-cert <path>                Edge certificate PEM
   --tls-key <path>                 Edge private key PEM
@@ -118,6 +122,14 @@ async fn main() -> ExitCode {
     config.max_raw_connections = parsed.max_raw_connections;
     config.raw_exposure = raw_exposure;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+    config.operations = parsed.ops_listen.map(|listen_addr| {
+        let mut operations = EdgeOperationsConfig::loopback(listen_addr);
+        operations.max_concurrent_connections = parsed.max_ops_connections;
+        operations.header_read_timeout = parsed.ops_header_timeout;
+        operations.request_timeout = parsed.ops_request_timeout;
+        operations.shutdown = config.shutdown;
+        operations
+    });
     let (https_ingress, public_tls_reloader) = match load_https_configuration(&parsed).await {
         Ok(configuration) => configuration,
         Err(error) => {
@@ -278,6 +290,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         %agent_addr,
         raw_addr = %parsed.raw_listen,
         https_addr = ?parsed.https_listen,
+        operations_addr = ?parsed.ops_listen,
         https_host = ?parsed.https_host,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
@@ -366,6 +379,11 @@ struct ParsedArgs {
     http_rate_limit_idle: Duration,
     http_header_timeout: Duration,
     http_request_timeout: Duration,
+    ops_listen: Option<SocketAddr>,
+    max_ops_connections: usize,
+    ops_header_timeout: Duration,
+    ops_request_timeout: Duration,
+    ops_options_present: bool,
     drain_timeout: Duration,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -425,6 +443,11 @@ impl Default for ParsedArgs {
             http_rate_limit_idle: Duration::from_secs(5 * 60),
             http_header_timeout: Duration::from_secs(10),
             http_request_timeout: Duration::from_secs(60),
+            ops_listen: None,
+            max_ops_connections: 8,
+            ops_header_timeout: Duration::from_secs(2),
+            ops_request_timeout: Duration::from_secs(5),
+            ops_options_present: false,
             drain_timeout: Duration::from_secs(10),
             tls_cert: None,
             tls_key: None,
@@ -470,6 +493,7 @@ enum ArgError {
     PublicHttpsPerIpLimitRequired,
     PublicHttpsPerIpLimitWithoutOptIn,
     PublicHttpsPerIpLimitInvalid,
+    OperationsOptionsWithoutListener,
     UnknownFlag(String),
 }
 
@@ -514,6 +538,9 @@ impl std::fmt::Display for ArgError {
             Self::PublicHttpsPerIpLimitInvalid => f.write_str(
                 "--max-http-connections-per-ip must be non-zero and cannot exceed --max-http-connections",
             ),
+            Self::OperationsOptionsWithoutListener => {
+                f.write_str("operations limit/timeout options require --ops-listen")
+            }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
@@ -667,6 +694,26 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.https_options_present = true;
                 index += 2;
             }
+            "--ops-listen" => {
+                parsed.ops_listen = Some(parse_addr(args, index, flag)?);
+                index += 2;
+            }
+            "--max-ops-connections" => {
+                parsed.max_ops_connections = parse_number(args, index, flag)?;
+                parsed.ops_options_present = true;
+                index += 2;
+            }
+            "--ops-header-timeout-ms" => {
+                parsed.ops_header_timeout = Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.ops_options_present = true;
+                index += 2;
+            }
+            "--ops-request-timeout-ms" => {
+                parsed.ops_request_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.ops_options_present = true;
+                index += 2;
+            }
             "--drain-timeout-ms" => {
                 parsed.drain_timeout = Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
@@ -782,6 +829,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
+    }
+    if parsed.ops_options_present && parsed.ops_listen.is_none() {
+        return Err(ArgError::OperationsOptionsWithoutListener);
     }
     Ok(parsed)
 }
@@ -1388,6 +1438,14 @@ mod tests {
             "--allow-public-raw-ingress",
             "--max-raw-connections-per-ip",
             "3",
+            "--ops-listen",
+            "127.0.0.1:19090",
+            "--max-ops-connections",
+            "6",
+            "--ops-header-timeout-ms",
+            "108",
+            "--ops-request-timeout-ms",
+            "109",
             "--drain-timeout-ms",
             "250",
             "--tls-cert",
@@ -1442,6 +1500,10 @@ mod tests {
         assert_eq!(parsed.max_raw_connections, 9);
         assert!(parsed.allow_public_raw_ingress);
         assert_eq!(parsed.max_raw_connections_per_ip, Some(3));
+        assert_eq!(parsed.ops_listen.unwrap().port(), 19090);
+        assert_eq!(parsed.max_ops_connections, 6);
+        assert_eq!(parsed.ops_header_timeout, Duration::from_millis(108));
+        assert_eq!(parsed.ops_request_timeout, Duration::from_millis(109));
         assert_eq!(parsed.drain_timeout, Duration::from_millis(250));
         assert_eq!(parsed.tls_cert, Some(PathBuf::from("edge.pem")));
         assert_eq!(parsed.tls_key, Some(PathBuf::from("edge-key.pem")));
@@ -1495,6 +1557,10 @@ mod tests {
             parse_args(&args(&["--tunnel-id", "bad/id"])),
             Err(ArgError::InvalidIdentifier { .. })
         ));
+        assert_eq!(
+            parse_args(&args(&["--max-ops-connections", "2"])),
+            Err(ArgError::OperationsOptionsWithoutListener)
+        );
     }
 
     #[test]

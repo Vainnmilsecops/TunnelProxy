@@ -52,6 +52,9 @@
 | HTTP rate-peer cardinality and idle TTL  | ✅   | —           | —   | Bounded table rejects when full, scans a fixed cleanup batch, and reclaims expired peers without trusting forwarding headers. |
 | HTTP rate-limit response and isolation   | ✅   | ✅          | —   | `429` includes integer `Retry-After`; the real TLS test proves a rejected request does not reach the Agent's local HTTP service. |
 | HTTP ingress live rate status            | ✅   | ✅          | —   | Status snapshots report admitted and categorized rejected requests plus current/peak tracked peers; runtime outcome asserts final totals. |
+| Edge operations endpoint bounds          | ✅   | ✅          | —   | Config rejects non-loopback/zero/oversized bounds; real TCP proves connection capacity rejection, RAII release, startup rollback, and listener release. |
+| Edge health and tunnel readiness         | ✅   | ✅          | —   | Real TCP covers `/healthz` plus readiness `503 → 200 → 503` across Agent connect/disconnect and proves readiness is false while operations remains observable during ingress drain. |
+| Edge Prometheus metrics                  | ✅   | ✅          | —   | Fixed-cardinality text output reports authorization and raw/HTTPS/rate-limit counters, including real `429` and TLS rejection, without identity, peer, certificate, secret, or payload values. |
 | Public HTTPS TLS generation reload       | ✅   | ✅          | —   | Typed/secret-safe config plus a real manifest runtime test prove complete monotonic public certificate/key generation publication. |
 | Tunnel protocol framing                   | ✅   | —           | —   | Protocol v2 codec covers round-trip, binary, fragmentation, truncation, invalid magic/version/frame/flags/scope, bounds, real TCP, and explicit v1 rejection. |
 | Tunnel protocol: control stream scope    | ✅   | —           | —   | `frame::tests::frame_control_scope_validation` and `frame::tests::frame_stream_scope_validation`. |
