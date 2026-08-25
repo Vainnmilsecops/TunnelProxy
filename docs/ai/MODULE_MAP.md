@@ -82,8 +82,9 @@ snapshot client alongside the data plane without binding before bootstrap.
 Public raw ingress remains opaque TCP. The alternative HTTPS mode terminates a
 separate reloadable public TLS identity, requires exact SNI/Host routing,
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
-router, and enforces connection/header/body/time bounds without hot-path
-control-plane access.
+router, and enforces connection/header/body/time bounds plus process-local
+global/per-source-IP request token buckets without hot-path control-plane
+access. Its rate-limit peer state and live counters are explicitly bounded.
 
 **Responsibility (future)**
 

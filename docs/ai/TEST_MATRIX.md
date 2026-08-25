@@ -47,7 +47,11 @@
 | HTTPS/HTTP/1.1 reverse proxy              | ✅   | ✅          | —   | Real TLS crosses exact Host/SNI routing through Edge → Agent → local HTTP and validates the returned response. |
 | HTTP host-fronting defense                | ✅   | ✅          | —   | Exact Host/SNI/absolute authority validation rejects mismatches; unknown/offline routes fail closed. |
 | HTTP forwarding-header sanitization      | ✅   | ✅          | —   | Real local HTTP capture proves spoofed forwarding and Connection-nominated headers are removed and trusted values replace them. |
-| HTTP ingress resource bounds             | ✅   | ✅          | —   | Config/CLI validate global/per-IP connections, header bytes/count, body, TLS/header/request deadlines, duplex capacity, and drain. |
+| HTTP ingress resource bounds             | ✅   | ✅          | —   | Config/CLI validate global/per-IP connections and request rates, bounded rate-peer state, header bytes/count, body, TLS/header/request deadlines, duplex capacity, and drain. |
+| HTTP global/per-IP request admission     | ✅   | ✅          | —   | Integer fixed-point token-bucket tests cover isolation, atomic rejection, refill, saturation, and clock regression; real TLS proves per-IP `429` then refill. |
+| HTTP rate-peer cardinality and idle TTL  | ✅   | —           | —   | Bounded table rejects when full, scans a fixed cleanup batch, and reclaims expired peers without trusting forwarding headers. |
+| HTTP rate-limit response and isolation   | ✅   | ✅          | —   | `429` includes integer `Retry-After`; the real TLS test proves a rejected request does not reach the Agent's local HTTP service. |
+| HTTP ingress live rate status            | ✅   | ✅          | —   | Status snapshots report admitted and categorized rejected requests plus current/peak tracked peers; runtime outcome asserts final totals. |
 | Public HTTPS TLS generation reload       | ✅   | ✅          | —   | Typed/secret-safe config plus a real manifest runtime test prove complete monotonic public certificate/key generation publication. |
 | Tunnel protocol framing                   | ✅   | —           | —   | Protocol v2 codec covers round-trip, binary, fragmentation, truncation, invalid magic/version/frame/flags/scope, bounds, real TCP, and explicit v1 rejection. |
 | Tunnel protocol: control stream scope    | ✅   | —           | —   | `frame::tests::frame_control_scope_validation` and `frame::tests::frame_stream_scope_validation`. |

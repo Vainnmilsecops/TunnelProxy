@@ -3,7 +3,7 @@
 use std::io::{BufReader, Cursor};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,9 +37,9 @@ use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeRegistrationPolicy, EdgeRuntime,
     EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig, EdgeTlsReloadConfig,
     EdgeTlsReloadRuntime, EdgeTransportSecurity, HttpHostRoutes, HttpHostname, HttpIngressConfig,
-    HttpIngressExposurePolicy, PublicTlsConfig, PublicTlsReloadConfig, PublicTlsReloadRuntime,
-    RawIngressExposurePolicy, RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime,
-    SnapshotAwareEdgeRuntimeError,
+    HttpIngressExposurePolicy, HttpRequestRateLimitConfig, PublicTlsConfig, PublicTlsReloadConfig,
+    PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownOutcome,
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
@@ -472,6 +472,7 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
         max_header_bytes: 16 * 1024,
         max_headers: 32,
         max_request_body_bytes: 1024 * 1024,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         duplex_capacity: 64 * 1024,
@@ -544,6 +545,140 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
 }
 
 #[tokio::test]
+async fn https_request_rate_limit_returns_429_before_local_service_and_refills() {
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let local_requests = Arc::new(AtomicUsize::new(0));
+    let local_requests_for_task = Arc::clone(&local_requests);
+    let local_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = local_listener.accept().await.unwrap();
+            local_requests_for_task.fetch_add(1, Ordering::Relaxed);
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        }
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 4,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        request_rate_limit: HttpRequestRateLimitConfig {
+            global_requests_per_second: 2,
+            global_burst: 2,
+            per_ip_requests_per_second: 1,
+            per_ip_burst: 1,
+            max_tracked_ips: 2,
+            peer_idle_ttl: Duration::from_secs(5),
+        },
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(3),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Agent did not become routable");
+
+    let connector = TlsConnector::from(raw_tls_client_config(
+        &public_pki.authority_pem,
+        None,
+        false,
+    ));
+    let request = || {
+        let connector = connector.clone();
+        async move {
+            let tcp = connect_eventually(https_addr).await;
+            let mut tls = connector
+                .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+                .await
+                .unwrap();
+            tls.write_all(b"GET /limited HTTP/1.1\r\nHost: demo.example.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+    };
+
+    assert!(request().await.starts_with("HTTP/1.1 200 OK"));
+    let limited = request().await.to_ascii_lowercase();
+    assert!(limited.starts_with("http/1.1 429 too many requests"));
+    assert!(limited.contains("retry-after: 1\r\n"));
+    assert_eq!(local_requests.load(Ordering::Relaxed), 1);
+
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    assert!(request().await.starts_with("HTTP/1.1 200 OK"));
+
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.admitted_requests, 2);
+    assert_eq!(https.completed_requests, 2);
+    assert_eq!(https.rejected_requests, 1);
+    assert_eq!(https.global_rate_limit_rejections, 0);
+    assert_eq!(https.per_ip_rate_limit_rejections, 1);
+    assert_eq!(https.rate_limit_peer_capacity_rejections, 0);
+    assert_eq!(https.tracked_rate_limit_peers, 1);
+    assert_eq!(https.peak_tracked_rate_limit_peers, 1);
+    local_task.await.unwrap();
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
 async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
     let public_pki = test_pki("demo.example.test");
     let https_addr = unused_addr().await;
@@ -565,6 +700,7 @@ async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
         max_header_bytes: 16 * 1024,
         max_headers: 32,
         max_request_body_bytes: 1024,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
         duplex_capacity: 16 * 1024,
@@ -644,6 +780,7 @@ async fn public_https_per_ip_admission_releases_after_connection_close() {
         max_header_bytes: 16 * 1024,
         max_headers: 32,
         max_request_body_bytes: 1024,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(3),
         duplex_capacity: 16 * 1024,
@@ -1193,6 +1330,7 @@ fn public_https_config_requires_agent_mtls_and_dynamic_authorization() {
         max_header_bytes: 16 * 1024,
         max_headers: 64,
         max_request_body_bytes: 1024,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
         duplex_capacity: 16 * 1024,

@@ -13,7 +13,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Incoming};
 use hyper::header::{
     HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE,
-    PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+    PROXY_AUTHORIZATION, RETRY_AFTER, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::http::uri::Authority;
 use hyper::{Method, Request, Response, StatusCode, Uri};
@@ -26,6 +26,10 @@ use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
 
 use crate::admission::{PeerAdmission, PeerAdmissionPermit};
+use crate::http_rate_limit::{
+    HttpRateLimitRejection, HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError,
+    HttpRequestRateLimiter,
+};
 use crate::http_tls::{PublicTlsConfig, PUBLIC_HTTP1_ALPN};
 use crate::multiplex::{EdgeSessionRouter, RouteError};
 
@@ -202,6 +206,7 @@ pub struct HttpIngressConfig {
     pub max_header_bytes: usize,
     pub max_headers: usize,
     pub max_request_body_bytes: usize,
+    pub request_rate_limit: HttpRequestRateLimitConfig,
     pub header_read_timeout: Duration,
     pub request_timeout: Duration,
     pub duplex_capacity: usize,
@@ -241,6 +246,9 @@ impl HttpIngressConfig {
         if self.max_request_body_bytes == 0 {
             return Err(HttpIngressConfigError::ZeroRequestBodyBytes);
         }
+        self.request_rate_limit
+            .validate()
+            .map_err(HttpIngressConfigError::InvalidRequestRateLimit)?;
         if self.duplex_capacity == 0 || self.duplex_capacity > 1024 * 1024 {
             return Err(HttpIngressConfigError::InvalidDuplexCapacity);
         }
@@ -266,6 +274,7 @@ pub enum HttpIngressConfigError {
     InvalidHeaderBytes,
     InvalidHeaderCount,
     ZeroRequestBodyBytes,
+    InvalidRequestRateLimit(HttpRequestRateLimitConfigError),
     InvalidDuplexCapacity,
     ZeroHeaderTimeout,
     ZeroRequestTimeout,
@@ -298,6 +307,9 @@ impl std::fmt::Display for HttpIngressConfigError {
             Self::ZeroRequestBodyBytes => {
                 f.write_str("max HTTP request body bytes must be greater than zero")
             }
+            Self::InvalidRequestRateLimit(error) => {
+                write!(f, "invalid HTTP request rate limit: {error}")
+            }
             Self::InvalidDuplexCapacity => {
                 f.write_str("HTTP duplex capacity must be between 1 and 1048576 bytes")
             }
@@ -319,10 +331,16 @@ pub struct HttpIngressOutcome {
     pub local_addr: SocketAddr,
     pub accepted_connections: u64,
     pub completed_requests: u64,
+    pub admitted_requests: u64,
     pub rejected_requests: u64,
     pub global_capacity_rejections: u64,
     pub per_ip_capacity_rejections: u64,
     pub tls_rejections: u64,
+    pub global_rate_limit_rejections: u64,
+    pub per_ip_rate_limit_rejections: u64,
+    pub rate_limit_peer_capacity_rejections: u64,
+    pub tracked_rate_limit_peers: usize,
+    pub peak_tracked_rate_limit_peers: usize,
     pub shutdown: RuntimeShutdownOutcome,
 }
 
@@ -356,10 +374,73 @@ struct HttpIngressCounters {
     active_connections: AtomicUsize,
     accepted_connections: AtomicU64,
     completed_requests: AtomicU64,
+    admitted_requests: AtomicU64,
     rejected_requests: AtomicU64,
     global_capacity_rejections: AtomicU64,
     per_ip_capacity_rejections: AtomicU64,
     tls_rejections: AtomicU64,
+    global_rate_limit_rejections: AtomicU64,
+    per_ip_rate_limit_rejections: AtomicU64,
+    rate_limit_peer_capacity_rejections: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpIngressStatus {
+    pub active_connections: usize,
+    pub accepted_connections: u64,
+    pub completed_requests: u64,
+    pub admitted_requests: u64,
+    pub rejected_requests: u64,
+    pub global_capacity_rejections: u64,
+    pub per_ip_capacity_rejections: u64,
+    pub tls_rejections: u64,
+    pub global_rate_limit_rejections: u64,
+    pub per_ip_rate_limit_rejections: u64,
+    pub rate_limit_peer_capacity_rejections: u64,
+    pub tracked_rate_limit_peers: usize,
+    pub peak_tracked_rate_limit_peers: usize,
+}
+
+#[derive(Clone)]
+pub struct HttpIngressStatusHandle {
+    counters: Arc<HttpIngressCounters>,
+    rate_limiter: HttpRequestRateLimiter,
+}
+
+impl HttpIngressStatusHandle {
+    pub fn snapshot(&self) -> HttpIngressStatus {
+        let rate = self.rate_limiter.status();
+        HttpIngressStatus {
+            active_connections: self.counters.active_connections.load(Ordering::Relaxed),
+            accepted_connections: self.counters.accepted_connections.load(Ordering::Relaxed),
+            completed_requests: self.counters.completed_requests.load(Ordering::Relaxed),
+            admitted_requests: self.counters.admitted_requests.load(Ordering::Relaxed),
+            rejected_requests: self.counters.rejected_requests.load(Ordering::Relaxed),
+            global_capacity_rejections: self
+                .counters
+                .global_capacity_rejections
+                .load(Ordering::Relaxed),
+            per_ip_capacity_rejections: self
+                .counters
+                .per_ip_capacity_rejections
+                .load(Ordering::Relaxed),
+            tls_rejections: self.counters.tls_rejections.load(Ordering::Relaxed),
+            global_rate_limit_rejections: self
+                .counters
+                .global_rate_limit_rejections
+                .load(Ordering::Relaxed),
+            per_ip_rate_limit_rejections: self
+                .counters
+                .per_ip_rate_limit_rejections
+                .load(Ordering::Relaxed),
+            rate_limit_peer_capacity_rejections: self
+                .counters
+                .rate_limit_peer_capacity_rejections
+                .load(Ordering::Relaxed),
+            tracked_rate_limit_peers: rate.tracked_peer_ips,
+            peak_tracked_rate_limit_peers: rate.peak_tracked_peer_ips,
+        }
+    }
 }
 
 pub struct HttpIngressRuntime {
@@ -367,6 +448,7 @@ pub struct HttpIngressRuntime {
     local_addr: SocketAddr,
     config: HttpIngressConfig,
     router: EdgeSessionRouter,
+    status: HttpIngressStatusHandle,
 }
 
 impl HttpIngressRuntime {
@@ -379,16 +461,25 @@ impl HttpIngressRuntime {
             .await
             .map_err(HttpIngressError::Bind)?;
         let local_addr = listener.local_addr().map_err(HttpIngressError::Bind)?;
+        let status = HttpIngressStatusHandle {
+            counters: Arc::new(HttpIngressCounters::default()),
+            rate_limiter: HttpRequestRateLimiter::new(config.request_rate_limit),
+        };
         Ok(Self {
             listener,
             local_addr,
             config,
             router,
+            status,
         })
     }
 
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn status_handle(&self) -> HttpIngressStatusHandle {
+        self.status.clone()
     }
 
     pub async fn run_until_shutdown(
@@ -402,7 +493,8 @@ impl HttpIngressRuntime {
                 max_connections_per_ip,
             } => Some(Arc::new(PeerAdmission::new(max_connections_per_ip))),
         };
-        let counters = Arc::new(HttpIngressCounters::default());
+        let counters = Arc::clone(&self.status.counters);
+        let rate_limiter = self.status.rate_limiter.clone();
         let mut connections = JoinSet::new();
         let mut terminal_error = None;
 
@@ -440,16 +532,18 @@ impl HttpIngressRuntime {
                         },
                         None => None,
                     };
-                    counters.active_connections.fetch_add(1, Ordering::Relaxed);
                     counters.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                    let active_connection = ActiveConnectionGuard::new(Arc::clone(&counters));
                     connections.spawn(run_connection(
                         socket,
                         peer,
                         self.config.clone(),
                         self.router.clone(),
                         Arc::clone(&counters),
+                        rate_limiter.clone(),
                         global_permit,
                         peer_permit,
+                        active_connection,
                     ));
                 }
                 _ = connections.join_next(), if !connections.is_empty() => {}
@@ -478,16 +572,42 @@ impl HttpIngressRuntime {
         if let Some(error) = terminal_error {
             return Err(error);
         }
+        let status = self.status.snapshot();
         Ok(HttpIngressOutcome {
             local_addr: self.local_addr,
             accepted_connections: counters.accepted_connections.load(Ordering::Relaxed),
             completed_requests: counters.completed_requests.load(Ordering::Relaxed),
+            admitted_requests: counters.admitted_requests.load(Ordering::Relaxed),
             rejected_requests: counters.rejected_requests.load(Ordering::Relaxed),
             global_capacity_rejections: counters.global_capacity_rejections.load(Ordering::Relaxed),
             per_ip_capacity_rejections: counters.per_ip_capacity_rejections.load(Ordering::Relaxed),
             tls_rejections: counters.tls_rejections.load(Ordering::Relaxed),
+            global_rate_limit_rejections: status.global_rate_limit_rejections,
+            per_ip_rate_limit_rejections: status.per_ip_rate_limit_rejections,
+            rate_limit_peer_capacity_rejections: status.rate_limit_peer_capacity_rejections,
+            tracked_rate_limit_peers: status.tracked_rate_limit_peers,
+            peak_tracked_rate_limit_peers: status.peak_tracked_rate_limit_peers,
             shutdown,
         })
+    }
+}
+
+struct ActiveConnectionGuard {
+    counters: Arc<HttpIngressCounters>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(counters: Arc<HttpIngressCounters>) -> Self {
+        counters.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { counters }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -498,8 +618,10 @@ async fn run_connection(
     config: HttpIngressConfig,
     router: EdgeSessionRouter,
     counters: Arc<HttpIngressCounters>,
+    rate_limiter: HttpRequestRateLimiter,
     _global_permit: OwnedSemaphorePermit,
     _peer_permit: Option<PeerAdmissionPermit>,
+    _active_connection: ActiveConnectionGuard,
 ) {
     let acceptor = TlsAcceptor::from(config.tls.server_config.current());
     let tls =
@@ -507,7 +629,6 @@ async fn run_connection(
             Ok(Ok(tls)) => tls,
             Ok(Err(_)) | Err(_) => {
                 counters.tls_rejections.fetch_add(1, Ordering::Relaxed);
-                counters.active_connections.fetch_sub(1, Ordering::Relaxed);
                 warn!(%peer, event = "https_tls_rejected");
                 return;
             }
@@ -517,7 +638,6 @@ async fn run_connection(
         None | Some(PUBLIC_HTTP1_ALPN)
     ) {
         counters.tls_rejections.fetch_add(1, Ordering::Relaxed);
-        counters.active_connections.fetch_sub(1, Ordering::Relaxed);
         warn!(%peer, event = "https_alpn_rejected");
         return;
     }
@@ -536,6 +656,7 @@ async fn run_connection(
             service_config.clone(),
             router.clone(),
             Arc::clone(&service_counters),
+            rate_limiter.clone(),
         )
     });
     let mut http = hyper::server::conn::http1::Builder::new();
@@ -555,7 +676,6 @@ async fn run_connection(
         Ok(Err(error)) => warn!(%peer, %error, event = "https_connection_failed"),
         Err(_) => warn!(%peer, event = "https_request_timeout"),
     }
-    counters.active_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
 async fn proxy_request(
@@ -565,6 +685,7 @@ async fn proxy_request(
     config: HttpIngressConfig,
     router: EdgeSessionRouter,
     counters: Arc<HttpIngressCounters>,
+    rate_limiter: HttpRequestRateLimiter,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let outcome = prepare_request(&mut request, peer, server_name.as_ref(), &config);
     let (hostname, tunnel_id) = match outcome {
@@ -575,6 +696,32 @@ async fn proxy_request(
             return Ok(error_response(rejection.status));
         }
     };
+
+    if let Err(rejection) = rate_limiter.try_admit(peer.ip()) {
+        counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        match rejection {
+            HttpRateLimitRejection::Global { .. } => {
+                counters
+                    .global_rate_limit_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, %hostname, event = "https_global_rate_limited");
+            }
+            HttpRateLimitRejection::PerIp { .. } => {
+                counters
+                    .per_ip_rate_limit_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, %hostname, event = "https_per_ip_rate_limited");
+            }
+            HttpRateLimitRejection::PeerTableFull { .. } => {
+                counters
+                    .rate_limit_peer_capacity_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, %hostname, event = "https_rate_limit_peer_capacity_rejected");
+            }
+        }
+        return Ok(rate_limited_response(rejection.retry_after()));
+    }
+    counters.admitted_requests.fetch_add(1, Ordering::Relaxed);
 
     let (parts, body) = request.into_parts();
     if body
@@ -811,6 +958,27 @@ fn error_response(status: StatusCode) -> Response<ProxyBody> {
         .expect("static error response is valid")
 }
 
+fn rate_limited_response(retry_after: Duration) -> Response<ProxyBody> {
+    let status = StatusCode::TOO_MANY_REQUESTS;
+    let message = status.canonical_reason().unwrap_or("request rejected");
+    let retry_after_seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1);
+    let retry_after = HeaderValue::from_str(&retry_after_seconds.to_string())
+        .expect("integer Retry-After is a valid header value");
+    let body = Full::new(Bytes::copy_from_slice(message.as_bytes()))
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed_unsync();
+    Response::builder()
+        .status(status)
+        .header(CONNECTION, "close")
+        .header(CONTENT_LENGTH, message.len())
+        .header(RETRY_AFTER, retry_after)
+        .body(body)
+        .expect("static rate-limited response is valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +1019,37 @@ mod tests {
             ]),
             Err(HttpHostRoutesError::DuplicateHostname(value)) if value == hostname
         ));
+    }
+
+    #[test]
+    fn status_snapshot_is_live_bounded_and_active_guard_is_raii() {
+        let counters = Arc::new(HttpIngressCounters::default());
+        let rate_limiter = HttpRequestRateLimiter::new(HttpRequestRateLimitConfig::default());
+        let status = HttpIngressStatusHandle {
+            counters: Arc::clone(&counters),
+            rate_limiter: rate_limiter.clone(),
+        };
+        counters.accepted_connections.store(3, Ordering::Relaxed);
+        counters.admitted_requests.store(2, Ordering::Relaxed);
+        rate_limiter
+            .try_admit(IpAddr::from([127, 0, 0, 1]))
+            .unwrap();
+        let active = ActiveConnectionGuard::new(Arc::clone(&counters));
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.active_connections, 1);
+        assert_eq!(snapshot.accepted_connections, 3);
+        assert_eq!(snapshot.admitted_requests, 2);
+        assert_eq!(snapshot.tracked_rate_limit_peers, 1);
+        assert_eq!(snapshot.peak_tracked_rate_limit_peers, 1);
+        drop(active);
+        assert_eq!(status.snapshot().active_connections, 0);
+    }
+
+    #[test]
+    fn rate_limited_response_rounds_retry_after_up_to_seconds() {
+        let response = rate_limited_response(Duration::from_millis(1));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
+        assert_eq!(response.headers().get(CONNECTION).unwrap(), "close");
     }
 }

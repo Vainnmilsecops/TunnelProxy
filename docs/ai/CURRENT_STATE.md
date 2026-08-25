@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Public HTTPS/HTTP/1.1 Ingress** (Session 25).
+**Bounded HTTP Request Rate Limiting & Observability** (Session 26).
 
 ## Completed
 
@@ -306,7 +306,16 @@
 - `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
   the HTTP client connection can reuse the existing multiplexed Tunnel
   Protocol v2 path without a wire-format change.
-- 270 explicit workspace tests are present; all prior behavior is preserved.
+- HTTPS ingress atomically applies integer fixed-point global and
+  socket-source-IP token buckets after hostname validation and before request
+  body forwarding or tunnel-stream creation. Rejections return `429` with an
+  integer `Retry-After`.
+- Per-IP rate state is cardinality-bounded, uses bounded-batch idle-TTL
+  reclamation, and fails closed when full. Live status exposes admitted and
+  category-specific rejection totals plus current/peak tracked peers.
+- The runnable Edge exposes validated request-rate, burst, peer-capacity, and
+  idle-TTL flags. Rate state is process-local and resets on restart.
+- 279 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -324,8 +333,8 @@
 - Automatic public port/hostname allocation and durable endpoint catalog.
 - HTTP/2, HTTP keep-alive, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
-- Public-client authentication for arbitrary raw protocols, request-rate
-  limiting, and distributed DDoS mitigation.
+- Public-client authentication for arbitrary raw protocols, distributed/shared
+  request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
@@ -334,7 +343,7 @@
 
 ## Next planned session
 
-Session 26 has not been selected. The next plan should choose one bounded scope
-from public HTTP abuse controls/telemetry, durable hostname administration, or
-transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
-separate larger scopes.
+Session 27 has not been selected. The next plan should choose one bounded scope
+from durable hostname administration, production metrics export, or transport
+fairness; HTTP/2, signed access URLs, and multi-edge ownership remain separate
+larger scopes.

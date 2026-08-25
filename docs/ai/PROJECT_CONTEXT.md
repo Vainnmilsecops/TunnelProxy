@@ -74,10 +74,11 @@ localhost:<port>
 ## What is NOT in scope right now
 
 Automatic hostname allocation, custom domains, dashboard, billing,
-request-rate limiting, request inspection, stream replay, protected issuer
-custody, multi-edge ownership, and cloud deployment are explicitly **not
-implemented**. The implemented public surfaces are opt-in opaque raw TCP and a
-bounded operator-configured HTTPS/HTTP/1.1 route. Both use per-IP concurrency
-admission and authenticated dynamic Agent authority; the HTTPS slice also
-terminates reloadable public TLS and enforces exact Host/SNI routing, but it is
-not yet the automatic future product UX.
+distributed/shared request-rate coordination, request inspection, stream
+replay, protected issuer custody, multi-edge ownership, and cloud deployment
+are explicitly **not implemented**. The implemented public surfaces are opt-in
+opaque raw TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
+per-IP concurrency admission and authenticated dynamic Agent authority; the
+HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
+routing, and applies process-local global/per-IP request token buckets, but it
+is not yet the automatic future product UX.
