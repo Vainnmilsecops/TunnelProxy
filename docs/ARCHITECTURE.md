@@ -641,6 +641,32 @@ remote shipping, dashboards/alerts, and an asynchronous buffering queue remain
 operator/backend work tracked by DEBT-010. Protocol and snapshot schemas are
 unchanged.
 
+### 2.27 Bounded Agent operations endpoint (Session 29)
+
+The runnable Agent may bind a separate loopback-only HTTP/1.1 operations
+listener. A process-local atomic status handle records one of six fixed phases:
+offline, connecting, connected, reconnect backoff, draining, or stopped. It
+also records monotonic connection attempts, established sessions, reconnects,
+disconnects, connection failures, and the current consecutive-failure streak.
+The reconnect supervisor is the only counter writer; the process supervisor
+may atomically force `draining`, which later reconnect transitions cannot
+overwrite.
+
+`/healthz` reports operations-listener liveness. `/readyz` is true only for an
+established registered Agent session. `/metrics` renders the status and bounded
+operations-admission counters with a fixed state label set. No durable identity,
+address, transport session, certificate, secret, or traffic value is exposed.
+The operations listener has explicit connection/header/time/drain limits and
+is unavailable on non-loopback addresses.
+
+Startup binds operations before polling the Agent connection future, so bind
+failure creates no outbound connection. Shutdown marks Agent readiness false,
+drains the transport/TLS/enrollment supervisors while operations remains
+available, then stops operations and releases its port. Metrics are
+process-local and reset on restart. Control Plane metrics, remote write,
+durability, dashboards, and alerting remain tracked by DEBT-010; protocol and
+snapshot formats are unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

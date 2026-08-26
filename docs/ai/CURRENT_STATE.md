@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Secret-Safe Structured JSON Logging** (Session 28).
+**Bounded Agent Operations Endpoint & Connection Metrics** (Session 29).
 
 ## Completed
 
@@ -333,7 +333,18 @@
 - Invalid logging configuration fails with exit code 2 before CLI-driven
   network binding or file mutation. JSON-mode argument failures omit multiline
   usage text so stderr remains parseable JSON Lines.
-- 296 explicit workspace tests are present; all prior behavior is preserved.
+- The runnable Agent optionally binds a loopback-only, connection/header/time
+  bounded HTTP/1.1 operations endpoint. `/healthz`, `/readyz`, and `/metrics`
+  expose process liveness, established-session readiness, and connection
+  lifecycle counters.
+- Agent status distinguishes offline, connecting, connected, reconnect
+  backoff, draining, and stopped. Readiness turns false before Agent drain;
+  operations remains observable until transport, TLS reload, and enrollment
+  supervisors have stopped, then releases its own listener.
+- Agent metrics have only fixed connection-state labels and exclude AgentId,
+  TunnelId, addresses, session IDs, certificates, secrets, and payloads.
+  Operations bind failure occurs before the first outbound Edge connection.
+- 302 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -357,12 +368,12 @@
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
-- Agent/Control Plane metrics, durable/remote-write telemetry, nonblocking log
-  sinks, dashboards, and alerting (DEBT-010 partially resolved).
+- Control Plane metrics, durable/remote-write telemetry, nonblocking log sinks,
+  dashboards, and alerting (DEBT-010 partially resolved).
 
 ## Next planned session
 
-Session 29 has not been selected. The next plan should choose one bounded scope
-from durable hostname administration, Agent/Control Plane metrics, or transport
-fairness; HTTP/2, signed access URLs, and multi-edge ownership remain separate
-larger scopes.
+Session 30 has not been selected. The next plan should choose one bounded scope
+from Control Plane operations metrics, durable hostname administration, or
+transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
+separate larger scopes.

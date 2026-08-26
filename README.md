@@ -41,6 +41,8 @@ correct agent, which in turn proxies them into the local service.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, raw ingress, HTTPS, and rate limiting.
+- An opt-in loopback-only Agent operations endpoint with bounded admission,
+  session-aware readiness, and fixed-cardinality connection/reconnect metrics.
 - Secret-safe process logging for Agent, Edge, and Control Plane with
   human-readable stderr output by default or schema-stable JSON Lines selected
   through `TUNNELPROXY_LOG_FORMAT=json` and filtered through `RUST_LOG`.
@@ -67,7 +69,7 @@ The following are **not yet implemented**:
   rollover.
 - Request inspection, replay, and webhook debugging.
 - Public/authenticated operations access, metrics persistence/remote write,
-  dashboards, alerts, and Agent/Control Plane metrics.
+  dashboards, alerts, and Control Plane metrics.
 - Multi-tenant or multi-edge runtime.
 
 Any README, comment, or doc that suggests these features work today is a bug.
@@ -111,8 +113,8 @@ authorization snapshots, SQLite persistence, full-snapshot import, and a
 runnable authenticated distribution service. The data plane has tested
 opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
 slice with exact configured hostname routing, public TLS reload, and local
-global/per-IP request-rate enforcement. Edge can optionally export bounded
-loopback health/readiness and Prometheus metrics. See
+global/per-IP request-rate enforcement. Edge and Agent can optionally export
+bounded loopback health/readiness and fixed-cardinality Prometheus metrics. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
 ## Future UX (not implemented yet)
@@ -198,6 +200,8 @@ and Definition of Done.
 | 25 _(complete)_ | bounded public HTTPS/HTTP/1.1 ingress and exact hostname routing |
 | 26 _(complete)_ | bounded global/per-IP HTTP request-rate limiting and observability |
 | 27 _(complete)_ | bounded loopback Edge operations endpoint and Prometheus metrics |
+| 28 _(complete)_ | secret-safe text/JSON process logging for all runnable components |
+| 29 _(complete)_ | bounded loopback Agent operations endpoint and connection metrics |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

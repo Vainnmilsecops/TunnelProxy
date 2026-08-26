@@ -50,3 +50,29 @@ fn help_remains_plain_stdout_in_json_mode() {
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("Usage:"));
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn invalid_operations_config_fails_before_outbound_connect() {
+    let edge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    edge.set_nonblocking(true).unwrap();
+    let occupied_operations = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = Command::new(binary())
+        .args([
+            "--edge",
+            &edge.local_addr().unwrap().to_string(),
+            "--ops-listen",
+            &occupied_operations.local_addr().unwrap().to_string(),
+        ])
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(matches!(
+        edge.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    let non_loopback = run(&["--ops-listen", "0.0.0.0:9091"], "json", "info");
+    assert_eq!(non_loopback.status.code(), Some(2));
+}

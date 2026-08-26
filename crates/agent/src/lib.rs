@@ -21,13 +21,15 @@
 //! bounded concurrent streams through `AgentSession::run_multiplexed`.
 //! Session 12 adds the runnable single-session `AgentRuntime` and CLI, Session
 //! 13 adds reconnect, Session 14 adds mutual TLS, and Session 15 binds durable
-//! Agent/tunnel registration to the authenticated certificate. The final
-//! `tunnelproxy http` UX remains out of scope. See
+//! Agent/tunnel registration to the authenticated certificate. Session 29 adds
+//! a bounded loopback operations endpoint and connection-lifecycle metrics.
+//! The final `tunnelproxy http` UX remains out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
 mod enrollment;
 mod multiplex;
+mod operations;
 mod runtime;
 mod tls;
 
@@ -43,9 +45,15 @@ pub use enrollment::{
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,
 };
+pub use operations::{
+    AgentOperationsConfig, AgentOperationsConfigError, AgentOperationsError,
+    AgentOperationsOutcome, AgentOperationsRuntime, MAX_OPERATIONS_CONNECTIONS,
+    MAX_OPERATIONS_HEADERS, MAX_OPERATIONS_HEADER_BYTES, MIN_OPERATIONS_HEADER_BYTES,
+};
 pub use runtime::{
-    AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError, AgentRuntimeError,
-    AgentRuntimeOutcome, ReconnectConfig, ReconnectConfigError,
+    AgentConnectionState, AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError,
+    AgentRuntimeControl, AgentRuntimeError, AgentRuntimeOutcome, AgentRuntimeStatus,
+    AgentRuntimeStatusHandle, ReconnectConfig, ReconnectConfigError,
 };
 pub use tls::{
     AgentTlsConfig, AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig,

@@ -1,6 +1,8 @@
 //! Process-level composition and reconnect supervision for one Agent.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
@@ -118,6 +120,166 @@ impl std::fmt::Display for ReconnectConfigError {
 }
 
 impl std::error::Error for ReconnectConfigError {}
+
+/// Current phase of the Agent's single outbound transport lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgentConnectionState {
+    Offline = 0,
+    Connecting = 1,
+    Connected = 2,
+    Backoff = 3,
+    Draining = 4,
+    Stopped = 5,
+}
+
+impl AgentConnectionState {
+    pub const ALL: [Self; 6] = [
+        Self::Offline,
+        Self::Connecting,
+        Self::Connected,
+        Self::Backoff,
+        Self::Draining,
+        Self::Stopped,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Backoff => "backoff",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Connecting,
+            2 => Self::Connected,
+            3 => Self::Backoff,
+            4 => Self::Draining,
+            5 => Self::Stopped,
+            _ => Self::Offline,
+        }
+    }
+}
+
+/// Fixed-cardinality process state exposed to local operations consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRuntimeStatus {
+    pub state: AgentConnectionState,
+    pub connection_attempts: u64,
+    pub established_sessions: u64,
+    pub successful_reconnects: u64,
+    pub disconnects: u64,
+    pub connection_failures: u64,
+    pub consecutive_failures: u64,
+}
+
+impl AgentRuntimeStatus {
+    pub const fn is_ready(self) -> bool {
+        matches!(self.state, AgentConnectionState::Connected)
+    }
+}
+
+#[derive(Debug)]
+struct AgentRuntimeTelemetry {
+    state: AtomicU8,
+    connection_attempts: AtomicU64,
+    established_sessions: AtomicU64,
+    successful_reconnects: AtomicU64,
+    disconnects: AtomicU64,
+    connection_failures: AtomicU64,
+    consecutive_failures: AtomicU64,
+}
+
+impl Default for AgentRuntimeTelemetry {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(AgentConnectionState::Offline as u8),
+            connection_attempts: AtomicU64::new(0),
+            established_sessions: AtomicU64::new(0),
+            successful_reconnects: AtomicU64::new(0),
+            disconnects: AtomicU64::new(0),
+            connection_failures: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+impl AgentRuntimeTelemetry {
+    fn snapshot(&self) -> AgentRuntimeStatus {
+        AgentRuntimeStatus {
+            state: AgentConnectionState::from_raw(self.state.load(Ordering::Relaxed)),
+            connection_attempts: self.connection_attempts.load(Ordering::Relaxed),
+            established_sessions: self.established_sessions.load(Ordering::Relaxed),
+            successful_reconnects: self.successful_reconnects.load(Ordering::Relaxed),
+            disconnects: self.disconnects.load(Ordering::Relaxed),
+            connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set_runtime_state(&self, state: AgentConnectionState) {
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            if current == AgentConnectionState::Draining as u8
+                || current == AgentConnectionState::Stopped as u8
+            {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                current,
+                state as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// Cloneable read-only view used by the local operations endpoint.
+#[derive(Debug, Clone)]
+pub struct AgentRuntimeStatusHandle {
+    telemetry: Arc<AgentRuntimeTelemetry>,
+}
+
+impl AgentRuntimeStatusHandle {
+    pub fn snapshot(&self) -> AgentRuntimeStatus {
+        self.telemetry.snapshot()
+    }
+}
+
+/// Process supervisor control which removes readiness before shutdown drain.
+#[derive(Debug, Clone)]
+pub struct AgentRuntimeControl {
+    telemetry: Arc<AgentRuntimeTelemetry>,
+}
+
+impl AgentRuntimeControl {
+    pub fn begin_draining(&self) {
+        self.telemetry
+            .state
+            .store(AgentConnectionState::Draining as u8, Ordering::Relaxed);
+    }
+}
+
+struct AgentRuntimeStatusGuard {
+    telemetry: Arc<AgentRuntimeTelemetry>,
+}
+
+impl Drop for AgentRuntimeStatusGuard {
+    fn drop(&mut self) {
+        self.telemetry
+            .state
+            .store(AgentConnectionState::Stopped as u8, Ordering::Relaxed);
+    }
+}
 
 /// Complete configuration for the runnable Agent process.
 #[derive(Debug, Clone)]
@@ -254,6 +416,7 @@ impl std::error::Error for AgentRuntimeError {
 
 pub struct AgentRuntime {
     config: AgentRuntimeConfig,
+    telemetry: Arc<AgentRuntimeTelemetry>,
 }
 
 impl AgentRuntime {
@@ -261,11 +424,26 @@ impl AgentRuntime {
         config
             .validate()
             .map_err(AgentRuntimeError::InvalidConfig)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            telemetry: Arc::new(AgentRuntimeTelemetry::default()),
+        })
     }
 
     pub const fn config(&self) -> &AgentRuntimeConfig {
         &self.config
+    }
+
+    pub fn status_handle(&self) -> AgentRuntimeStatusHandle {
+        AgentRuntimeStatusHandle {
+            telemetry: Arc::clone(&self.telemetry),
+        }
+    }
+
+    pub fn control(&self) -> AgentRuntimeControl {
+        AgentRuntimeControl {
+            telemetry: Arc::clone(&self.telemetry),
+        }
     }
 
     /// Reconnects one outbound session at a time until process shutdown or a
@@ -274,6 +452,9 @@ impl AgentRuntime {
         self,
         signal: ShutdownSignal,
     ) -> Result<AgentRuntimeOutcome, AgentRuntimeError> {
+        let _status_guard = AgentRuntimeStatusGuard {
+            telemetry: Arc::clone(&self.telemetry),
+        };
         let mut outcome = AgentRuntimeOutcome {
             connection_attempts: 0,
             established_sessions: 0,
@@ -288,6 +469,11 @@ impl AgentRuntime {
                 return Ok(outcome);
             }
             outcome.connection_attempts = outcome.connection_attempts.saturating_add(1);
+            self.telemetry
+                .connection_attempts
+                .store(outcome.connection_attempts, Ordering::Relaxed);
+            self.telemetry
+                .set_runtime_state(AgentConnectionState::Connecting);
             info!(
                 attempt = outcome.connection_attempts,
                 edge = %self.config.edge_addr,
@@ -308,16 +494,24 @@ impl AgentRuntime {
                 connect_outcome = &mut connecting => match connect_outcome {
                     ConnectOutcome::Established(session) => session,
                     ConnectOutcome::Failed { reason } => {
+                        self.telemetry
+                            .connection_failures
+                            .fetch_add(1, Ordering::Relaxed);
                         if !is_retryable(&reason) {
                             return Err(AgentRuntimeError::Terminal(reason));
                         }
                         consecutive_failures = consecutive_failures.saturating_add(1);
+                        self.telemetry
+                            .consecutive_failures
+                            .store(u64::from(consecutive_failures), Ordering::Relaxed);
                         if retry_exhausted(self.config.reconnect, consecutive_failures) {
                             return Err(AgentRuntimeError::ReconnectExhausted {
                                 consecutive_failures,
                                 last_error: reason,
                             });
                         }
+                        self.telemetry
+                            .set_runtime_state(AgentConnectionState::Backoff);
                         if !wait_for_retry(
                             self.config.reconnect,
                             &signal,
@@ -335,10 +529,18 @@ impl AgentRuntime {
             let session_id = session.session_id;
             let established_at = tokio::time::Instant::now();
             outcome.established_sessions = outcome.established_sessions.saturating_add(1);
+            self.telemetry
+                .established_sessions
+                .store(outcome.established_sessions, Ordering::Relaxed);
             if outcome.established_sessions > 1 {
                 outcome.successful_reconnects = outcome.successful_reconnects.saturating_add(1);
+                self.telemetry
+                    .successful_reconnects
+                    .store(outcome.successful_reconnects, Ordering::Relaxed);
             }
             outcome.last_session_id = Some(session_id);
+            self.telemetry
+                .set_runtime_state(AgentConnectionState::Connected);
             info!(
                 %session_id,
                 reconnects = outcome.successful_reconnects,
@@ -356,11 +558,18 @@ impl AgentRuntime {
             match session_result {
                 Ok(AgentSessionCloseReason::LocalShutdown) => return Ok(outcome),
                 Ok(AgentSessionCloseReason::PeerClosed) => {
+                    self.telemetry.disconnects.fetch_add(1, Ordering::Relaxed);
                     if established_at.elapsed() >= self.config.reconnect.stable_session_reset_after
                     {
                         consecutive_failures = 0;
                     }
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    self.telemetry
+                        .connection_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .consecutive_failures
+                        .store(u64::from(consecutive_failures), Ordering::Relaxed);
                     let reason = AgentError::ConnectionClosed;
                     if retry_exhausted(self.config.reconnect, consecutive_failures) {
                         return Err(AgentRuntimeError::ReconnectExhausted {
@@ -368,6 +577,8 @@ impl AgentRuntime {
                             last_error: reason,
                         });
                     }
+                    self.telemetry
+                        .set_runtime_state(AgentConnectionState::Backoff);
                     if !wait_for_retry(
                         self.config.reconnect,
                         &signal,
@@ -381,17 +592,26 @@ impl AgentRuntime {
                     }
                 }
                 Err(error) if is_retryable(&error) => {
+                    self.telemetry.disconnects.fetch_add(1, Ordering::Relaxed);
                     if established_at.elapsed() >= self.config.reconnect.stable_session_reset_after
                     {
                         consecutive_failures = 0;
                     }
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    self.telemetry
+                        .connection_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .consecutive_failures
+                        .store(u64::from(consecutive_failures), Ordering::Relaxed);
                     if retry_exhausted(self.config.reconnect, consecutive_failures) {
                         return Err(AgentRuntimeError::ReconnectExhausted {
                             consecutive_failures,
                             last_error: error,
                         });
                     }
+                    self.telemetry
+                        .set_runtime_state(AgentConnectionState::Backoff);
                     if !wait_for_retry(
                         self.config.reconnect,
                         &signal,
@@ -404,7 +624,13 @@ impl AgentRuntime {
                         return Ok(outcome);
                     }
                 }
-                Err(error) => return Err(AgentRuntimeError::Terminal(error)),
+                Err(error) => {
+                    self.telemetry.disconnects.fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .connection_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(AgentRuntimeError::Terminal(error));
+                }
             }
         }
     }
@@ -484,6 +710,28 @@ mod tests {
             "127.0.0.1:3000".parse().unwrap(),
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn status_starts_offline_and_control_removes_readiness() {
+        let runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ))
+        .unwrap();
+        let status = runtime.status_handle();
+        assert_eq!(status.snapshot().state, AgentConnectionState::Offline);
+        assert!(!status.snapshot().is_ready());
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        assert!(status.snapshot().is_ready());
+        runtime.control().begin_draining();
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        assert_eq!(status.snapshot().state, AgentConnectionState::Draining);
+        assert!(!status.snapshot().is_ready());
     }
 
     #[test]
