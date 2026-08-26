@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Control Plane Operations Endpoint & Service Metrics** (Session 30).
+**Durable HTTPS Route Catalog & CLI Administration** (Session 31).
 
 ## Completed
 
@@ -352,7 +352,16 @@
   Labels are a fixed outcome set and output excludes IDs, addresses, database
   paths, fingerprints, digests, tokens, certificates, keys, and payloads.
   Readiness becomes false before child-service shutdown; operations stops last.
-- 306 explicit workspace tests are present; all prior behavior is preserved.
+- Shared `PublicHostname` validation now gives Control Plane catalog records and
+  Edge HTTPS ingress one exact canonical DNS identity contract.
+- A separate SQLite HTTPS route catalog stores at most 64 exact
+  hostname-to-TunnelId records with enabled/disabled status and an independent
+  non-zero monotonic version. Immediate transactions make record and version
+  changes atomic; identical upserts and absent removals do not bump version.
+- Control Plane CLI commands `https-route-upsert`, `https-route-remove`, and
+  `https-route-list` validate before storage mutation, produce deterministic
+  secret-safe output, and preserve the existing snapshot schema/state.
+- 316 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -367,7 +376,8 @@
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
-- Automatic public port/hostname allocation and durable endpoint catalog.
+- Automatic public port/hostname allocation and HTTPS route-catalog
+  distribution/activation at Edge. The durable operator-managed catalog exists.
 - HTTP/2, HTTP keep-alive, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -381,7 +391,7 @@
 
 ## Next planned session
 
-Session 31 has not been selected. The next plan should choose one bounded scope
-from durable hostname administration, transport fairness, or operator-owned
-telemetry collection guidance; HTTP/2, signed access URLs, and multi-edge
-ownership remain separate larger scopes.
+Session 32 has not been selected. The next plan should choose one bounded scope
+from distributing the durable HTTPS route catalog to Edge, transport fairness,
+or operator-owned telemetry collection guidance; automatic allocation, HTTP/2,
+signed access URLs, and multi-edge ownership remain separate larger scopes.

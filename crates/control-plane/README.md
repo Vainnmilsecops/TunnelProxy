@@ -33,6 +33,10 @@ reconnect. Session 18 adds strict JSON full-snapshot import, repository refresh,
 and the runnable `tunnelproxy-control-plane serve|import` process. There is
 also transactional Agent enrollment/activation/revocation and an optional
 bounded loopback operations endpoint for health, readiness, and process-local
-service metrics. Operations scrapes read only in-memory atomics. There is still
-no general administrative API, protected issuer-key service, durable metrics,
-or multi-edge coordination.
+service metrics. Session 31 adds a separate 64-record, monotonically versioned
+SQLite catalog for exact public HTTPS hostname routes plus idempotent
+`https-route-upsert`, `https-route-remove`, and `https-route-list` operator
+commands. Operations scrapes read only in-memory atomics. Catalog distribution
+to Edge, automatic hostname allocation, a general administrative API,
+protected issuer-key service, durable metrics, and multi-edge coordination are
+still absent.

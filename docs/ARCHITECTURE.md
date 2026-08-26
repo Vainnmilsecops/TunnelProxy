@@ -690,6 +690,27 @@ The endpoint is disabled by default and cannot bind a non-loopback address.
 Metrics reset on restart; durable storage, remote write, public/authenticated
 access, dashboards, and alerts remain out of scope.
 
+### 2.29 Durable HTTPS route catalog (Session 31)
+
+The Control Plane owns a separate SQLite catalog mapping one canonical exact
+`PublicHostname` to one durable `TunnelId` and an enabled/disabled status. The
+shared hostname type lowercases ASCII DNS names, removes one terminal dot, and
+rejects IP literals, ports, wildcards, invalid labels, and oversized names, so
+the operator catalog and Edge ingress use the same identity rules.
+
+The catalog starts at non-zero version 1 and holds at most 64 routes. Upsert
+and removal take an immediate SQLite transaction, change the record and
+monotonic version atomically, and do not advance the version for an identical
+upsert or absent removal. Reads validate every stored field, fail closed on
+corruption or overflow, and return routes sorted by hostname. The catalog
+coexists with the authorization snapshot schema without modifying its wire or
+storage contract.
+
+This session provides local operator CLI administration only. It does not push
+the catalog to Edge, alter the existing single-route HTTPS runtime, allocate
+random hostnames, automate DNS/TLS, or add custom domains, signed URLs,
+administrative HTTP endpoints, or multi-edge ownership.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

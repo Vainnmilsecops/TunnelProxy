@@ -835,3 +835,30 @@ SQLite/network work or identity, address, path, fingerprint, digest, token,
 certificate, key, or payload values. Metrics reset at restart. Public or
 authenticated access, persistence, remote write, dashboards, alerts, and
 protocol/schema changes remain outside this decision.
+
+---
+
+## ADR-031 — HTTPS route administration uses an independent versioned catalog
+
+**Status:** Accepted (Session 31).
+
+**Context:** Public HTTPS ingress accepts one exact operator-configured route,
+but the Control Plane had no durable hostname authority. Route identity must be
+identical across components, mutations must survive restart without partial
+version changes, and this bounded step must not silently alter authorization
+snapshot consumers or put SQLite on the request path.
+
+**Decision:** `PublicHostname` is a shared canonical ASCII DNS value type used
+by both Edge and Control Plane. The Control Plane stores at most 64 exact
+hostname, TunnelId, and enabled/disabled records in a separate SQLite catalog
+with its own non-zero monotonic version. An immediate transaction couples each
+effective upsert/removal with one version increment; semantic no-ops do not
+increment. Reads validate all durable values and return deterministic order.
+Operator CLI commands are the only mutation surface in this session.
+
+**Consequences:** Operators can safely prepare and inspect durable HTTPS route
+intent, including across process restarts, without changing Tunnel Protocol v2,
+authorization snapshots, or current Edge routing. Edge does not consume this
+catalog yet, so process-start `--https-host` remains authoritative there.
+Automatic allocation, DNS/TLS automation, custom domains, signed URLs,
+administrative HTTP APIs, and multi-edge coordination remain out of scope.

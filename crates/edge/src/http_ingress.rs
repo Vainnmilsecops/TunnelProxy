@@ -25,6 +25,10 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
 
+pub use tunnelproxy_common::{
+    PublicHostname as HttpHostname, PublicHostnameError as HttpHostnameError,
+};
+
 use crate::admission::{PeerAdmission, PeerAdmissionPermit};
 use crate::http_rate_limit::{
     HttpRateLimitRejection, HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError,
@@ -39,82 +43,6 @@ pub const MAX_HTTP_HOST_ROUTES: usize = 64;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HttpHostname(String);
-
-impl HttpHostname {
-    pub fn new(value: impl AsRef<str>) -> Result<Self, HttpHostnameError> {
-        normalize_dns_hostname(value.as_ref()).map(Self)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for HttpHostname {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpHostnameError {
-    Empty,
-    TooLong,
-    InvalidLabel,
-    IpAddress,
-    PortNotAllowed,
-}
-
-impl std::fmt::Display for HttpHostnameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Empty => "HTTP hostname must not be empty",
-            Self::TooLong => "HTTP hostname exceeds 253 bytes",
-            Self::InvalidLabel => "HTTP hostname contains an invalid DNS label",
-            Self::IpAddress => "HTTP hostname must be a DNS name, not an IP address",
-            Self::PortNotAllowed => "configured HTTP hostname must not contain a port",
-        })
-    }
-}
-
-impl std::error::Error for HttpHostnameError {}
-
-fn normalize_dns_hostname(value: &str) -> Result<String, HttpHostnameError> {
-    if value.is_empty() {
-        return Err(HttpHostnameError::Empty);
-    }
-    if value.parse::<IpAddr>().is_ok() {
-        return Err(HttpHostnameError::IpAddress);
-    }
-    if value.contains(':') {
-        return Err(HttpHostnameError::PortNotAllowed);
-    }
-    let normalized = value
-        .strip_suffix('.')
-        .unwrap_or(value)
-        .to_ascii_lowercase();
-    if normalized.is_empty() {
-        return Err(HttpHostnameError::Empty);
-    }
-    if normalized.len() > 253 {
-        return Err(HttpHostnameError::TooLong);
-    }
-    if normalized.split('.').any(|label| {
-        label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err(HttpHostnameError::InvalidLabel);
-    }
-    Ok(normalized)
-}
 
 fn normalize_authority(value: &str) -> Result<HttpHostname, HttpHostnameError> {
     let authority: Authority = value.parse().map_err(|_| HttpHostnameError::InvalidLabel)?;

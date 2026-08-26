@@ -1019,3 +1019,28 @@ Out of scope:
 
 - Database state gauges, one-shot command metrics, public/authenticated
   operations, persistence/remote write, dashboards, alerts, and schema changes.
+
+## Session 31 — Durable HTTPS Route Catalog & CLI Administration — complete
+
+Scope delivered:
+
+- Promoted exact canonical DNS hostname validation into the shared
+  `PublicHostname` type and retained Edge `HttpHostname` source compatibility.
+- Added a separate SQLite catalog capped at 64 exact hostname-to-TunnelId
+  records with enabled/disabled status and an independent non-zero monotonic
+  version. Immediate transactions atomically commit each record/version change.
+- Made identical upserts and absent removals idempotent without version bumps;
+  catalog reads validate stored state, fail closed, and sort by hostname.
+- Added `https-route-upsert`, `https-route-remove`, and `https-route-list`
+  Control Plane commands with validation before database creation, stable exit
+  codes, deterministic output, and secret-safe repository errors.
+- Added shared validation, repository durability/capacity/corruption/migration,
+  parser, and subprocess CLI coverage. The workspace now contains 316 explicit
+  tests.
+
+Out of scope:
+
+- Catalog distribution or activation at Edge, changes to the authorization
+  snapshot or Tunnel Protocol v2, and an administrative HTTP API.
+- Automatic/random hostname allocation, DNS/TLS automation, custom domains,
+  signed access URLs, HTTP/2, and multi-edge ownership.

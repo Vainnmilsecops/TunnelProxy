@@ -55,6 +55,8 @@ correct agent, which in turn proxies them into the local service.
 - Transactional SQLite snapshot persistence, strict JSON full-snapshot import,
   a runnable mutual-TLS Control Plane service, and snapshot-aware Edge CLI
   bootstrap/reconnect supervision.
+- A transactional, versioned SQLite HTTPS route catalog with exact canonical
+  hostname records and idempotent operator upsert/remove/list commands.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, and snapshot
   transports with last-known-good rollback, expiry enforcement, and static
   Agent-certificate authorization rotation.
@@ -65,7 +67,8 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Credit/window-based flow control and strict weighted stream scheduling.
-- Automatic hostname allocation, custom-domain administration, and HTTP/2.
+- Automatic hostname allocation, catalog distribution to Edge,
+  custom-domain administration, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA
@@ -112,8 +115,9 @@ The architecture conceptually separates:
   request/response traffic.
 
 Today the control-plane crate provides versioned certificate/Agent/tunnel
-authorization snapshots, SQLite persistence, full-snapshot import, and a
-runnable authenticated distribution service. The data plane has tested
+authorization snapshots, SQLite persistence, full-snapshot import, a runnable
+authenticated distribution service, and a separate durable exact-hostname
+route catalog with operator CLI administration. The data plane has tested
 opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
 slice with exact configured hostname routing, public TLS reload, and local
 global/per-IP request-rate enforcement. Edge and Agent can optionally export
@@ -130,7 +134,9 @@ https://blue-cat.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
 This automatic hostname-allocation UX does not work yet. Session 25 provides
-the underlying operator-configured HTTPS route, not this developer CLI.
+the Edge ingress path and Session 31 provides a durable operator-managed route
+catalog; automatic allocation and catalog distribution to Edge remain future
+work.
 
 ## Repository structure
 
@@ -206,6 +212,7 @@ and Definition of Done.
 | 28 _(complete)_ | secret-safe text/JSON process logging for all runnable components |
 | 29 _(complete)_ | bounded loopback Agent operations endpoint and connection metrics |
 | 30 _(complete)_ | bounded loopback Control Plane operations endpoint and service metrics |
+| 31 _(complete)_ | durable versioned HTTPS route catalog and operator CLI administration |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
