@@ -43,6 +43,9 @@ correct agent, which in turn proxies them into the local service.
   metrics for authorization, raw ingress, HTTPS, and rate limiting.
 - An opt-in loopback-only Agent operations endpoint with bounded admission,
   session-aware readiness, and fixed-cardinality connection/reconnect metrics.
+- An opt-in loopback-only Control Plane operations endpoint with bounded
+  admission, service readiness, and fixed-cardinality snapshot, refresh,
+  enrollment, reconciliation, and operations metrics.
 - Secret-safe process logging for Agent, Edge, and Control Plane with
   human-readable stderr output by default or schema-stable JSON Lines selected
   through `TUNNELPROXY_LOG_FORMAT=json` and filtered through `RUST_LOG`.
@@ -69,7 +72,7 @@ The following are **not yet implemented**:
   rollover.
 - Request inspection, replay, and webhook debugging.
 - Public/authenticated operations access, metrics persistence/remote write,
-  dashboards, alerts, and Control Plane metrics.
+  dashboards, and alerts.
 - Multi-tenant or multi-edge runtime.
 
 Any README, comment, or doc that suggests these features work today is a bug.
@@ -202,6 +205,7 @@ and Definition of Done.
 | 27 _(complete)_ | bounded loopback Edge operations endpoint and Prometheus metrics |
 | 28 _(complete)_ | secret-safe text/JSON process logging for all runnable components |
 | 29 _(complete)_ | bounded loopback Agent operations endpoint and connection metrics |
+| 30 _(complete)_ | bounded loopback Control Plane operations endpoint and service metrics |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

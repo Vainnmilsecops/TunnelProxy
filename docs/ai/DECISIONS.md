@@ -809,5 +809,29 @@ certificates, secrets, and payloads.
 alive, connected, reconnecting, or draining without scraping logs or touching
 Edge/Control Plane state. The endpoint is unauthenticated because it cannot be
 publicly bound. Metrics reset on restart and do not include stream/byte
-telemetry. Control Plane metrics, durable/remote storage, dashboards, alerts,
-and nonblocking log shipping remain outside this decision.
+telemetry. Control Plane metrics are handled by ADR-030; durable/remote storage,
+dashboards, alerts, and nonblocking log shipping remain outside this decision.
+
+---
+
+## ADR-030 — Control Plane operations are loopback-only and memory-backed
+
+**Status:** Accepted (Session 30).
+
+**Context:** Operators need to distinguish liveness from an initialized and
+distributing Control Plane and observe refresh/enrollment failures without
+querying SQLite per scrape or exposing durable identities and secrets.
+
+**Decision:** The runnable Control Plane may opt into a bounded loopback-only
+HTTP/1.1 listener serving liveness, service readiness, and Prometheus metrics.
+Authority, refresh, distribution, enrollment, reconciliation, and operations
+code update one process-local atomic telemetry handle. Labels use only fixed
+outcomes. Readiness becomes false before child-service drain; operations stays
+available until snapshot and enrollment stop, then drains last. Configuration
+rejects non-loopback binding and is validated before storage initialization.
+
+**Consequences:** Local supervisors can scrape the Control Plane without
+SQLite/network work or identity, address, path, fingerprint, digest, token,
+certificate, key, or payload values. Metrics reset at restart. Public or
+authenticated access, persistence, remote write, dashboards, alerts, and
+protocol/schema changes remain outside this decision.

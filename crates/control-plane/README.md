@@ -31,5 +31,8 @@ transactional SQLite persistence, durable-before-live publication, and a
 dedicated mutually authenticated Edge bootstrap/push service with bounded
 reconnect. Session 18 adds strict JSON full-snapshot import, repository refresh,
 and the runnable `tunnelproxy-control-plane serve|import` process. There is
-still no general administrative API, Edge cold-start disk cache, certificate
-lifecycle, or multi-edge coordination.
+also transactional Agent enrollment/activation/revocation and an optional
+bounded loopback operations endpoint for health, readiness, and process-local
+service metrics. Operations scrapes read only in-memory atomics. There is still
+no general administrative API, protected issuer-key service, durable metrics,
+or multi-edge coordination.

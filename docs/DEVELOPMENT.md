@@ -583,3 +583,29 @@ available while Agent-owned supervisors drain and is stopped last. Metrics do
 not contain AgentId, TunnelId, addresses, session IDs, certificates, secrets,
 or traffic payloads. Do not expose this unauthenticated endpoint through a
 public port forward.
+
+## 21. Running the Control Plane operations endpoint
+
+Add the optional operations flags to `tunnelproxy-control-plane serve`:
+
+```text
+tunnelproxy-control-plane serve \
+  ... \
+  --ops-listen 127.0.0.1:9092 \
+  --max-ops-connections 8 \
+  --ops-header-timeout-ms 2000 \
+  --ops-request-timeout-ms 5000
+```
+
+`GET /healthz` returns `200` while the listener runs. `GET /readyz` returns
+`200` only when durable authority, snapshot distribution, and optional
+enrollment are live; drain returns `503`. `GET /metrics` emits process-local
+Prometheus text for snapshot, refresh, enrollment, reconciliation, and
+operations admission. `HEAD` is supported; other methods return `405` and
+unknown paths return `404`.
+
+The endpoint is disabled by default, accepts loopback addresses only, closes
+after one bounded HTTP/1.1 request, and performs no SQLite query during a
+scrape. Do not expose it through a public port forward. Metrics exclude IDs,
+addresses, database paths, fingerprints, digests, tokens, certificates, keys,
+and protocol payloads.

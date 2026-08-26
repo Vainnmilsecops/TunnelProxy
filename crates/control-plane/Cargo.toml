@@ -24,6 +24,10 @@ rcgen = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 getrandom = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 tunnelproxy-common = { path = "../common" }
 tunnelproxy-protocol = { path = "../protocol" }
 

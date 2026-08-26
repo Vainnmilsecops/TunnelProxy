@@ -17,6 +17,7 @@ use tunnelproxy_common::{AgentId, TunnelId};
 mod certificate_issuer;
 mod enrollment_repository;
 mod enrollment_service;
+mod operations;
 mod repository;
 mod runtime;
 mod snapshot_cache;
@@ -35,6 +36,11 @@ pub use enrollment_repository::{
 pub use enrollment_service::{
     EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,
     EnrollmentTlsConfigError,
+};
+pub use operations::{
+    ControlPlaneOperationsConfig, ControlPlaneOperationsConfigError, ControlPlaneOperationsError,
+    ControlPlaneOperationsOutcome, MAX_OPERATIONS_CONNECTIONS, MAX_OPERATIONS_HEADERS,
+    MAX_OPERATIONS_HEADER_BYTES, MIN_OPERATIONS_HEADER_BYTES,
 };
 pub use repository::{
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotCommitOutcome,

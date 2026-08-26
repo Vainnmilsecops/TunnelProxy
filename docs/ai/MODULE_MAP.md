@@ -120,7 +120,10 @@ snapshot activation. Credential persistence includes activation deadlines and
 terminal tombstones; a bounded supervised reconciler expires abandoned
 overlaps. Operator commands expose secret-safe credential status and an
 idempotent Agent/Tunnel emergency revoke that invalidates tokens and commits
-through the same complete-snapshot authority path.
+through the same complete-snapshot authority path. An optional bounded,
+loopback-only operations listener reports in-memory readiness and
+fixed-cardinality snapshot, refresh, enrollment, and reconciliation metrics
+without querying SQLite during a scrape.
 
 **Responsibility (future)**
 

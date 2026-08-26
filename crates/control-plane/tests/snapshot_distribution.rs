@@ -9,19 +9,21 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout, Instant};
 use tunnelproxy_common::{shutdown_channel, AgentId, ShutdownTrigger, TlsConfigHealth, TunnelId};
 use tunnelproxy_control_plane::{
     AgentGrant, AuthorizationSnapshot, AuthorizationSnapshotSubscription, CertificateFingerprint,
-    ControlPlaneRuntime, ControlPlaneRuntimeConfig, ControlPlaneRuntimeError,
-    PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotBootstrapClient,
-    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotCacheError, SnapshotClientConfig,
-    SnapshotClientError, SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime,
-    SnapshotDistributionServer, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
-    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotSourceHealth,
-    SnapshotVersion, SqliteSnapshotRepository, TunnelGrant, TunnelStatus,
-    VersionedAuthorizationSnapshot,
+    ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
+    ControlPlaneRuntimeError, PersistentSnapshotAuthority, PersistentSnapshotAuthorityError,
+    SnapshotBootstrapClient, SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotCacheError,
+    SnapshotClientConfig, SnapshotClientError, SnapshotClientTlsReloadConfig,
+    SnapshotClientTlsReloadRuntime, SnapshotDistributionServer, SnapshotRepository,
+    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig,
+    SnapshotServerTlsReloadRuntime, SnapshotSourceHealth, SnapshotVersion,
+    SqliteSnapshotRepository, TunnelGrant, TunnelStatus, VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -312,10 +314,14 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        operations: Some(ControlPlaneOperationsConfig::loopback(
+            "127.0.0.1:0".parse().unwrap(),
+        )),
     })
     .await
     .unwrap();
     let server_addr = runtime.local_addr();
+    let operations_addr = runtime.operations_addr().unwrap();
     let (server_trigger, server_signal) = shutdown_channel();
     let server_task = tokio::spawn(runtime.run_until_shutdown(server_signal));
     let (mut edge_snapshots, client) =
@@ -325,20 +331,58 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
     let (client_trigger, client_signal) = shutdown_channel();
     let client_task = tokio::spawn(client.run_until_shutdown(client_signal));
 
+    let ready = operations_request(operations_addr, "GET", "/readyz").await;
+    assert!(ready.starts_with("HTTP/1.1 200 OK"));
+    let head = operations_request(operations_addr, "HEAD", "/healthz").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert!(head.ends_with("\r\n\r\n"));
+    assert!(operations_request(operations_addr, "POST", "/metrics")
+        .await
+        .starts_with("HTTP/1.1 405 Method Not Allowed"));
+    assert!(operations_request(operations_addr, "GET", "/missing")
+        .await
+        .starts_with("HTTP/1.1 404 Not Found"));
+    let metrics = operations_request(operations_addr, "GET", "/metrics").await;
+    assert!(metrics.contains("tunnelproxy_control_plane_ready 1\n"));
+    assert!(metrics.contains("tunnelproxy_control_plane_snapshot_version 1\n"));
+    assert!(metrics.contains("tunnelproxy_control_plane_snapshot_accepted_connections_total 1\n"));
+    assert!(metrics.contains("tunnelproxy_control_plane_snapshot_subscriptions_total 1\n"));
+    assert!(!metrics.contains("agent-snapshot"));
+    assert!(!metrics.contains("tunnel-snapshot"));
+
     repository
         .commit(&snapshot(2, TunnelStatus::Disabled))
         .unwrap();
     wait_for_version(&mut edge_snapshots, 2).await;
 
+    let mut drain_probe = TcpStream::connect(operations_addr).await.unwrap();
+    sleep(Duration::from_millis(20)).await;
     server_trigger.shutdown();
+    sleep(Duration::from_millis(10)).await;
+    drain_probe
+        .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut draining_response = Vec::new();
+    drain_probe
+        .read_to_end(&mut draining_response)
+        .await
+        .unwrap();
+    assert!(String::from_utf8(draining_response)
+        .unwrap()
+        .starts_with("HTTP/1.1 503 Service Unavailable"));
     let outcome = server_task.await.unwrap().unwrap();
     assert_eq!(outcome.applied_refreshes, 1);
+    assert_eq!(outcome.operations_addr, Some(operations_addr));
+    assert!(outcome.operations.is_some());
+    assert!(TcpStream::connect(operations_addr).await.is_err());
     wait_for_health(&mut edge_snapshots, SnapshotSourceHealth::Stale).await;
 
     let restarted = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config(server_addr, &pki),
+        operations: None,
     })
     .await
     .unwrap();
@@ -355,15 +399,144 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+async fn operations_request(addr: SocketAddr, method: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+#[tokio::test]
+async fn operations_bind_failure_releases_the_snapshot_listener() {
+    let (database, directory) = temp_database();
+    let repository = SqliteSnapshotRepository::open(&database).unwrap();
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    drop(repository);
+    let pki = test_pki("control-plane.test");
+    let snapshot_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snapshot_addr = snapshot_probe.local_addr().unwrap();
+    drop(snapshot_probe);
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let operations_addr = occupied.local_addr().unwrap();
+    let result = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
+        database_path: database,
+        refresh_interval: Duration::from_millis(20),
+        snapshot_server: server_config(snapshot_addr, &pki),
+        operations: Some(ControlPlaneOperationsConfig::loopback(operations_addr)),
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(ControlPlaneRuntimeError::Operations(_))
+    ));
+    let rebound = tokio::net::TcpListener::bind(snapshot_addr).await.unwrap();
+    drop(rebound);
+    drop(occupied);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn operations_capacity_rejection_releases_after_stalled_connection_closes() {
+    let (database, directory) = temp_database();
+    let repository = SqliteSnapshotRepository::open(&database).unwrap();
+    repository
+        .commit(&snapshot(1, TunnelStatus::Enabled))
+        .unwrap();
+    drop(repository);
+    let pki = test_pki("control-plane.test");
+    let mut operations = ControlPlaneOperationsConfig::loopback("127.0.0.1:0".parse().unwrap());
+    operations.max_concurrent_connections = 1;
+    operations.header_read_timeout = Duration::from_secs(1);
+    let runtime = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
+        database_path: database,
+        refresh_interval: Duration::from_secs(1),
+        snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        operations: Some(operations),
+    })
+    .await
+    .unwrap();
+    let addr = runtime.operations_addr().unwrap();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(runtime.run_until_shutdown(signal));
+
+    let held = TcpStream::connect(addr).await.unwrap();
+    sleep(Duration::from_millis(20)).await;
+    let mut rejected = TcpStream::connect(addr).await.unwrap();
+    let _ = rejected
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await;
+    let mut bytes = Vec::new();
+    let _ = timeout(Duration::from_secs(1), rejected.read_to_end(&mut bytes)).await;
+    assert!(bytes.is_empty());
+
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let metrics = loop {
+        if let Ok(response) = try_operations_request(addr, "GET", "/metrics").await {
+            if response.starts_with("HTTP/1.1 200") {
+                break response;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capacity permit was not released"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert!(metrics.contains("tunnelproxy_control_plane_operations_capacity_rejections_total 1\n"));
+
+    trigger.shutdown();
+    let outcome = task.await.unwrap().unwrap();
+    assert!(!outcome.operations.unwrap().was_forced());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+async fn try_operations_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    String::from_utf8(response)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 #[tokio::test]
 async fn control_plane_runtime_refuses_an_uninitialized_repository() {
     let (database, directory) = temp_database();
     let pki = test_pki("control-plane.test");
     let mut config = ControlPlaneRuntimeConfig {
-        database_path: database,
+        database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        operations: None,
     };
+    config.operations = Some(ControlPlaneOperationsConfig::loopback(
+        "0.0.0.0:9092".parse().unwrap(),
+    ));
+    assert!(matches!(
+        ControlPlaneRuntime::bind(config.clone()).await,
+        Err(ControlPlaneRuntimeError::InvalidConfig)
+    ));
+    assert!(!database.exists());
+    config.operations = None;
     config.refresh_interval = Duration::ZERO;
     assert!(matches!(
         ControlPlaneRuntime::bind(config.clone()).await,

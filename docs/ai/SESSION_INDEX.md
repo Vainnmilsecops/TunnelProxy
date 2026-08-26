@@ -996,3 +996,26 @@ Out of scope:
   remote write, durable metric history, dashboards, alerts, and log buffering.
 - Hostname administration, transport fairness, HTTP/2, signed access URLs, and
   multi-edge ownership.
+
+## Session 30 — Bounded Control Plane Operations Endpoint & Service Metrics — complete
+
+Scope delivered:
+
+- Added an opt-in loopback-only HTTP/1.1 operations listener with bounded
+  connections, headers, request/drain deadlines, and `GET`/`HEAD` health,
+  readiness, and metrics routes.
+- Defined readiness as initialized snapshot authority with live distribution
+  and optional enrollment supervisors outside drain. Scrapes read only
+  process-local atomics and never query SQLite or another service.
+- Added fixed-cardinality snapshot, refresh, enrollment, reconciliation, and
+  operations metrics without identity, address, path, certificate, secret, or
+  payload values.
+- Integrated CLI configuration, bind rollback, and ordered shutdown: readiness
+  is removed first, child services stop next, and operations drains last.
+- Added unit, CLI, real-TCP, and mTLS-backed tests. The workspace now contains
+  306 explicit tests.
+
+Out of scope:
+
+- Database state gauges, one-shot command metrics, public/authenticated
+  operations, persistence/remote write, dashboards, alerts, and schema changes.
