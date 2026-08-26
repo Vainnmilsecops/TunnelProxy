@@ -2113,6 +2113,7 @@ async fn snapshot_aware_edge_routes_and_survives_control_plane_restart() {
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap()),
+        operations: None,
     })
     .await
     .unwrap();
@@ -2168,6 +2169,7 @@ async fn snapshot_aware_edge_routes_and_survives_control_plane_restart() {
         database_path: database,
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config(snapshot_addr),
+        operations: None,
     })
     .await
     .unwrap();
@@ -2245,6 +2247,7 @@ async fn snapshot_cache_cold_start_routes_then_expiry_releases_edge_listeners() 
             request_timeout: Duration::from_secs(1),
             tls: snapshot_tls,
         },
+        operations: None,
     })
     .await
     .unwrap();

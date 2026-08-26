@@ -18,11 +18,12 @@ use tunnelproxy_common::{
 };
 
 use crate::{
-    authorization_snapshot_channel, read_snapshot_message, write_snapshot_message,
-    AuthorizationSnapshotPublisher, AuthorizationSnapshotSubscription, FileSnapshotCache,
-    SnapshotCacheConfig, SnapshotCacheError, SnapshotMessage, SnapshotProtocolError,
-    SnapshotServiceErrorCode, SnapshotSourceHealth, VersionedAuthorizationSnapshot,
-    SNAPSHOT_PROTOCOL_ALPN,
+    authorization_snapshot_channel,
+    operations::{ActiveTelemetryGuard, ControlPlaneTelemetry},
+    read_snapshot_message, write_snapshot_message, AuthorizationSnapshotPublisher,
+    AuthorizationSnapshotSubscription, FileSnapshotCache, SnapshotCacheConfig, SnapshotCacheError,
+    SnapshotMessage, SnapshotProtocolError, SnapshotServiceErrorCode, SnapshotSourceHealth,
+    VersionedAuthorizationSnapshot, SNAPSHOT_PROTOCOL_ALPN,
 };
 
 #[derive(Clone)]
@@ -158,12 +159,21 @@ pub struct SnapshotDistributionServer {
     local_addr: SocketAddr,
     config: SnapshotServerConfig,
     snapshots: AuthorizationSnapshotSubscription,
+    telemetry: ControlPlaneTelemetry,
 }
 
 impl SnapshotDistributionServer {
     pub async fn bind(
         config: SnapshotServerConfig,
         snapshots: AuthorizationSnapshotSubscription,
+    ) -> Result<Self, SnapshotServerError> {
+        Self::bind_with_telemetry(config, snapshots, ControlPlaneTelemetry::default()).await
+    }
+
+    pub(crate) async fn bind_with_telemetry(
+        config: SnapshotServerConfig,
+        snapshots: AuthorizationSnapshotSubscription,
+        telemetry: ControlPlaneTelemetry,
     ) -> Result<Self, SnapshotServerError> {
         config.validate()?;
         let listener = TcpListener::bind(config.listen_addr)
@@ -175,6 +185,7 @@ impl SnapshotDistributionServer {
             local_addr,
             config,
             snapshots,
+            telemetry,
         })
     }
 
@@ -195,15 +206,19 @@ impl SnapshotDistributionServer {
                 accepted = self.listener.accept() => {
                     let (socket, peer) = accepted.map_err(SnapshotServerError::Accept)?;
                     let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                        self.telemetry.snapshot_capacity_rejected();
                         warn!(%peer, event = "snapshot_client_capacity_rejected");
                         continue;
                     };
+                    let active = self.telemetry.snapshot_accepted();
                     tasks.spawn(serve_edge(
                         socket,
                         peer,
                         permit,
                         self.config.clone(),
                         self.snapshots.clone(),
+                        self.telemetry.clone(),
+                        active,
                     ));
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -221,6 +236,8 @@ async fn serve_edge(
     _permit: OwnedSemaphorePermit,
     config: SnapshotServerConfig,
     mut snapshots: AuthorizationSnapshotSubscription,
+    telemetry: ControlPlaneTelemetry,
+    _active: ActiveTelemetryGuard,
 ) {
     let acceptor = TlsAcceptor::from(config.tls.server_config.current());
     let mut stream =
@@ -231,6 +248,7 @@ async fn serve_edge(
                 stream
             }
             _ => {
+                telemetry.snapshot_tls_rejected();
                 warn!(%peer, event = "snapshot_tls_rejected");
                 return;
             }
@@ -245,6 +263,7 @@ async fn serve_edge(
             last_applied_version,
         })) => last_applied_version,
         _ => {
+            telemetry.snapshot_invalid_request();
             let _ = tokio::time::timeout(
                 config.request_timeout,
                 write_snapshot_message(
@@ -275,8 +294,10 @@ async fn serve_edge(
         return;
     }
     if matches!(response, SnapshotMessage::Error(_)) {
+        telemetry.snapshot_invalid_request();
         return;
     }
+    telemetry.snapshot_subscribed();
     info!(%peer, snapshot_version = current.version().get(), event = "snapshot_edge_subscribed");
     while snapshots.changed().await.is_ok() {
         let next = snapshots.current();
@@ -290,6 +311,7 @@ async fn serve_edge(
         ) {
             break;
         }
+        telemetry.snapshot_updated(next.version().get());
     }
 }
 

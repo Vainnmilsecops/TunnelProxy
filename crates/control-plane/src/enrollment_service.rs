@@ -21,8 +21,10 @@ use tunnelproxy_protocol::{
 };
 
 use crate::{
-    enrollment_token_hash, unix_time_now, AgentCertificateIssuer, CertificateFingerprint,
-    CertificateIssuerError, EnrollmentRepository, EnrollmentRepositoryError, IssuanceCandidate,
+    enrollment_token_hash,
+    operations::{ActiveTelemetryGuard, ControlPlaneTelemetry, EnrollmentRequestOutcome},
+    unix_time_now, AgentCertificateIssuer, CertificateFingerprint, CertificateIssuerError,
+    EnrollmentRepository, EnrollmentRepositoryError, IssuanceCandidate,
     PersistentSnapshotAuthority,
 };
 
@@ -105,12 +107,21 @@ pub struct EnrollmentServer {
     authority: PersistentSnapshotAuthority,
     permits: Arc<Semaphore>,
     mutation_gate: Arc<Mutex<()>>,
+    telemetry: ControlPlaneTelemetry,
 }
 
 impl EnrollmentServer {
     pub async fn bind(
         config: EnrollmentServerConfig,
         authority: PersistentSnapshotAuthority,
+    ) -> Result<Self, EnrollmentServerError> {
+        Self::bind_with_telemetry(config, authority, ControlPlaneTelemetry::default()).await
+    }
+
+    pub(crate) async fn bind_with_telemetry(
+        config: EnrollmentServerConfig,
+        authority: PersistentSnapshotAuthority,
+        telemetry: ControlPlaneTelemetry,
     ) -> Result<Self, EnrollmentServerError> {
         config.validate()?;
         let database_path = config.database_path.clone();
@@ -132,6 +143,7 @@ impl EnrollmentServer {
             authority,
             permits: Arc::new(Semaphore::new(max_clients)),
             mutation_gate: Arc::new(Mutex::new(())),
+            telemetry,
         })
     }
 
@@ -157,18 +169,31 @@ impl EnrollmentServer {
                 _ = reconcile.tick() => {
                     let _guard = self.mutation_gate.lock().await;
                     let repository = self.repository.clone();
-                    let outcome = tokio::task::spawn_blocking(move || {
+                    let outcome = match tokio::task::spawn_blocking(move || {
                         repository.reconcile_expired(unix_time_now()?)
                     })
                     .await
-                    .map_err(|_| EnrollmentServerError::StorageTask)?
-                    .map_err(EnrollmentServerError::Repository)?;
-                    if outcome.snapshot_changed {
-                        self.authority
-                            .refresh_from_repository()
-                            .await
-                            .map_err(|_| EnrollmentServerError::Authority)?;
+                    {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(error)) => {
+                            self.telemetry.reconciliation_failed();
+                            return Err(EnrollmentServerError::Repository(error));
+                        }
+                        Err(_) => {
+                            self.telemetry.reconciliation_failed();
+                            return Err(EnrollmentServerError::StorageTask);
+                        }
+                    };
+                    if outcome.snapshot_changed
+                        && self.authority.refresh_from_repository().await.is_err()
+                    {
+                        self.telemetry.reconciliation_failed();
+                        return Err(EnrollmentServerError::Authority);
                     }
+                    self.telemetry.reconciliation_completed(
+                        outcome.affected_credentials as u64,
+                        outcome.snapshot_version.get(),
+                    );
                     if outcome.affected_credentials != 0 {
                         info!(
                             affected_credentials = outcome.affected_credentials,
@@ -187,18 +212,24 @@ impl EnrollmentServer {
                     let permit = match Arc::clone(&self.permits).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
+                            self.telemetry.enrollment_capacity_rejected();
                             warn!(%peer, event = "enrollment_capacity_rejected");
                             continue;
                         }
                     };
+                    let active = self.telemetry.enrollment_accepted();
                     tasks.spawn(serve_connection(
                         socket,
                         peer,
                         permit,
-                        self.config.clone(),
-                        self.repository.clone(),
-                        self.authority.clone(),
-                        Arc::clone(&self.mutation_gate),
+                        EnrollmentConnectionContext {
+                            config: self.config.clone(),
+                            repository: self.repository.clone(),
+                            authority: self.authority.clone(),
+                            mutation_gate: Arc::clone(&self.mutation_gate),
+                            telemetry: self.telemetry.clone(),
+                        },
+                        active,
                     ));
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -210,24 +241,39 @@ impl EnrollmentServer {
     }
 }
 
-async fn serve_connection(
-    socket: TcpStream,
-    peer: SocketAddr,
-    _permit: OwnedSemaphorePermit,
+struct EnrollmentConnectionContext {
     config: EnrollmentServerConfig,
     repository: EnrollmentRepository,
     authority: PersistentSnapshotAuthority,
     mutation_gate: Arc<Mutex<()>>,
+    telemetry: ControlPlaneTelemetry,
+}
+
+async fn serve_connection(
+    socket: TcpStream,
+    peer: SocketAddr,
+    _permit: OwnedSemaphorePermit,
+    context: EnrollmentConnectionContext,
+    _active: ActiveTelemetryGuard,
 ) {
+    let EnrollmentConnectionContext {
+        config,
+        repository,
+        authority,
+        mutation_gate,
+        telemetry,
+    } = context;
     let acceptor = TlsAcceptor::from(Arc::clone(&config.tls.server_config));
     let mut stream = match timeout(config.tls.handshake_timeout, acceptor.accept(socket)).await {
         Ok(Ok(stream)) => stream,
         _ => {
+            telemetry.enrollment_tls_rejected();
             warn!(%peer, event = "enrollment_tls_rejected");
             return;
         }
     };
     if stream.get_ref().1.alpn_protocol() != Some(ENROLLMENT_PROTOCOL_ALPN) {
+        telemetry.enrollment_tls_rejected();
         warn!(%peer, event = "enrollment_alpn_rejected");
         return;
     }
@@ -235,10 +281,12 @@ async fn serve_connection(
     {
         Ok(Ok(Some(request))) => request,
         _ => {
+            telemetry.enrollment_outcome(EnrollmentRequestOutcome::Rejected);
             let _ = write_error(&mut stream, EnrollmentErrorCode::InvalidRequest).await;
             return;
         }
     };
+    let mut request_outcome = EnrollmentOutcomeGuard::new(telemetry.clone());
     let response = match request {
         EnrollmentMessage::Enroll {
             request_id,
@@ -271,6 +319,7 @@ async fn serve_connection(
             {
                 Ok(Ok(existing)) => existing,
                 Ok(Err(error)) => {
+                    request_outcome.complete(repository_request_outcome(&error));
                     let _ = write_error(&mut stream, repository_error_code(error)).await;
                     return;
                 }
@@ -293,6 +342,7 @@ async fn serve_connection(
                 {
                     Ok(Ok(issued)) => issued,
                     _ => {
+                        request_outcome.reject();
                         let _ = write_error(&mut stream, EnrollmentErrorCode::InvalidCsr).await;
                         return;
                     }
@@ -328,6 +378,7 @@ async fn serve_connection(
                 {
                     Ok(Ok(durable)) => durable,
                     Ok(Err(error)) => {
+                        request_outcome.complete(repository_request_outcome(&error));
                         let _ = write_error(&mut stream, repository_error_code(error)).await;
                         return;
                     }
@@ -341,6 +392,7 @@ async fn serve_connection(
                 let _ = write_error(&mut stream, EnrollmentErrorCode::Internal).await;
                 return;
             }
+            telemetry.set_snapshot_version(authority.current().version().get());
             info!(
                 %agent_id,
                 %tunnel_id,
@@ -348,6 +400,7 @@ async fn serve_connection(
                 fingerprint = %durable.fingerprint,
                 event = "agent_certificate_issued"
             );
+            request_outcome.complete(EnrollmentRequestOutcome::Issued);
             EnrollmentMessage::Issued {
                 request_id,
                 generation: durable.generation.get(),
@@ -383,6 +436,7 @@ async fn serve_connection(
                         let _ = write_error(&mut stream, EnrollmentErrorCode::Internal).await;
                         return;
                     }
+                    request_outcome.complete(repository_request_outcome(&error));
                     let _ = write_error(&mut stream, repository_error_code(error)).await;
                     return;
                 }
@@ -395,24 +449,59 @@ async fn serve_connection(
                 let _ = write_error(&mut stream, EnrollmentErrorCode::Internal).await;
                 return;
             }
+            telemetry.set_snapshot_version(authority.current().version().get());
             info!(
                 snapshot_version = version.get(),
                 fingerprint = %CertificateFingerprint::from_bytes(fingerprint),
                 event = "agent_certificate_activated"
             );
+            request_outcome.complete(EnrollmentRequestOutcome::Activated);
             EnrollmentMessage::Activated {
                 snapshot_version: version.get(),
             }
         }
-        _ => EnrollmentMessage::Error {
-            code: EnrollmentErrorCode::InvalidRequest,
-        },
+        _ => {
+            request_outcome.reject();
+            EnrollmentMessage::Error {
+                code: EnrollmentErrorCode::InvalidRequest,
+            }
+        }
     };
     let _ = timeout(
         config.request_timeout,
         write_enrollment_message(&mut stream, &response),
     )
     .await;
+}
+
+struct EnrollmentOutcomeGuard {
+    telemetry: ControlPlaneTelemetry,
+    outcome: Option<EnrollmentRequestOutcome>,
+}
+
+impl EnrollmentOutcomeGuard {
+    fn new(telemetry: ControlPlaneTelemetry) -> Self {
+        Self {
+            telemetry,
+            outcome: Some(EnrollmentRequestOutcome::Failed),
+        }
+    }
+
+    fn reject(&mut self) {
+        self.outcome = Some(EnrollmentRequestOutcome::Rejected);
+    }
+
+    fn complete(&mut self, outcome: EnrollmentRequestOutcome) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl Drop for EnrollmentOutcomeGuard {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.outcome.take() {
+            self.telemetry.enrollment_outcome(outcome);
+        }
+    }
 }
 
 async fn write_error(
@@ -438,6 +527,25 @@ fn repository_error_code(error: EnrollmentRepositoryError) -> EnrollmentErrorCod
         | EnrollmentRepositoryError::Random
         | EnrollmentRepositoryError::TokenOutput
         | EnrollmentRepositoryError::ResourceLimit => EnrollmentErrorCode::Internal,
+    }
+}
+
+fn repository_request_outcome(error: &EnrollmentRepositoryError) -> EnrollmentRequestOutcome {
+    match error {
+        EnrollmentRepositoryError::Unauthorized
+        | EnrollmentRepositoryError::TokenExpired
+        | EnrollmentRepositoryError::CredentialRevoked
+        | EnrollmentRepositoryError::RequestExpired
+        | EnrollmentRepositoryError::IdentityMismatch
+        | EnrollmentRepositoryError::Conflict => EnrollmentRequestOutcome::Rejected,
+        EnrollmentRepositoryError::Storage
+        | EnrollmentRepositoryError::Uninitialized
+        | EnrollmentRepositoryError::Corrupt
+        | EnrollmentRepositoryError::InvalidTime
+        | EnrollmentRepositoryError::VersionExhausted
+        | EnrollmentRepositoryError::Random
+        | EnrollmentRepositoryError::TokenOutput
+        | EnrollmentRepositoryError::ResourceLimit => EnrollmentRequestOutcome::Failed,
     }
 }
 

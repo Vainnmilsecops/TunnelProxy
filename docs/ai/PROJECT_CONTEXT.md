@@ -82,7 +82,7 @@ per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
 routing, and applies process-local global/per-IP request token buckets, but it
 is not yet the automatic future product UX. Edge and Agent have opt-in bounded
-loopback operations endpoints; public/authenticated operations access, durable
-metrics storage, and a Control Plane exporter are not implemented. All
+loopback operations endpoints for Agent, Edge, and Control Plane;
+public/authenticated operations access and durable metrics storage are not implemented. All
 three runnable components can emit collector-friendly, secret-safe JSON Lines
 to stderr without changing their plain stdout command contracts.

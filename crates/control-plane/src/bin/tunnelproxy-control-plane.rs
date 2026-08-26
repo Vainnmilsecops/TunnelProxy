@@ -13,11 +13,11 @@ use tunnelproxy_common::{
 };
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
-    ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentRepository, EnrollmentServerConfig,
-    EnrollmentServerTlsConfig, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
-    SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
-    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
-    MAX_SNAPSHOT_BYTES,
+    ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
+    EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig, SnapshotCommitOutcome,
+    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
+    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
+    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -38,6 +38,10 @@ Serve options:
   --tls-handshake-timeout-ms <ms>    TLS timeout (default 5000)
   --request-timeout-ms <ms>          protocol I/O timeout (default 5000)
   --refresh-interval-ms <ms>         SQLite refresh interval (default 500)
+  --ops-listen <addr>                opt-in loopback operations listener
+  --max-ops-connections <usize>      operations connection limit (default 8)
+  --ops-header-timeout-ms <ms>       operations header timeout (default 2000)
+  --ops-request-timeout-ms <ms>      operations request timeout (default 5000)
   --tls-reload-manifest <path>       atomic TLS generation manifest
   --tls-reload-interval-ms <ms>      reload poll (default 1000)
   --tls-expiry-warning-ms <ms>       expiry warning (default 604800000)
@@ -191,6 +195,13 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
             request_timeout: args.request_timeout,
             tls,
         },
+        operations: args.operations.map(|operations| {
+            let mut config = ControlPlaneOperationsConfig::loopback(operations.listen);
+            config.max_concurrent_connections = operations.max_connections;
+            config.header_read_timeout = operations.header_timeout;
+            config.request_timeout = operations.request_timeout;
+            config
+        }),
     };
     let runtime = match enrollment {
         Some(enrollment) => {
@@ -206,6 +217,9 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     );
     if let Some(addr) = runtime.enrollment_addr() {
         info!(%addr, "Control Plane enrollment service started");
+    }
+    if let Some(addr) = runtime.operations_addr() {
+        info!(%addr, "Control Plane operations service started");
     }
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
@@ -376,6 +390,15 @@ struct ServeArgs {
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
     enrollment: Option<EnrollmentArgs>,
+    operations: Option<OperationsArgs>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OperationsArgs {
+    listen: SocketAddr,
+    max_connections: usize,
+    header_timeout: Duration,
+    request_timeout: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -495,6 +518,11 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut enrollment_activation_grace = Duration::from_secs(10 * 60);
     let mut enrollment_reconcile_interval = Duration::from_secs(30);
     let mut enrollment_options_present = false;
+    let mut operations_listen = None;
+    let mut max_operations_connections = 8;
+    let mut operations_header_timeout = Duration::from_secs(2);
+    let mut operations_request_timeout = Duration::from_secs(5);
+    let mut operations_options_present = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -510,6 +538,22 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             }
             "--request-timeout-ms" => request_timeout = parse_duration(args, index, flag)?,
             "--refresh-interval-ms" => refresh_interval = parse_duration(args, index, flag)?,
+            "--ops-listen" => {
+                operations_listen = Some(parse_addr(args, index, flag)?);
+                operations_options_present = true;
+            }
+            "--max-ops-connections" => {
+                max_operations_connections = parse_positive(args, index, flag)?;
+                operations_options_present = true;
+            }
+            "--ops-header-timeout-ms" => {
+                operations_header_timeout = parse_duration(args, index, flag)?;
+                operations_options_present = true;
+            }
+            "--ops-request-timeout-ms" => {
+                operations_request_timeout = parse_duration(args, index, flag)?;
+                operations_options_present = true;
+            }
             "--tls-reload-manifest" => {
                 tls_reload_manifest = Some(parse_path(args, index, flag)?);
             }
@@ -580,6 +624,16 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     } else {
         None
     };
+    let operations = if operations_options_present {
+        Some(OperationsArgs {
+            listen: operations_listen.ok_or(ArgError::MissingRequired("--ops-listen"))?,
+            max_connections: max_operations_connections,
+            header_timeout: operations_header_timeout,
+            request_timeout: operations_request_timeout,
+        })
+    } else {
+        None
+    };
     Ok(ServeArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
         listen,
@@ -594,6 +648,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         tls_reload_interval,
         tls_expiry_warning,
         enrollment,
+        operations,
     })
 }
 
@@ -891,6 +946,14 @@ mod tests {
             "400",
             "--tls-expiry-warning-ms",
             "500",
+            "--ops-listen",
+            "127.0.0.1:19090",
+            "--max-ops-connections",
+            "3",
+            "--ops-header-timeout-ms",
+            "600",
+            "--ops-request-timeout-ms",
+            "700",
         ]))
         .unwrap();
         let ParsedCommand::Serve(serve) = serve else {
@@ -905,6 +968,11 @@ mod tests {
         );
         assert_eq!(serve.tls_reload_interval, Duration::from_millis(400));
         assert_eq!(serve.tls_expiry_warning, Duration::from_millis(500));
+        let operations = serve.operations.unwrap();
+        assert_eq!(operations.listen.port(), 19090);
+        assert_eq!(operations.max_connections, 3);
+        assert_eq!(operations.header_timeout, Duration::from_millis(600));
+        assert_eq!(operations.request_timeout, Duration::from_millis(700));
 
         assert_eq!(
             parse_args(&args(&[
@@ -943,6 +1011,22 @@ mod tests {
                 "0",
             ])),
             Err(ArgError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "key.pem",
+                "--edge-client-ca",
+                "ca.pem",
+                "--max-ops-connections",
+                "2",
+            ])),
+            Err(ArgError::MissingRequired("--ops-listen"))
         ));
         assert!(matches!(
             parse_args(&args(&["import", "--database"])),

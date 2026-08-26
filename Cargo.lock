@@ -992,7 +992,11 @@ dependencies = [
 name = "tunnelproxy-control-plane"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "getrandom",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rcgen",
  "rusqlite",
  "rustls",

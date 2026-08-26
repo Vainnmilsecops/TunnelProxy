@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Agent Operations Endpoint & Connection Metrics** (Session 29).
+**Bounded Control Plane Operations Endpoint & Service Metrics** (Session 30).
 
 ## Completed
 
@@ -344,7 +344,15 @@
 - Agent metrics have only fixed connection-state labels and exclude AgentId,
   TunnelId, addresses, session IDs, certificates, secrets, and payloads.
   Operations bind failure occurs before the first outbound Edge connection.
-- 302 explicit workspace tests are present; all prior behavior is preserved.
+- The runnable Control Plane optionally binds a loopback-only bounded HTTP/1.1
+  operations listener. `/healthz`, `/readyz`, and `/metrics` expose process
+  liveness, authority/distribution/enrollment readiness, and process-local
+  snapshot, refresh, enrollment, reconciliation, and admission counters.
+- Control Plane scrapes read only atomics: no SQLite or network query is made.
+  Labels are a fixed outcome set and output excludes IDs, addresses, database
+  paths, fingerprints, digests, tokens, certificates, keys, and payloads.
+  Readiness becomes false before child-service shutdown; operations stops last.
+- 306 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -368,12 +376,12 @@
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
-- Control Plane metrics, durable/remote-write telemetry, nonblocking log sinks,
+- Durable/remote-write telemetry, nonblocking log sinks,
   dashboards, and alerting (DEBT-010 partially resolved).
 
 ## Next planned session
 
-Session 30 has not been selected. The next plan should choose one bounded scope
-from Control Plane operations metrics, durable hostname administration, or
-transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
-separate larger scopes.
+Session 31 has not been selected. The next plan should choose one bounded scope
+from durable hostname administration, transport fairness, or operator-owned
+telemetry collection guidance; HTTP/2, signed access URLs, and multi-edge
+ownership remain separate larger scopes.

@@ -616,7 +616,7 @@ On shutdown, Edge first marks readiness false, then drains public ingress while
 operations remains observable. It next drains operations and finally stops the
 Agent transport. The endpoint and counters are process-local and non-durable;
 public/authenticated operations, remote write, dashboards, alerting, and
-Agent/Control Plane exporters remain separate work. Tunnel Protocol v2 and the
+Agent and Control Plane exporters are supplied by Sessions 29–30. Tunnel Protocol v2 and the
 snapshot format are unchanged.
 
 ### 2.26 Secret-safe process logging (Session 28)
@@ -663,9 +663,32 @@ Startup binds operations before polling the Agent connection future, so bind
 failure creates no outbound connection. Shutdown marks Agent readiness false,
 drains the transport/TLS/enrollment supervisors while operations remains
 available, then stops operations and releases its port. Metrics are
-process-local and reset on restart. Control Plane metrics, remote write,
-durability, dashboards, and alerting remain tracked by DEBT-010; protocol and
+process-local and reset on restart. Control Plane metrics arrive in Session 30;
+remote write, durability, dashboards, and alerting remain tracked by DEBT-010; protocol and
 snapshot formats are unchanged.
+
+### 2.28 Bounded Control Plane operations endpoint (Session 30)
+
+The runnable Control Plane may bind a separate loopback-only HTTP/1.1
+operations listener. A shared process-local atomic telemetry handle is updated
+by the SQLite refresh supervisor, snapshot distribution service, optional
+enrollment service, and reconciliation loop. Scraping never performs SQLite or
+network I/O.
+
+`/healthz` reports operations-listener liveness. `/readyz` is true only after
+the durable authority is initialized and required snapshot and optional
+enrollment supervisors are running outside shutdown drain. `/metrics` reports
+snapshot version, fixed refresh/enrollment outcomes, snapshot and enrollment
+admission, reconciliation, and operations admission. Labels are fixed and no
+identity, address, database path, fingerprint, digest, secret, certificate,
+key, or payload is emitted.
+
+Operations configuration is validated before storage is opened. A later bind
+failure drops already-bound child listeners. Shutdown removes readiness first,
+stops snapshot distribution and enrollment next, then drains operations last.
+The endpoint is disabled by default and cannot bind a non-loopback address.
+Metrics reset on restart; durable storage, remote write, public/authenticated
+access, dashboards, and alerts remain out of scope.
 
 ## 3. Control plane vs data plane
 

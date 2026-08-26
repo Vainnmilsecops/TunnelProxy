@@ -138,7 +138,7 @@
   public raw-ingress production path. This debt remains open only for the
   legacy standalone `Forwarder`, which is not used by that public route.
 
-### DEBT-010 — Production telemetry is non-durable and lacks Control Plane metrics
+### DEBT-010 — Production telemetry is non-durable
 
 - **Introduced in:** Session 04
 - **Category:** ops
@@ -146,16 +146,17 @@
 - **Rationale:** Session 27 adds a bounded loopback Prometheus exporter for the
   Edge production data path. Session 28 gives Agent, Edge, and Control Plane a
   common secret-safe JSON Lines stderr sink and filter. Session 29 adds bounded
-  Agent connection/readiness metrics. Metrics remain process-local, the Control
-  Plane has no exporter, stderr emission is synchronous, and there is no remote
-  write, durable history, dashboard, or alert policy.
-- **Exit plan:** Add bounded Control Plane metrics plus operator-owned
-  collection/retention guidance and an optional bounded nonblocking sink before
+  Agent connection/readiness metrics. Session 30 adds bounded Control Plane
+  readiness and service metrics. Metrics remain process-local, stderr emission
+  is synchronous, and there is no remote write, durable history, dashboard, or
+  alert policy.
+- **Exit plan:** Add operator-owned collection/retention guidance and an
+  optional bounded nonblocking sink before
   claiming complete production observability. Keep external backend I/O off
   request routing.
 - **Tracking:** partially resolved by Edge metrics in Session 27, shared logs
-  in Session 28, and Agent metrics in Session 29; open for Control Plane metrics
-  and durable backend integration.
+  in Session 28, Agent metrics in Session 29, and Control Plane metrics in
+  Session 30; open for durable backend integration.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 
