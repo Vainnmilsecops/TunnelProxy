@@ -782,3 +782,32 @@ wire or domain schema change. Event authors remain responsible for excluding
 tokens, certificates, private keys, payloads, and bodies. The synchronous
 stderr sink has no rotation, durable retention, remote shipping, backpressure
 queue, dashboard, or alert policy; those remain under DEBT-010.
+
+---
+
+## ADR-029 — Agent operations are loopback-only and session-ready
+
+**Status:** Accepted (Session 29).
+
+**Context:** Structured logs describe individual Agent transitions, but a local
+supervisor or collector cannot cheaply distinguish a live process from an
+Agent with an established routable session. Metrics must not expose durable
+identity, local topology, ephemeral session IDs, or traffic values, and
+observability must remain available while the data path drains.
+
+**Decision:** The runnable Agent may opt into a separate bounded loopback-only
+HTTP/1.1 listener serving liveness, established-session readiness, and
+Prometheus connection-lifecycle metrics. The reconnect runtime publishes one
+fixed phase and monotonic counters through process-local atomics. The process
+supervisor forces `draining` before cancellation; runtime state updates cannot
+overwrite it. Operations binds before the outbound connection future is
+polled, remains available while Agent-owned supervisors drain, and stops last.
+Metric labels are fixed and omit identities, addresses, sessions,
+certificates, secrets, and payloads.
+
+**Consequences:** Local process supervisors can tell whether the Agent is
+alive, connected, reconnecting, or draining without scraping logs or touching
+Edge/Control Plane state. The endpoint is unauthenticated because it cannot be
+publicly bound. Metrics reset on restart and do not include stream/byte
+telemetry. Control Plane metrics, durable/remote storage, dashboards, alerts,
+and nonblocking log shipping remain outside this decision.

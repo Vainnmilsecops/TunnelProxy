@@ -19,6 +19,10 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
 tunnelproxy-common = { path = "../common" }
 

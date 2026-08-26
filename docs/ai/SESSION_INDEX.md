@@ -968,3 +968,31 @@ Out of scope:
   buffering, dashboards, and alerts.
 - Agent/Control Plane metrics, hostname administration, transport fairness,
   HTTP/2, signed access URLs, and multi-edge ownership.
+
+## Session 29 — Bounded Agent Operations Endpoint & Connection Metrics — complete
+
+Scope delivered:
+
+- Added process-local Agent runtime status for offline, connecting, connected,
+  reconnect backoff, draining, and stopped phases plus bounded monotonic
+  connection lifecycle counters.
+- Added an opt-in loopback-only HTTP/1.1 operations runtime with bounded
+  connections, headers, request deadline, drain deadline, and
+  `/healthz`, `/readyz`, and `/metrics` for `GET`/`HEAD`.
+- Defined readiness as one established registered session outside shutdown
+  drain. Metrics use only a fixed state label set and exclude durable identity,
+  addresses, session IDs, certificates, secrets, and payloads.
+- Integrated Agent CLI flags and ordered supervision. Operations bind failure
+  occurs before outbound dial; shutdown removes readiness, drains Agent/TLS/
+  enrollment work, then drains operations and releases its listener.
+- Added unit, CLI subprocess, and real-TCP tests for configuration/rendering,
+  pre-dial rollback, offline→connected→reconnect readiness, counters, capacity
+  RAII, ordered shutdown, and port release. The workspace now contains 302
+  explicit tests.
+
+Out of scope:
+
+- Control Plane metrics, stream/byte telemetry, public/authenticated operations,
+  remote write, durable metric history, dashboards, alerts, and log buffering.
+- Hostname administration, transport fairness, HTTP/2, signed access URLs, and
+  multi-edge ownership.

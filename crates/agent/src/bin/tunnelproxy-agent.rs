@@ -8,7 +8,8 @@ use std::time::Duration;
 use tracing::{error, info};
 use tunnelproxy_agent::{
     bootstrap_agent_credentials, AgentEnrollmentConfig, AgentEnrollmentError,
-    AgentEnrollmentRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig,
+    AgentEnrollmentRuntime, AgentOperationsConfig, AgentOperationsError, AgentOperationsOutcome,
+    AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig,
     AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
     AgentTransportSecurity, EnrollmentClientConfig, RuntimeShutdownConfig,
 };
@@ -36,6 +37,10 @@ Options:
   --reconnect-jitter-percent <n> downward jitter (default 20)
   --stable-session-reset-ms <ms> reset streak  (default 30000)
   --max-reconnect-attempts <n>   failure limit (default unlimited)
+  --ops-listen <loopback-addr>   enable health/readiness/metrics endpoint
+  --max-ops-connections <usize>  operations connection limit (default 8)
+  --ops-header-timeout-ms <ms>   operations header deadline (default 2000)
+  --ops-request-timeout-ms <ms>  operations request deadline (default 5000)
   --tls-ca <path>                trusted Edge CA PEM
   --tls-client-cert <path>       Agent certificate PEM
   --tls-client-key <path>        Agent private key PEM
@@ -150,6 +155,28 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let runtime_status = runtime.status_handle();
+    let runtime_control = runtime.control();
+    let operations = match parsed.ops_listen {
+        Some(listen_addr) => {
+            let mut config = AgentOperationsConfig::loopback(listen_addr);
+            config.max_concurrent_connections = parsed.max_ops_connections;
+            config.header_read_timeout = parsed.ops_header_timeout;
+            config.request_timeout = parsed.ops_request_timeout;
+            config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+            match AgentOperationsRuntime::bind(config, runtime_status).await {
+                Ok(runtime) => {
+                    info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
+                    Some(runtime)
+                }
+                Err(error) => {
+                    error!(%error, "failed to start Agent operations endpoint");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        None => None,
+    };
     info!(
         edge = %parsed.edge,
         local = %parsed.local,
@@ -159,12 +186,15 @@ async fn main() -> ExitCode {
     );
 
     let (trigger, signal) = shutdown_channel();
+    let (operations_trigger, operations_signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
     let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
     tokio::pin!(reload_future);
     let enrollment_future = run_optional_enrollment(enrollment_runtime, signal.clone());
     tokio::pin!(enrollment_future);
+    let operations_future = run_optional_operations(operations, operations_signal);
+    tokio::pin!(operations_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
     return tokio::select! {
@@ -172,49 +202,73 @@ async fn main() -> ExitCode {
             trigger.shutdown();
             let _ = reload_future.await;
             let _ = enrollment_future.await;
-            agent_exit_code(result)
+            operations_trigger.shutdown();
+            let operations = operations_future.await;
+            combine_exit_codes(agent_exit_code(result), operations)
         },
         reload = &mut reload_future => {
+            runtime_control.begin_draining();
             trigger.shutdown();
             let _ = runtime_future.await;
             let _ = enrollment_future.await;
-            match reload {
+            operations_trigger.shutdown();
+            let operations = operations_future.await;
+            let code = match reload {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     error!(%error, "Agent TLS reload runtime failed");
                     ExitCode::from(1)
                 }
-            }
+            };
+            combine_exit_codes(code, operations)
         },
         enrollment = &mut enrollment_future => {
+            runtime_control.begin_draining();
             trigger.shutdown();
             let _ = runtime_future.await;
             let _ = reload_future.await;
-            match enrollment {
+            operations_trigger.shutdown();
+            let operations = operations_future.await;
+            let code = match enrollment {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     error!(%error, "Agent enrollment runtime failed");
                     ExitCode::from(1)
                 }
-            }
+            };
+            combine_exit_codes(code, operations)
+        },
+        operations = &mut operations_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            combine_exit_codes(ExitCode::from(1), operations)
         },
         observed = &mut os_signal => {
             match observed {
                 Ok(cause) => info!(%cause, "process shutdown requested"),
                 Err(error) => {
                     error!(%error, "OS shutdown listener failed");
+                    runtime_control.begin_draining();
                     trigger.shutdown();
                     let _ = runtime_future.await;
                     let _ = reload_future.await;
                     let _ = enrollment_future.await;
-                    return ExitCode::from(1);
+                    operations_trigger.shutdown();
+                    let operations = operations_future.await;
+                    return combine_exit_codes(ExitCode::from(1), operations);
                 }
             }
+            runtime_control.begin_draining();
             trigger.shutdown();
             let result = runtime_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
-            agent_exit_code(result)
+            operations_trigger.shutdown();
+            let operations = operations_future.await;
+            combine_exit_codes(agent_exit_code(result), operations)
         }
     };
 }
@@ -234,6 +288,43 @@ async fn run_optional_enrollment(
         None => {
             signal.cancelled().await;
             Ok(())
+        }
+    }
+}
+
+async fn run_optional_operations(
+    runtime: Option<AgentOperationsRuntime>,
+    signal: tunnelproxy_common::ShutdownSignal,
+) -> Result<Option<AgentOperationsOutcome>, AgentOperationsError> {
+    match runtime {
+        Some(runtime) => runtime.run_until_shutdown(signal).await.map(Some),
+        None => {
+            signal.cancelled().await;
+            Ok(None)
+        }
+    }
+}
+
+fn combine_exit_codes(
+    base: ExitCode,
+    operations: Result<Option<AgentOperationsOutcome>, AgentOperationsError>,
+) -> ExitCode {
+    match operations {
+        Ok(Some(outcome)) if outcome.was_forced() => {
+            error!(
+                ?outcome,
+                "Agent operations shutdown exceeded its drain deadline"
+            );
+            ExitCode::from(1)
+        }
+        Ok(Some(outcome)) => {
+            info!(?outcome, "Agent operations shutdown completed");
+            base
+        }
+        Ok(None) => base,
+        Err(error) => {
+            error!(%error, "Agent operations runtime failed");
+            ExitCode::from(1)
         }
     }
 }
@@ -286,6 +377,10 @@ struct ParsedArgs {
     reconnect_jitter_percent: u8,
     stable_session_reset: Duration,
     max_reconnect_attempts: Option<u32>,
+    ops_listen: Option<SocketAddr>,
+    max_ops_connections: usize,
+    ops_header_timeout: Duration,
+    ops_request_timeout: Duration,
     tls_ca: Option<PathBuf>,
     tls_client_cert: Option<PathBuf>,
     tls_client_key: Option<PathBuf>,
@@ -328,6 +423,10 @@ impl Default for ParsedArgs {
             reconnect_jitter_percent: 20,
             stable_session_reset: Duration::from_secs(30),
             max_reconnect_attempts: None,
+            ops_listen: None,
+            max_ops_connections: 8,
+            ops_header_timeout: Duration::from_secs(2),
+            ops_request_timeout: Duration::from_secs(5),
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -447,6 +546,23 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-reconnect-attempts" => {
                 parsed.max_reconnect_attempts = Some(parse_number(args, index, flag)?);
+                index += 2;
+            }
+            "--ops-listen" => {
+                parsed.ops_listen = Some(parse_addr(args, index, flag)?);
+                index += 2;
+            }
+            "--max-ops-connections" => {
+                parsed.max_ops_connections = parse_number(args, index, flag)?;
+                index += 2;
+            }
+            "--ops-header-timeout-ms" => {
+                parsed.ops_header_timeout = Duration::from_millis(parse_number(args, index, flag)?);
+                index += 2;
+            }
+            "--ops-request-timeout-ms" => {
+                parsed.ops_request_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
                 index += 2;
             }
             "--tls-ca" => {
@@ -822,6 +938,14 @@ mod tests {
             "500",
             "--max-reconnect-attempts",
             "7",
+            "--ops-listen",
+            "127.0.0.1:19091",
+            "--max-ops-connections",
+            "9",
+            "--ops-header-timeout-ms",
+            "900",
+            "--ops-request-timeout-ms",
+            "1000",
             "--tls-ca",
             "ca.pem",
             "--tls-client-cert",
@@ -854,6 +978,10 @@ mod tests {
         assert_eq!(parsed.reconnect_jitter_percent, 15);
         assert_eq!(parsed.stable_session_reset, Duration::from_millis(500));
         assert_eq!(parsed.max_reconnect_attempts, Some(7));
+        assert_eq!(parsed.ops_listen.unwrap().port(), 19091);
+        assert_eq!(parsed.max_ops_connections, 9);
+        assert_eq!(parsed.ops_header_timeout, Duration::from_millis(900));
+        assert_eq!(parsed.ops_request_timeout, Duration::from_millis(1000));
         assert_eq!(parsed.tls_ca, Some(PathBuf::from("ca.pem")));
         assert_eq!(parsed.tls_client_cert, Some(PathBuf::from("agent.pem")));
         assert_eq!(parsed.tls_client_key, Some(PathBuf::from("agent-key.pem")));

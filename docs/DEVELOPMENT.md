@@ -553,3 +553,33 @@ appending multiline usage text. Invalid `TUNNELPROXY_LOG_FORMAT` or `RUST_LOG`
 stops the process with exit code 2 before CLI-driven listener binding or file
 mutation. Never place tokens, keys, certificates, payloads, or traffic bodies
 in filter directives or event fields.
+
+## 20. Running the Agent operations endpoint
+
+The runnable Agent can expose local health, readiness, and Prometheus
+connection metrics on an opt-in loopback listener:
+
+```text
+tunnelproxy-agent \
+  --ops-listen 127.0.0.1:9091 \
+  --max-ops-connections 8 \
+  --ops-header-timeout-ms 2000 \
+  --ops-request-timeout-ms 5000
+```
+
+`GET /healthz` returns `200` while the operations listener is running.
+`GET /readyz` returns `200` only after the Agent has completed registration and
+its outbound session is active; it returns `503` during initial connection,
+reconnect backoff, disconnect, and shutdown drain. `GET /metrics` reports
+connection attempts, established sessions, reconnects, disconnects, failures,
+the current fixed connection phase, and operations admission counters. `HEAD`
+is supported; other methods return `405` and unknown paths return `404`.
+
+The endpoint is disabled by default, rejects non-loopback addresses, closes
+after one HTTP/1.1 request, and has explicit connection/header/request/drain
+bounds. An operations bind failure stops startup before the Agent dials Edge.
+During orderly shutdown readiness becomes false first; the endpoint remains
+available while Agent-owned supervisors drain and is stopped last. Metrics do
+not contain AgentId, TunnelId, addresses, session IDs, certificates, secrets,
+or traffic payloads. Do not expose this unauthenticated endpoint through a
+public port forward.

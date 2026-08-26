@@ -49,8 +49,9 @@ the separate bounded Enrollment Protocol v1 message codec.
 **Current implementation:** Outbound mutual-TLS-or-loopback transport,
 certificate-bound Protocol v2 registration intent, handshake/heartbeat,
 bounded multiplexed local bridging, a runnable reconnecting single-session
-process supervisor/CLI, and Agent-owned-key bootstrap/renewal that publishes
-atomic credential manifests.
+process supervisor/CLI, a bounded loopback operations endpoint with connection
+status/metrics, and Agent-owned-key bootstrap/renewal that publishes atomic
+credential manifests.
 
 **Responsibility (future)**
 

@@ -138,23 +138,24 @@
   public raw-ingress production path. This debt remains open only for the
   legacy standalone `Forwarder`, which is not used by that public route.
 
-### DEBT-010 — Production telemetry coverage is Edge-local and non-durable
+### DEBT-010 — Production telemetry is non-durable and lacks Control Plane metrics
 
 - **Introduced in:** Session 04
 - **Category:** ops
 - **Impact:** low
 - **Rationale:** Session 27 adds a bounded loopback Prometheus exporter for the
   Edge production data path. Session 28 gives Agent, Edge, and Control Plane a
-  common secret-safe JSON Lines stderr sink and filter. Metrics remain
-  Edge-local and process-local; stderr emission is synchronous and there is no
-  remote write, durable history, dashboard, or alert policy.
-- **Exit plan:** Add bounded Agent and Control Plane metrics plus
-  operator-owned collection/retention guidance and an optional bounded
-  nonblocking sink before claiming complete production observability. Keep
-  external backend I/O off request routing.
-- **Tracking:** partially resolved by Edge metrics in Session 27 and shared
-  structured log output in Session 28; open for remaining metrics and durable
-  backend integration.
+  common secret-safe JSON Lines stderr sink and filter. Session 29 adds bounded
+  Agent connection/readiness metrics. Metrics remain process-local, the Control
+  Plane has no exporter, stderr emission is synchronous, and there is no remote
+  write, durable history, dashboard, or alert policy.
+- **Exit plan:** Add bounded Control Plane metrics plus operator-owned
+  collection/retention guidance and an optional bounded nonblocking sink before
+  claiming complete production observability. Keep external backend I/O off
+  request routing.
+- **Tracking:** partially resolved by Edge metrics in Session 27, shared logs
+  in Session 28, and Agent metrics in Session 29; open for Control Plane metrics
+  and durable backend integration.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 
