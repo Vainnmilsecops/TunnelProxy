@@ -7,8 +7,8 @@
 
 **Responsibility**
 
-- Cross-component value types and identifiers (`AgentId`, `TunnelId`,
-  future `UserId`, `EdgeId`).
+- Cross-component value types and identifiers (`AgentId`, `TunnelId`, exact
+  canonical `PublicHostname`, future `UserId`, `EdgeId`).
 - Cross-component error sentinels when they are genuinely shared.
 - Small allocation-light helpers used by more than one other crate.
 - Cross-platform process termination observation shared by Edge and Agent.
@@ -123,7 +123,9 @@ idempotent Agent/Tunnel emergency revoke that invalidates tokens and commits
 through the same complete-snapshot authority path. An optional bounded,
 loopback-only operations listener reports in-memory readiness and
 fixed-cardinality snapshot, refresh, enrollment, and reconciliation metrics
-without querying SQLite during a scrape.
+without querying SQLite during a scrape. A separate transactional SQLite HTTPS
+route catalog holds at most 64 exact hostname-to-TunnelId/status records with
+its own monotonic version and idempotent operator CLI administration.
 
 **Responsibility (future)**
 

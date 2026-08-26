@@ -81,8 +81,11 @@ opaque raw TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
 routing, and applies process-local global/per-IP request token buckets, but it
-is not yet the automatic future product UX. Edge and Agent have opt-in bounded
-loopback operations endpoints for Agent, Edge, and Control Plane;
-public/authenticated operations access and durable metrics storage are not implemented. All
-three runnable components can emit collector-friendly, secret-safe JSON Lines
-to stderr without changing their plain stdout command contracts.
+is not yet the automatic future product UX. Control Plane has a separate
+bounded, versioned SQLite catalog and operator CLI for durable exact-hostname
+route intent, but Edge does not consume that catalog yet. Agent, Edge, and
+Control Plane have opt-in bounded loopback operations endpoints;
+public/authenticated operations access and durable metrics storage are not
+implemented. All three runnable components can emit collector-friendly,
+secret-safe JSON Lines to stderr without changing their plain stdout command
+contracts.

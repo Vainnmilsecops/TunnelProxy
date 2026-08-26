@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 mod credential_bundle;
 mod process_logging;
+mod public_hostname;
 mod tls_reload;
 
 pub use credential_bundle::{
@@ -23,6 +24,10 @@ pub use credential_bundle::{
 
 pub use process_logging::{
     init_process_logging, ProcessLogFormat, ProcessLoggingConfigError, LOG_FORMAT_ENV,
+};
+
+pub use public_hostname::{
+    PublicHostname, PublicHostnameError, MAX_DNS_LABEL_BYTES, MAX_PUBLIC_HOSTNAME_BYTES,
 };
 
 pub use tls_reload::{

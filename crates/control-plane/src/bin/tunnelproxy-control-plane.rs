@@ -9,13 +9,14 @@ use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 use tunnelproxy_common::{
     init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
-    TunnelId,
+    PublicHostname, TunnelId,
 };
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
     ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
-    EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig, SnapshotCommitOutcome,
-    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
+    EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig,
+    HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteStatus,
+    SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
     SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
     SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
 };
@@ -27,6 +28,9 @@ Usage:
   tunnelproxy-control-plane create-token [OPTIONS]
   tunnelproxy-control-plane revoke-agent [OPTIONS]
   tunnelproxy-control-plane credential-status [OPTIONS]
+  tunnelproxy-control-plane https-route-upsert [OPTIONS]
+  tunnelproxy-control-plane https-route-remove [OPTIONS]
+  tunnelproxy-control-plane https-route-list [OPTIONS]
 
 Serve options:
   --database <path>                  SQLite snapshot database (required)
@@ -70,6 +74,16 @@ Credential command options:
   --database <path>                  SQLite snapshot database (required)
   --agent-id <id>                    exact Agent ID (required)
   --tunnel-id <id>                   exact Tunnel ID (required)
+
+HTTPS route upsert options:
+  --database <path>                  SQLite state database (required)
+  --hostname <name>                  exact public DNS hostname (required)
+  --tunnel-id <id>                   target Tunnel ID (required)
+  --status <enabled|disabled>        administrative route state (required)
+
+HTTPS route remove/list options:
+  --database <path>                  SQLite state database (required)
+  --hostname <name>                  exact hostname (remove only, required)
 
   --help                             print this help and exit
 ";
@@ -144,6 +158,35 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 error!(%error, "credential status query failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::HttpsRouteUpsert(args) => match run_https_route_upsert(args).await {
+            Ok(outcome) => {
+                print_route_mutation(outcome);
+                info!(?outcome, "HTTPS route upsert completed");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "HTTPS route upsert failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::HttpsRouteRemove(args) => match run_https_route_remove(args).await {
+            Ok(outcome) => {
+                print_route_mutation(outcome);
+                info!(?outcome, "HTTPS route removal completed");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "HTTPS route removal failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::HttpsRouteList(args) => match run_https_route_list(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                error!(%error, "HTTPS route listing failed");
                 ExitCode::from(1)
             }
         },
@@ -373,6 +416,9 @@ enum ParsedCommand {
     CreateToken(CreateTokenArgs),
     RevokeAgent(CredentialTargetArgs),
     CredentialStatus(CredentialTargetArgs),
+    HttpsRouteUpsert(HttpsRouteUpsertArgs),
+    HttpsRouteRemove(HttpsRouteRemoveArgs),
+    HttpsRouteList(HttpsRouteListArgs),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -453,6 +499,59 @@ async fn run_credential_status(args: CredentialTargetArgs) -> Result<(), Credent
     Ok(())
 }
 
+async fn run_https_route_upsert(
+    args: HttpsRouteUpsertArgs,
+) -> Result<HttpsRouteMutationOutcome, HttpsRouteCommandError> {
+    tokio::task::spawn_blocking(move || {
+        HttpsRouteRepository::open(args.database)?.upsert(&HttpsRouteRecord::new(
+            args.hostname,
+            args.tunnel_id,
+            args.status,
+        ))
+    })
+    .await
+    .map_err(|_| HttpsRouteCommandError::StorageTask)?
+    .map_err(HttpsRouteCommandError::Repository)
+}
+
+async fn run_https_route_remove(
+    args: HttpsRouteRemoveArgs,
+) -> Result<HttpsRouteMutationOutcome, HttpsRouteCommandError> {
+    tokio::task::spawn_blocking(move || {
+        HttpsRouteRepository::open(args.database)?.remove(&args.hostname)
+    })
+    .await
+    .map_err(|_| HttpsRouteCommandError::StorageTask)?
+    .map_err(HttpsRouteCommandError::Repository)
+}
+
+async fn run_https_route_list(args: HttpsRouteListArgs) -> Result<(), HttpsRouteCommandError> {
+    let catalog =
+        tokio::task::spawn_blocking(move || HttpsRouteRepository::open(args.database)?.load())
+            .await
+            .map_err(|_| HttpsRouteCommandError::StorageTask)?
+            .map_err(HttpsRouteCommandError::Repository)?;
+    println!("catalog_version={}", catalog.version());
+    for route in catalog.routes() {
+        println!(
+            "hostname={} tunnel_id={} status={}",
+            route.hostname, route.tunnel_id, route.status
+        );
+    }
+    Ok(())
+}
+
+fn print_route_mutation(outcome: HttpsRouteMutationOutcome) {
+    match outcome {
+        HttpsRouteMutationOutcome::Applied { current, .. } => {
+            println!("catalog_version={current} changed=true");
+        }
+        HttpsRouteMutationOutcome::Unchanged { version } => {
+            println!("catalog_version={version} changed=false");
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ImportArgs {
     database: PathBuf,
@@ -475,6 +574,25 @@ struct CredentialTargetArgs {
     tunnel_id: TunnelId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpsRouteUpsertArgs {
+    database: PathBuf,
+    hostname: PublicHostname,
+    tunnel_id: TunnelId,
+    status: HttpsRouteStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpsRouteRemoveArgs {
+    database: PathBuf,
+    hostname: PublicHostname,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpsRouteListArgs {
+    database: PathBuf,
+}
+
 fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(ArgError::MissingCommand);
@@ -490,6 +608,13 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
         "credential-status" => {
             parse_credential_target(&args[1..]).map(ParsedCommand::CredentialStatus)
         }
+        "https-route-upsert" => {
+            parse_https_route_upsert(&args[1..]).map(ParsedCommand::HttpsRouteUpsert)
+        }
+        "https-route-remove" => {
+            parse_https_route_remove(&args[1..]).map(ParsedCommand::HttpsRouteRemove)
+        }
+        "https-route-list" => parse_https_route_list(&args[1..]).map(ParsedCommand::HttpsRouteList),
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
 }
@@ -722,6 +847,87 @@ fn parse_credential_target(args: &[String]) -> Result<CredentialTargetArgs, ArgE
     })
 }
 
+fn parse_https_route_upsert(args: &[String]) -> Result<HttpsRouteUpsertArgs, ArgError> {
+    let mut database = None;
+    let mut hostname = None;
+    let mut tunnel_id = None;
+    let mut status = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--hostname" => {
+                hostname = Some(
+                    PublicHostname::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            "--tunnel-id" => {
+                tunnel_id = Some(
+                    TunnelId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            "--status" => {
+                status = Some(
+                    value(args, index, flag)?
+                        .parse()
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HttpsRouteUpsertArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        hostname: hostname.ok_or(ArgError::MissingRequired("--hostname"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
+        status: status.ok_or(ArgError::MissingRequired("--status"))?,
+    })
+}
+
+fn parse_https_route_remove(args: &[String]) -> Result<HttpsRouteRemoveArgs, ArgError> {
+    let mut database = None;
+    let mut hostname = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--hostname" => {
+                hostname = Some(
+                    PublicHostname::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HttpsRouteRemoveArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        hostname: hostname.ok_or(ArgError::MissingRequired("--hostname"))?,
+    })
+}
+
+fn parse_https_route_list(args: &[String]) -> Result<HttpsRouteListArgs, ArgError> {
+    let mut database = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HttpsRouteListArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+    })
+}
+
 fn parse_import(args: &[String]) -> Result<ImportArgs, ArgError> {
     let mut database = None;
     let mut snapshot = None;
@@ -906,6 +1112,23 @@ impl std::fmt::Display for CredentialCommandError {
         match self {
             Self::Repository(error) => error.fmt(f),
             Self::StorageTask => f.write_str("credential storage worker stopped unexpectedly"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum HttpsRouteCommandError {
+    Repository(tunnelproxy_control_plane::HttpsRouteRepositoryError),
+    StorageTask,
+}
+
+impl std::fmt::Display for HttpsRouteCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(error) => error.fmt(formatter),
+            Self::StorageTask => {
+                formatter.write_str("HTTPS route storage worker stopped unexpectedly")
+            }
         }
     }
 }
@@ -1144,5 +1367,75 @@ mod tests {
             ])),
             Ok(ParsedCommand::CredentialStatus(target))
         );
+    }
+
+    #[test]
+    fn https_route_commands_parse_canonical_values_and_reject_invalid_input() {
+        assert_eq!(
+            parse_args(&args(&[
+                "https-route-upsert",
+                "--database",
+                "state.db",
+                "--hostname",
+                "Demo.Example.TEST.",
+                "--tunnel-id",
+                "tunnel-route",
+                "--status",
+                "disabled",
+            ])),
+            Ok(ParsedCommand::HttpsRouteUpsert(HttpsRouteUpsertArgs {
+                database: PathBuf::from("state.db"),
+                hostname: PublicHostname::new("demo.example.test").unwrap(),
+                tunnel_id: TunnelId::new("tunnel-route").unwrap(),
+                status: HttpsRouteStatus::Disabled,
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "https-route-remove",
+                "--database",
+                "state.db",
+                "--hostname",
+                "demo.example.test",
+            ])),
+            Ok(ParsedCommand::HttpsRouteRemove(HttpsRouteRemoveArgs {
+                database: PathBuf::from("state.db"),
+                hostname: PublicHostname::new("demo.example.test").unwrap(),
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["https-route-list", "--database", "state.db"])),
+            Ok(ParsedCommand::HttpsRouteList(HttpsRouteListArgs {
+                database: PathBuf::from("state.db"),
+            }))
+        );
+        assert!(matches!(
+            parse_args(&args(&[
+                "https-route-upsert",
+                "--database",
+                "must-not-exist.db",
+                "--hostname",
+                "*.example.test",
+                "--tunnel-id",
+                "tunnel-route",
+                "--status",
+                "enabled",
+            ])),
+            Err(ArgError::InvalidValue(flag)) if flag == "--hostname"
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "https-route-upsert",
+                "--database",
+                "state.db",
+                "--hostname",
+                "demo.example.test",
+                "--tunnel-id",
+                "tunnel-route",
+                "--status",
+                "active",
+            ])),
+            Err(ArgError::InvalidValue(flag)) if flag == "--status"
+        ));
     }
 }

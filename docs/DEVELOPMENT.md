@@ -609,3 +609,35 @@ after one bounded HTTP/1.1 request, and performs no SQLite query during a
 scrape. Do not expose it through a public port forward. Metrics exclude IDs,
 addresses, database paths, fingerprints, digests, tokens, certificates, keys,
 and protocol payloads.
+
+## 22. Administering the durable HTTPS route catalog
+
+The Control Plane CLI stores exact HTTPS hostname routes in the same SQLite
+database used by the durable authority, while keeping catalog versions
+independent from authorization snapshot versions:
+
+```text
+tunnelproxy-control-plane https-route-upsert \
+  --database state.sqlite \
+  --hostname Demo.Example.test. \
+  --tunnel-id tunnel-a \
+  --status enabled
+
+tunnelproxy-control-plane https-route-list --database state.sqlite
+
+tunnelproxy-control-plane https-route-remove \
+  --database state.sqlite \
+  --hostname demo.example.test
+```
+
+Hostnames are canonicalized to lowercase without a trailing dot. Wildcards,
+IP literals, ports, non-ASCII names, invalid DNS labels, and names over the DNS
+length limits are rejected with exit code 2 before the database is opened.
+Successful mutations print `catalog_version=<n> changed=true|false`; repeated
+identical upserts and absent removals are successful no-ops. Listing prints the
+catalog version followed by routes in deterministic hostname order. Repository
+failures use exit code 1 and do not expose the database path.
+
+The catalog is capped at 64 records and mutations are transactional. It is not
+yet distributed to Edge; the runnable HTTPS ingress continues to use its
+explicit `--https-host` and `--tunnel-id` configuration.

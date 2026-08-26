@@ -3,11 +3,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
-use tunnelproxy_common::{AgentId, TunnelId};
+use tunnelproxy_common::{AgentId, PublicHostname, TunnelId};
 use tunnelproxy_control_plane::{
     enrollment_token_hash, unix_time_now, AuthorizationSnapshot, EnrollmentRepository,
-    EnrollmentRepositoryError, SnapshotRepository, SnapshotVersion, SqliteSnapshotRepository,
-    VersionedAuthorizationSnapshot,
+    EnrollmentRepositoryError, HttpsRouteRepository, HttpsRouteStatus, SnapshotRepository,
+    SnapshotVersion, SqliteSnapshotRepository, VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -268,5 +268,136 @@ fn revoke_and_status_commands_are_idempotent_and_secret_safe() {
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("snapshot_version=1"));
     assert!(!String::from_utf8_lossy(&status.stdout).contains(token_text));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn https_route_cli_is_canonical_idempotent_sorted_and_validates_before_mutation() {
+    let directory = temp_directory();
+    let invalid_database = directory.join("must-not-exist.sqlite");
+    let invalid = Command::new(binary())
+        .args([
+            "https-route-upsert",
+            "--database",
+            invalid_database.to_str().unwrap(),
+            "--hostname",
+            "*.example.test",
+            "--tunnel-id",
+            "tunnel-invalid",
+            "--status",
+            "enabled",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!invalid_database.exists());
+
+    let database = directory.join("state.sqlite");
+    let first = Command::new(binary())
+        .args([
+            "https-route-upsert",
+            "--database",
+            database.to_str().unwrap(),
+            "--hostname",
+            "Z.Example.TEST.",
+            "--tunnel-id",
+            "tunnel-z",
+            "--status",
+            "enabled",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    assert_eq!(
+        String::from_utf8(first.stdout).unwrap(),
+        "catalog_version=2 changed=true\n"
+    );
+    let repeated = Command::new(binary())
+        .args([
+            "https-route-upsert",
+            "--database",
+            database.to_str().unwrap(),
+            "--hostname",
+            "z.example.test",
+            "--tunnel-id",
+            "tunnel-z",
+            "--status",
+            "enabled",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stdout).unwrap(),
+        "catalog_version=2 changed=false\n"
+    );
+    let second = Command::new(binary())
+        .args([
+            "https-route-upsert",
+            "--database",
+            database.to_str().unwrap(),
+            "--hostname",
+            "a.example.test",
+            "--tunnel-id",
+            "tunnel-a",
+            "--status",
+            "disabled",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+
+    let listed = Command::new(binary())
+        .args(["https-route-list", "--database", database.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap(),
+        "catalog_version=3\nhostname=a.example.test tunnel_id=tunnel-a status=disabled\nhostname=z.example.test tunnel_id=tunnel-z status=enabled\n"
+    );
+
+    let removed = Command::new(binary())
+        .args([
+            "https-route-remove",
+            "--database",
+            database.to_str().unwrap(),
+            "--hostname",
+            "a.example.test",
+        ])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    assert_eq!(
+        String::from_utf8(removed.stdout).unwrap(),
+        "catalog_version=4 changed=true\n"
+    );
+    let absent = Command::new(binary())
+        .args([
+            "https-route-remove",
+            "--database",
+            database.to_str().unwrap(),
+            "--hostname",
+            "a.example.test",
+        ])
+        .output()
+        .unwrap();
+    assert!(absent.status.success());
+    assert_eq!(
+        String::from_utf8(absent.stdout).unwrap(),
+        "catalog_version=4 changed=false\n"
+    );
+
+    let catalog = HttpsRouteRepository::open(&database)
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(catalog.version().get(), 4);
+    assert_eq!(catalog.routes().len(), 1);
+    assert_eq!(
+        catalog.routes()[0].hostname,
+        PublicHostname::new("z.example.test").unwrap()
+    );
+    assert_eq!(catalog.routes()[0].status, HttpsRouteStatus::Enabled);
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -17,6 +17,7 @@ use tunnelproxy_common::{AgentId, TunnelId};
 mod certificate_issuer;
 mod enrollment_repository;
 mod enrollment_service;
+mod https_route_repository;
 mod operations;
 mod repository;
 mod runtime;
@@ -36,6 +37,11 @@ pub use enrollment_repository::{
 pub use enrollment_service::{
     EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,
     EnrollmentTlsConfigError,
+};
+pub use https_route_repository::{
+    HttpsRouteCatalog, HttpsRouteCatalogVersion, HttpsRouteMutationOutcome, HttpsRouteRecord,
+    HttpsRouteRepository, HttpsRouteRepositoryError, HttpsRouteStatus, HttpsRouteStatusParseError,
+    MAX_HTTPS_ROUTE_RECORDS,
 };
 pub use operations::{
     ControlPlaneOperationsConfig, ControlPlaneOperationsConfigError, ControlPlaneOperationsError,

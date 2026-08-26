@@ -20,6 +20,22 @@
 
 ## Open items
 
+### DEBT-022 — Durable HTTPS routes are not distributed to Edge
+
+- **Introduced in:** Session 31
+- **Category:** product / reliability
+- **Impact:** medium for dynamic administration, low for the existing
+  operator-configured single-route Edge
+- **Rationale:** The first durable catalog establishes canonical identity,
+  bounded transactional storage, versions, and CLI mutation without coupling a
+  new distribution contract to the authorization snapshot or Edge hot path.
+  Edge therefore continues to use explicit process-start HTTPS route config.
+- **Exit plan:** Define a bounded authenticated latest-value catalog delivery
+  and cache contract, then atomically reconcile immutable Edge routing tables
+  without per-request Control Plane or SQLite lookups. Specify stale/expiry and
+  revocation behavior before enabling multiple dynamic routes.
+- **Tracking:** open.
+
 ### DEBT-021 — HTTP request-rate state is per-Edge and non-durable
 
 - **Introduced in:** Session 26
