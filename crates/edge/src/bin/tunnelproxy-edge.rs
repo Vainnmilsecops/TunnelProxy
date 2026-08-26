@@ -6,8 +6,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
-use tunnelproxy_common::{shutdown_channel, wait_for_process_shutdown, AgentId, TunnelId};
+use tunnelproxy_common::{
+    init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
+    TunnelId,
+};
 use tunnelproxy_control_plane::{
     SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
     SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime, SnapshotTlsConfigError,
@@ -86,18 +88,20 @@ Options:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let log_format = match init_process_logging() {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("failed to configure logging: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     let args: Vec<_> = std::env::args().skip(1).collect();
     let parsed = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             error!(%error, "invalid Edge CLI arguments");
-            eprintln!("{USAGE}");
+            print_usage_for_error(log_format);
             return ExitCode::from(2);
         }
     };
@@ -109,7 +113,7 @@ async fn main() -> ExitCode {
         Ok(exposure) => exposure,
         Err(error) => {
             error!(%error, "invalid raw ingress exposure policy");
-            eprintln!("{USAGE}");
+            print_usage_for_error(log_format);
             return ExitCode::from(2);
         }
     };
@@ -166,6 +170,12 @@ async fn main() -> ExitCode {
             config.multiplex.security = security;
             run_snapshot_edge(config, snapshots, cache, reloaders, &parsed).await
         }
+    }
+}
+
+fn print_usage_for_error(log_format: ProcessLogFormat) {
+    if log_format == ProcessLogFormat::Text {
+        eprintln!("{USAGE}");
     }
 }
 

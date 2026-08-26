@@ -41,6 +41,9 @@ correct agent, which in turn proxies them into the local service.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, raw ingress, HTTPS, and rate limiting.
+- Secret-safe process logging for Agent, Edge, and Control Plane with
+  human-readable stderr output by default or schema-stable JSON Lines selected
+  through `TUNNELPROXY_LOG_FORMAT=json` and filtered through `RUST_LOG`.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
@@ -64,7 +67,7 @@ The following are **not yet implemented**:
   rollover.
 - Request inspection, replay, and webhook debugging.
 - Public/authenticated operations access, metrics persistence/remote write,
-  dashboards, and Agent/Control Plane metrics.
+  dashboards, alerts, and Agent/Control Plane metrics.
 - Multi-tenant or multi-edge runtime.
 
 Any README, comment, or doc that suggests these features work today is a bug.

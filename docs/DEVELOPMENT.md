@@ -521,3 +521,35 @@ local-only. Do not expose it through a public port forward. Metric labels never
 contain peer IPs, hostnames, TunnelIds, AgentIds, session IDs, certificates, or
 payload data. Remote write, persistence, dashboards, alerts, and Agent/Control
 Plane exporters are not implemented.
+
+## 19. Configuring process logs
+
+Agent, Edge, Control Plane, and the development examples write structured
+events to stderr. Human-readable text is the default. Set
+`TUNNELPROXY_LOG_FORMAT=json` for one JSON object per line with stable
+`timestamp`, `level`, `target`, and `fields` keys. ANSI is disabled in JSON
+mode. `RUST_LOG` uses tracing-subscriber filter directives in both modes and
+defaults to `info`.
+
+PowerShell:
+
+```powershell
+$env:TUNNELPROXY_LOG_FORMAT = "json"
+$env:RUST_LOG = "info,tunnelproxy_edge=debug"
+cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- --help
+```
+
+Bash:
+
+```bash
+TUNNELPROXY_LOG_FORMAT=json \
+RUST_LOG=info,tunnelproxy_edge=debug \
+cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- --help
+```
+
+Help and machine-readable command reports stay on stdout; events stay on
+stderr. In JSON mode, invalid CLI arguments produce a JSON error event without
+appending multiline usage text. Invalid `TUNNELPROXY_LOG_FORMAT` or `RUST_LOG`
+stops the process with exit code 2 before CLI-driven listener binding or file
+mutation. Never place tokens, keys, certificates, payloads, or traffic bodies
+in filter directives or event fields.

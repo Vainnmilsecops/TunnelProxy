@@ -756,3 +756,29 @@ new wire protocol. The listener has no public mode, authentication, or TLS and
 must not be port-forwarded externally. Counters reset on restart; remote write,
 durable history, dashboards/alerts, JSON logging, and Agent/Control Plane
 exporters remain out of scope. Tunnel Protocol v2 and snapshots are unchanged.
+
+---
+
+## ADR-028 — Runnable components share secret-safe stderr logging
+
+**Status:** Accepted (Session 28).
+
+**Context:** Agent, Edge, and Control Plane each configured a human-readable
+subscriber independently. Operators need collector-friendly output, but log
+selection must fail before process side effects, preserve command stdout, and
+never mix multiline usage text into a JSON stream or weaken INV-003.
+
+**Decision:** A shared common-crate initializer validates
+`TUNNELPROXY_LOG_FORMAT=text|json` and `RUST_LOG`, installs exactly one stderr
+subscriber, and returns the selected format to the entrypoint. JSON output is
+JSON Lines with ANSI disabled and stable `timestamp`, `level`, `target`, and
+nested `fields` keys. Help and reports remain stdout. JSON-mode CLI failures
+emit the structured error without raw usage; invalid logging configuration
+exits before component parsing, listener bind, or file mutation.
+
+**Consequences:** All runnable components and development examples have the
+same operational contract and can feed ordinary stderr collectors without a
+wire or domain schema change. Event authors remain responsible for excluding
+tokens, certificates, private keys, payloads, and bodies. The synchronous
+stderr sink has no rotation, durable retention, remote shipping, backpressure
+queue, dashboard, or alert policy; those remain under DEBT-010.

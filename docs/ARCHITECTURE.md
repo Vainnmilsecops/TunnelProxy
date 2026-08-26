@@ -619,6 +619,28 @@ public/authenticated operations, remote write, dashboards, alerting, and
 Agent/Control Plane exporters remain separate work. Tunnel Protocol v2 and the
 snapshot format are unchanged.
 
+### 2.26 Secret-safe process logging (Session 28)
+
+Every runnable Agent, Edge, and Control Plane process initializes tracing
+through `tunnelproxy-common` before parsing component arguments or touching
+network/file resources. `TUNNELPROXY_LOG_FORMAT` selects `text` (the default)
+or `json`; `RUST_LOG` provides the same validated filter in either format.
+Invalid values fail startup with a configuration exit before component side
+effects.
+
+Both renderers write events to stderr. JSON mode emits one object per line,
+disables ANSI, and retains stable top-level `timestamp`, `level`, `target`, and
+nested `fields` keys. CLI help and operator reports remain plain stdout.
+Multiline usage is omitted after JSON-mode argument errors so collectors never
+receive mixed JSON/text stderr. Existing invariant INV-003 still governs event
+construction: tokens, private keys, certificates, paths to secret material,
+and traffic bodies are not event fields.
+
+The sink is deliberately local and synchronous. File rotation, durable or
+remote shipping, dashboards/alerts, and an asynchronous buffering queue remain
+operator/backend work tracked by DEBT-010. Protocol and snapshot schemas are
+unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

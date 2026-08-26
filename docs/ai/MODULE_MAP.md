@@ -12,12 +12,14 @@
 - Cross-component error sentinels when they are genuinely shared.
 - Small allocation-light helpers used by more than one other crate.
 - Cross-platform process termination observation shared by Edge and Agent.
+- Process-wide text/JSON stderr logging configuration shared by runnable
+  components and development examples.
 
 **Prohibited**
 
 - Network I/O of any kind.
 - Wire-format types (those belong in `tunnelproxy-protocol`).
-- Configuration parsing.
+- Component-specific configuration parsing.
 - Component-specific business logic.
 - "Generic utils" dumping ground.
 
