@@ -6,7 +6,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 use tunnelproxy_agent::{
     bootstrap_agent_credentials, AgentEnrollmentConfig, AgentEnrollmentError,
     AgentEnrollmentRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig,
@@ -14,7 +13,8 @@ use tunnelproxy_agent::{
     AgentTransportSecurity, EnrollmentClientConfig, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{
-    shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths, AgentId, TunnelId,
+    init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths,
+    AgentId, ProcessLogFormat, TunnelId,
 };
 use tunnelproxy_protocol::RegistrationRequest;
 
@@ -61,17 +61,19 @@ Options:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let log_format = match init_process_logging() {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("failed to configure logging: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let args: Vec<_> = std::env::args().skip(1).collect();
     let parsed = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             error!(%error, "invalid Agent CLI arguments");
-            eprintln!("{USAGE}");
+            print_usage_for_error(log_format);
             return ExitCode::from(2);
         }
     };
@@ -215,6 +217,12 @@ async fn main() -> ExitCode {
             agent_exit_code(result)
         }
     };
+}
+
+fn print_usage_for_error(log_format: ProcessLogFormat) {
+    if log_format == ProcessLogFormat::Text {
+        eprintln!("{USAGE}");
+    }
 }
 
 async fn run_optional_enrollment(

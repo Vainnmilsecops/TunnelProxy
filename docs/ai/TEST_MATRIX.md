@@ -124,6 +124,7 @@
 | Agent process runtime                     | ✅   | ✅          | —   | Config validation, cancellable bounded reconnect, typed retry exhaustion, and composed outbound handshake/multiplex lifecycle. |
 | Edge process runtime                      | ✅   | ✅          | —   | Binds one TunnelId raw route before Agent availability, fails closed offline, keeps the listener across reconnect, and shuts down route→transport. |
 | Runnable Edge/Agent CLIs                  | ✅   | ✅          | —   | Parsers cover durable IDs, reconnect/TLS flags, exact authorized client certificate, complete argument sets, and invalid values. |
+| Process logging contract                  | ✅   | ✅          | —   | Pure parsing tests cover text/JSON format and `RUST_LOG`; Agent, Edge, and Control Plane subprocess tests cover JSON schema, filtering, no ANSI, stdout/stderr separation, pre-mutation config failure, and token secrecy. |
 | Composed local tunnel                     | —    | ✅          | —   | Real TCP crosses runnable Edge→Agent→local echo byte-exactly, then releases both listener ports after shutdown. |
 | OS process shutdown observation           | ✅   | —           | —   | Ctrl-C on all platforms and SIGTERM on Unix compile behind Tokio's signal feature; runtime cleanup is tested via injected shutdown signals. |
 | Reconnect                                 | ✅    | ✅           | —   | Backoff bounds/jitter are unit tested; real TCP covers cancellation, retry exhaustion, Edge restart, and same-address route recovery. |

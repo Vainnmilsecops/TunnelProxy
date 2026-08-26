@@ -13,11 +13,16 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 mod credential_bundle;
+mod process_logging;
 mod tls_reload;
 
 pub use credential_bundle::{
     publish_agent_credential_bundle, replace_secret_file, AgentCredentialPaths,
     CredentialBundleError,
+};
+
+pub use process_logging::{
+    init_process_logging, ProcessLogFormat, ProcessLoggingConfigError, LOG_FORMAT_ENV,
 };
 
 pub use tls_reload::{

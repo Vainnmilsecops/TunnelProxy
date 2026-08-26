@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Edge Operations Endpoint & Prometheus Metrics** (Session 27).
+**Secret-Safe Structured JSON Logging** (Session 28).
 
 ## Completed
 
@@ -323,7 +323,17 @@
   HTTPS counters remain process-local and reset on restart.
 - Shutdown marks readiness false before ingress drain, keeps operations
   observable during that drain, then drains operations before Agent transport.
-- 286 explicit workspace tests are present; all prior behavior is preserved.
+- Agent, Edge, Control Plane, and their runnable development examples share one
+  process logging initializer. Text is the default; JSON Lines is explicitly
+  selected with `TUNNELPROXY_LOG_FORMAT=json`, while `RUST_LOG` controls event
+  filtering in either format.
+- Every structured event is written to stderr. JSON events have stable
+  `timestamp`, `level`, `target`, and nested `fields` keys with ANSI disabled;
+  help and operator report output remain plain stdout.
+- Invalid logging configuration fails with exit code 2 before CLI-driven
+  network binding or file mutation. JSON-mode argument failures omit multiline
+  usage text so stderr remains parseable JSON Lines.
+- 296 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -347,12 +357,12 @@
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
-- Agent/Control Plane metrics, durable/remote-write telemetry, JSON log sink,
-  dashboards, and alerting (DEBT-010 partially resolved for Edge).
+- Agent/Control Plane metrics, durable/remote-write telemetry, nonblocking log
+  sinks, dashboards, and alerting (DEBT-010 partially resolved).
 
 ## Next planned session
 
-Session 28 has not been selected. The next plan should choose one bounded scope
-from durable hostname administration, structured JSON operations logs, or
-transport fairness; HTTP/2, signed access URLs, and multi-edge ownership remain
-separate larger scopes.
+Session 29 has not been selected. The next plan should choose one bounded scope
+from durable hostname administration, Agent/Control Plane metrics, or transport
+fairness; HTTP/2, signed access URLs, and multi-edge ownership remain separate
+larger scopes.

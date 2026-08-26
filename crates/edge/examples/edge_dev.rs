@@ -31,7 +31,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
+use tunnelproxy_common::{init_process_logging, ProcessLogFormat};
 use tunnelproxy_edge::{
     ForwardConfig, ForwardConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
 };
@@ -49,18 +49,22 @@ Options:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let log_format = match init_process_logging() {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("failed to configure logging: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(err) => {
             error!(error = %err, "invalid CLI arguments");
-            eprintln!("{USAGE}");
+            if log_format == ProcessLogFormat::Text {
+                eprintln!("{USAGE}");
+            }
             return ExitCode::from(2);
         }
     };

@@ -83,4 +83,6 @@ HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
 routing, and applies process-local global/per-IP request token buckets, but it
 is not yet the automatic future product UX. Edge also has an opt-in bounded
 loopback operations endpoint; public/authenticated operations access, durable
-metrics storage, and Agent/Control Plane exporters are not implemented.
+metrics storage, and Agent/Control Plane exporters are not implemented. All
+three runnable components can emit collector-friendly, secret-safe JSON Lines
+to stderr without changing their plain stdout command contracts.

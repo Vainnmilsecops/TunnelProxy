@@ -13,15 +13,14 @@ use std::process::ExitCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
+use tunnelproxy_common::init_process_logging;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    if let Err(error) = init_process_logging() {
+        eprintln!("failed to configure logging: {error}");
+        return ExitCode::from(2);
+    }
 
     let bind_addr: SocketAddr = match std::env::var("TUNNELPROXY_UPSTREAM_ADDR") {
         Ok(raw) => match raw.parse() {

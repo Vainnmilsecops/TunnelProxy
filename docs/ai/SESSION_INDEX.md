@@ -943,3 +943,28 @@ Out of scope:
   metrics persistence/remote write, dashboards, alerts, and JSON log output.
 - Agent/Control Plane exporters, distributed rate limiting, hostname
   administration, HTTP/2, and multi-edge ownership.
+
+## Session 28 — Secret-Safe Structured JSON Logging — complete
+
+Scope delivered:
+
+- Added one shared, typed logging initializer for Agent, Edge, Control Plane,
+  and runnable development examples. `TUNNELPROXY_LOG_FORMAT` accepts only
+  `text` or `json`; `RUST_LOG` is validated and defaults to `info`.
+- Standardized JSON Lines stderr events with ANSI disabled and stable
+  `timestamp`, `level`, `target`, and nested `fields` keys. Text remains the
+  default and all existing tracing filters continue to apply.
+- Preserved help and operator reports as plain stdout. JSON-mode CLI failures
+  avoid multiline usage contamination, and invalid logging configuration exits
+  before component file or network side effects.
+- Added pure configuration tests and Agent/Edge/Control Plane subprocess tests
+  for schema, filtering, ANSI exclusion, stdout/stderr separation, pre-mutation
+  failure, and enrollment-token secrecy. The workspace now contains 296
+  explicit tests.
+
+Out of scope:
+
+- Log file rotation, durable or remote shipping, asynchronous/nonblocking
+  buffering, dashboards, and alerts.
+- Agent/Control Plane metrics, hostname administration, transport fairness,
+  HTTP/2, signed access URLs, and multi-edge ownership.

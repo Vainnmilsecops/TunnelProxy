@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::Value;
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_control_plane::{
     enrollment_token_hash, unix_time_now, AuthorizationSnapshot, EnrollmentRepository,
@@ -27,12 +28,66 @@ fn binary() -> &'static str {
 
 #[test]
 fn help_and_invalid_arguments_have_stable_exit_codes() {
-    let help = Command::new(binary()).arg("--help").output().unwrap();
+    let help = Command::new(binary())
+        .arg("--help")
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .output()
+        .unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("snapshot JSON manifest"));
+    assert!(help.stderr.is_empty());
 
-    let invalid = Command::new(binary()).arg("serve").output().unwrap();
+    let invalid = Command::new(binary())
+        .arg("serve")
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    let stderr = String::from_utf8(invalid.stderr).unwrap();
+    assert!(!stderr.contains('\u{1b}'));
+    let event: Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert!(event["timestamp"].is_string());
+    assert_eq!(event["level"], "ERROR");
+    assert_eq!(event["target"], "tunnelproxy_control_plane");
+    assert!(event["fields"].is_object());
+}
+
+#[test]
+fn invalid_logging_configuration_stops_before_file_mutation() {
+    let directory = temp_directory();
+    for (suffix, format, filter) in [
+        ("format", "secret-format", None),
+        ("filter", "json", Some("secret-filter[")),
+    ] {
+        let database = directory.join(format!("must-not-exist-{suffix}.sqlite"));
+        let token = directory.join(format!("must-not-exist-{suffix}.token"));
+        let mut command = Command::new(binary());
+        command
+            .args([
+                "create-token",
+                "--database",
+                database.to_str().unwrap(),
+                "--agent-id",
+                "agent-no-mutation",
+                "--tunnel-id",
+                "tunnel-no-mutation",
+                "--output",
+                token.to_str().unwrap(),
+            ])
+            .env("TUNNELPROXY_LOG_FORMAT", format);
+        if let Some(filter) = filter {
+            command.env("RUST_LOG", filter);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("secret-"));
+        assert!(!database.exists());
+        assert!(!token.exists());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -101,6 +156,8 @@ fn create_token_writes_a_bound_secret_file_without_printing_the_token() {
         .arg(&token_path)
         .arg("--ttl-ms")
         .arg("60000")
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "info")
         .output()
         .unwrap();
     assert!(
@@ -113,6 +170,10 @@ fn create_token_writes_a_bound_secret_file_without_printing_the_token() {
     assert_eq!(token_text.len(), 64);
     assert!(!String::from_utf8_lossy(&result.stdout).contains(token_text));
     assert!(!String::from_utf8_lossy(&result.stderr).contains(token_text));
+    for line in String::from_utf8_lossy(&result.stderr).lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert!(event["fields"].is_object());
+    }
     let mut token = [0_u8; 32];
     for (index, byte) in token.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&token_text[index * 2..index * 2 + 2], 16).unwrap();

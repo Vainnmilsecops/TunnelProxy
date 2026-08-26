@@ -144,15 +144,17 @@
 - **Category:** ops
 - **Impact:** low
 - **Rationale:** Session 27 adds a bounded loopback Prometheus exporter for the
-  Edge production data path, including readiness, authorization source, raw and
-  HTTPS ingress, and rate limiting. Counters remain process-local and reset on
-  restart; Agent and Control Plane have structured tracing only. There is no
-  remote write, durable history, dashboard/alert policy, or JSON log sink.
-- **Exit plan:** Add bounded Agent and Control Plane metrics, JSON log output,
-  and operator-owned collection/retention guidance before claiming complete
-  production observability. Keep external backend I/O off request routing.
-- **Tracking:** partially resolved for Edge in Session 27; open for the
-  remaining components and durable backend integration.
+  Edge production data path. Session 28 gives Agent, Edge, and Control Plane a
+  common secret-safe JSON Lines stderr sink and filter. Metrics remain
+  Edge-local and process-local; stderr emission is synchronous and there is no
+  remote write, durable history, dashboard, or alert policy.
+- **Exit plan:** Add bounded Agent and Control Plane metrics plus
+  operator-owned collection/retention guidance and an optional bounded
+  nonblocking sink before claiming complete production observability. Keep
+  external backend I/O off request routing.
+- **Tracking:** partially resolved by Edge metrics in Session 27 and shared
+  structured log output in Session 28; open for remaining metrics and durable
+  backend integration.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 
