@@ -314,6 +314,7 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        https_route_server: None,
         operations: Some(ControlPlaneOperationsConfig::loopback(
             "127.0.0.1:0".parse().unwrap(),
         )),
@@ -382,6 +383,7 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config(server_addr, &pki),
+        https_route_server: None,
         operations: None,
     })
     .await
@@ -431,6 +433,7 @@ async fn operations_bind_failure_releases_the_snapshot_listener() {
         database_path: database,
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config(snapshot_addr, &pki),
+        https_route_server: None,
         operations: Some(ControlPlaneOperationsConfig::loopback(operations_addr)),
     })
     .await;
@@ -460,6 +463,7 @@ async fn operations_capacity_rejection_releases_after_stalled_connection_closes(
         database_path: database,
         refresh_interval: Duration::from_secs(1),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        https_route_server: None,
         operations: Some(operations),
     })
     .await
@@ -526,6 +530,7 @@ async fn control_plane_runtime_refuses_an_uninitialized_repository() {
         database_path: database.clone(),
         refresh_interval: Duration::from_millis(20),
         snapshot_server: server_config("127.0.0.1:0".parse().unwrap(), &pki),
+        https_route_server: None,
         operations: None,
     };
     config.operations = Some(ControlPlaneOperationsConfig::loopback(

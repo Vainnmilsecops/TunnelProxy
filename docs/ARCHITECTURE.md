@@ -706,10 +706,36 @@ corruption or overflow, and return routes sorted by hostname. The catalog
 coexists with the authorization snapshot schema without modifying its wire or
 storage contract.
 
-This session provides local operator CLI administration only. It does not push
-the catalog to Edge, alter the existing single-route HTTPS runtime, allocate
-random hostnames, automate DNS/TLS, or add custom domains, signed URLs,
-administrative HTTP endpoints, or multi-edge ownership.
+Session 31 provides local operator CLI administration and leaves distribution
+to the next independent protocol described below. It does not alter the
+authorization snapshot or Tunnel Protocol v2.
+
+### 2.30 Authenticated HTTPS route distribution (Session 32)
+
+The Control Plane exposes an opt-in route listener with mutual TLS and the
+dedicated `tunnelproxy-https-routes/1` ALPN. A strict `TPR1` protocol carries a
+subscription version and complete canonical catalogs bounded to 64 KiB and 64
+records. The route service owns its own connection semaphore and I/O deadline;
+it neither extends the authorization snapshot nor shares the Agent data-plane
+wire format.
+
+Edge must complete online route bootstrap before it binds dynamic HTTPS
+ingress. Each higher catalog version replaces the complete immutable in-memory
+view atomically. Host lookup reads only that view and the live tunnel router;
+it performs no database or Control Plane operation on the request path.
+Duplicate versions are idempotent, while stale and same-version-conflicting
+content fail closed.
+
+After the authenticated stream disconnects, Edge marks the catalog stale and
+continues serving it for a configured maximum age. At expiry it retains the
+bytes only for version-aware recovery but exposes zero routable hosts and
+reports not-ready. Reauthentication restores live state, including an
+up-to-date response with no redundant catalog. Route state is intentionally
+not persisted to disk, so a cold start cannot serve unauthenticated old intent.
+
+Static `--https-host` routing remains supported and is mutually exclusive with
+`--https-route-server`. Automatic allocation, DNS/TLS automation, custom
+domains, signed access, HTTP/2, and multi-edge coordination remain separate.
 
 ## 3. Control plane vs data plane
 

@@ -20,7 +20,22 @@
 
 ## Open items
 
-### DEBT-022 — Durable HTTPS routes are not distributed to Edge
+### DEBT-023 — HTTPS route-stream credentials require a process restart
+
+- **Introduced in:** Session 32
+- **Category:** ops / security
+- **Impact:** medium during Control Plane or Edge credential rotation
+- **Rationale:** Route distribution has a dedicated ALPN and TLS configuration.
+  Session 32 reuses the trusted CA and leaf files at startup but deliberately
+  does not couple this new protocol to the existing snapshot TLS generation
+  reload supervisor. Last-known-good route data remains bounded by expiry.
+- **Exit plan:** Add route-specific digest-manifest reload runtimes on both
+  server and client, preserving independent ALPN validation, monotonic
+  generations, last-known-good rollback, expiry termination, and real mTLS
+  rotation coverage.
+- **Tracking:** open.
+
+### DEBT-022 — Durable HTTPS routes are not distributed to Edge — resolved
 
 - **Introduced in:** Session 31
 - **Category:** product / reliability
@@ -34,7 +49,10 @@
   and cache contract, then atomically reconcile immutable Edge routing tables
   without per-request Control Plane or SQLite lookups. Specify stale/expiry and
   revocation behavior before enabling multiple dynamic routes.
-- **Tracking:** open.
+- **Resolution:** Session 32 added a separate bounded mutual-TLS latest-value
+  protocol, atomic in-memory Edge replacement, and explicit stale-to-expired
+  fail-closed behavior without a disk route cache or hot-path lookup.
+- **Tracking:** resolved in Session 32.
 
 ### DEBT-021 — HTTP request-rate state is per-Edge and non-durable
 

@@ -11,7 +11,7 @@ use tunnelproxy_common::{
     TunnelId,
 };
 use tunnelproxy_control_plane::{
-    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
+    HttpsRouteClientConfig, SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
     SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime, SnapshotTlsConfigError,
     SnapshotTlsReloadBootstrapError,
 };
@@ -35,11 +35,14 @@ Options:
   --agent-id <id>                  authorized Agent ID (default agent-dev)
   --tunnel-id <id>                 authorized Tunnel ID (default tunnel-dev)
   --max-streams <usize>            stream limit  (default 32)
+  --max-agent-sessions <usize>     Agent session limit (default 1)
   --max-raw-connections <usize>    ingress limit (default 32)
   --allow-public-raw-ingress       explicitly allow a non-loopback raw listener
   --max-raw-connections-per-ip <usize> required per-IP limit in public mode
   --https-listen <addr>            replace raw ingress with HTTPS
   --https-host <hostname>          exact public hostname routed to Tunnel ID
+  --https-route-server <addr>      authenticated dynamic route service
+  --https-route-max-stale-ms <ms>  route lifetime after disconnect (default 300000)
   --public-tls-cert <path>         public HTTPS certificate PEM
   --public-tls-key <path>          public HTTPS private key PEM
   --public-tls-reload-manifest <path> public HTTPS TLS generation manifest
@@ -121,6 +124,7 @@ async fn main() -> ExitCode {
     let mut config = EdgeRuntimeConfig::dev_defaults();
     config.multiplex.agent_listener.listen_addr = parsed.agent_listen;
     config.multiplex.max_streams_per_session = parsed.max_streams;
+    config.multiplex.agent_listener.max_agent_sessions = parsed.max_agent_sessions;
     config.raw_listen_addr = parsed.raw_listen;
     config.tunnel_id = parsed.tunnel_id.clone();
     config.max_raw_connections = parsed.max_raw_connections;
@@ -142,6 +146,13 @@ async fn main() -> ExitCode {
         }
     };
     config.https_ingress = https_ingress;
+    let https_routes = match load_https_route_configuration(&parsed).await {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            error!(%error, "failed to configure HTTPS route distribution");
+            return ExitCode::from(2);
+        }
+    };
     let authorization = match load_transport_configuration(&parsed).await {
         Ok(configuration) => configuration,
         Err(error) => {
@@ -155,6 +166,10 @@ async fn main() -> ExitCode {
             registration,
             mut reloaders,
         } => {
+            if https_routes.is_some() {
+                error!("dynamic HTTPS routes require snapshot authorization");
+                return ExitCode::from(2);
+            }
             reloaders.public = public_tls_reloader;
             config.multiplex.security = security;
             config.multiplex.registration = registration;
@@ -168,7 +183,7 @@ async fn main() -> ExitCode {
         } => {
             reloaders.public = public_tls_reloader;
             config.multiplex.security = security;
-            run_snapshot_edge(config, snapshots, cache, reloaders, &parsed).await
+            run_snapshot_edge(config, snapshots, cache, https_routes, reloaders, &parsed).await
         }
     }
 }
@@ -226,12 +241,24 @@ async fn run_snapshot_edge(
     config: EdgeRuntimeConfig,
     snapshots: SnapshotClientConfig,
     cache: Option<SnapshotCacheConfig>,
+    https_routes: Option<HttpsRouteClientConfig>,
     reloaders: LoadedTlsReloaders,
     parsed: &ParsedArgs,
 ) -> ExitCode {
-    let bind_result = match cache {
-        Some(cache) => SnapshotAwareEdgeRuntime::bind_with_cache(config, snapshots, cache).await,
-        None => SnapshotAwareEdgeRuntime::bind(config, snapshots).await,
+    let bind_result = match (cache, https_routes) {
+        (Some(cache), Some(routes)) => {
+            SnapshotAwareEdgeRuntime::bind_with_cache_and_https_routes(
+                config, snapshots, cache, routes,
+            )
+            .await
+        }
+        (None, Some(routes)) => {
+            SnapshotAwareEdgeRuntime::bind_with_https_routes(config, snapshots, routes).await
+        }
+        (Some(cache), None) => {
+            SnapshotAwareEdgeRuntime::bind_with_cache(config, snapshots, cache).await
+        }
+        (None, None) => SnapshotAwareEdgeRuntime::bind(config, snapshots).await,
     };
     let runtime = match bind_result {
         Ok(runtime) => runtime,
@@ -302,6 +329,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         https_addr = ?parsed.https_listen,
         operations_addr = ?parsed.ops_listen,
         https_host = ?parsed.https_host,
+        https_route_server = ?parsed.https_route_server,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
         public_raw_ingress = parsed.allow_public_raw_ingress,
@@ -365,6 +393,7 @@ struct ParsedArgs {
     agent_id: AgentId,
     tunnel_id: TunnelId,
     max_streams: usize,
+    max_agent_sessions: usize,
     max_raw_connections: usize,
     allow_public_raw_ingress: bool,
     max_raw_connections_per_ip: Option<usize>,
@@ -372,6 +401,8 @@ struct ParsedArgs {
     https_options_present: bool,
     https_listen: Option<SocketAddr>,
     https_host: Option<HttpHostname>,
+    https_route_server: Option<SocketAddr>,
+    https_route_max_stale: Option<Duration>,
     public_tls_cert: Option<PathBuf>,
     public_tls_key: Option<PathBuf>,
     public_tls_reload_manifest: Option<PathBuf>,
@@ -429,6 +460,7 @@ impl Default for ParsedArgs {
             agent_id: AgentId::new("agent-dev").unwrap(),
             tunnel_id: TunnelId::new("tunnel-dev").unwrap(),
             max_streams: 32,
+            max_agent_sessions: 1,
             max_raw_connections: 32,
             allow_public_raw_ingress: false,
             max_raw_connections_per_ip: None,
@@ -436,6 +468,8 @@ impl Default for ParsedArgs {
             https_options_present: false,
             https_listen: None,
             https_host: None,
+            https_route_server: None,
+            https_route_max_stale: None,
             public_tls_cert: None,
             public_tls_key: None,
             public_tls_reload_manifest: None,
@@ -498,6 +532,8 @@ enum ArgError {
     PublicRawPerIpLimitWithoutOptIn,
     PublicRawPerIpLimitInvalid,
     InvalidHostname(String),
+    HttpsRouteHostConflict,
+    HttpsRouteStaleWithoutServer,
     IngressModeConflict,
     PublicHttpsOptInRequired,
     PublicHttpsPerIpLimitRequired,
@@ -533,6 +569,12 @@ impl std::fmt::Display for ArgError {
                 "--max-raw-connections-per-ip must be non-zero and cannot exceed --max-raw-connections",
             ),
             Self::InvalidHostname(value) => write!(f, "invalid HTTPS hostname: {value}"),
+            Self::HttpsRouteHostConflict => {
+                f.write_str("--https-host cannot be combined with --https-route-server")
+            }
+            Self::HttpsRouteStaleWithoutServer => {
+                f.write_str("--https-route-max-stale-ms requires --https-route-server")
+            }
             Self::IngressModeConflict => {
                 f.write_str("raw-ingress options cannot be combined with --https-listen")
             }
@@ -587,6 +629,10 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.max_streams = parse_number(args, index, flag)?;
                 index += 2;
             }
+            "--max-agent-sessions" => {
+                parsed.max_agent_sessions = parse_number(args, index, flag)?;
+                index += 2;
+            }
             "--max-raw-connections" => {
                 parsed.max_raw_connections = parse_number(args, index, flag)?;
                 parsed.raw_options_present = true;
@@ -613,6 +659,17 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                     HttpHostname::new(raw)
                         .map_err(|_| ArgError::InvalidHostname(raw.to_owned()))?,
                 );
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--https-route-server" => {
+                parsed.https_route_server = Some(parse_addr(args, index, flag)?);
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--https-route-max-stale-ms" => {
+                parsed.https_route_max_stale =
+                    Some(Duration::from_millis(parse_number(args, index, flag)?));
                 parsed.https_options_present = true;
                 index += 2;
             }
@@ -843,6 +900,12 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.ops_options_present && parsed.ops_listen.is_none() {
         return Err(ArgError::OperationsOptionsWithoutListener);
     }
+    if parsed.https_route_server.is_some() && parsed.https_host.is_some() {
+        return Err(ArgError::HttpsRouteHostConflict);
+    }
+    if parsed.https_route_max_stale.is_some() && parsed.https_route_server.is_none() {
+        return Err(ArgError::HttpsRouteStaleWithoutServer);
+    }
     Ok(parsed)
 }
 
@@ -910,6 +973,8 @@ enum TlsLoadError {
     InvalidRegistration(EdgeRegistrationPolicyError),
     InvalidSnapshotTls(SnapshotTlsConfigError),
     InvalidSnapshotConfig,
+    InvalidHttpsRouteTls(SnapshotTlsConfigError),
+    InvalidHttpsRouteConfig,
     IncompleteSnapshotCacheArguments,
     InvalidSnapshotCache,
     ReloadArguments,
@@ -944,6 +1009,12 @@ impl std::fmt::Display for TlsLoadError {
                 write!(f, "invalid snapshot TLS configuration: {error}")
             }
             Self::InvalidSnapshotConfig => f.write_str("snapshot client configuration is invalid"),
+            Self::InvalidHttpsRouteTls(error) => {
+                write!(f, "invalid HTTPS route client TLS configuration: {error}")
+            }
+            Self::InvalidHttpsRouteConfig => {
+                f.write_str("HTTPS route client configuration is invalid")
+            }
             Self::IncompleteSnapshotCacheArguments => f.write_str(
                 "snapshot cache requires both --snapshot-cache-dir and --snapshot-cache-max-stale-ms",
             ),
@@ -958,7 +1029,7 @@ impl std::fmt::Display for TlsLoadError {
                 write!(f, "snapshot-client TLS reload is invalid: {error}")
             }
             Self::IncompletePublicHttpsArguments => f.write_str(
-                "HTTPS ingress requires --https-listen, --https-host, --public-tls-cert, and --public-tls-key",
+                "HTTPS ingress requires --https-listen, one route source, --public-tls-cert, and --public-tls-key",
             ),
             Self::PublicHttpsWithoutListener => {
                 f.write_str("public HTTPS options require --https-listen")
@@ -1303,13 +1374,15 @@ async fn load_https_configuration(
         }
         return Ok((None, None));
     };
-    let (Some(hostname), Some(certificate_path), Some(private_key_path)) = (
-        parsed.https_host.clone(),
+    let (Some(certificate_path), Some(private_key_path)) = (
         parsed.public_tls_cert.clone(),
         parsed.public_tls_key.clone(),
     ) else {
         return Err(TlsLoadError::IncompletePublicHttpsArguments);
     };
+    if parsed.https_host.is_none() && parsed.https_route_server.is_none() {
+        return Err(TlsLoadError::IncompletePublicHttpsArguments);
+    }
     let exposure = https_exposure_policy(parsed).map_err(TlsLoadError::PublicHttpsExposure)?;
     let request_rate_limit = HttpRequestRateLimitConfig {
         global_requests_per_second: parsed.http_requests_per_second,
@@ -1351,7 +1424,10 @@ async fn load_https_configuration(
     };
     let config = HttpIngressConfig {
         listen_addr,
-        routes: HttpHostRoutes::single(hostname, parsed.tunnel_id.clone()),
+        routes: match parsed.https_host.clone() {
+            Some(hostname) => HttpHostRoutes::single(hostname, parsed.tunnel_id.clone()),
+            None => HttpHostRoutes::dynamic_unavailable(),
+        },
         tls,
         exposure,
         max_concurrent_connections: parsed.max_http_connections,
@@ -1368,6 +1444,42 @@ async fn load_https_configuration(
         .validate()
         .map_err(TlsLoadError::InvalidHttpIngress)?;
     Ok((Some(config), reloader))
+}
+
+async fn load_https_route_configuration(
+    parsed: &ParsedArgs,
+) -> Result<Option<HttpsRouteClientConfig>, TlsLoadError> {
+    let Some(server) = parsed.https_route_server else {
+        return Ok(None);
+    };
+    let (Some(ca), Some(client_cert), Some(client_key), Some(server_name)) = (
+        parsed.snapshot_ca.as_ref(),
+        parsed.snapshot_client_cert.as_ref(),
+        parsed.snapshot_client_key.as_ref(),
+        parsed.snapshot_server_name.as_deref(),
+    ) else {
+        return Err(TlsLoadError::IncompleteSnapshotArguments);
+    };
+    let (ca, client_cert, client_key) = tokio::try_join!(
+        read_tls_file(ca, "HTTPS route Control Plane CA"),
+        read_tls_file(client_cert, "HTTPS route Edge client certificate"),
+        read_tls_file(client_key, "HTTPS route Edge client private key"),
+    )?;
+    let config = HttpsRouteClientConfig::from_pem(
+        server,
+        &ca,
+        &client_cert,
+        &client_key,
+        server_name,
+        parsed
+            .https_route_max_stale
+            .unwrap_or(Duration::from_secs(5 * 60)),
+    )
+    .map_err(TlsLoadError::InvalidHttpsRouteTls)?;
+    config
+        .validate()
+        .map_err(|_| TlsLoadError::InvalidHttpsRouteConfig)?;
+    Ok(Some(config))
 }
 
 async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, TlsLoadError> {
@@ -1443,6 +1555,8 @@ mod tests {
             "tunnel-prod",
             "--max-streams",
             "8",
+            "--max-agent-sessions",
+            "3",
             "--max-raw-connections",
             "9",
             "--allow-public-raw-ingress",
@@ -1507,6 +1621,7 @@ mod tests {
         assert_eq!(parsed.agent_id.as_str(), "agent-prod");
         assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
         assert_eq!(parsed.max_streams, 8);
+        assert_eq!(parsed.max_agent_sessions, 3);
         assert_eq!(parsed.max_raw_connections, 9);
         assert!(parsed.allow_public_raw_ingress);
         assert_eq!(parsed.max_raw_connections_per_ip, Some(3));
@@ -1708,6 +1823,38 @@ mod tests {
             parse_args(&args(&["--https-host", "bad_host"])),
             Err(ArgError::InvalidHostname(_))
         ));
+    }
+
+    #[test]
+    fn dynamic_https_route_flags_are_bounded_and_exclusive() {
+        let parsed = parse_args(&args(&[
+            "--https-listen",
+            "127.0.0.1:8443",
+            "--https-route-server",
+            "127.0.0.1:17201",
+            "--https-route-max-stale-ms",
+            "45000",
+            "--public-tls-cert",
+            "public.pem",
+            "--public-tls-key",
+            "public-key.pem",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.https_route_server.unwrap().port(), 17201);
+        assert_eq!(parsed.https_route_max_stale, Some(Duration::from_secs(45)));
+        assert!(matches!(
+            parse_args(&args(&[
+                "--https-host",
+                "demo.example.test",
+                "--https-route-server",
+                "127.0.0.1:17201",
+            ])),
+            Err(ArgError::HttpsRouteHostConflict)
+        ));
+        assert_eq!(
+            parse_args(&args(&["--https-route-max-stale-ms", "1000"])),
+            Err(ArgError::HttpsRouteStaleWithoutServer)
+        );
     }
 
     #[tokio::test]

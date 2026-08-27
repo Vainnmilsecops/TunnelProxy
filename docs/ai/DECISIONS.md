@@ -862,3 +862,26 @@ authorization snapshots, or current Edge routing. Edge does not consume this
 catalog yet, so process-start `--https-host` remains authoritative there.
 Automatic allocation, DNS/TLS automation, custom domains, signed URLs,
 administrative HTTP APIs, and multi-edge coordination remain out of scope.
+
+---
+
+## ADR-032 — HTTPS routes use an independent authenticated latest-value stream
+
+**Status:** Accepted (Session 32).
+
+**Context:** The durable route catalog must reach Edge without putting SQLite
+or network I/O on the public request path, coupling route churn to Agent
+authorization, or silently serving indefinitely after authority loss.
+
+**Decision:** Control Plane distributes complete canonical route catalogs over
+a dedicated bounded `TPR1` mutual-TLS service and ALPN. Edge bootstraps online,
+atomically swaps immutable latest values, accepts monotonic versions, and keeps
+the last authenticated value in memory during a bounded stale interval. Once
+expired, route resolution and dynamic readiness fail closed until an
+authenticated reconnect. No route disk cache is created.
+
+**Consequences:** Operator CLI mutations become live without Edge restart and
+requests remain independent of Control Plane/storage availability within the
+explicit stale window. Authorization snapshots and Tunnel Protocol v2 remain
+unchanged. Cold-start offline routing, automatic allocation, custom domains,
+HTTP/2, and multi-edge replication remain outside this decision.

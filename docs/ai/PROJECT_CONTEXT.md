@@ -80,10 +80,11 @@ are explicitly **not implemented**. The implemented public surfaces are opt-in
 opaque raw TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
-routing, and applies process-local global/per-IP request token buckets, but it
+routing from static or authenticated dynamically distributed state, and applies process-local global/per-IP request token buckets, but it
 is not yet the automatic future product UX. Control Plane has a separate
 bounded, versioned SQLite catalog and operator CLI for durable exact-hostname
-route intent, but Edge does not consume that catalog yet. Agent, Edge, and
+route intent; Edge can consume it through an independent bounded mutual-TLS
+latest-value stream with atomic activation and fail-closed expiry. Agent, Edge, and
 Control Plane have opt-in bounded loopback operations endpoints;
 public/authenticated operations access and durable metrics storage are not
 implemented. All three runnable components can emit collector-friendly,

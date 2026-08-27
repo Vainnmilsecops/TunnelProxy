@@ -42,8 +42,27 @@ impl SnapshotServerTlsConfig {
         if handshake_timeout.is_zero() {
             return Err(SnapshotTlsConfigError::ZeroHandshakeTimeout);
         }
+        Self::from_pem_with_alpn(
+            server_cert_pem,
+            server_key_pem,
+            edge_client_ca_pem,
+            handshake_timeout,
+            SNAPSHOT_PROTOCOL_ALPN,
+        )
+    }
+
+    pub(crate) fn from_pem_with_alpn(
+        server_cert_pem: &[u8],
+        server_key_pem: &[u8],
+        edge_client_ca_pem: &[u8],
+        handshake_timeout: Duration,
+        alpn: &[u8],
+    ) -> Result<Self, SnapshotTlsConfigError> {
+        if handshake_timeout.is_zero() {
+            return Err(SnapshotTlsConfigError::ZeroHandshakeTimeout);
+        }
         let candidate =
-            build_server_tls_config(server_cert_pem, server_key_pem, edge_client_ca_pem)?;
+            build_server_tls_config(server_cert_pem, server_key_pem, edge_client_ca_pem, alpn)?;
         Ok(Self {
             server_config: ReloadableConfig::new(1, [0; 32], candidate.config, candidate.validity)
                 .map_err(|_| SnapshotTlsConfigError::InvalidCertificateValidity)?,
@@ -53,6 +72,14 @@ impl SnapshotServerTlsConfig {
 
     pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
         self.server_config.status(SystemTime::now(), expiry_warning)
+    }
+
+    pub(crate) fn acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(self.server_config.current())
+    }
+
+    pub(crate) const fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
     }
 }
 
@@ -85,12 +112,31 @@ impl SnapshotClientConfig {
         edge_client_key_pem: &[u8],
         server_name: &str,
     ) -> Result<Self, SnapshotTlsConfigError> {
+        Self::from_pem_with_alpn(
+            server_addr,
+            control_plane_ca_pem,
+            edge_client_cert_pem,
+            edge_client_key_pem,
+            server_name,
+            SNAPSHOT_PROTOCOL_ALPN,
+        )
+    }
+
+    pub(crate) fn from_pem_with_alpn(
+        server_addr: SocketAddr,
+        control_plane_ca_pem: &[u8],
+        edge_client_cert_pem: &[u8],
+        edge_client_key_pem: &[u8],
+        server_name: &str,
+        alpn: &[u8],
+    ) -> Result<Self, SnapshotTlsConfigError> {
         let server_name = ServerName::try_from(server_name.to_owned())
             .map_err(|_| SnapshotTlsConfigError::InvalidServerName)?;
         let candidate = build_client_tls_config(
             control_plane_ca_pem,
             edge_client_cert_pem,
             edge_client_key_pem,
+            alpn,
         )?;
         Ok(Self {
             server_addr,
@@ -119,6 +165,14 @@ impl SnapshotClientConfig {
 
     pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
         self.client_config.status(SystemTime::now(), expiry_warning)
+    }
+
+    pub(crate) fn connector(&self) -> TlsConnector {
+        TlsConnector::from(self.client_config.current())
+    }
+
+    pub(crate) fn server_name(&self) -> ServerName<'static> {
+        self.server_name.clone()
     }
 }
 
@@ -697,6 +751,7 @@ fn build_server_tls_config(
     server_cert_pem: &[u8],
     server_key_pem: &[u8],
     edge_client_ca_pem: &[u8],
+    alpn: &[u8],
 ) -> Result<TlsReloadCandidate<ServerConfig>, SnapshotTlsConfigError> {
     let server_certificates = parse_certificates(server_cert_pem, CertificateKind::Identity)?;
     let validity = certificate_validity(server_certificates[0].as_ref())
@@ -716,7 +771,7 @@ fn build_server_tls_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(server_certificates, server_key)
         .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
-    server_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+    server_config.alpn_protocols = vec![alpn.to_vec()];
     Ok(TlsReloadCandidate {
         config: server_config,
         validity,
@@ -727,6 +782,7 @@ fn build_client_tls_config(
     control_plane_ca_pem: &[u8],
     edge_client_cert_pem: &[u8],
     edge_client_key_pem: &[u8],
+    alpn: &[u8],
 ) -> Result<TlsReloadCandidate<ClientConfig>, SnapshotTlsConfigError> {
     let authorities = parse_certificates(control_plane_ca_pem, CertificateKind::Authority)?;
     let identity = parse_certificates(edge_client_cert_pem, CertificateKind::Identity)?;
@@ -743,7 +799,7 @@ fn build_client_tls_config(
         .with_root_certificates(roots)
         .with_client_auth_cert(identity, key)
         .map_err(|_| SnapshotTlsConfigError::InvalidIdentity)?;
-    client_config.alpn_protocols = vec![SNAPSHOT_PROTOCOL_ALPN.to_vec()];
+    client_config.alpn_protocols = vec![alpn.to_vec()];
     Ok(TlsReloadCandidate {
         config: client_config,
         validity,
@@ -851,6 +907,7 @@ fn build_server_reload_generation(
         generation.file(RELOAD_SERVER_CERTIFICATE).map_err(|_| ())?,
         generation.file(RELOAD_SERVER_PRIVATE_KEY).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_CA).map_err(|_| ())?,
+        SNAPSHOT_PROTOCOL_ALPN,
     )
     .map_err(|_| ())
 }
@@ -954,6 +1011,7 @@ fn build_client_reload_generation(
         generation.file(RELOAD_SERVER_CA).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_CERTIFICATE).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_PRIVATE_KEY).map_err(|_| ())?,
+        SNAPSHOT_PROTOCOL_ALPN,
     )
     .map_err(|_| ())
 }
