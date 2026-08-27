@@ -122,6 +122,23 @@ pub struct HttpsRouteCatalog {
 }
 
 impl HttpsRouteCatalog {
+    pub fn new(
+        version: HttpsRouteCatalogVersion,
+        mut routes: Vec<HttpsRouteRecord>,
+    ) -> Result<Self, HttpsRouteCatalogError> {
+        if routes.len() > MAX_HTTPS_ROUTE_RECORDS {
+            return Err(HttpsRouteCatalogError::TooManyRoutes);
+        }
+        routes.sort_unstable_by(|left, right| left.hostname.cmp(&right.hostname));
+        if routes
+            .windows(2)
+            .any(|pair| pair[0].hostname == pair[1].hostname)
+        {
+            return Err(HttpsRouteCatalogError::DuplicateHostname);
+        }
+        Ok(Self { version, routes })
+    }
+
     pub const fn version(&self) -> HttpsRouteCatalogVersion {
         self.version
     }
@@ -129,7 +146,28 @@ impl HttpsRouteCatalog {
     pub fn routes(&self) -> &[HttpsRouteRecord] {
         &self.routes
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpsRouteCatalogError {
+    TooManyRoutes,
+    DuplicateHostname,
+}
+
+impl std::fmt::Display for HttpsRouteCatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyRoutes => "HTTPS route catalog exceeds its route limit",
+            Self::DuplicateHostname => "HTTPS route catalog contains a duplicate hostname",
+        })
+    }
+}
+
+impl std::error::Error for HttpsRouteCatalogError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpsRouteMutationOutcome {
@@ -315,7 +353,10 @@ fn load_catalog(connection: &Connection) -> Result<HttpsRouteCatalog, HttpsRoute
             HttpsRouteStatus::from_raw(status)?,
         ));
     }
-    Ok(HttpsRouteCatalog { version, routes })
+    HttpsRouteCatalog::new(version, routes).map_err(|error| match error {
+        HttpsRouteCatalogError::TooManyRoutes => HttpsRouteRepositoryError::CapacityExceeded,
+        HttpsRouteCatalogError::DuplicateHostname => HttpsRouteRepositoryError::Corrupt,
+    })
 }
 
 fn load_version(

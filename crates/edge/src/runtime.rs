@@ -1,5 +1,6 @@
 //! Process-level composition for one durable raw tunnel and one Agent.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use tokio::task::JoinHandle;
@@ -55,12 +56,16 @@ impl EdgeRuntimeConfig {
         self.multiplex
             .validate()
             .map_err(EdgeRuntimeConfigError::Multiplex)?;
-        if self.multiplex.agent_listener.max_agent_sessions != 1 {
+        let dynamic_https = self
+            .https_ingress
+            .as_ref()
+            .is_some_and(|https| https.routes.is_dynamic());
+        if self.multiplex.agent_listener.max_agent_sessions != 1 && !dynamic_https {
             return Err(EdgeRuntimeConfigError::AgentCapacityMustBeOne);
         }
         if let Some(https) = &self.https_ingress {
             https.validate().map_err(EdgeRuntimeConfigError::Https)?;
-            if !https.routes.contains_tunnel(&self.tunnel_id) {
+            if !https.routes.is_dynamic() && !https.routes.contains_tunnel(&self.tunnel_id) {
                 return Err(EdgeRuntimeConfigError::HttpsTunnelNotConfigured(
                     self.tunnel_id.clone(),
                 ));
@@ -112,7 +117,8 @@ impl EdgeRuntimeConfig {
                 }
             }
         }
-        if !self.multiplex.registration.contains_tunnel(&self.tunnel_id)
+        if !dynamic_https
+            && !self.multiplex.registration.contains_tunnel(&self.tunnel_id)
             && !self.multiplex.registration.has_live_updates()
         {
             return Err(EdgeRuntimeConfigError::RawTunnelNotAuthorized(
@@ -533,6 +539,8 @@ impl EdgeRuntime {
         let router = self.transport.router();
         let shutdown = self.config.shutdown;
         https_config.shutdown = shutdown;
+        let https_routes = https_config.routes.clone();
+        let dynamic_https = https_routes.is_dynamic();
         let ingress = HttpIngressRuntime::bind(https_config, router.clone())
             .await
             .map_err(EdgeRuntimeError::HttpsStartup)?;
@@ -546,7 +554,10 @@ impl EdgeRuntime {
                         operations_config,
                         router.clone(),
                         self.config.tunnel_id.clone(),
-                        EdgeIngressMetricsSource::Https(https_status),
+                        EdgeIngressMetricsSource::Https {
+                            status: https_status,
+                            routes: https_routes,
+                        },
                     )
                     .await
                     .map_err(EdgeRuntimeError::OperationsStartup)?,
@@ -563,7 +574,7 @@ impl EdgeRuntime {
         let mut https_task = tokio::spawn(ingress.run_until_shutdown(https_signal));
         let mut operations = operations_runtime.map(spawn_operations);
         let mut tunnels = router.subscribe_tunnels();
-        let mut current_session = None;
+        let mut current_sessions = HashSet::new();
         let mut sessions_seen = 0_u64;
         info!(%https_addr, tunnel_id = %self.config.tunnel_id, event = "https_ingress_bound");
 
@@ -616,17 +627,17 @@ impl EdgeRuntime {
                     if changed.is_err() {
                         return Err(EdgeRuntimeError::TransportStopped);
                     }
-                    let next_session = tunnels
+                    let next_sessions: HashSet<_> = tunnels
                         .borrow()
                         .iter()
-                        .find(|(tunnel_id, _)| tunnel_id == &self.config.tunnel_id)
-                        .map(|(_, session_id)| *session_id);
-                    if next_session != current_session {
-                        if next_session.is_some() {
-                            sessions_seen = sessions_seen.saturating_add(1);
-                        }
-                        current_session = next_session;
-                    }
+                        .filter(|(tunnel_id, _)| dynamic_https || tunnel_id == &self.config.tunnel_id)
+                        .map(|(_, session_id)| *session_id)
+                        .collect();
+                    sessions_seen = sessions_seen.saturating_add(
+                        u64::try_from(next_sessions.difference(&current_sessions).count())
+                            .unwrap_or(u64::MAX),
+                    );
+                    current_sessions = next_sessions;
                 }
             }
         }

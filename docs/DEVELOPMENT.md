@@ -638,6 +638,51 @@ identical upserts and absent removals are successful no-ops. Listing prints the
 catalog version followed by routes in deterministic hostname order. Repository
 failures use exit code 1 and do not expose the database path.
 
-The catalog is capped at 64 records and mutations are transactional. It is not
-yet distributed to Edge; the runnable HTTPS ingress continues to use its
-explicit `--https-host` and `--tunnel-id` configuration.
+The catalog is capped at 64 records and mutations are transactional. Static
+Edge routing continues to support explicit `--https-host` and `--tunnel-id`.
+
+## 23. Distributing HTTPS routes to Edge
+
+Enable the independent authenticated route listener on the Control Plane:
+
+```text
+tunnelproxy-control-plane serve \
+  --database state.sqlite \
+  --listen 127.0.0.1:7200 \
+  --https-route-listen 127.0.0.1:7201 \
+  --tls-cert control-plane.pem \
+  --tls-key control-plane-key.pem \
+  --edge-client-ca edge-client-ca.pem
+```
+
+Dynamic HTTPS Edge mode reuses the snapshot client trust identity but connects
+to the route listener with its separate ALPN:
+
+```text
+tunnelproxy-edge \
+  --https-listen 127.0.0.1:8443 \
+  --https-route-server 127.0.0.1:7201 \
+  --https-route-max-stale-ms 300000 \
+  --max-agent-sessions 8 \
+  --public-tls-cert public.pem \
+  --public-tls-key public-key.pem \
+  --snapshot-server 127.0.0.1:7200 \
+  --snapshot-ca control-plane-ca.pem \
+  --snapshot-client-cert edge-client.pem \
+  --snapshot-client-key edge-client-key.pem \
+  --snapshot-server-name control-plane.internal \
+  --tls-cert edge.pem \
+  --tls-key edge-key.pem \
+  --tls-client-ca agent-ca.pem
+```
+
+`--https-host` and `--https-route-server` are mutually exclusive. Dynamic
+mode requires snapshot authorization because distributed records may target
+multiple authenticated tunnels. `--max-agent-sessions` bounds how many of
+those tunnels may be connected concurrently. Edge must bootstrap both streams online before
+binding; route state has no cold-start disk cache. During a route-service
+outage the last authenticated catalog remains usable only until the stale
+deadline, then every host fails closed until mutual-TLS recovery.
+Route-stream TLS credentials are read at process start; the existing snapshot
+TLS reload manifest does not rotate this separate ALPN configuration yet
+(DEBT-023), so rotate them with an ordered process restart.

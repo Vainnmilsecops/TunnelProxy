@@ -15,10 +15,11 @@ use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
     ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
     EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig,
-    HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteStatus,
-    SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
-    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
-    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
+    HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
+    HttpsRouteServerTlsConfig, HttpsRouteStatus, SnapshotCommitOutcome, SnapshotRepository,
+    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig,
+    SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError,
+    SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -42,6 +43,7 @@ Serve options:
   --tls-handshake-timeout-ms <ms>    TLS timeout (default 5000)
   --request-timeout-ms <ms>          protocol I/O timeout (default 5000)
   --refresh-interval-ms <ms>         SQLite refresh interval (default 500)
+  --https-route-listen <addr>        opt-in HTTPS route distribution listener
   --ops-listen <addr>                opt-in loopback operations listener
   --max-ops-connections <usize>      operations connection limit (default 8)
   --ops-header-timeout-ms <ms>       operations header timeout (default 2000)
@@ -228,6 +230,7 @@ async fn read_manifest(path: PathBuf) -> Result<Vec<u8>, ImportError> {
 
 async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (tls, reloader) = load_server_tls(&args).await?;
+    let https_route_server = load_https_route_server_config(&args).await?;
     let enrollment = load_enrollment_server_config(&args).await?;
     let runtime_config = ControlPlaneRuntimeConfig {
         database_path: args.database.clone(),
@@ -238,6 +241,7 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
             request_timeout: args.request_timeout,
             tls,
         },
+        https_route_server,
         operations: args.operations.map(|operations| {
             let mut config = ControlPlaneOperationsConfig::loopback(operations.listen);
             config.max_concurrent_connections = operations.max_connections;
@@ -260,6 +264,9 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     );
     if let Some(addr) = runtime.enrollment_addr() {
         info!(%addr, "Control Plane enrollment service started");
+    }
+    if let Some(addr) = runtime.https_route_addr() {
+        info!(%addr, "Control Plane HTTPS route distribution service started");
     }
     if let Some(addr) = runtime.operations_addr() {
         info!(%addr, "Control Plane operations service started");
@@ -293,6 +300,32 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     };
     info!(?outcome, "Control Plane shutdown completed");
     Ok(())
+}
+
+async fn load_https_route_server_config(
+    args: &ServeArgs,
+) -> Result<Option<HttpsRouteServerConfig>, ServeError> {
+    let Some(listen_addr) = args.https_route_listen else {
+        return Ok(None);
+    };
+    let (certificate, private_key, edge_client_ca) = tokio::try_join!(
+        read_pem(args.tls_cert.clone(), "server certificate"),
+        read_pem(args.tls_key.clone(), "server private key"),
+        read_pem(args.edge_client_ca.clone(), "Edge client CA"),
+    )?;
+    let tls = HttpsRouteServerTlsConfig::from_pem(
+        &certificate,
+        &private_key,
+        &edge_client_ca,
+        args.tls_handshake_timeout,
+    )
+    .map_err(ServeError::Tls)?;
+    Ok(Some(HttpsRouteServerConfig {
+        listen_addr,
+        max_edge_clients: args.max_edge_clients,
+        request_timeout: args.request_timeout,
+        tls,
+    }))
 }
 
 async fn load_enrollment_server_config(
@@ -425,6 +458,7 @@ enum ParsedCommand {
 struct ServeArgs {
     database: PathBuf,
     listen: SocketAddr,
+    https_route_listen: Option<SocketAddr>,
     tls_cert: PathBuf,
     tls_key: PathBuf,
     edge_client_ca: PathBuf,
@@ -622,6 +656,7 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
 fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut database = None;
     let mut listen = "127.0.0.1:7200".parse().unwrap();
+    let mut https_route_listen = None;
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut edge_client_ca = None;
@@ -654,6 +689,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         match flag {
             "--database" => database = Some(parse_path(args, index, flag)?),
             "--listen" => listen = parse_addr(args, index, flag)?,
+            "--https-route-listen" => {
+                https_route_listen = Some(parse_addr(args, index, flag)?);
+            }
             "--tls-cert" => tls_cert = Some(parse_path(args, index, flag)?),
             "--tls-key" => tls_key = Some(parse_path(args, index, flag)?),
             "--edge-client-ca" => edge_client_ca = Some(parse_path(args, index, flag)?),
@@ -762,6 +800,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     Ok(ServeArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
         listen,
+        https_route_listen,
         tls_cert: tls_cert.ok_or(ArgError::MissingRequired("--tls-cert"))?,
         tls_key: tls_key.ok_or(ArgError::MissingRequired("--tls-key"))?,
         edge_client_ca: edge_client_ca.ok_or(ArgError::MissingRequired("--edge-client-ca"))?,

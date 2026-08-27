@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Durable HTTPS Route Catalog & CLI Administration** (Session 31).
+**Authenticated HTTPS Route Distribution & Atomic Edge Activation** (Session 32).
 
 ## Completed
 
@@ -361,7 +361,15 @@
 - Control Plane CLI commands `https-route-upsert`, `https-route-remove`, and
   `https-route-list` validate before storage mutation, produce deterministic
   secret-safe output, and preserve the existing snapshot schema/state.
-- 316 explicit workspace tests are present; all prior behavior is preserved.
+- The Control Plane may expose an independent bounded mutual-TLS route service
+  using a strict versioned full-catalog protocol and latest-value publication.
+- Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
+  immutable in-memory routes, never queries SQLite/network per request, and
+  continues with stale state only until a configured deadline. Expired state
+  rejects every hostname until authenticated recovery; there is no disk cache.
+- Edge readiness and fixed-cardinality metrics report dynamic route source,
+  catalog version, enabled route count, and fail closed after expiry.
+- 325 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -371,13 +379,16 @@
 - Existing TLS connections generally retain their negotiated session until
   reconnect; static Edge certificate authorization is the exception because
   its snapshot update actively reconciles and revokes the old Agent session.
+- HTTPS route-stream client/server credentials are loaded at process start and
+  require restart for rotation (DEBT-023); snapshot TLS reload does not mutate
+  the separate route ALPN configuration.
 - General administrative mutation API and snapshot signing/hardware-backed
   rollback protection.
 - Credit/window-based flow control and strict weighted fairness between
   continuously backlogged streams.
 - Multiple tunnel registrations on one Agent transport.
-- Automatic public port/hostname allocation and HTTPS route-catalog
-  distribution/activation at Edge. The durable operator-managed catalog exists.
+- Automatic public port/hostname allocation. Durable operator-managed HTTPS
+  route distribution and activation are implemented.
 - HTTP/2, HTTP keep-alive, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -391,7 +402,7 @@
 
 ## Next planned session
 
-Session 32 has not been selected. The next plan should choose one bounded scope
-from distributing the durable HTTPS route catalog to Edge, transport fairness,
-or operator-owned telemetry collection guidance; automatic allocation, HTTP/2,
-signed access URLs, and multi-edge ownership remain separate larger scopes.
+Session 33 has not been selected. The next plan should choose one bounded scope
+from transport fairness, operator-owned telemetry collection guidance, or the
+next hostname lifecycle slice; automatic allocation, HTTP/2, signed access
+URLs, and multi-edge ownership remain separate larger scopes.

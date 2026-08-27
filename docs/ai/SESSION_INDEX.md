@@ -1044,3 +1044,29 @@ Out of scope:
   snapshot or Tunnel Protocol v2, and an administrative HTTP API.
 - Automatic/random hostname allocation, DNS/TLS automation, custom domains,
   signed access URLs, HTTP/2, and multi-edge ownership.
+
+## Session 32 — Authenticated HTTPS Route Distribution & Atomic Edge Activation — complete
+
+Scope delivered:
+
+- Added an independent `TPR1` mutual-TLS protocol with a strict 64 KiB frame,
+  canonical complete catalogs, 64-route bound, monotonic version checks, and a
+  latest-value Control Plane publication service.
+- Integrated the persistent route authority into Control Plane refresh,
+  supervision, CLI startup, rollback, and ordered shutdown without changing
+  authorization snapshots or Tunnel Protocol v2.
+- Added opt-in dynamic HTTPS Edge bootstrap/reconnect. Catalog replacement is
+  atomic and request routing reads only immutable process-local state.
+- Defined outage behavior as `live` → `stale` → `expired`: stale routes remain
+  usable only for the configured in-memory window, expiry rejects all hosts,
+  and authenticated same-address recovery restores service. No route disk
+  cache is written.
+- Added dynamic route readiness and fixed-cardinality source/version/count
+  metrics plus codec, protocol, CLI, atomic routing, and real mTLS tests. The
+  workspace now contains 325 explicit tests.
+
+Out of scope:
+
+- Automatic hostname allocation, DNS or certificate automation, custom
+  domains, an administrative HTTP API, HTTP/2/WebSocket/CONNECT, signed URLs,
+  multi-edge ownership, and authorization-snapshot/Tunnel Protocol changes.

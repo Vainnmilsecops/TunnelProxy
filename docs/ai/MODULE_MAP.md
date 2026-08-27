@@ -82,6 +82,9 @@ without placing control-plane storage on the ingress hot path. Edge can
 bootstrap that cache from the dedicated authenticated snapshot service and
 retain it as stale during reconnect. The runnable CLI can supervise this
 snapshot client alongside the data plane without binding before bootstrap.
+In dynamic HTTPS mode, Edge bootstraps an independent authenticated route
+stream, atomically reads immutable in-memory catalogs on the request path, and
+serves the last authenticated catalog only until its configured stale deadline.
 Public raw ingress remains opaque TCP. The alternative HTTPS mode terminates a
 separate reloadable public TLS identity, requires exact SNI/Host routing,
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
@@ -125,7 +128,9 @@ loopback-only operations listener reports in-memory readiness and
 fixed-cardinality snapshot, refresh, enrollment, and reconciliation metrics
 without querying SQLite during a scrape. A separate transactional SQLite HTTPS
 route catalog holds at most 64 exact hostname-to-TunnelId/status records with
-its own monotonic version and idempotent operator CLI administration.
+its own monotonic version and idempotent operator CLI administration. A
+separate bounded mutual-TLS service distributes complete latest-value route
+catalogs to Edge without changing authorization snapshots or Tunnel Protocol v2.
 
 **Responsibility (future)**
 

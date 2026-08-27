@@ -18,8 +18,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
+use tunnelproxy_control_plane::HttpsRouteSourceHealth;
 
-use crate::http_ingress::{HttpIngressStatus, HttpIngressStatusHandle};
+use crate::http_ingress::{HttpHostRoutes, HttpIngressStatus, HttpIngressStatusHandle};
 use crate::multiplex::{AuthorizationSourceStatus, EdgeSessionRouter};
 use crate::raw_ingress::{RawIngressRouteId, RawIngressRouteManager, RawIngressRouteStatus};
 
@@ -152,7 +153,10 @@ pub(crate) enum EdgeIngressMetricsSource {
         manager: RawIngressRouteManager,
         route_id: RawIngressRouteId,
     },
-    Https(HttpIngressStatusHandle),
+    Https {
+        status: HttpIngressStatusHandle,
+        routes: HttpHostRoutes,
+    },
 }
 
 #[derive(Clone)]
@@ -381,8 +385,7 @@ async fn serve_request(
         match request.uri().path() {
             "/healthz" => plain_response(StatusCode::OK, "ok\n", head),
             "/readyz" => {
-                let ready = !draining.load(Ordering::Relaxed)
-                    && router.resolve_tunnel(&tunnel_id).await.is_some();
+                let ready = ingress_ready(&router, &tunnel_id, &ingress, &draining).await;
                 if ready {
                     plain_response(StatusCode::OK, "ready\n", head)
                 } else {
@@ -402,6 +405,25 @@ async fn serve_request(
     };
     counters.completed_requests.fetch_add(1, Ordering::Relaxed);
     Ok(response)
+}
+
+async fn ingress_ready(
+    router: &EdgeSessionRouter,
+    tunnel_id: &TunnelId,
+    ingress: &EdgeIngressMetricsSource,
+    draining: &AtomicBool,
+) -> bool {
+    if draining.load(Ordering::Relaxed) {
+        return false;
+    }
+    match ingress {
+        EdgeIngressMetricsSource::Https { routes, .. } if routes.is_dynamic() => {
+            routes.dynamic_source_health() != Some(HttpsRouteSourceHealth::Expired)
+        }
+        EdgeIngressMetricsSource::Raw { .. } | EdgeIngressMetricsSource::Https { .. } => {
+            router.resolve_tunnel(tunnel_id).await.is_some()
+        }
+    }
 }
 
 fn plain_response(status: StatusCode, body: &'static str, head: bool) -> Response<Full<Bytes>> {
@@ -450,7 +472,12 @@ struct OperationsCounterSnapshot {
 #[derive(Clone)]
 enum IngressMetricSnapshot {
     Raw(Option<RawIngressRouteStatus>),
-    Https(HttpIngressStatus),
+    Https {
+        status: HttpIngressStatus,
+        route_health: Option<HttpsRouteSourceHealth>,
+        route_version: u64,
+        route_count: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -471,16 +498,22 @@ async fn collect_metrics(
     counters: &EdgeOperationsCounters,
     draining: &AtomicBool,
 ) -> EdgeMetricSnapshot {
-    let tunnel_connected = router.resolve_tunnel(tunnel_id).await.is_some();
+    let tunnel_connected = ingress_tunnel_connected(router, tunnel_id, ingress).await;
     let authorization = router.authorization_status();
+    let ready = ingress_ready(router, tunnel_id, ingress, draining).await;
     let ingress = match ingress {
         EdgeIngressMetricsSource::Raw { manager, route_id } => {
             IngressMetricSnapshot::Raw(manager.get_route(*route_id).await.ok())
         }
-        EdgeIngressMetricsSource::Https(status) => IngressMetricSnapshot::Https(status.snapshot()),
+        EdgeIngressMetricsSource::Https { status, routes } => IngressMetricSnapshot::Https {
+            status: status.snapshot(),
+            route_health: routes.dynamic_source_health(),
+            route_version: routes.dynamic_catalog_version().unwrap_or(0),
+            route_count: routes.len(),
+        },
     };
     EdgeMetricSnapshot {
-        ready: !draining.load(Ordering::Relaxed) && tunnel_connected,
+        ready,
         tunnel_connected,
         authorization_source: authorization.source,
         authorization_version: authorization.version.map_or(0, |version| version.get()),
@@ -493,6 +526,26 @@ async fn collect_metrics(
             capacity_rejections: counters.capacity_rejections.load(Ordering::Relaxed),
         },
         ingress,
+    }
+}
+
+async fn ingress_tunnel_connected(
+    router: &EdgeSessionRouter,
+    tunnel_id: &TunnelId,
+    ingress: &EdgeIngressMetricsSource,
+) -> bool {
+    match ingress {
+        EdgeIngressMetricsSource::Https { routes, .. } if routes.is_dynamic() => {
+            let tunnels = router.subscribe_tunnels();
+            let connected = tunnels
+                .borrow()
+                .iter()
+                .any(|(candidate, _)| routes.contains_tunnel(candidate));
+            connected
+        }
+        EdgeIngressMetricsSource::Raw { .. } | EdgeIngressMetricsSource::Https { .. } => {
+            router.resolve_tunnel(tunnel_id).await.is_some()
+        }
     }
 }
 
@@ -576,7 +629,18 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
     );
     match snapshot.ingress {
         IngressMetricSnapshot::Raw(status) => render_raw_metrics(&mut output, status.as_ref()),
-        IngressMetricSnapshot::Https(status) => render_https_metrics(&mut output, status),
+        IngressMetricSnapshot::Https {
+            status,
+            route_health,
+            route_version,
+            route_count,
+        } => render_https_metrics(
+            &mut output,
+            status,
+            route_health,
+            route_version,
+            route_count,
+        ),
     }
     output
 }
@@ -622,9 +686,43 @@ fn render_raw_metrics(output: &mut String, status: Option<&RawIngressRouteStatus
     );
 }
 
-fn render_https_metrics(output: &mut String, status: HttpIngressStatus) {
+fn render_https_metrics(
+    output: &mut String,
+    status: HttpIngressStatus,
+    route_health: Option<HttpsRouteSourceHealth>,
+    route_version: u64,
+    route_count: usize,
+) {
     metric(output, "tunnelproxy_edge_ingress_mode_raw", "gauge", 0);
     metric(output, "tunnelproxy_edge_ingress_mode_https", "gauge", 1);
+    let _ = writeln!(output, "# TYPE tunnelproxy_edge_https_route_source gauge");
+    for (source, active) in [
+        ("static", route_health.is_none()),
+        ("live", route_health == Some(HttpsRouteSourceHealth::Live)),
+        ("stale", route_health == Some(HttpsRouteSourceHealth::Stale)),
+        (
+            "expired",
+            route_health == Some(HttpsRouteSourceHealth::Expired),
+        ),
+    ] {
+        let _ = writeln!(
+            output,
+            "tunnelproxy_edge_https_route_source{{source=\"{source}\"}} {}",
+            u8::from(active)
+        );
+    }
+    metric(
+        output,
+        "tunnelproxy_edge_https_route_catalog_version",
+        "gauge",
+        route_version,
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_https_enabled_routes",
+        "gauge",
+        route_count,
+    );
     for (name, kind, value) in [
         (
             "tunnelproxy_edge_https_active_connections",

@@ -17,6 +17,9 @@ use tunnelproxy_common::{AgentId, TunnelId};
 mod certificate_issuer;
 mod enrollment_repository;
 mod enrollment_service;
+mod https_route_codec;
+mod https_route_distribution;
+mod https_route_protocol;
 mod https_route_repository;
 mod operations;
 mod repository;
@@ -38,10 +41,27 @@ pub use enrollment_service::{
     EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,
     EnrollmentTlsConfigError,
 };
+pub use https_route_codec::{
+    decode_https_route_catalog, encode_https_route_catalog, HttpsRouteCodecError,
+    MAX_HTTPS_ROUTE_CATALOG_BYTES,
+};
+pub use https_route_distribution::{
+    https_route_catalog_channel, HttpsRouteAuthorityError, HttpsRouteBootstrapClient,
+    HttpsRouteCatalogPublisher, HttpsRouteCatalogSubscription, HttpsRouteClientConfig,
+    HttpsRouteClientError, HttpsRouteClientRuntime, HttpsRouteDistributionServer,
+    HttpsRoutePublishOutcome, HttpsRouteServerConfig, HttpsRouteServerError,
+    HttpsRouteServerTlsConfig, HttpsRouteSourceClosed, HttpsRouteSourceHealth,
+    HttpsRouteUpdateError, PersistentHttpsRouteCatalog,
+};
+pub use https_route_protocol::{
+    decode_https_route_message, encode_https_route_message, read_https_route_message,
+    write_https_route_message, HttpsRouteMessage, HttpsRouteProtocolError,
+    HttpsRouteServiceErrorCode, HTTPS_ROUTE_PROTOCOL_ALPN, HTTPS_ROUTE_PROTOCOL_VERSION,
+};
 pub use https_route_repository::{
-    HttpsRouteCatalog, HttpsRouteCatalogVersion, HttpsRouteMutationOutcome, HttpsRouteRecord,
-    HttpsRouteRepository, HttpsRouteRepositoryError, HttpsRouteStatus, HttpsRouteStatusParseError,
-    MAX_HTTPS_ROUTE_RECORDS,
+    HttpsRouteCatalog, HttpsRouteCatalogError, HttpsRouteCatalogVersion, HttpsRouteMutationOutcome,
+    HttpsRouteRecord, HttpsRouteRepository, HttpsRouteRepositoryError, HttpsRouteStatus,
+    HttpsRouteStatusParseError, MAX_HTTPS_ROUTE_RECORDS,
 };
 pub use operations::{
     ControlPlaneOperationsConfig, ControlPlaneOperationsConfigError, ControlPlaneOperationsError,

@@ -24,6 +24,9 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
+use tunnelproxy_control_plane::{
+    HttpsRouteCatalogSubscription, HttpsRouteSourceHealth, HttpsRouteStatus,
+};
 
 pub use tunnelproxy_common::{
     PublicHostname as HttpHostname, PublicHostnameError as HttpHostnameError,
@@ -51,7 +54,13 @@ fn normalize_authority(value: &str) -> Result<HttpHostname, HttpHostnameError> {
 
 #[derive(Debug, Clone)]
 pub struct HttpHostRoutes {
-    routes: Arc<HashMap<HttpHostname, TunnelId>>,
+    source: HttpHostRouteSource,
+}
+
+#[derive(Debug, Clone)]
+enum HttpHostRouteSource {
+    Static(Arc<HashMap<HttpHostname, TunnelId>>),
+    Dynamic(HttpsRouteCatalogSubscription),
 }
 
 impl HttpHostRoutes {
@@ -69,28 +78,106 @@ impl HttpHostRoutes {
             }
         }
         Ok(Self {
-            routes: Arc::new(indexed),
+            source: HttpHostRouteSource::Static(Arc::new(indexed)),
         })
+    }
+
+    pub fn dynamic(subscription: HttpsRouteCatalogSubscription) -> Self {
+        Self {
+            source: HttpHostRouteSource::Dynamic(subscription),
+        }
+    }
+
+    pub fn dynamic_unavailable() -> Self {
+        use tunnelproxy_control_plane::{
+            https_route_catalog_channel, HttpsRouteCatalog, HttpsRouteCatalogVersion,
+        };
+
+        let catalog = HttpsRouteCatalog::new(HttpsRouteCatalogVersion::FIRST, Vec::new())
+            .expect("an empty route catalog is valid");
+        let (publisher, subscription) = https_route_catalog_channel(catalog);
+        publisher.set_source_health(HttpsRouteSourceHealth::Expired);
+        Self::dynamic(subscription)
     }
 
     pub fn single(hostname: HttpHostname, tunnel_id: TunnelId) -> Self {
         Self::new(vec![(hostname, tunnel_id)]).expect("one route is always valid")
     }
 
-    pub fn resolve(&self, hostname: &HttpHostname) -> Option<&TunnelId> {
-        self.routes.get(hostname)
+    pub fn resolve(&self, hostname: &HttpHostname) -> Option<TunnelId> {
+        match &self.source {
+            HttpHostRouteSource::Static(routes) => routes.get(hostname).cloned(),
+            HttpHostRouteSource::Dynamic(subscription)
+                if subscription.source_health() != HttpsRouteSourceHealth::Expired =>
+            {
+                subscription
+                    .current()
+                    .routes()
+                    .iter()
+                    .find(|route| {
+                        route.status == HttpsRouteStatus::Enabled && &route.hostname == hostname
+                    })
+                    .map(|route| route.tunnel_id.clone())
+            }
+            HttpHostRouteSource::Dynamic(_) => None,
+        }
     }
 
     pub fn contains_tunnel(&self, tunnel_id: &TunnelId) -> bool {
-        self.routes.values().any(|candidate| candidate == tunnel_id)
+        match &self.source {
+            HttpHostRouteSource::Static(routes) => {
+                routes.values().any(|candidate| candidate == tunnel_id)
+            }
+            HttpHostRouteSource::Dynamic(subscription)
+                if subscription.source_health() != HttpsRouteSourceHealth::Expired =>
+            {
+                subscription.current().routes().iter().any(|route| {
+                    route.status == HttpsRouteStatus::Enabled && &route.tunnel_id == tunnel_id
+                })
+            }
+            HttpHostRouteSource::Dynamic(_) => false,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.routes.len()
+        match &self.source {
+            HttpHostRouteSource::Static(routes) => routes.len(),
+            HttpHostRouteSource::Dynamic(subscription)
+                if subscription.source_health() != HttpsRouteSourceHealth::Expired =>
+            {
+                subscription
+                    .current()
+                    .routes()
+                    .iter()
+                    .filter(|route| route.status == HttpsRouteStatus::Enabled)
+                    .count()
+            }
+            HttpHostRouteSource::Dynamic(_) => 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.len() == 0
+    }
+
+    pub const fn is_dynamic(&self) -> bool {
+        matches!(&self.source, HttpHostRouteSource::Dynamic(_))
+    }
+
+    pub fn dynamic_source_health(&self) -> Option<HttpsRouteSourceHealth> {
+        match &self.source {
+            HttpHostRouteSource::Static(_) => None,
+            HttpHostRouteSource::Dynamic(subscription) => Some(subscription.source_health()),
+        }
+    }
+
+    pub fn dynamic_catalog_version(&self) -> Option<u64> {
+        match &self.source {
+            HttpHostRouteSource::Static(_) => None,
+            HttpHostRouteSource::Dynamic(subscription) => {
+                Some(subscription.current().version().get())
+            }
+        }
     }
 }
 
@@ -756,14 +843,10 @@ fn prepare_request(
             });
         }
     }
-    let tunnel_id = config
-        .routes
-        .resolve(&hostname)
-        .cloned()
-        .ok_or(RequestRejection {
-            status: StatusCode::NOT_FOUND,
-            reason: "unknown_host",
-        })?;
+    let tunnel_id = config.routes.resolve(&hostname).ok_or(RequestRejection {
+        status: StatusCode::NOT_FOUND,
+        reason: "unknown_host",
+    })?;
     sanitize_request_headers(request, peer.ip(), &hostname)?;
     let path = request
         .uri()
@@ -936,7 +1019,7 @@ mod tests {
         let hostname = HttpHostname::new("demo.example.com").unwrap();
         let tunnel = TunnelId::new("tunnel-a").unwrap();
         let routes = HttpHostRoutes::single(hostname.clone(), tunnel.clone());
-        assert_eq!(routes.resolve(&hostname), Some(&tunnel));
+        assert_eq!(routes.resolve(&hostname), Some(tunnel.clone()));
         assert!(routes
             .resolve(&HttpHostname::new("other.example.com").unwrap())
             .is_none());
@@ -947,6 +1030,47 @@ mod tests {
             ]),
             Err(HttpHostRoutesError::DuplicateHostname(value)) if value == hostname
         ));
+    }
+
+    #[test]
+    fn dynamic_routes_apply_complete_catalogs_and_expire_fail_closed() {
+        use tunnelproxy_control_plane::{
+            https_route_catalog_channel, HttpsRouteCatalog, HttpsRouteCatalogVersion,
+            HttpsRouteRecord,
+        };
+
+        let hostname = HttpHostname::new("demo.example.test").unwrap();
+        let first = TunnelId::new("tunnel-a").unwrap();
+        let second = TunnelId::new("tunnel-b").unwrap();
+        let initial = HttpsRouteCatalog::new(
+            HttpsRouteCatalogVersion::FIRST,
+            vec![HttpsRouteRecord::new(
+                hostname.clone(),
+                first.clone(),
+                HttpsRouteStatus::Enabled,
+            )],
+        )
+        .unwrap();
+        let (publisher, subscription) = https_route_catalog_channel(initial);
+        let routes = HttpHostRoutes::dynamic(subscription);
+        assert_eq!(routes.resolve(&hostname), Some(first));
+        publisher
+            .publish(
+                HttpsRouteCatalog::new(
+                    HttpsRouteCatalogVersion::new(2).unwrap(),
+                    vec![HttpsRouteRecord::new(
+                        hostname.clone(),
+                        second.clone(),
+                        HttpsRouteStatus::Enabled,
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(routes.resolve(&hostname), Some(second));
+        publisher.set_source_health(HttpsRouteSourceHealth::Expired);
+        assert_eq!(routes.resolve(&hostname), None);
+        assert!(routes.is_empty());
     }
 
     #[test]
