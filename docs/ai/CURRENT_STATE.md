@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Authenticated HTTPS Route Distribution & Atomic Edge Activation** (Session 32).
+**Atomic TLS Generation Reload for HTTPS Route Distribution** (Session 33).
 
 ## Completed
 
@@ -367,9 +367,13 @@
   immutable in-memory routes, never queries SQLite/network per request, and
   continues with stale state only until a configured deadline. Expired state
   rejects every hostname until authenticated recovery; there is no disk cache.
+- The HTTPS route server and client have separate opt-in digest manifests and
+  reload supervisors. Candidates preserve the dedicated route ALPN, publish
+  only increasing complete generations, keep the last-known-good generation
+  on rejection, and terminate supervision after certificate expiry.
 - Edge readiness and fixed-cardinality metrics report dynamic route source,
   catalog version, enabled route count, and fail closed after expiry.
-- 325 explicit workspace tests are present; all prior behavior is preserved.
+- 326 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -379,9 +383,6 @@
 - Existing TLS connections generally retain their negotiated session until
   reconnect; static Edge certificate authorization is the exception because
   its snapshot update actively reconciles and revokes the old Agent session.
-- HTTPS route-stream client/server credentials are loaded at process start and
-  require restart for rotation (DEBT-023); snapshot TLS reload does not mutate
-  the separate route ALPN configuration.
 - General administrative mutation API and snapshot signing/hardware-backed
   rollback protection.
 - Credit/window-based flow control and strict weighted fairness between
@@ -402,7 +403,7 @@
 
 ## Next planned session
 
-Session 33 has not been selected. The next plan should choose one bounded scope
+Session 34 has not been selected. The next plan should choose one bounded scope
 from transport fairness, operator-owned telemetry collection guidance, or the
 next hostname lifecycle slice; automatic allocation, HTTP/2, signed access
 URLs, and multi-edge ownership remain separate larger scopes.

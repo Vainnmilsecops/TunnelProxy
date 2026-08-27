@@ -1,6 +1,7 @@
 //! Latest-value HTTPS route publication and authenticated Edge distribution.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,13 +13,15 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::{client::TlsStream, TlsAcceptor};
 use tracing::{info, warn};
-use tunnelproxy_common::ShutdownSignal;
+use tunnelproxy_common::{ShutdownSignal, TlsConfigStatus, TlsReloadRuntimeError};
 
+use crate::snapshot_service::{ProtocolClientTlsReloadRuntime, ProtocolServerTlsReloadRuntime};
 use crate::{
     read_https_route_message, write_https_route_message, HttpsRouteCatalog,
     HttpsRouteCatalogVersion, HttpsRouteMessage, HttpsRouteProtocolError, HttpsRouteRepository,
     HttpsRouteRepositoryError, HttpsRouteServiceErrorCode, SnapshotClientConfig,
-    SnapshotServerTlsConfig, SnapshotTlsConfigError, HTTPS_ROUTE_PROTOCOL_ALPN,
+    SnapshotClientTlsReloadConfig, SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig,
+    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, HTTPS_ROUTE_PROTOCOL_ALPN,
 };
 
 #[derive(Debug)]
@@ -299,6 +302,10 @@ impl HttpsRouteServerTlsConfig {
         )
         .map(Self)
     }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.0.reload_status(expiry_warning)
+    }
 }
 
 impl std::fmt::Debug for HttpsRouteServerTlsConfig {
@@ -306,6 +313,55 @@ impl std::fmt::Debug for HttpsRouteServerTlsConfig {
         formatter
             .debug_struct("HttpsRouteServerTlsConfig")
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpsRouteServerTlsReloadConfig {
+    pub manifest_path: PathBuf,
+    pub server_certificate_path: PathBuf,
+    pub server_private_key_path: PathBuf,
+    pub client_ca_path: PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+}
+
+impl From<HttpsRouteServerTlsReloadConfig> for SnapshotServerTlsReloadConfig {
+    fn from(value: HttpsRouteServerTlsReloadConfig) -> Self {
+        Self {
+            manifest_path: value.manifest_path,
+            server_certificate_path: value.server_certificate_path,
+            server_private_key_path: value.server_private_key_path,
+            client_ca_path: value.client_ca_path,
+            poll_interval: value.poll_interval,
+            expiry_warning: value.expiry_warning,
+        }
+    }
+}
+
+pub struct HttpsRouteServerTlsReloadRuntime {
+    inner: ProtocolServerTlsReloadRuntime,
+}
+
+impl HttpsRouteServerTlsReloadRuntime {
+    pub async fn bootstrap(
+        reload: HttpsRouteServerTlsReloadConfig,
+        handshake_timeout: Duration,
+    ) -> Result<(HttpsRouteServerTlsConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let (tls, inner) = ProtocolServerTlsReloadRuntime::bootstrap(
+            reload.into(),
+            handshake_timeout,
+            HTTPS_ROUTE_PROTOCOL_ALPN,
+        )
+        .await?;
+        Ok((HttpsRouteServerTlsConfig(tls), Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
     }
 }
 
@@ -522,6 +578,10 @@ impl HttpsRouteClientConfig {
         }
         Ok(())
     }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.inner.reload_status(expiry_warning)
+    }
 }
 
 impl std::fmt::Debug for HttpsRouteClientConfig {
@@ -530,7 +590,71 @@ impl std::fmt::Debug for HttpsRouteClientConfig {
             .debug_struct("HttpsRouteClientConfig")
             .field("server_addr", &self.inner.server_addr)
             .field("max_stale_age", &self.max_stale_age)
+            .field(
+                "generation",
+                &self.inner.reload_status(Duration::from_secs(1)).generation,
+            )
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpsRouteClientTlsReloadConfig {
+    pub manifest_path: PathBuf,
+    pub server_ca_path: PathBuf,
+    pub client_certificate_path: PathBuf,
+    pub client_private_key_path: PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+    pub max_stale_age: Duration,
+}
+
+impl From<HttpsRouteClientTlsReloadConfig> for SnapshotClientTlsReloadConfig {
+    fn from(value: HttpsRouteClientTlsReloadConfig) -> Self {
+        Self {
+            manifest_path: value.manifest_path,
+            server_ca_path: value.server_ca_path,
+            client_certificate_path: value.client_certificate_path,
+            client_private_key_path: value.client_private_key_path,
+            poll_interval: value.poll_interval,
+            expiry_warning: value.expiry_warning,
+        }
+    }
+}
+
+pub struct HttpsRouteClientTlsReloadRuntime {
+    inner: ProtocolClientTlsReloadRuntime,
+}
+
+impl HttpsRouteClientTlsReloadRuntime {
+    pub async fn bootstrap(
+        server_addr: SocketAddr,
+        server_name: &str,
+        reload: HttpsRouteClientTlsReloadConfig,
+    ) -> Result<(HttpsRouteClientConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let max_stale_age = reload.max_stale_age;
+        let (inner_config, inner) = ProtocolClientTlsReloadRuntime::bootstrap(
+            server_addr,
+            server_name,
+            reload.into(),
+            HTTPS_ROUTE_PROTOCOL_ALPN,
+        )
+        .await?;
+        let config = HttpsRouteClientConfig {
+            inner: inner_config,
+            max_stale_age,
+        };
+        config.validate().map_err(|_| {
+            SnapshotTlsReloadBootstrapError::Runtime(TlsReloadRuntimeError::InvalidConfig)
+        })?;
+        Ok((config, Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
     }
 }
 

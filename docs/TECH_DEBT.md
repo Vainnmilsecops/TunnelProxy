@@ -20,7 +20,7 @@
 
 ## Open items
 
-### DEBT-023 — HTTPS route-stream credentials require a process restart
+### DEBT-023 — HTTPS route-stream credentials require a process restart — resolved
 
 - **Introduced in:** Session 32
 - **Category:** ops / security
@@ -33,7 +33,12 @@
   server and client, preserving independent ALPN validation, monotonic
   generations, last-known-good rollback, expiry termination, and real mTLS
   rotation coverage.
-- **Tracking:** open.
+- **Resolution:** Session 33 added independently supervised route-server and
+  route-client manifests backed by the shared atomic reload engine. The
+  dedicated route ALPN is preserved for every candidate; real mTLS coverage
+  proves rotation, reconnect, old-credential rejection, and last-known-good
+  retention after an invalid generation.
+- **Tracking:** resolved in Session 33.
 
 ### DEBT-022 — Durable HTTPS routes are not distributed to Edge — resolved
 

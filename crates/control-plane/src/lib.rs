@@ -48,10 +48,11 @@ pub use https_route_codec::{
 pub use https_route_distribution::{
     https_route_catalog_channel, HttpsRouteAuthorityError, HttpsRouteBootstrapClient,
     HttpsRouteCatalogPublisher, HttpsRouteCatalogSubscription, HttpsRouteClientConfig,
-    HttpsRouteClientError, HttpsRouteClientRuntime, HttpsRouteDistributionServer,
-    HttpsRoutePublishOutcome, HttpsRouteServerConfig, HttpsRouteServerError,
-    HttpsRouteServerTlsConfig, HttpsRouteSourceClosed, HttpsRouteSourceHealth,
-    HttpsRouteUpdateError, PersistentHttpsRouteCatalog,
+    HttpsRouteClientError, HttpsRouteClientRuntime, HttpsRouteClientTlsReloadConfig,
+    HttpsRouteClientTlsReloadRuntime, HttpsRouteDistributionServer, HttpsRoutePublishOutcome,
+    HttpsRouteServerConfig, HttpsRouteServerError, HttpsRouteServerTlsConfig,
+    HttpsRouteServerTlsReloadConfig, HttpsRouteServerTlsReloadRuntime, HttpsRouteSourceClosed,
+    HttpsRouteSourceHealth, HttpsRouteUpdateError, PersistentHttpsRouteCatalog,
 };
 pub use https_route_protocol::{
     decode_https_route_message, encode_https_route_message, read_https_route_message,

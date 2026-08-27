@@ -885,3 +885,30 @@ requests remain independent of Control Plane/storage availability within the
 explicit stale window. Authorization snapshots and Tunnel Protocol v2 remain
 unchanged. Cold-start offline routing, automatic allocation, custom domains,
 HTTP/2, and multi-edge replication remain outside this decision.
+
+---
+
+## ADR-033 — HTTPS route TLS reload uses protocol-bound atomic generations
+
+**Status:** Accepted (Session 33).
+
+**Context:** The route stream has a dedicated ALPN but initially loaded its
+server and client credentials only at process start. Reusing the snapshot
+reloader directly would risk constructing a candidate for the wrong protocol,
+while independent ad hoc reload logic would duplicate atomicity and expiry
+semantics.
+
+**Decision:** Snapshot and HTTPS route wrappers share internal server/client
+generation loaders, but every bootstrap captures an immutable protocol ALPN.
+The route server and client each use their own strict digest manifest and
+supervised runtime. A complete, valid, strictly newer generation is published
+atomically; rejected candidates retain the last-known-good configuration, and
+certificate expiry terminates the supervisor if no valid replacement arrives.
+
+**Consequences:** Route credentials rotate without process restart and normal
+reconnects authenticate with the new generation, while the route and snapshot
+wire protocols remain isolated. Existing sessions are not forcibly
+renegotiated. The runnable binaries still reuse their existing PEM path groups;
+operators publish bytes before the corresponding manifest. CA overlap,
+CRL/OCSP, automated issuance, and protocol changes remain outside this
+decision.

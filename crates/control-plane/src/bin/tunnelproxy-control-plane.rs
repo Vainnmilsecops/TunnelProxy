@@ -16,10 +16,11 @@ use tunnelproxy_control_plane::{
     ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
     EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig,
     HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
-    HttpsRouteServerTlsConfig, HttpsRouteStatus, SnapshotCommitOutcome, SnapshotRepository,
-    SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig,
-    SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError,
-    SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
+    HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig, HttpsRouteServerTlsReloadRuntime,
+    HttpsRouteStatus, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
+    SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
+    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
+    MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -49,6 +50,7 @@ Serve options:
   --ops-header-timeout-ms <ms>       operations header timeout (default 2000)
   --ops-request-timeout-ms <ms>      operations request timeout (default 5000)
   --tls-reload-manifest <path>       atomic TLS generation manifest
+  --https-route-tls-reload-manifest <path> route-service TLS generation manifest
   --tls-reload-interval-ms <ms>      reload poll (default 1000)
   --tls-expiry-warning-ms <ms>       expiry warning (default 604800000)
   --enrollment-listen <addr>         opt-in Agent enrollment listener
@@ -230,7 +232,7 @@ async fn read_manifest(path: PathBuf) -> Result<Vec<u8>, ImportError> {
 
 async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (tls, reloader) = load_server_tls(&args).await?;
-    let https_route_server = load_https_route_server_config(&args).await?;
+    let (https_route_server, https_route_reloader) = load_https_route_server_config(&args).await?;
     let enrollment = load_enrollment_server_config(&args).await?;
     let runtime_config = ControlPlaneRuntimeConfig {
         database_path: args.database.clone(),
@@ -274,7 +276,7 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
-    let reload_future = run_optional_tls_reloader(reloader, signal);
+    let reload_future = run_tls_reloaders(reloader, https_route_reloader, signal);
     tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
@@ -304,10 +306,40 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
 
 async fn load_https_route_server_config(
     args: &ServeArgs,
-) -> Result<Option<HttpsRouteServerConfig>, ServeError> {
+) -> Result<
+    (
+        Option<HttpsRouteServerConfig>,
+        Option<HttpsRouteServerTlsReloadRuntime>,
+    ),
+    ServeError,
+> {
     let Some(listen_addr) = args.https_route_listen else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    if let Some(manifest_path) = &args.https_route_tls_reload_manifest {
+        let (tls, runtime) = HttpsRouteServerTlsReloadRuntime::bootstrap(
+            HttpsRouteServerTlsReloadConfig {
+                manifest_path: manifest_path.clone(),
+                server_certificate_path: args.tls_cert.clone(),
+                server_private_key_path: args.tls_key.clone(),
+                client_ca_path: args.edge_client_ca.clone(),
+                poll_interval: args.tls_reload_interval,
+                expiry_warning: args.tls_expiry_warning,
+            },
+            args.tls_handshake_timeout,
+        )
+        .await
+        .map_err(ServeError::ReloadBootstrap)?;
+        return Ok((
+            Some(HttpsRouteServerConfig {
+                listen_addr,
+                max_edge_clients: args.max_edge_clients,
+                request_timeout: args.request_timeout,
+                tls,
+            }),
+            Some(runtime),
+        ));
+    }
     let (certificate, private_key, edge_client_ca) = tokio::try_join!(
         read_pem(args.tls_cert.clone(), "server certificate"),
         read_pem(args.tls_key.clone(), "server private key"),
@@ -320,12 +352,15 @@ async fn load_https_route_server_config(
         args.tls_handshake_timeout,
     )
     .map_err(ServeError::Tls)?;
-    Ok(Some(HttpsRouteServerConfig {
-        listen_addr,
-        max_edge_clients: args.max_edge_clients,
-        request_timeout: args.request_timeout,
-        tls,
-    }))
+    Ok((
+        Some(HttpsRouteServerConfig {
+            listen_addr,
+            max_edge_clients: args.max_edge_clients,
+            request_timeout: args.request_timeout,
+            tls,
+        }),
+        None,
+    ))
 }
 
 async fn load_enrollment_server_config(
@@ -422,15 +457,34 @@ async fn load_server_tls(
     Ok((tls, None))
 }
 
-async fn run_optional_tls_reloader(
-    reloader: Option<SnapshotServerTlsReloadRuntime>,
+async fn run_tls_reloaders(
+    snapshot: Option<SnapshotServerTlsReloadRuntime>,
+    routes: Option<HttpsRouteServerTlsReloadRuntime>,
     signal: tunnelproxy_common::ShutdownSignal,
 ) -> Result<(), tunnelproxy_common::TlsReloadRuntimeError> {
-    match reloader {
-        Some(reloader) => reloader.run_until_shutdown(signal).await,
-        None => {
-            signal.cancelled().await;
+    let mut tasks = tokio::task::JoinSet::new();
+    if let Some(runtime) = snapshot {
+        let child_signal = signal.clone();
+        tasks.spawn(runtime.run_until_shutdown(child_signal));
+    }
+    if let Some(runtime) = routes {
+        let child_signal = signal.clone();
+        tasks.spawn(runtime.run_until_shutdown(child_signal));
+    }
+    if tasks.is_empty() {
+        signal.cancelled().await;
+        return Ok(());
+    }
+    tokio::select! {
+        biased;
+        () = signal.cancelled() => {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
             Ok(())
+        }
+        result = tasks.join_next() => match result {
+            Some(Ok(result)) => result,
+            Some(Err(_)) | None => Err(tunnelproxy_common::TlsReloadRuntimeError::InvalidConfig),
         }
     }
 }
@@ -467,6 +521,7 @@ struct ServeArgs {
     request_timeout: Duration,
     refresh_interval: Duration,
     tls_reload_manifest: Option<PathBuf>,
+    https_route_tls_reload_manifest: Option<PathBuf>,
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
     enrollment: Option<EnrollmentArgs>,
@@ -665,6 +720,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut request_timeout = Duration::from_secs(5);
     let mut refresh_interval = Duration::from_millis(500);
     let mut tls_reload_manifest = None;
+    let mut https_route_tls_reload_manifest = None;
     let mut tls_reload_interval = Duration::from_secs(1);
     let mut tls_expiry_warning = Duration::from_secs(7 * 24 * 60 * 60);
     let mut reload_tuning_present = false;
@@ -720,6 +776,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             "--tls-reload-manifest" => {
                 tls_reload_manifest = Some(parse_path(args, index, flag)?);
             }
+            "--https-route-tls-reload-manifest" => {
+                https_route_tls_reload_manifest = Some(parse_path(args, index, flag)?);
+            }
             "--tls-reload-interval-ms" => {
                 tls_reload_interval = parse_duration(args, index, flag)?;
                 reload_tuning_present = true;
@@ -768,8 +827,14 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         }
         index += 2;
     }
-    if reload_tuning_present && tls_reload_manifest.is_none() {
+    if reload_tuning_present
+        && tls_reload_manifest.is_none()
+        && https_route_tls_reload_manifest.is_none()
+    {
         return Err(ArgError::MissingRequired("--tls-reload-manifest"));
+    }
+    if https_route_tls_reload_manifest.is_some() && https_route_listen.is_none() {
+        return Err(ArgError::MissingRequired("--https-route-listen"));
     }
     let enrollment = if enrollment_options_present {
         Some(EnrollmentArgs {
@@ -809,6 +874,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         request_timeout,
         refresh_interval,
         tls_reload_manifest,
+        https_route_tls_reload_manifest,
         tls_reload_interval,
         tls_expiry_warning,
         enrollment,
@@ -1194,6 +1260,8 @@ mod tests {
             "edge-ca.pem",
             "--listen",
             "127.0.0.1:17200",
+            "--https-route-listen",
+            "127.0.0.1:17201",
             "--max-edge-clients",
             "8",
             "--tls-handshake-timeout-ms",
@@ -1204,6 +1272,8 @@ mod tests {
             "300",
             "--tls-reload-manifest",
             "control-tls.json",
+            "--https-route-tls-reload-manifest",
+            "route-tls.json",
             "--tls-reload-interval-ms",
             "400",
             "--tls-expiry-warning-ms",
@@ -1222,11 +1292,16 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(serve.listen.port(), 17200);
+        assert_eq!(serve.https_route_listen.unwrap().port(), 17201);
         assert_eq!(serve.max_edge_clients, 8);
         assert_eq!(serve.refresh_interval, Duration::from_millis(300));
         assert_eq!(
             serve.tls_reload_manifest,
             Some(PathBuf::from("control-tls.json"))
+        );
+        assert_eq!(
+            serve.https_route_tls_reload_manifest,
+            Some(PathBuf::from("route-tls.json"))
         );
         assert_eq!(serve.tls_reload_interval, Duration::from_millis(400));
         assert_eq!(serve.tls_expiry_warning, Duration::from_millis(500));
@@ -1293,6 +1368,22 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["import", "--database"])),
             Err(ArgError::MissingValue(_))
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "key.pem",
+                "--edge-client-ca",
+                "ca.pem",
+                "--https-route-tls-reload-manifest",
+                "route-tls.json",
+            ])),
+            Err(ArgError::MissingRequired("--https-route-listen"))
         ));
     }
 
