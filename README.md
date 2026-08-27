@@ -38,6 +38,8 @@ correct agent, which in turn proxies them into the local service.
   hostname, including public TLS termination/reload, Host/SNI validation,
   forwarding-header sanitization, cached TunnelId routing, and bounded global
   plus per-source-IP request-rate admission with explicit `429` responses.
+  Opt-in keep-alive permits a bounded number of sequential requests per TLS
+  connection with per-request deadlines and graceful drain.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, raw ingress, HTTPS, and rate limiting.
@@ -119,8 +121,9 @@ authorization snapshots, SQLite persistence, full-snapshot import, a runnable
 authenticated distribution service, and a separate durable exact-hostname
 route catalog with authenticated distribution to an in-memory Edge cache. The data plane has tested
 opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
-slice with exact static or dynamically distributed hostname routing, public TLS reload, and local
-global/per-IP request-rate enforcement. Edge and Agent can optionally export
+slice with exact static or dynamically distributed hostname routing, bounded
+HTTP/1.1 keep-alive, public TLS reload, and local global/per-IP request-rate
+enforcement. Edge and Agent can optionally export
 bounded loopback health/readiness and fixed-cardinality Prometheus metrics. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
 
@@ -215,6 +218,7 @@ and Definition of Done.
 | 31 _(complete)_ | durable versioned HTTPS route catalog and operator CLI administration |
 | 32 _(complete)_ | authenticated HTTPS route distribution and atomic Edge activation |
 | 33 _(complete)_ | atomic TLS generation reload for HTTPS route distribution |
+| 34 _(complete)_ | bounded HTTP/1.1 keep-alive and per-request deadlines |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

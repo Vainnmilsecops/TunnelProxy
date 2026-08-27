@@ -75,7 +75,7 @@
   and explicit behavior during coordination outages.
 - **Tracking:** open.
 
-### DEBT-020 — Public HTTP ingress is HTTP/1.1 single-request only
+### DEBT-020 — Public HTTP ingress lacks HTTP/2 and upgrade support
 
 - **Introduced in:** Session 25
 - **Category:** product / performance
@@ -89,7 +89,12 @@
   per-connection/per-stream admission, fair tunnel scheduling, independent body
   deadlines, graceful drain tests, and equivalent host-fronting/header
   sanitization coverage. Treat upgrades/CONNECT as separate policy surfaces.
-- **Tracking:** open.
+- **Progress:** Session 34 added opt-in sequential HTTP/1.1 keep-alive with a
+  hard request cap, per-request header/body deadlines, repeated admission and
+  routing checks, error-close semantics, graceful drain, and fixed-cardinality
+  reuse/timeout metrics. The default remains one request for compatibility.
+- **Tracking:** HTTP/1.1 connection reuse resolved in Session 34; HTTP/2,
+  WebSocket/upgrade, CONNECT, and measured multiplexed fairness remain open.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

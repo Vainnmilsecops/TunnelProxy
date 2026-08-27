@@ -54,6 +54,7 @@ Options:
   --max-http-header-bytes <usize>  HTTP/1 buffer (default 16384)
   --max-http-headers <usize>       header count (default 64)
   --max-http-request-body-bytes <usize> body limit (default 10485760)
+  --max-http-requests-per-connection <usize> keep-alive request cap (default 1)
   --http-requests-per-second <u64> global request rate (default 100)
   --http-request-burst <u64>       global burst capacity (default 200)
   --http-requests-per-ip-per-second <u64> per-IP rate (default 20)
@@ -416,6 +417,7 @@ struct ParsedArgs {
     max_http_header_bytes: usize,
     max_http_headers: usize,
     max_http_request_body_bytes: usize,
+    max_http_requests_per_connection: usize,
     http_requests_per_second: u64,
     http_request_burst: u64,
     http_requests_per_ip_per_second: u64,
@@ -484,6 +486,7 @@ impl Default for ParsedArgs {
             max_http_header_bytes: 16 * 1024,
             max_http_headers: 64,
             max_http_request_body_bytes: 10 * 1024 * 1024,
+            max_http_requests_per_connection: 1,
             http_requests_per_second: 100,
             http_request_burst: 200,
             http_requests_per_ip_per_second: 20,
@@ -731,6 +734,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-http-request-body-bytes" => {
                 parsed.max_http_request_body_bytes = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--max-http-requests-per-connection" => {
+                parsed.max_http_requests_per_connection = parse_number(args, index, flag)?;
                 parsed.https_options_present = true;
                 index += 2;
             }
@@ -1473,6 +1481,7 @@ async fn load_https_configuration(
         max_header_bytes: parsed.max_http_header_bytes,
         max_headers: parsed.max_http_headers,
         max_request_body_bytes: parsed.max_http_request_body_bytes,
+        max_requests_per_connection: parsed.max_http_requests_per_connection,
         request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
@@ -1826,6 +1835,8 @@ mod tests {
             "40",
             "--max-http-request-body-bytes",
             "2048",
+            "--max-http-requests-per-connection",
+            "3",
             "--http-requests-per-second",
             "50",
             "--http-request-burst",
@@ -1854,6 +1865,7 @@ mod tests {
         assert_eq!(parsed.max_http_header_bytes, 32768);
         assert_eq!(parsed.max_http_headers, 40);
         assert_eq!(parsed.max_http_request_body_bytes, 2048);
+        assert_eq!(parsed.max_http_requests_per_connection, 3);
         assert_eq!(parsed.http_requests_per_second, 50);
         assert_eq!(parsed.http_request_burst, 100);
         assert_eq!(parsed.http_requests_per_ip_per_second, 10);

@@ -555,9 +555,29 @@ header-read, full-request, and duplex-buffer bounds are explicit. HTTP ingress
 reads only the immutable hostname table and the existing in-memory
 `TunnelId -> TransportSessionId` router; it never queries the Control Plane.
 Shutdown stops HTTPS admission and drains or force-joins its connection tasks
-before Agent transport shutdown. The first slice deliberately supports one
-HTTP/1.1 request per public TLS connection, with no HTTP/2, WebSocket/upgrade,
-CONNECT, automatic hostname allocation, or public-client authentication.
+before Agent transport shutdown. Session 25 initially supported one HTTP/1.1
+request per public TLS connection; Session 34 extends that boundary below.
+HTTP/2, WebSocket/upgrade, CONNECT, automatic hostname allocation, and
+public-client authentication remain excluded.
+
+### 2.32 Bounded HTTP/1.1 keep-alive and per-request deadlines (Session 34)
+
+HTTP/1.1 connection reuse is opt-in through a request cap whose default is one
+and hard maximum is 1024. A connection owns its global and per-source-IP
+admission permits until close. Each sequential request independently repeats
+Host/SNI/absolute-authority validation, dynamic route resolution, request-rate
+admission, header sanitization, body bounding, and tunnel stream creation. No
+request is replayed after uncertain delivery.
+
+The header-read deadline also bounds idle time between requests. A fresh
+request deadline covers upstream response acquisition and the streamed
+downstream response body. The last permitted response closes the connection;
+all rejection, rate-limit, upstream-failure, and timeout paths also close so an
+unread or ambiguous body is never followed by another request. On process
+shutdown, Hyper stops accepting requests on established connections and
+gracefully finishes active work before the existing drain deadline can abort
+the task. Fixed-cardinality counters expose reused requests and request
+timeouts without peer, hostname, TunnelId, or payload labels.
 
 ### 2.24 Bounded HTTP request-rate admission (Session 26)
 

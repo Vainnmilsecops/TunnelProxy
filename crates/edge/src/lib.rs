@@ -1186,7 +1186,7 @@ pub use http_ingress::{
     HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError, HttpIngressConfig,
     HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy, HttpIngressOutcome,
     HttpIngressRuntime, HttpIngressStatus, HttpIngressStatusHandle, MAX_HTTP_HEADER_BYTES,
-    MAX_HTTP_HOST_ROUTES, MIN_HTTP_HEADER_BYTES,
+    MAX_HTTP_HOST_ROUTES, MAX_HTTP_REQUESTS_PER_CONNECTION, MIN_HTTP_HEADER_BYTES,
 };
 pub use http_rate_limit::{
     HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError, MAX_HTTP_RATE_LIMIT_IDLE,
