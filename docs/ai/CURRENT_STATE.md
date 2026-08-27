@@ -303,6 +303,10 @@
 - Header bytes/count, request-body size, header-read/full-request deadlines,
   connection count, per-IP count, duplex capacity, and drain deadline are
   bounded. HTTPS drains before Agent transport shutdown.
+- Public HTTP/1.1 keep-alive is opt-in with a default cap of one and hard cap
+  of 1024 sequential requests per TLS connection. Every request revalidates
+  routing/security/admission state; errors close, deadlines cover response
+  bodies, and shutdown gracefully closes idle reused connections.
 - `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
   the HTTP client connection can reuse the existing multiplexed Tunnel
   Protocol v2 path without a wire-format change.
@@ -373,7 +377,7 @@
   on rejection, and terminate supervision after certificate expiry.
 - Edge readiness and fixed-cardinality metrics report dynamic route source,
   catalog version, enabled route count, and fail closed after expiry.
-- 326 explicit workspace tests are present; all prior behavior is preserved.
+- 332 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -390,7 +394,7 @@
 - Multiple tunnel registrations on one Agent transport.
 - Automatic public port/hostname allocation. Durable operator-managed HTTPS
   route distribution and activation are implemented.
-- HTTP/2, HTTP keep-alive, WebSocket/upgrade, CONNECT, custom-domain
+- HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
@@ -403,7 +407,7 @@
 
 ## Next planned session
 
-Session 34 has not been selected. The next plan should choose one bounded scope
+Session 35 has not been selected. The next plan should choose one bounded scope
 from transport fairness, operator-owned telemetry collection guidance, or the
 next hostname lifecycle slice; automatic allocation, HTTP/2, signed access
 URLs, and multi-edge ownership remain separate larger scopes.

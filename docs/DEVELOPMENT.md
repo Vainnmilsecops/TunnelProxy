@@ -473,11 +473,20 @@ tunnelproxy-edge \
 
 `--https-host` is one exact DNS hostname for the configured TunnelId. Host and
 TLS SNI must match; wildcard allocation is not implemented. Raw-ingress flags
-and HTTPS mode are mutually exclusive. The listener speaks HTTP/1.1 only,
-closes after one request, rejects CONNECT/upgrades, and replaces client-supplied
-forwarding headers. Header bytes/count, request body, TLS handshake, header
-read, complete request, global connection, and public per-IP limits are all
-configurable and validated before bind.
+and HTTPS mode are mutually exclusive. The listener speaks HTTP/1.1 only and
+rejects CONNECT/upgrades. `--max-http-requests-per-connection` defaults to `1`
+and may opt into at most 1024 sequential requests on one TLS connection. The
+header-read timeout is also the idle deadline between requests, while
+`--http-request-timeout-ms` is restarted for every request and covers both
+upstream response acquisition and downstream response-body delivery.
+
+Every reused request repeats Host/SNI validation, route lookup, global/per-IP
+rate admission, and forwarding-header sanitization. The physical connection
+retains its global/per-IP permit for its whole lifetime. The final allowed
+response carries `Connection: close`; validation failures, `429`, upstream
+errors, and timeouts also close immediately so unread bodies cannot be reused.
+During shutdown, keep-alive admission stops and Hyper drains the active request
+within the existing process drain deadline.
 
 Request admission additionally uses global and socket-peer-IP token buckets.
 Rates are tokens per second and bursts are token capacities; each burst must be

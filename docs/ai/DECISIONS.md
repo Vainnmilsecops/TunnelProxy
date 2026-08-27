@@ -912,3 +912,30 @@ renegotiated. The runnable binaries still reuse their existing PEM path groups;
 operators publish bytes before the corresponding manifest. CA overlap,
 CRL/OCSP, automated issuance, and protocol changes remain outside this
 decision.
+
+---
+
+## ADR-034 — HTTP/1.1 connection reuse is opt-in, capped, and revalidated
+
+**Status:** Accepted (Session 34).
+
+**Context:** Public HTTPS originally closed after one request. Unbounded
+keep-alive would let clients retain scarce global/per-IP permits, turn the
+whole-connection timeout into an incorrect lifetime limit, and risk reusing a
+connection after a rejected request body or stale routing decision.
+
+**Decision:** `max_requests_per_connection` defaults to one and is capped at
+1024. Values above one enable sequential HTTP/1.1 keep-alive. Every request
+repeats security, route, rate-limit, sanitization, size, and tunnel admission
+checks. Header-read timeout bounds idle time; a fresh deadline covers request
+processing and response-body delivery. The last allowed response and every
+rejection, timeout, or upstream failure close the connection. Connection
+permits span the TLS lifetime, and process shutdown invokes graceful Hyper
+drain before the existing hard deadline.
+
+**Consequences:** Operators may reduce TLS handshake overhead without adding
+unbounded connection ownership or stale per-connection authorization. The
+default behavior remains compatible, requests are never automatically
+replayed, and metrics remain fixed-cardinality. HTTP/2, pipelining guarantees,
+WebSocket/upgrade, CONNECT, distributed quotas, and multi-edge coordination
+remain outside this decision.

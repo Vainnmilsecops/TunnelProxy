@@ -71,7 +71,8 @@ credential manifests.
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed raw TCP routes, and bounded
-HTTPS/HTTP/1.1 ingress. The runnable
+HTTPS/HTTP/1.1 ingress with opt-in capped keep-alive, per-request deadlines,
+and graceful connection drain. The runnable
 single-tunnel process keeps its durable TunnelId listener bound across
 replacement Agent sessions. Loopback is the default; explicit public raw mode
 requires Agent mTLS, dynamic snapshot authority, global admission, and a

@@ -37,6 +37,7 @@
 | 31      | Durable HTTPS Route Catalog & CLI Administration | complete |
 | 32      | Authenticated HTTPS Route Distribution & Atomic Edge Activation | complete |
 | 33      | Atomic TLS Generation Reload for HTTPS Route Distribution | complete |
+| 34      | Bounded HTTP/1.1 Keep-Alive & Per-Request Deadlines | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1106,3 +1107,27 @@ Out of scope:
 - Forced renegotiation of established TLS connections, CRL/OCSP, CA-overlap
   orchestration, protocol/schema changes, route disk cache, HTTP/2, automatic
   hostname or certificate issuance, and multi-edge ownership.
+
+## Session 34 — Bounded HTTP/1.1 Keep-Alive & Per-Request Deadlines — complete
+
+Scope delivered:
+
+- Added an opt-in `max_requests_per_connection` contract with a CLI flag,
+  compatibility default of one, and hard maximum of 1024.
+- Enabled sequential HTTP/1.1 reuse while repeating Host/SNI validation,
+  dynamic route lookup, request-rate admission, forwarding sanitization, body
+  bounds, and tunnel creation for every request. Physical connection permits
+  remain held for the full TLS lifetime.
+- Replaced the former whole-connection request timeout with a fresh deadline
+  per request, including response-body streaming. Error, rejection, final-cap,
+  and timeout responses close the connection.
+- Added graceful Hyper shutdown for established keep-alive connections and
+  fixed-cardinality reuse/timeout counters in status, outcomes, and metrics.
+- Added config, CLI, body-deadline, real-TLS reuse/cap, reused-rate-limit,
+  timeout, and graceful/forced shutdown coverage. The workspace now contains
+  332 explicit tests.
+
+Out of scope:
+
+- HTTP/2, HTTP pipelining guarantees, WebSocket/upgrade, CONNECT, request
+  replay, distributed request-rate coordination, and multi-edge ownership.

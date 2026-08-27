@@ -765,6 +765,16 @@ fn render_https_metrics(
             status.tls_rejections,
         ),
         (
+            "tunnelproxy_edge_https_reused_requests_total",
+            "counter",
+            status.reused_requests,
+        ),
+        (
+            "tunnelproxy_edge_https_request_timeouts_total",
+            "counter",
+            status.request_timeouts,
+        ),
+        (
             "tunnelproxy_edge_https_global_rate_limit_rejections_total",
             "counter",
             status.global_rate_limit_rejections,
