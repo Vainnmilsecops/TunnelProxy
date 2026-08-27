@@ -130,7 +130,10 @@ without querying SQLite during a scrape. A separate transactional SQLite HTTPS
 route catalog holds at most 64 exact hostname-to-TunnelId/status records with
 its own monotonic version and idempotent operator CLI administration. A
 separate bounded mutual-TLS service distributes complete latest-value route
-catalogs to Edge without changing authorization snapshots or Tunnel Protocol v2.
+catalogs to Edge without changing authorization snapshots or Tunnel Protocol
+v2. Its server and Edge client configurations support separate digest-manifest
+TLS reload supervisors while retaining the route-specific ALPN and atomic
+last-known-good publication semantics.
 
 **Responsibility (future)**
 

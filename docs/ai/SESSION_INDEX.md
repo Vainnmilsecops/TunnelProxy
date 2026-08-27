@@ -24,6 +24,19 @@
 | 18      | Runnable Snapshot Service & Operations Wiring  | complete |
 | 19      | Edge Cold-Start Snapshot Cache                 | complete |
 | 20      | Certificate Lifecycle & Atomic TLS Reload      | complete |
+| 21      | Automated Agent Enrollment & Renewal           | complete |
+| 22      | Emergency Credential Revocation & Reconciliation | complete |
+| 23      | Public Raw TCP Ingress & Per-IP Admission      | complete |
+| 24      | Reproducible Builds & GitHub CI                | complete |
+| 25      | Bounded Public HTTPS/HTTP/1.1 Ingress          | complete |
+| 26      | Bounded HTTP Request Rate Limiting & Observability | complete |
+| 27      | Bounded Edge Operations Endpoint & Prometheus Metrics | complete |
+| 28      | Secret-Safe Structured JSON Logging            | complete |
+| 29      | Bounded Agent Operations Endpoint & Connection Metrics | complete |
+| 30      | Bounded Control Plane Operations Endpoint & Service Metrics | complete |
+| 31      | Durable HTTPS Route Catalog & CLI Administration | complete |
+| 32      | Authenticated HTTPS Route Distribution & Atomic Edge Activation | complete |
+| 33      | Atomic TLS Generation Reload for HTTPS Route Distribution | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1070,3 +1083,26 @@ Out of scope:
 - Automatic hostname allocation, DNS or certificate automation, custom
   domains, an administrative HTTP API, HTTP/2/WebSocket/CONNECT, signed URLs,
   multi-edge ownership, and authorization-snapshot/Tunnel Protocol changes.
+
+## Session 33 — Atomic TLS Generation Reload for HTTPS Route Distribution — complete
+
+Scope delivered:
+
+- Generalized the snapshot TLS reload builders internally so each protocol
+  supplies its own immutable ALPN while retaining the existing public snapshot
+  API and shared digest-generation engine.
+- Added route-server and route-client reload configurations and runtimes with
+  independent manifests, monotonic publication, status reporting,
+  last-known-good rollback, and certificate-expiry termination.
+- Integrated dedicated route reload flags into Control Plane and Edge startup,
+  validation, supervision, and ordered shutdown.
+- Added parser coverage and real mTLS rotation coverage proving generation
+  publication, old-credential rejection, reconnect with rotated credentials,
+  and retention of generation 2 after an invalid generation 3. The workspace
+  now contains 326 explicit tests.
+
+Out of scope:
+
+- Forced renegotiation of established TLS connections, CRL/OCSP, CA-overlap
+  orchestration, protocol/schema changes, route disk cache, HTTP/2, automatic
+  hostname or certificate issuance, and multi-edge ownership.

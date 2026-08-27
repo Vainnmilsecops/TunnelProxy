@@ -84,7 +84,8 @@ routing from static or authenticated dynamically distributed state, and applies 
 is not yet the automatic future product UX. Control Plane has a separate
 bounded, versioned SQLite catalog and operator CLI for durable exact-hostname
 route intent; Edge can consume it through an independent bounded mutual-TLS
-latest-value stream with atomic activation and fail-closed expiry. Agent, Edge, and
+latest-value stream with atomic activation, fail-closed expiry, and independent
+digest-manifest TLS reload on both ends. Agent, Edge, and
 Control Plane have opt-in bounded loopback operations endpoints;
 public/authenticated operations access and durable metrics storage are not
 implemented. All three runnable components can emit collector-friendly,

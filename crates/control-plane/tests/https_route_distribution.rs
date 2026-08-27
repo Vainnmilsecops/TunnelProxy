@@ -6,14 +6,19 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
+use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tunnelproxy_common::{shutdown_channel, PublicHostname, ShutdownTrigger, TunnelId};
+use tunnelproxy_common::{
+    shutdown_channel, PublicHostname, ShutdownTrigger, TlsConfigHealth, TunnelId,
+};
 use tunnelproxy_control_plane::{
     AuthorizationSnapshot, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
     HttpsRouteBootstrapClient, HttpsRouteCatalogSubscription, HttpsRouteClientConfig,
+    HttpsRouteClientError, HttpsRouteClientTlsReloadConfig, HttpsRouteClientTlsReloadRuntime,
     HttpsRouteDistributionServer, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
-    HttpsRouteServerError, HttpsRouteServerTlsConfig, HttpsRouteSourceHealth, HttpsRouteStatus,
+    HttpsRouteServerError, HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig,
+    HttpsRouteServerTlsReloadRuntime, HttpsRouteSourceHealth, HttpsRouteStatus,
     PersistentHttpsRouteCatalog, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
     SnapshotVersion, SqliteSnapshotRepository, VersionedAuthorizationSnapshot,
 };
@@ -85,6 +90,23 @@ fn temp_database() -> (PathBuf, PathBuf) {
     (directory.join("state.sqlite"), directory)
 }
 
+fn write_reload_manifest(path: &PathBuf, generation: u64, files: &[(&str, &PathBuf)]) {
+    let entries = files
+        .iter()
+        .map(|(name, path)| {
+            let digest = Sha256::digest(std::fs::read(path).unwrap());
+            let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!(r#""{name}":"{digest}""#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        path,
+        format!(r#"{{"generation":{generation},"files":{{{entries}}}}}"#),
+    )
+    .unwrap();
+}
+
 fn route(tunnel: &str, status: HttpsRouteStatus) -> HttpsRouteRecord {
     HttpsRouteRecord::new(
         PublicHostname::new("demo.example.test").unwrap(),
@@ -114,6 +136,32 @@ async fn start_server(
                 Duration::from_secs(1),
             )
             .unwrap(),
+        },
+        authority.subscribe(),
+    )
+    .await
+    .unwrap();
+    let address = server.local_addr();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(server.run_until_shutdown(signal));
+    (address, trigger, task)
+}
+
+async fn start_server_with_tls(
+    listen_addr: std::net::SocketAddr,
+    tls: HttpsRouteServerTlsConfig,
+    authority: &PersistentHttpsRouteCatalog,
+) -> (
+    std::net::SocketAddr,
+    ShutdownTrigger,
+    JoinHandle<Result<(), HttpsRouteServerError>>,
+) {
+    let server = HttpsRouteDistributionServer::bind(
+        HttpsRouteServerConfig {
+            listen_addr,
+            max_edge_clients: 4,
+            request_timeout: Duration::from_secs(1),
+            tls,
         },
         authority.subscribe(),
     )
@@ -292,5 +340,193 @@ async fn control_plane_runtime_refreshes_and_supervises_route_distribution() {
     assert_eq!(outcome.applied_route_refreshes, 1);
     client_trigger.shutdown();
     client_task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn route_tls_server_and_client_rotate_reconnect_and_keep_last_good_generation() {
+    let first_pki = test_pki("control-plane.test");
+    let second_pki = test_pki("control-plane.test");
+    let (database, directory) = temp_database();
+    let repository = HttpsRouteRepository::open(&database).unwrap();
+    repository
+        .upsert(&route("tunnel-a", HttpsRouteStatus::Enabled))
+        .unwrap();
+    let authority = PersistentHttpsRouteCatalog::open(repository.clone())
+        .await
+        .unwrap();
+
+    let server_certificate = directory.join("route-server.pem");
+    let server_key = directory.join("route-server-key.pem");
+    let edge_ca = directory.join("route-edge-ca.pem");
+    let server_ca = directory.join("route-server-ca.pem");
+    let client_certificate = directory.join("route-edge.pem");
+    let client_key = directory.join("route-edge-key.pem");
+    let server_manifest = directory.join("route-server-reload.json");
+    let client_manifest = directory.join("route-client-reload.json");
+    let write_generation = |pki: &TestPki| {
+        std::fs::write(&server_certificate, &pki.server.certificate_pem).unwrap();
+        std::fs::write(&server_key, &pki.server.private_key_pem).unwrap();
+        std::fs::write(&edge_ca, &pki.authority_pem).unwrap();
+        std::fs::write(&server_ca, &pki.authority_pem).unwrap();
+        std::fs::write(&client_certificate, &pki.edge.certificate_pem).unwrap();
+        std::fs::write(&client_key, &pki.edge.private_key_pem).unwrap();
+    };
+    write_generation(&first_pki);
+    write_reload_manifest(
+        &server_manifest,
+        1,
+        &[
+            ("server_certificate", &server_certificate),
+            ("server_private_key", &server_key),
+            ("client_ca", &edge_ca),
+        ],
+    );
+    write_reload_manifest(
+        &client_manifest,
+        1,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+
+    let (server_tls, server_reloader) = HttpsRouteServerTlsReloadRuntime::bootstrap(
+        HttpsRouteServerTlsReloadConfig {
+            manifest_path: server_manifest.clone(),
+            server_certificate_path: server_certificate.clone(),
+            server_private_key_path: server_key.clone(),
+            client_ca_path: edge_ca.clone(),
+            poll_interval: Duration::from_millis(20),
+            expiry_warning: Duration::from_secs(60),
+        },
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let server_status = server_tls.clone();
+    let (server_addr, server_trigger, server_task) =
+        start_server_with_tls("127.0.0.1:0".parse().unwrap(), server_tls, &authority).await;
+    let (server_reload_trigger, server_reload_signal) = shutdown_channel();
+    let server_reload_task = tokio::spawn(server_reloader.run_until_shutdown(server_reload_signal));
+
+    let (route_client_config, client_reloader) = HttpsRouteClientTlsReloadRuntime::bootstrap(
+        server_addr,
+        "control-plane.test",
+        HttpsRouteClientTlsReloadConfig {
+            manifest_path: client_manifest.clone(),
+            server_ca_path: server_ca.clone(),
+            client_certificate_path: client_certificate.clone(),
+            client_private_key_path: client_key.clone(),
+            poll_interval: Duration::from_millis(20),
+            expiry_warning: Duration::from_secs(60),
+            max_stale_age: Duration::from_secs(2),
+        },
+    )
+    .await
+    .unwrap();
+    let client_status = route_client_config.clone();
+    let (mut routes, client_runtime) =
+        HttpsRouteBootstrapClient::bootstrap(route_client_config.clone())
+            .await
+            .unwrap();
+    let (client_trigger, client_signal) = shutdown_channel();
+    let client_task = tokio::spawn(client_runtime.run_until_shutdown(client_signal));
+    let (client_reload_trigger, client_reload_signal) = shutdown_channel();
+    let client_reload_task = tokio::spawn(client_reloader.run_until_shutdown(client_reload_signal));
+
+    write_generation(&second_pki);
+    write_reload_manifest(
+        &server_manifest,
+        2,
+        &[
+            ("server_certificate", &server_certificate),
+            ("server_private_key", &server_key),
+            ("client_ca", &edge_ca),
+        ],
+    );
+    write_reload_manifest(
+        &client_manifest,
+        2,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server_status
+                .reload_status(Duration::from_secs(1))
+                .generation
+                == 2
+                && client_status
+                    .reload_status(Duration::from_secs(1))
+                    .generation
+                    == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("route TLS generation two was not published");
+
+    let (_, rotated_runtime) = HttpsRouteBootstrapClient::bootstrap(route_client_config.clone())
+        .await
+        .unwrap();
+    drop(rotated_runtime);
+    let old_client = client_config(server_addr, &first_pki, Duration::from_secs(1));
+    assert!(matches!(
+        HttpsRouteBootstrapClient::bootstrap(old_client).await,
+        Err(HttpsRouteClientError::TlsAuthentication)
+    ));
+
+    server_trigger.shutdown();
+    server_task.await.unwrap().unwrap();
+    wait_for_health(&mut routes, HttpsRouteSourceHealth::Stale).await;
+    let (_, restarted_trigger, restarted_task) =
+        start_server_with_tls(server_addr, server_status.clone(), &authority).await;
+    wait_for_health(&mut routes, HttpsRouteSourceHealth::Live).await;
+
+    std::fs::write(&client_key, b"invalid private key").unwrap();
+    write_reload_manifest(
+        &client_manifest,
+        3,
+        &[
+            ("server_ca", &server_ca),
+            ("client_certificate", &client_certificate),
+            ("client_private_key", &client_key),
+        ],
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let status = client_status.reload_status(Duration::from_secs(1));
+            if status.health == TlsConfigHealth::ReloadFailed {
+                assert_eq!(status.generation, 2);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid route client generation was not reported");
+    let (_, last_good_runtime) = HttpsRouteBootstrapClient::bootstrap(route_client_config)
+        .await
+        .unwrap();
+    drop(last_good_runtime);
+
+    client_trigger.shutdown();
+    client_reload_trigger.shutdown();
+    server_reload_trigger.shutdown();
+    restarted_trigger.shutdown();
+    client_task.await.unwrap().unwrap();
+    client_reload_task.await.unwrap().unwrap();
+    server_reload_task.await.unwrap().unwrap();
+    restarted_task.await.unwrap().unwrap();
+    drop(authority);
+    drop(repository);
     std::fs::remove_dir_all(directory).unwrap();
 }

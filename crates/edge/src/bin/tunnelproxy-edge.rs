@@ -11,7 +11,8 @@ use tunnelproxy_common::{
     TunnelId,
 };
 use tunnelproxy_control_plane::{
-    HttpsRouteClientConfig, SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
+    HttpsRouteClientConfig, HttpsRouteClientTlsReloadConfig, HttpsRouteClientTlsReloadRuntime,
+    SnapshotBootstrapSource, SnapshotCacheConfig, SnapshotClientConfig,
     SnapshotClientTlsReloadConfig, SnapshotClientTlsReloadRuntime, SnapshotTlsConfigError,
     SnapshotTlsReloadBootstrapError,
 };
@@ -43,6 +44,7 @@ Options:
   --https-host <hostname>          exact public hostname routed to Tunnel ID
   --https-route-server <addr>      authenticated dynamic route service
   --https-route-max-stale-ms <ms>  route lifetime after disconnect (default 300000)
+  --https-route-tls-reload-manifest <path> route-client TLS generation manifest
   --public-tls-cert <path>         public HTTPS certificate PEM
   --public-tls-key <path>          public HTTPS private key PEM
   --public-tls-reload-manifest <path> public HTTPS TLS generation manifest
@@ -146,7 +148,7 @@ async fn main() -> ExitCode {
         }
     };
     config.https_ingress = https_ingress;
-    let https_routes = match load_https_route_configuration(&parsed).await {
+    let (https_routes, https_route_reloader) = match load_https_route_configuration(&parsed).await {
         Ok(configuration) => configuration,
         Err(error) => {
             error!(%error, "failed to configure HTTPS route distribution");
@@ -182,6 +184,7 @@ async fn main() -> ExitCode {
             mut reloaders,
         } => {
             reloaders.public = public_tls_reloader;
+            reloaders.routes = https_route_reloader;
             config.multiplex.security = security;
             run_snapshot_edge(config, snapshots, cache, https_routes, reloaders, &parsed).await
         }
@@ -403,6 +406,7 @@ struct ParsedArgs {
     https_host: Option<HttpHostname>,
     https_route_server: Option<SocketAddr>,
     https_route_max_stale: Option<Duration>,
+    https_route_tls_reload_manifest: Option<PathBuf>,
     public_tls_cert: Option<PathBuf>,
     public_tls_key: Option<PathBuf>,
     public_tls_reload_manifest: Option<PathBuf>,
@@ -470,6 +474,7 @@ impl Default for ParsedArgs {
             https_host: None,
             https_route_server: None,
             https_route_max_stale: None,
+            https_route_tls_reload_manifest: None,
             public_tls_cert: None,
             public_tls_key: None,
             public_tls_reload_manifest: None,
@@ -534,6 +539,7 @@ enum ArgError {
     InvalidHostname(String),
     HttpsRouteHostConflict,
     HttpsRouteStaleWithoutServer,
+    HttpsRouteReloadWithoutServer,
     IngressModeConflict,
     PublicHttpsOptInRequired,
     PublicHttpsPerIpLimitRequired,
@@ -574,6 +580,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::HttpsRouteStaleWithoutServer => {
                 f.write_str("--https-route-max-stale-ms requires --https-route-server")
+            }
+            Self::HttpsRouteReloadWithoutServer => {
+                f.write_str("--https-route-tls-reload-manifest requires --https-route-server")
             }
             Self::IngressModeConflict => {
                 f.write_str("raw-ingress options cannot be combined with --https-listen")
@@ -671,6 +680,13 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.https_route_max_stale =
                     Some(Duration::from_millis(parse_number(args, index, flag)?));
                 parsed.https_options_present = true;
+                index += 2;
+            }
+            "--https-route-tls-reload-manifest" => {
+                parsed.https_route_tls_reload_manifest =
+                    Some(PathBuf::from(value(args, index, flag)?));
+                parsed.https_options_present = true;
+                parsed.tls_reload_options_present = true;
                 index += 2;
             }
             "--public-tls-cert" => {
@@ -906,6 +922,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.https_route_max_stale.is_some() && parsed.https_route_server.is_none() {
         return Err(ArgError::HttpsRouteStaleWithoutServer);
     }
+    if parsed.https_route_tls_reload_manifest.is_some() && parsed.https_route_server.is_none() {
+        return Err(ArgError::HttpsRouteReloadWithoutServer);
+    }
     Ok(parsed)
 }
 
@@ -980,6 +999,7 @@ enum TlsLoadError {
     ReloadArguments,
     EdgeReload(EdgeTlsReloadBootstrapError),
     SnapshotReload(SnapshotTlsReloadBootstrapError),
+    HttpsRouteReload(SnapshotTlsReloadBootstrapError),
     IncompletePublicHttpsArguments,
     PublicHttpsWithoutListener,
     PublicHttpsExposure(ArgError),
@@ -1028,6 +1048,9 @@ impl std::fmt::Display for TlsLoadError {
             Self::SnapshotReload(error) => {
                 write!(f, "snapshot-client TLS reload is invalid: {error}")
             }
+            Self::HttpsRouteReload(error) => {
+                write!(f, "HTTPS route-client TLS reload is invalid: {error}")
+            }
             Self::IncompletePublicHttpsArguments => f.write_str(
                 "HTTPS ingress requires --https-listen, one route source, --public-tls-cert, and --public-tls-key",
             ),
@@ -1047,6 +1070,7 @@ struct LoadedTlsReloaders {
     edge: Option<EdgeTlsReloadRuntime>,
     snapshot: Option<SnapshotClientTlsReloadRuntime>,
     public: Option<PublicTlsReloadRuntime>,
+    routes: Option<HttpsRouteClientTlsReloadRuntime>,
 }
 
 impl LoadedTlsReloaders {
@@ -1082,6 +1106,15 @@ impl LoadedTlsReloaders {
                     .map_err(TlsReloadSupervisorError::Public)
             });
         }
+        if let Some(runtime) = self.routes {
+            let child_signal = signal.clone();
+            tasks.spawn(async move {
+                runtime
+                    .run_until_shutdown(child_signal)
+                    .await
+                    .map_err(TlsReloadSupervisorError::HttpsRoute)
+            });
+        }
         if tasks.is_empty() {
             signal.cancelled().await;
             return Ok(());
@@ -1106,6 +1139,7 @@ enum TlsReloadSupervisorError {
     Edge(tunnelproxy_common::TlsReloadRuntimeError),
     Snapshot(tunnelproxy_common::TlsReloadRuntimeError),
     Public(tunnelproxy_common::TlsReloadRuntimeError),
+    HttpsRoute(tunnelproxy_common::TlsReloadRuntimeError),
     Task,
 }
 
@@ -1115,6 +1149,7 @@ impl std::fmt::Display for TlsReloadSupervisorError {
             Self::Edge(error) => write!(f, "Agent-facing TLS reload failed: {error}"),
             Self::Snapshot(error) => write!(f, "snapshot-client TLS reload failed: {error}"),
             Self::Public(error) => write!(f, "public TLS reload failed: {error}"),
+            Self::HttpsRoute(error) => write!(f, "HTTPS route-client TLS reload failed: {error}"),
             Self::Task => f.write_str("TLS reload task stopped unexpectedly"),
         }
     }
@@ -1167,6 +1202,7 @@ async fn load_transport_configuration(
             if parsed.tls_reload_options_present
                 && parsed.tls_reload_manifest.is_none()
                 && parsed.snapshot_tls_reload_manifest.is_none()
+                && parsed.https_route_tls_reload_manifest.is_none()
             {
                 return Err(TlsLoadError::ReloadArguments);
             }
@@ -1203,6 +1239,7 @@ async fn load_transport_configuration(
                             edge: Some(runtime),
                             snapshot: None,
                             public: None,
+                            routes: None,
                         },
                     });
                 }
@@ -1260,6 +1297,7 @@ async fn load_transport_configuration(
                         edge: edge_reloader,
                         snapshot: None,
                         public: None,
+                        routes: None,
                     },
                 })
             }
@@ -1339,6 +1377,7 @@ async fn load_snapshot_configuration(
             edge: edge_reloader,
             snapshot: snapshot_reloader,
             public: None,
+            routes: None,
         },
     })
 }
@@ -1448,9 +1487,15 @@ async fn load_https_configuration(
 
 async fn load_https_route_configuration(
     parsed: &ParsedArgs,
-) -> Result<Option<HttpsRouteClientConfig>, TlsLoadError> {
+) -> Result<
+    (
+        Option<HttpsRouteClientConfig>,
+        Option<HttpsRouteClientTlsReloadRuntime>,
+    ),
+    TlsLoadError,
+> {
     let Some(server) = parsed.https_route_server else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let (Some(ca), Some(client_cert), Some(client_key), Some(server_name)) = (
         parsed.snapshot_ca.as_ref(),
@@ -1460,6 +1505,27 @@ async fn load_https_route_configuration(
     ) else {
         return Err(TlsLoadError::IncompleteSnapshotArguments);
     };
+    let max_stale_age = parsed
+        .https_route_max_stale
+        .unwrap_or(Duration::from_secs(5 * 60));
+    if let Some(manifest_path) = &parsed.https_route_tls_reload_manifest {
+        let (config, runtime) = HttpsRouteClientTlsReloadRuntime::bootstrap(
+            server,
+            server_name,
+            HttpsRouteClientTlsReloadConfig {
+                manifest_path: manifest_path.clone(),
+                server_ca_path: ca.clone(),
+                client_certificate_path: client_cert.clone(),
+                client_private_key_path: client_key.clone(),
+                poll_interval: parsed.tls_reload_interval,
+                expiry_warning: parsed.tls_expiry_warning,
+                max_stale_age,
+            },
+        )
+        .await
+        .map_err(TlsLoadError::HttpsRouteReload)?;
+        return Ok((Some(config), Some(runtime)));
+    }
     let (ca, client_cert, client_key) = tokio::try_join!(
         read_tls_file(ca, "HTTPS route Control Plane CA"),
         read_tls_file(client_cert, "HTTPS route Edge client certificate"),
@@ -1471,15 +1537,13 @@ async fn load_https_route_configuration(
         &client_cert,
         &client_key,
         server_name,
-        parsed
-            .https_route_max_stale
-            .unwrap_or(Duration::from_secs(5 * 60)),
+        max_stale_age,
     )
     .map_err(TlsLoadError::InvalidHttpsRouteTls)?;
     config
         .validate()
         .map_err(|_| TlsLoadError::InvalidHttpsRouteConfig)?;
-    Ok(Some(config))
+    Ok((Some(config), None))
 }
 
 async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, TlsLoadError> {
@@ -1834,6 +1898,8 @@ mod tests {
             "127.0.0.1:17201",
             "--https-route-max-stale-ms",
             "45000",
+            "--https-route-tls-reload-manifest",
+            "route-client-tls.json",
             "--public-tls-cert",
             "public.pem",
             "--public-tls-key",
@@ -1842,6 +1908,10 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.https_route_server.unwrap().port(), 17201);
         assert_eq!(parsed.https_route_max_stale, Some(Duration::from_secs(45)));
+        assert_eq!(
+            parsed.https_route_tls_reload_manifest,
+            Some(PathBuf::from("route-client-tls.json"))
+        );
         assert!(matches!(
             parse_args(&args(&[
                 "--https-host",
@@ -1854,6 +1924,13 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["--https-route-max-stale-ms", "1000"])),
             Err(ArgError::HttpsRouteStaleWithoutServer)
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--https-route-tls-reload-manifest",
+                "route-client-tls.json",
+            ])),
+            Err(ArgError::HttpsRouteReloadWithoutServer)
         );
     }
 

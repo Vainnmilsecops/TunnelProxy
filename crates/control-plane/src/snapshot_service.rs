@@ -844,16 +844,18 @@ impl SnapshotServerTlsReloadConfig {
     }
 }
 
-type ServerBuild = fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ServerConfig>, ()>;
+type ServerBuild =
+    Box<dyn Fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ServerConfig>, ()> + Send + Sync>;
 
-pub struct SnapshotServerTlsReloadRuntime {
+pub(crate) struct ProtocolServerTlsReloadRuntime {
     inner: TlsReloadRuntime<ServerConfig, ServerBuild>,
 }
 
-impl SnapshotServerTlsReloadRuntime {
-    pub async fn bootstrap(
+impl ProtocolServerTlsReloadRuntime {
+    pub(crate) async fn bootstrap(
         reload: SnapshotServerTlsReloadConfig,
         handshake_timeout: Duration,
+        alpn: &'static [u8],
     ) -> Result<(SnapshotServerTlsConfig, Self), SnapshotTlsReloadBootstrapError> {
         if handshake_timeout.is_zero() {
             return Err(SnapshotTlsReloadBootstrapError::Tls(
@@ -870,7 +872,7 @@ impl SnapshotServerTlsReloadRuntime {
         )
         .await
         .map_err(SnapshotTlsReloadBootstrapError::Load)?;
-        let candidate = build_server_reload_generation(&generation)
+        let candidate = build_server_reload_generation(&generation, alpn)
             .map_err(|()| SnapshotTlsReloadBootstrapError::Candidate)?;
         let server_config = ReloadableConfig::new(
             generation.generation(),
@@ -883,12 +885,36 @@ impl SnapshotServerTlsReloadRuntime {
             server_config: server_config.clone(),
             handshake_timeout,
         };
-        let inner = TlsReloadRuntime::new(
-            runtime_config,
-            server_config,
-            build_server_reload_generation as ServerBuild,
+        let build: ServerBuild =
+            Box::new(move |generation| build_server_reload_generation(generation, alpn));
+        let inner = TlsReloadRuntime::new(runtime_config, server_config, build)
+            .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        Ok((tls, Self { inner }))
+    }
+
+    pub(crate) async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
+    }
+}
+
+pub struct SnapshotServerTlsReloadRuntime {
+    inner: ProtocolServerTlsReloadRuntime,
+}
+
+impl SnapshotServerTlsReloadRuntime {
+    pub async fn bootstrap(
+        reload: SnapshotServerTlsReloadConfig,
+        handshake_timeout: Duration,
+    ) -> Result<(SnapshotServerTlsConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let (tls, inner) = ProtocolServerTlsReloadRuntime::bootstrap(
+            reload,
+            handshake_timeout,
+            SNAPSHOT_PROTOCOL_ALPN,
         )
-        .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        .await?;
         Ok((tls, Self { inner }))
     }
 
@@ -902,12 +928,13 @@ impl SnapshotServerTlsReloadRuntime {
 
 fn build_server_reload_generation(
     generation: &TlsReloadGeneration,
+    alpn: &[u8],
 ) -> Result<TlsReloadCandidate<ServerConfig>, ()> {
     build_server_tls_config(
         generation.file(RELOAD_SERVER_CERTIFICATE).map_err(|_| ())?,
         generation.file(RELOAD_SERVER_PRIVATE_KEY).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_CA).map_err(|_| ())?,
-        SNAPSHOT_PROTOCOL_ALPN,
+        alpn,
     )
     .map_err(|_| ())
 }
@@ -943,17 +970,19 @@ impl SnapshotClientTlsReloadConfig {
     }
 }
 
-type ClientBuild = fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ClientConfig>, ()>;
+type ClientBuild =
+    Box<dyn Fn(&TlsReloadGeneration) -> Result<TlsReloadCandidate<ClientConfig>, ()> + Send + Sync>;
 
-pub struct SnapshotClientTlsReloadRuntime {
+pub(crate) struct ProtocolClientTlsReloadRuntime {
     inner: TlsReloadRuntime<ClientConfig, ClientBuild>,
 }
 
-impl SnapshotClientTlsReloadRuntime {
-    pub async fn bootstrap(
+impl ProtocolClientTlsReloadRuntime {
+    pub(crate) async fn bootstrap(
         server_addr: SocketAddr,
         server_name: &str,
         reload: SnapshotClientTlsReloadConfig,
+        alpn: &'static [u8],
     ) -> Result<(SnapshotClientConfig, Self), SnapshotTlsReloadBootstrapError> {
         let server_name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
             SnapshotTlsReloadBootstrapError::Tls(SnapshotTlsConfigError::InvalidServerName)
@@ -968,7 +997,7 @@ impl SnapshotClientTlsReloadRuntime {
         )
         .await
         .map_err(SnapshotTlsReloadBootstrapError::Load)?;
-        let candidate = build_client_reload_generation(&generation)
+        let candidate = build_client_reload_generation(&generation, alpn)
             .map_err(|()| SnapshotTlsReloadBootstrapError::Candidate)?;
         let client_config = ReloadableConfig::new(
             generation.generation(),
@@ -987,12 +1016,38 @@ impl SnapshotClientTlsReloadRuntime {
             reconnect_initial_delay: Duration::from_millis(250),
             reconnect_max_delay: Duration::from_secs(30),
         };
-        let inner = TlsReloadRuntime::new(
-            runtime_config,
-            client_config,
-            build_client_reload_generation as ClientBuild,
+        let build: ClientBuild =
+            Box::new(move |generation| build_client_reload_generation(generation, alpn));
+        let inner = TlsReloadRuntime::new(runtime_config, client_config, build)
+            .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        Ok((config, Self { inner }))
+    }
+
+    pub(crate) async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
+    }
+}
+
+pub struct SnapshotClientTlsReloadRuntime {
+    inner: ProtocolClientTlsReloadRuntime,
+}
+
+impl SnapshotClientTlsReloadRuntime {
+    pub async fn bootstrap(
+        server_addr: SocketAddr,
+        server_name: &str,
+        reload: SnapshotClientTlsReloadConfig,
+    ) -> Result<(SnapshotClientConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let (config, inner) = ProtocolClientTlsReloadRuntime::bootstrap(
+            server_addr,
+            server_name,
+            reload,
+            SNAPSHOT_PROTOCOL_ALPN,
         )
-        .map_err(SnapshotTlsReloadBootstrapError::Runtime)?;
+        .await?;
         Ok((config, Self { inner }))
     }
 
@@ -1006,12 +1061,13 @@ impl SnapshotClientTlsReloadRuntime {
 
 fn build_client_reload_generation(
     generation: &TlsReloadGeneration,
+    alpn: &[u8],
 ) -> Result<TlsReloadCandidate<ClientConfig>, ()> {
     build_client_tls_config(
         generation.file(RELOAD_SERVER_CA).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_CERTIFICATE).map_err(|_| ())?,
         generation.file(RELOAD_CLIENT_PRIVATE_KEY).map_err(|_| ())?,
-        SNAPSHOT_PROTOCOL_ALPN,
+        alpn,
     )
     .map_err(|_| ())
 }

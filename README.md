@@ -58,9 +58,9 @@ correct agent, which in turn proxies them into the local service.
 - A transactional, versioned SQLite HTTPS route catalog with exact canonical
   hostname records, idempotent operator commands, and an independent bounded
   mutual-TLS latest-value stream for atomic Edge activation.
-- Opt-in digest-bound TLS generation reload for Agent, Edge, and snapshot
-  transports with last-known-good rollback, expiry enforcement, and static
-  Agent-certificate authorization rotation.
+- Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
+  HTTPS, and HTTPS route transports with last-known-good rollback, expiry
+  enforcement, and static Agent-certificate authorization rotation.
 - Real TCP/mTLS integration tests for framing, forwarding, lifecycle, liveness,
   public admission, revocation, and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -214,6 +214,7 @@ and Definition of Done.
 | 30 _(complete)_ | bounded loopback Control Plane operations endpoint and service metrics |
 | 31 _(complete)_ | durable versioned HTTPS route catalog and operator CLI administration |
 | 32 _(complete)_ | authenticated HTTPS route distribution and atomic Edge activation |
+| 33 _(complete)_ | atomic TLS generation reload for HTTPS route distribution |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

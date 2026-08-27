@@ -310,7 +310,8 @@ never performed on the ingress path.
 TLS reload is opt-in. Keep the normal PEM path flags and add the matching
 manifest flag. Agent and Control Plane use `--tls-reload-manifest`; Edge uses
 that flag for Agent-facing TLS and `--snapshot-tls-reload-manifest` for its
-Control Plane client identity. All processes accept
+Control Plane snapshot-client identity. The route service and route client use
+`--https-route-tls-reload-manifest`. All processes accept
 `--tls-reload-interval-ms` and `--tls-expiry-warning-ms`.
 
 The manifest is strict JSON. `generation` must be non-zero; a replacement must
@@ -332,8 +333,10 @@ manifest is:
 
 Other exact file sets are:
 
-- Agent and snapshot client: `server_ca`, `client_certificate`,
+- Agent, snapshot client, and HTTPS route client: `server_ca`, `client_certificate`,
   `client_private_key`.
+- Control Plane snapshot server and HTTPS route server: `server_certificate`,
+  `server_private_key`, `client_ca`.
 - Dynamic Edge Agent-facing server: `server_certificate`,
   `server_private_key`, `client_ca`.
 - Control Plane snapshot server: `server_certificate`,
@@ -683,6 +686,13 @@ those tunnels may be connected concurrently. Edge must bootstrap both streams on
 binding; route state has no cold-start disk cache. During a route-service
 outage the last authenticated catalog remains usable only until the stale
 deadline, then every host fails closed until mutual-TLS recovery.
-Route-stream TLS credentials are read at process start; the existing snapshot
-TLS reload manifest does not rotate this separate ALPN configuration yet
-(DEBT-023), so rotate them with an ordered process restart.
+Route-stream reload is opt-in and independent of snapshot reload even though
+the runnable processes reuse the same PEM path flags. Add
+`--https-route-tls-reload-manifest <path>` to both commands. Publish all PEM
+bytes first and each matching manifest last. Snapshot and route manifests have
+their own monotonic generation numbers and supervisors; every route candidate
+is rebuilt with `tunnelproxy-https-routes/1`, while snapshot candidates retain
+their snapshot ALPN. A rejected route generation leaves the active generation
+serving, and expiry without a valid replacement terminates the process
+supervisor. Existing authenticated connections are not renegotiated; the next
+connection or normal reconnect uses the new generation.

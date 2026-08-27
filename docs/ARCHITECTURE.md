@@ -737,6 +737,24 @@ Static `--https-host` routing remains supported and is mutually exclusive with
 `--https-route-server`. Automatic allocation, DNS/TLS automation, custom
 domains, signed access, HTTP/2, and multi-edge coordination remain separate.
 
+### 2.31 Atomic HTTPS route TLS generation reload (Session 33)
+
+The route server and Edge route client each expose a dedicated opt-in digest
+manifest and supervised reload runtime. They reuse the generic atomic TLS
+generation engine but inject `tunnelproxy-https-routes/1` when building every
+candidate, so snapshot and route protocol configuration cannot cross ALPN
+boundaries. Manifests require exact file sets, SHA-256 digests, and strictly
+increasing non-zero generations.
+
+Candidate bytes are fully loaded, verified, parsed, and validated before one
+shared configuration pointer is replaced. A malformed, incomplete, stale, or
+cryptographically invalid generation is observable as reload failure while the
+last-known-good generation remains active. Certificate expiry without a valid
+replacement terminates the owning supervisor. Existing TLS sessions retain
+their negotiated generation; new connections and reconnects use the latest
+published generation. Route catalog versions and TLS generations remain
+independent domains.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
