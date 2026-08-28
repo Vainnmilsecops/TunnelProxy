@@ -16,7 +16,8 @@ correct agent, which in turn proxies them into the local service.
 - Tunnel Protocol v2 binary framing with bounded durable registration and a
   64 KiB frame payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
-- A multiplexed reverse TCP data path with bounded queues,
+- A multiplexed reverse TCP data path with globally bounded DATA admission,
+  per-stream FIFO round-robin scheduling, bounded control-frame bursts,
   half-close, typed reset, open/idle deadlines, and per-session routing.
 - Lifecycle-managed raw-ingress routes with bounded global and per-source-IP
   connection admission, tracked stream completion, graceful drain, and
@@ -69,7 +70,7 @@ correct agent, which in turn proxies them into the local service.
 
 The following are **not yet implemented**:
 
-- Credit/window-based flow control and strict weighted stream scheduling.
+- Peer-negotiated credit/window flow control and weighted byte scheduling.
 - Automatic hostname allocation, custom-domain administration, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.

@@ -112,6 +112,7 @@
 | Multiplexing                              | ✅   | ✅          | —   | `eight_streams_run_concurrently_without_cross_talk` drives eight byte-exact real-TCP streams on one Agent session. |
 | Live session and durable tunnel routing   | ✅   | ✅          | —   | Exact session routing plus cached `TunnelId -> TransportSessionId`; duplicate claim rejects and releases after disconnect. |
 | Multiplexed capacity and isolation        | ✅   | ✅          | —   | Capacity rejection preserves the session; one Agent local failure does not affect another Agent. |
+| Bounded fair DATA scheduling              | ✅   | ✅          | —   | Per-key FIFO and strict admission are deterministic unit tests; real TCP drives eight 256 KiB streams through a two-frame shared DATA bound while heartbeat remains live. |
 | Raw ingress route golden path             | ✅   | ✅          | —   | `raw_route_golden_path_is_byte_exact_and_drains` binds an ephemeral listener and crosses Edge → Agent → local service. |
 | Raw ingress concurrent routing            | —    | ✅          | —   | Six concurrent clients remain byte-exact; two routes target two exact Agent sessions. |
 | Raw route admission                       | ✅   | ✅          | —   | Global route and per-route connection bounds reject excess work without stopping healthy routes. |
@@ -131,7 +132,7 @@
 | Composed local tunnel                     | —    | ✅          | —   | Real TCP crosses runnable Edge→Agent→local echo byte-exactly, then releases both listener ports after shutdown. |
 | OS process shutdown observation           | ✅   | —           | —   | Ctrl-C on all platforms and SIGTERM on Unix compile behind Tokio's signal feature; runtime cleanup is tested via injected shutdown signals. |
 | Reconnect                                 | ✅    | ✅           | —   | Backoff bounds/jitter are unit tested; real TCP covers cancellation, retry exhaustion, Edge restart, and same-address route recovery. |
-| Backpressure                              | ✅   | ✅          | —   | Session 09 adds bounded per-stream, command, control, and DATA queues plus a 16 KiB runtime DATA limit. Credit windows remain deferred. |
+| Backpressure                              | ✅   | ✅          | —   | Session 35 extends bounded queues with one admission permit across channel/scheduler/encode state and round-robin frame service. Peer credit windows remain deferred. |
 | Agent transport mutual TLS                | ✅    | ✅           | —   | Runtime-generated PKI covers byte-exact mTLS with ALPN v2, wrong CA/name, timeout/cancellation, secret-safe Debug, and secure reconnect. |
 | Agent certificate authentication          | ✅    | ✅           | —   | Missing/untrusted certs, same-CA unassigned certs, false Agent/Tunnel claims, and disabled tunnels never become routable. |
 | Atomic TLS generation reload              | ✅    | ✅           | —   | Strict digest manifests and monotonic last-known-good publication are unit tested; real mTLS rotates Agent/Edge, snapshot client/server, and HTTPS route client/server without restart, rejects old credentials, reconnects on the new route generation, and retains the active generation after an invalid candidate. |

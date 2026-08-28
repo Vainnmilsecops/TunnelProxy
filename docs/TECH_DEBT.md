@@ -235,13 +235,15 @@
 - **Category:** performance
 - **Impact:** medium
 - **Rationale:** Session 09 bounds every queue and prioritizes heartbeat/reset
-  traffic. DATA senders share Tokio's bounded FIFO channel, which provides
-  cooperative backpressure but not byte-credit negotiation or weighted
-  round-robin service for permanently backlogged streams.
+  traffic. Session 35 replaces the shared FIFO writer policy with strict
+  process-local admission, per-stream FIFO round-robin frame service, and a
+  bounded control burst. This still does not provide peer byte-credit
+  negotiation or weighted byte fairness.
 - **Exit plan:** Add explicit per-stream/session byte credits and a deficit
   round-robin writer only after measurements show the bounded FIFO policy is
   insufficient.
-- **Tracking:** open.
+- **Tracking:** partially resolved in Session 35; peer credit windows and
+  weighted/deficit byte scheduling remain open.
 
 ### DEBT-015 — Durable route snapshots are not persisted across restarts — resolved
 

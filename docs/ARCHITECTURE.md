@@ -579,6 +579,22 @@ gracefully finishes active work before the existing drain deadline can abort
 the task. Fixed-cardinality counters expose reused requests and request
 timeouts without peer, hostname, TunnelId, or payload labels.
 
+### 2.33 Bounded fair DATA scheduling (Session 35)
+
+Each multiplexed Agent↔Edge writer admits DATA and END_STREAM frames through a
+shared semaphore-backed bound. A permit follows a frame from producer wait,
+through the channel and per-stream scheduler, until encoding completes, so
+moving frames between internal structures cannot multiply the configured
+memory allowance.
+
+The writer preserves FIFO order within each stream and serves active streams
+round-robin. END_STREAM uses the same per-stream queue as DATA and therefore
+cannot overtake earlier payload. Lifecycle and heartbeat frames retain
+priority, but a continuously ready control producer is limited to eight frames
+before one queued DATA frame is served. The scheduler is process-local and
+frame-based: it adds no wire fields, ALPN change, peer credit negotiation,
+weighted byte fairness, or distributed flow control.
+
 ### 2.24 Bounded HTTP request-rate admission (Session 26)
 
 After TLS and exact Host/SNI/absolute-authority validation, but before reading

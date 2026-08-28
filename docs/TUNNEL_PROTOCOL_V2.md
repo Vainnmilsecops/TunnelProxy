@@ -105,6 +105,12 @@ owned and releases on handshake failure, EOF, protocol failure, timeout, or
 shutdown. Reconnect therefore receives a fresh `TransportSessionId` and
 reattaches the same `TunnelId` only after the prior claim is gone.
 
+Session 35 changes only local writer scheduling. DATA and END_STREAM frames are
+admitted under one hard process-local bound, retain FIFO order per stream, and
+are served round-robin between active streams. Control frames retain priority
+with a bounded burst. Frame numbers, payloads, ALPN, and peer behavior are
+unchanged; no credit/window field is negotiated on this protocol.
+
 ## Raw ingress behavior
 
 The runnable raw listener defaults to loopback-only. Session 23 permits an

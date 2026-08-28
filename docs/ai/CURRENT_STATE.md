@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Atomic TLS Generation Reload for HTTPS Route Distribution** (Session 33).
+**Bounded Fair DATA Scheduling** (Session 35).
 
 ## Completed
 
@@ -61,9 +61,11 @@
   ephemeral Agent session and returns after OPEN_STREAM is acknowledged.
 - Agent `run_multiplexed` bridges a configurable number of concurrent logical
   streams to its configured local service.
-- Every session has one frame reader and one writer actor. Separate bounded
-  lifecycle/heartbeat and DATA queues keep control traffic responsive; DATA
-  and END_STREAM share FIFO ordering so half-close cannot overtake payloads.
+- Every session has one frame reader and one writer actor. DATA admission is
+  globally bounded across channel, scheduler, and in-flight encode state.
+  Active streams are served round-robin with per-stream FIFO ordering, so
+  END_STREAM cannot overtake payloads. Lifecycle/heartbeat traffic retains
+  priority with a bounded eight-frame control burst.
 - Per-stream inbound queues, a 16 KiB DATA-frame limit, bounded session queues,
   capacity admission, and open/connect/idle deadlines bound memory and failure
   scope.
@@ -377,7 +379,7 @@
   on rejection, and terminate supervision after certificate expiry.
 - Edge readiness and fixed-cardinality metrics report dynamic route source,
   catalog version, enabled route count, and fail closed after expiry.
-- 332 explicit workspace tests are present; all prior behavior is preserved.
+- 338 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -389,8 +391,8 @@
   its snapshot update actively reconciles and revokes the old Agent session.
 - General administrative mutation API and snapshot signing/hardware-backed
   rollback protection.
-- Credit/window-based flow control and strict weighted fairness between
-  continuously backlogged streams.
+- Peer-negotiated credit/window flow control and weighted byte fairness.
+  Session 35 implements bounded process-local frame round-robin scheduling.
 - Multiple tunnel registrations on one Agent transport.
 - Automatic public port/hostname allocation. Durable operator-managed HTTPS
   route distribution and activation are implemented.
@@ -407,7 +409,8 @@
 
 ## Next planned session
 
-Session 35 has not been selected. The next plan should choose one bounded scope
-from transport fairness, operator-owned telemetry collection guidance, or the
-next hostname lifecycle slice; automatic allocation, HTTP/2, signed access
-URLs, and multi-edge ownership remain separate larger scopes.
+Session 36 has not been selected. The next plan should choose one bounded scope
+from peer-negotiated transport flow control, operator-owned telemetry
+collection guidance, or the next hostname lifecycle slice; automatic
+allocation, HTTP/2, signed access URLs, and multi-edge ownership remain
+separate larger scopes.

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,7 +10,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
+use tunnelproxy_common::{
+    bounded_queue_channel, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
+    RuntimeShutdownConfig, ShutdownSignal,
+};
 
 use tunnelproxy_protocol::{
     Frame, FrameDecoder, FrameEncoder, FrameType, HeartbeatErrorCode, HeartbeatSequence, StreamId,
@@ -21,6 +25,8 @@ use crate::tls::BoxedTransport;
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
+
+const MAX_CONTROL_FRAME_BURST: usize = 8;
 
 /// Agent-side limits for one multiplexed transport session.
 #[derive(Debug, Clone)]
@@ -158,8 +164,11 @@ impl AgentSession {
 
         let (mut reader, writer) = tokio::io::split(self.socket);
         let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
-        let (data_tx, data_rx) = mpsc::channel(config.data_queue_capacity);
-        let mut writer_task = tokio::spawn(writer_actor(writer, control_rx, data_rx));
+        let data_capacity = NonZeroUsize::new(config.data_queue_capacity)
+            .expect("validated DATA queue capacity must be non-zero");
+        let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
+        let mut writer_task =
+            tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
         let (event_tx, mut event_rx) = mpsc::channel(config.max_concurrent_streams);
         let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
         let mut stream_tasks = JoinSet::new();
@@ -304,7 +313,7 @@ async fn run_local_stream(
     config: MultiplexedAgentConfig,
     mut inbound: mpsc::Receiver<Frame>,
     control_tx: mpsc::Sender<Frame>,
-    data_tx: mpsc::Sender<Frame>,
+    data_tx: BoundedQueueSender<Frame>,
     event_tx: mpsc::Sender<StreamEvent>,
 ) {
     let connect = tokio::time::timeout(
@@ -385,13 +394,13 @@ async fn run_local_stream(
                 match read {
                     Ok(0) => {
                         local_ended = true;
-                        if send_stream(&data_tx, FrameType::EndStream, stream_id, Vec::new()).await.is_err() {
+                        if send_data(&data_tx, FrameType::EndStream, stream_id, Vec::new()).await.is_err() {
                             break;
                         }
                     }
                     Ok(count) => {
                         idle.as_mut().reset(tokio::time::Instant::now() + config.stream_idle_timeout);
-                        if send_stream(&data_tx, FrameType::Data, stream_id, buffer[..count].to_vec()).await.is_err() {
+                        if send_data(&data_tx, FrameType::Data, stream_id, buffer[..count].to_vec()).await.is_err() {
                             break;
                         }
                     }
@@ -414,27 +423,80 @@ async fn run_local_stream(
 async fn writer_actor(
     mut writer: tokio::io::WriteHalf<BoxedTransport>,
     mut control_rx: mpsc::Receiver<Frame>,
-    mut data_rx: mpsc::Receiver<Frame>,
+    mut data_rx: mpsc::Receiver<BoundedQueueItem<Frame>>,
+    data_capacity: NonZeroUsize,
 ) -> Result<(), AgentError> {
     let mut control_open = true;
     let mut data_open = true;
-    while control_open || data_open {
-        let frame = tokio::select! {
-            biased;
-            frame = control_rx.recv(), if control_open => {
-                match frame { Some(frame) => Some(frame), None => { control_open = false; None } }
+    let mut control_burst = 0_usize;
+    let mut scheduled = BoundedFairQueue::new(data_capacity);
+    while control_open || data_open || !scheduled.is_empty() {
+        while data_open && scheduled.len() < data_capacity.get() {
+            match data_rx.try_recv() {
+                Ok(frame) => scheduled
+                    .push(frame.value().stream_id, frame)
+                    .map_err(|_| fair_queue_invariant())?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => data_open = false,
             }
-            frame = data_rx.recv(), if data_open => {
-                match frame { Some(frame) => Some(frame), None => { data_open = false; None } }
+        }
+
+        if control_open && (control_burst < MAX_CONTROL_FRAME_BURST || scheduled.is_empty()) {
+            match control_rx.try_recv() {
+                Ok(frame) => {
+                    FrameEncoder::encode(&mut writer, &frame)
+                        .await
+                        .map_err(AgentError::ProtocolDecode)?;
+                    control_burst = control_burst.saturating_add(1);
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
             }
-        };
-        if let Some(frame) = frame {
-            FrameEncoder::encode(&mut writer, &frame)
+        }
+
+        if let Some(frame) = scheduled.pop() {
+            FrameEncoder::encode(&mut writer, frame.value())
                 .await
                 .map_err(AgentError::ProtocolDecode)?;
+            control_burst = 0;
+            continue;
+        }
+
+        if !control_open && !data_open {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            frame = control_rx.recv(), if control_open => {
+                match frame {
+                    Some(frame) => {
+                        FrameEncoder::encode(&mut writer, &frame)
+                            .await
+                            .map_err(AgentError::ProtocolDecode)?;
+                        control_burst = control_burst.saturating_add(1);
+                    }
+                    None => control_open = false,
+                }
+            }
+            frame = data_rx.recv(), if data_open => {
+                match frame {
+                    Some(frame) => scheduled
+                        .push(frame.value().stream_id, frame)
+                        .map_err(|_| fair_queue_invariant())?,
+                    None => data_open = false,
+                }
+            }
         }
     }
     writer.shutdown().await.map_err(AgentError::SessionIo)
+}
+
+fn fair_queue_invariant() -> AgentError {
+    AgentError::SessionIo(std::io::Error::other(
+        "bounded fair DATA queue exceeded its admission limit",
+    ))
 }
 
 async fn send_control(
@@ -451,6 +513,20 @@ async fn send_control(
 
 async fn send_stream(
     sender: &mpsc::Sender<Frame>,
+    frame_type: FrameType,
+    stream_id: StreamId,
+    payload: Vec<u8>,
+) -> Result<(), AgentError> {
+    let frame =
+        Frame::stream(stream_id, frame_type, payload).map_err(AgentError::ProtocolDecode)?;
+    sender
+        .send(frame)
+        .await
+        .map_err(|_| AgentError::ConnectionClosed)
+}
+
+async fn send_data(
+    sender: &BoundedQueueSender<Frame>,
     frame_type: FrameType,
     stream_id: StreamId,
     payload: Vec<u8>,
@@ -521,6 +597,43 @@ fn join_error(error: tokio::task::JoinError) -> AgentError {
 mod tests {
     use super::*;
 
+    async fn decode_writer_output(
+        control_frames: usize,
+        data_frames: &[(StreamId, &'static [u8])],
+    ) -> Vec<Frame> {
+        let data_capacity = NonZeroUsize::new(16).unwrap();
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
+        for sequence in 1..=control_frames {
+            send_control(
+                &control_tx,
+                FrameType::Pong,
+                (sequence as u64).to_be_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+        }
+        for (stream_id, payload) in data_frames {
+            send_data(&data_tx, FrameType::Data, *stream_id, payload.to_vec())
+                .await
+                .unwrap();
+        }
+        drop(control_tx);
+        drop(data_tx);
+
+        let (transport, mut peer) = tokio::io::duplex(64 * 1024);
+        let transport: BoxedTransport = Box::new(transport);
+        let (_, writer) = tokio::io::split(transport);
+        let task = tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
+        let mut decoder = FrameDecoder::new();
+        let mut output = Vec::new();
+        while let Some(frame) = decoder.decode(&mut peer).await.unwrap() {
+            output.push(frame);
+        }
+        task.await.unwrap().unwrap();
+        output
+    }
+
     #[test]
     fn defaults_are_bounded_and_valid() {
         let config = MultiplexedAgentConfig::new("127.0.0.1:3000".parse().unwrap());
@@ -537,5 +650,33 @@ mod tests {
             config.validate(),
             Err(MultiplexedAgentConfigError::ZeroPerStreamQueue)
         );
+    }
+
+    #[tokio::test]
+    async fn writer_round_robins_streams_and_bounds_control_bursts() {
+        let stream_a = StreamId::new(1).unwrap();
+        let stream_b = StreamId::new(2).unwrap();
+        let output = decode_writer_output(
+            MAX_CONTROL_FRAME_BURST + 2,
+            &[
+                (stream_a, b"a1"),
+                (stream_a, b"a2"),
+                (stream_b, b"b1"),
+                (stream_b, b"b2"),
+            ],
+        )
+        .await;
+
+        assert!(output[..MAX_CONTROL_FRAME_BURST]
+            .iter()
+            .all(|frame| frame.frame_type == FrameType::Pong));
+        assert_eq!(output[MAX_CONTROL_FRAME_BURST].payload, b"a1");
+        assert_eq!(output[MAX_CONTROL_FRAME_BURST + 3].payload, b"b1");
+        let data: Vec<_> = output
+            .iter()
+            .filter(|frame| frame.frame_type == FrameType::Data)
+            .map(|frame| frame.payload.as_slice())
+            .collect();
+        assert_eq!(data, [b"a1".as_slice(), b"b1", b"a2", b"b2"]);
     }
 }

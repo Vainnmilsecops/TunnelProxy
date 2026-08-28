@@ -38,6 +38,7 @@
 | 32      | Authenticated HTTPS Route Distribution & Atomic Edge Activation | complete |
 | 33      | Atomic TLS Generation Reload for HTTPS Route Distribution | complete |
 | 34      | Bounded HTTP/1.1 Keep-Alive & Per-Request Deadlines | complete |
+| 35      | Bounded Fair DATA Scheduling                  | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1131,3 +1132,24 @@ Out of scope:
 
 - HTTP/2, HTTP pipelining guarantees, WebSocket/upgrade, CONNECT, request
   replay, distributed request-rate coordination, and multi-edge ownership.
+
+## Session 35 — Bounded Fair DATA Scheduling — complete
+
+Scope delivered:
+
+- Added a reusable bounded per-key FIFO scheduler with round-robin service and
+  semaphore-backed admission shared across channel, scheduler, and in-flight
+  writer state.
+- Integrated the scheduler into both multiplexed Agent and Edge writers. DATA
+  and END_STREAM preserve stream-local ordering while continuously backlogged
+  streams receive alternating frame service.
+- Retained control-frame priority with a hard burst of eight frames so
+  heartbeat and lifecycle traffic remain responsive without starving DATA.
+- Added deterministic scheduler and writer-order tests plus a real-TCP stress
+  test with eight 256 KiB streams, a two-frame DATA admission bound, and live
+  heartbeat. The workspace now contains 338 explicit tests.
+
+Out of scope:
+
+- Peer-negotiated byte-credit windows, weighted/deficit byte scheduling,
+  adaptive weights, protocol or ALPN changes, and distributed coordination.
