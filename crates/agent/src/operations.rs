@@ -17,7 +17,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
+use tunnelproxy_common::{
+    MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
+};
 
 use crate::{AgentConnectionState, AgentRuntimeStatus, AgentRuntimeStatusHandle};
 
@@ -335,7 +337,11 @@ async fn serve_request(
                 }
             }
             "/metrics" => metrics_response(
-                &render_metrics(status.snapshot(), counters.snapshot()),
+                &render_metrics(
+                    status.snapshot(),
+                    status.transport_telemetry(),
+                    counters.snapshot(),
+                ),
                 head,
             ),
             _ => {
@@ -403,7 +409,11 @@ impl AgentOperationsCounters {
     }
 }
 
-fn render_metrics(status: AgentRuntimeStatus, operations: OperationsCounterSnapshot) -> String {
+fn render_metrics(
+    status: AgentRuntimeStatus,
+    transport: MultiplexTelemetrySnapshot,
+    operations: OperationsCounterSnapshot,
+) -> String {
     let mut output = String::with_capacity(2 * 1024);
     metric(&mut output, "tunnelproxy_agent_up", "gauge", 1);
     metric(
@@ -480,7 +490,80 @@ fn render_metrics(status: AgentRuntimeStatus, operations: OperationsCounterSnaps
     ] {
         metric(&mut output, name, kind, value);
     }
+    render_transport_metrics(&mut output, transport);
     output
+}
+
+fn render_transport_metrics(output: &mut String, transport: MultiplexTelemetrySnapshot) {
+    metric(
+        output,
+        "tunnelproxy_agent_transport_active_streams",
+        "gauge",
+        transport.active_streams,
+    );
+    metric(
+        output,
+        "tunnelproxy_agent_transport_peak_active_streams",
+        "gauge",
+        transport.peak_active_streams,
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_agent_transport_data_frames_total counter"
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_agent_transport_data_frames_total{{direction=\"sent\"}} {}",
+        transport.sent_data_frames
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_agent_transport_data_frames_total{{direction=\"received\"}} {}",
+        transport.received_data_frames
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_agent_transport_data_bytes_total counter"
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_agent_transport_data_bytes_total{{direction=\"sent\"}} {}",
+        transport.sent_data_bytes
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_agent_transport_data_bytes_total{{direction=\"received\"}} {}",
+        transport.received_data_bytes
+    );
+    for (name, kind, value) in [
+        (
+            "tunnelproxy_agent_transport_data_admission_waits_total",
+            "counter",
+            transport.data_admission_waits,
+        ),
+        (
+            "tunnelproxy_agent_transport_data_pipeline_frames",
+            "gauge",
+            transport.data_pipeline_frames,
+        ),
+        (
+            "tunnelproxy_agent_transport_peak_data_pipeline_frames",
+            "gauge",
+            transport.peak_data_pipeline_frames,
+        ),
+        (
+            "tunnelproxy_agent_transport_flow_control_resets_total",
+            "counter",
+            transport.flow_control_resets,
+        ),
+        (
+            "tunnelproxy_agent_transport_control_burst_yields_total",
+            "counter",
+            transport.control_burst_yields,
+        ),
+    ] {
+        metric(output, name, kind, value);
+    }
 }
 
 fn metric(output: &mut String, name: &str, kind: &str, value: impl std::fmt::Display) {
@@ -530,6 +613,13 @@ mod tests {
     fn metric_rendering_has_fixed_state_labels_and_no_identity_values() {
         let rendered = render_metrics(
             status().snapshot(),
+            MultiplexTelemetrySnapshot {
+                sent_data_frames: 2,
+                sent_data_bytes: 17,
+                received_data_frames: 3,
+                received_data_bytes: 29,
+                ..MultiplexTelemetrySnapshot::default()
+            },
             OperationsCounterSnapshot {
                 active_connections: 1,
                 accepted_connections: 2,
@@ -542,6 +632,10 @@ mod tests {
             assert!(rendered.contains(&format!("state=\"{}\"", state.as_str())));
         }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
+        assert!(rendered
+            .contains("tunnelproxy_agent_transport_data_frames_total{direction=\"sent\"} 2"));
+        assert!(rendered
+            .contains("tunnelproxy_agent_transport_data_bytes_total{direction=\"received\"} 29"));
         assert!(!rendered.contains("agent-dev"));
         assert!(!rendered.contains("tunnel-dev"));
         assert!(!rendered.contains("127.0.0.1"));

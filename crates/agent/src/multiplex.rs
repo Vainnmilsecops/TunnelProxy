@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tunnelproxy_common::{
-    bounded_queue_channel, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
-    RuntimeShutdownConfig, ShutdownSignal,
+    bounded_queue_channel_with_telemetry, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
+    MultiplexTelemetry, RuntimeShutdownConfig, ShutdownSignal,
 };
 
 use tunnelproxy_protocol::{
@@ -46,6 +46,8 @@ pub struct MultiplexedAgentConfig {
     pub data_queue_capacity: usize,
     /// Maximum time a logical stream may make no data progress.
     pub stream_idle_timeout: Duration,
+    /// Fixed-cardinality process-local transport telemetry.
+    pub telemetry: MultiplexTelemetry,
 }
 
 impl MultiplexedAgentConfig {
@@ -59,6 +61,7 @@ impl MultiplexedAgentConfig {
             control_queue_capacity: 32,
             data_queue_capacity: 128,
             stream_idle_timeout: Duration::from_secs(60),
+            telemetry: MultiplexTelemetry::default(),
         }
     }
 
@@ -166,9 +169,17 @@ impl AgentSession {
         let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
         let data_capacity = NonZeroUsize::new(config.data_queue_capacity)
             .expect("validated DATA queue capacity must be non-zero");
-        let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
-        let mut writer_task =
-            tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
+        let (data_tx, data_rx) = bounded_queue_channel_with_telemetry(
+            data_capacity,
+            config.telemetry.data_queue_telemetry(),
+        );
+        let mut writer_task = tokio::spawn(writer_actor(
+            writer,
+            control_rx,
+            data_rx,
+            data_capacity,
+            config.telemetry.clone(),
+        ));
         let (event_tx, mut event_rx) = mpsc::channel(config.max_concurrent_streams);
         let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
         let mut stream_tasks = JoinSet::new();
@@ -245,14 +256,19 @@ impl AgentSession {
                             if frame.frame_type == FrameType::Data
                                 && frame.payload.len() > MULTIPLEXED_DATA_PAYLOAD_SIZE
                             {
+                                config.telemetry.flow_control_reset();
                                 streams.remove(&frame.stream_id);
                                 send_reset(&control_tx, frame.stream_id, StreamResetCode::FlowControlExceeded).await?;
                                 continue;
+                            }
+                            if frame.frame_type == FrameType::Data {
+                                config.telemetry.data_received(frame.payload.len());
                             }
                             match streams.get(&frame.stream_id) {
                                 Some(sender) => match sender.try_send(frame) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(frame)) => {
+                                        config.telemetry.flow_control_reset();
                                         streams.remove(&frame.stream_id);
                                         send_reset(&control_tx, frame.stream_id, StreamResetCode::FlowControlExceeded).await?;
                                     }
@@ -316,6 +332,7 @@ async fn run_local_stream(
     data_tx: BoundedQueueSender<Frame>,
     event_tx: mpsc::Sender<StreamEvent>,
 ) {
+    let _stream = config.telemetry.stream_opened();
     let connect = tokio::time::timeout(
         config.connect_timeout,
         TcpStream::connect(config.local_addr),
@@ -425,6 +442,7 @@ async fn writer_actor(
     mut control_rx: mpsc::Receiver<Frame>,
     mut data_rx: mpsc::Receiver<BoundedQueueItem<Frame>>,
     data_capacity: NonZeroUsize,
+    telemetry: MultiplexTelemetry,
 ) -> Result<(), AgentError> {
     let mut control_open = true;
     let mut data_open = true;
@@ -456,9 +474,15 @@ async fn writer_actor(
         }
 
         if let Some(frame) = scheduled.pop() {
+            if control_burst >= MAX_CONTROL_FRAME_BURST && control_open && !control_rx.is_empty() {
+                telemetry.control_burst_yielded();
+            }
             FrameEncoder::encode(&mut writer, frame.value())
                 .await
                 .map_err(AgentError::ProtocolDecode)?;
+            if frame.value().frame_type == FrameType::Data {
+                telemetry.data_sent(frame.value().payload.len());
+            }
             control_burst = 0;
             continue;
         }
@@ -600,10 +624,12 @@ mod tests {
     async fn decode_writer_output(
         control_frames: usize,
         data_frames: &[(StreamId, &'static [u8])],
-    ) -> Vec<Frame> {
+    ) -> (Vec<Frame>, tunnelproxy_common::MultiplexTelemetrySnapshot) {
         let data_capacity = NonZeroUsize::new(16).unwrap();
         let (control_tx, control_rx) = mpsc::channel(16);
-        let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
+        let telemetry = MultiplexTelemetry::default();
+        let (data_tx, data_rx) =
+            bounded_queue_channel_with_telemetry(data_capacity, telemetry.data_queue_telemetry());
         for sequence in 1..=control_frames {
             send_control(
                 &control_tx,
@@ -624,14 +650,20 @@ mod tests {
         let (transport, mut peer) = tokio::io::duplex(64 * 1024);
         let transport: BoxedTransport = Box::new(transport);
         let (_, writer) = tokio::io::split(transport);
-        let task = tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
+        let task = tokio::spawn(writer_actor(
+            writer,
+            control_rx,
+            data_rx,
+            data_capacity,
+            telemetry.clone(),
+        ));
         let mut decoder = FrameDecoder::new();
         let mut output = Vec::new();
         while let Some(frame) = decoder.decode(&mut peer).await.unwrap() {
             output.push(frame);
         }
         task.await.unwrap().unwrap();
-        output
+        (output, telemetry.snapshot())
     }
 
     #[test]
@@ -656,7 +688,7 @@ mod tests {
     async fn writer_round_robins_streams_and_bounds_control_bursts() {
         let stream_a = StreamId::new(1).unwrap();
         let stream_b = StreamId::new(2).unwrap();
-        let output = decode_writer_output(
+        let (output, telemetry) = decode_writer_output(
             MAX_CONTROL_FRAME_BURST + 2,
             &[
                 (stream_a, b"a1"),
@@ -678,5 +710,10 @@ mod tests {
             .map(|frame| frame.payload.as_slice())
             .collect();
         assert_eq!(data, [b"a1".as_slice(), b"b1", b"a2", b"b2"]);
+        assert_eq!(telemetry.sent_data_frames, 4);
+        assert_eq!(telemetry.sent_data_bytes, 8);
+        assert_eq!(telemetry.data_pipeline_frames, 0);
+        assert_eq!(telemetry.peak_data_pipeline_frames, 4);
+        assert_eq!(telemetry.control_burst_yields, 1);
     }
 }

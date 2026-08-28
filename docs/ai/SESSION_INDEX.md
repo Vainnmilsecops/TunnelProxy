@@ -39,6 +39,7 @@
 | 33      | Atomic TLS Generation Reload for HTTPS Route Distribution | complete |
 | 34      | Bounded HTTP/1.1 Keep-Alive & Per-Request Deadlines | complete |
 | 35      | Bounded Fair DATA Scheduling                  | complete |
+| 36      | Multiplexed Transport Fairness Telemetry       | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1153,3 +1154,28 @@ Out of scope:
 
 - Peer-negotiated byte-credit windows, weighted/deficit byte scheduling,
   adaptive weights, protocol or ALPN changes, and distributed coordination.
+
+## Session 36 — Multiplexed Transport Fairness Telemetry — complete
+
+Scope delivered:
+
+- Added shared atomic multiplex telemetry for active/peak streams,
+  directional DATA frames/bytes, admission waits, current/peak admitted DATA
+  pipeline depth, flow-control resets, and control-burst DATA yields.
+- Extended the semaphore-backed queue with exact first-attempt wait
+  classification and an RAII occupancy guard that spans channel, scheduler,
+  encode, receiver close, and writer error paths.
+- Integrated one aggregate into each Agent process runtime and Edge runtime;
+  reconnects/sessions contribute to the same process-local counters while
+  separately constructed runtimes never share state.
+- Exported the metrics through existing loopback Agent and Edge operations
+  endpoints with only the fixed `sent`/`received` direction label.
+- Added deterministic counter/RAII tests and real-TCP coverage that sends four
+  concurrent 256 KiB streams, verifies exact directional byte totals on both
+  processes, and rejects identity/payload leakage. The workspace now contains
+  341 explicit tests.
+
+Out of scope:
+
+- Wire-protocol or ALPN changes, peer byte-credit windows, weighted/deficit
+  scheduling, remote write, durable metric history, dashboards, and alerts.

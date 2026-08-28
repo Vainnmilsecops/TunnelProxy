@@ -43,9 +43,11 @@ correct agent, which in turn proxies them into the local service.
   connection with per-request deadlines and graceful drain.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
-  metrics for authorization, raw ingress, HTTPS, and rate limiting.
+  metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
+  rate limiting.
 - An opt-in loopback-only Agent operations endpoint with bounded admission,
-  session-aware readiness, and fixed-cardinality connection/reconnect metrics.
+  session-aware readiness, connection/reconnect metrics, and multiplexed DATA
+  saturation/fairness telemetry.
 - An opt-in loopback-only Control Plane operations endpoint with bounded
   admission, service readiness, and fixed-cardinality snapshot, refresh,
   enrollment, reconciliation, and operations metrics.
@@ -220,6 +222,8 @@ and Definition of Done.
 | 32 _(complete)_ | authenticated HTTPS route distribution and atomic Edge activation |
 | 33 _(complete)_ | atomic TLS generation reload for HTTPS route distribution |
 | 34 _(complete)_ | bounded HTTP/1.1 keep-alive and per-request deadlines |
+| 35 _(complete)_ | bounded per-stream fair DATA scheduling |
+| 36 _(complete)_ | multiplexed transport fairness and saturation telemetry |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

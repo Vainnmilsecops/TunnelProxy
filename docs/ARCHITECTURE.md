@@ -595,6 +595,25 @@ before one queued DATA frame is served. The scheduler is process-local and
 frame-based: it adds no wire fields, ALPN change, peer credit negotiation,
 weighted byte fairness, or distributed flow control.
 
+### 2.34 Multiplexed transport fairness telemetry (Session 36)
+
+Agent and Edge each aggregate process-local multiplexed transport telemetry in
+shared atomics. DATA frames and payload bytes are counted by the fixed
+`sent`/`received` direction set. RAII guards measure current and peak active
+streams, while the semaphore-backed queue holds a second RAII guard from
+admission through encoding to expose current and peak DATA pipeline depth.
+The first failed immediate permit attempt increments one admission-wait event;
+inbound queue overflow/oversize resets and control-burst DATA yields have
+separate monotonic counters.
+
+The existing loopback operations endpoints render these values without
+acquiring session locks, querying storage, or performing network I/O. Metrics
+contain no AgentId, TunnelId, StreamId, session ID, address, hostname,
+certificate, secret, or payload label. Counters reset on process restart. No
+Tunnel Protocol v2 frame, payload, handshake, or ALPN value changes; remote
+write, durable history, alerting, peer credits, and weighted byte scheduling
+remain outside this slice.
+
 ### 2.24 Bounded HTTP request-rate admission (Session 26)
 
 After TLS and exact Host/SNI/absolute-authority validation, but before reading

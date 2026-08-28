@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
-use tunnelproxy_common::{RuntimeShutdownConfig, ShutdownSignal};
+use tunnelproxy_common::{
+    MultiplexTelemetry, MultiplexTelemetrySnapshot, RuntimeShutdownConfig, ShutdownSignal,
+};
 use tunnelproxy_protocol::{RegistrationRequest, TransportSessionId};
 
 use crate::{
@@ -247,11 +249,16 @@ impl AgentRuntimeTelemetry {
 #[derive(Debug, Clone)]
 pub struct AgentRuntimeStatusHandle {
     telemetry: Arc<AgentRuntimeTelemetry>,
+    multiplex: MultiplexTelemetry,
 }
 
 impl AgentRuntimeStatusHandle {
     pub fn snapshot(&self) -> AgentRuntimeStatus {
         self.telemetry.snapshot()
+    }
+
+    pub fn transport_telemetry(&self) -> MultiplexTelemetrySnapshot {
+        self.multiplex.snapshot()
     }
 }
 
@@ -420,10 +427,13 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    pub fn new(config: AgentRuntimeConfig) -> Result<Self, AgentRuntimeError> {
+    pub fn new(mut config: AgentRuntimeConfig) -> Result<Self, AgentRuntimeError> {
         config
             .validate()
             .map_err(AgentRuntimeError::InvalidConfig)?;
+        // Each process runtime owns one fresh aggregate. Cloning a reusable
+        // configuration must not merge metrics from independent runtimes.
+        config.multiplex.telemetry = MultiplexTelemetry::default();
         Ok(Self {
             config,
             telemetry: Arc::new(AgentRuntimeTelemetry::default()),
@@ -437,6 +447,7 @@ impl AgentRuntime {
     pub fn status_handle(&self) -> AgentRuntimeStatusHandle {
         AgentRuntimeStatusHandle {
             telemetry: Arc::clone(&self.telemetry),
+            multiplex: self.config.multiplex.telemetry.clone(),
         }
     }
 

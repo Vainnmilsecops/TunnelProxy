@@ -808,8 +808,9 @@ certificates, secrets, and payloads.
 **Consequences:** Local process supervisors can tell whether the Agent is
 alive, connected, reconnecting, or draining without scraping logs or touching
 Edge/Control Plane state. The endpoint is unauthenticated because it cannot be
-publicly bound. Metrics reset on restart and do not include stream/byte
-telemetry. Control Plane metrics are handled by ADR-030; durable/remote storage,
+publicly bound. Session 29 metrics reset on restart and initially excluded
+stream/byte telemetry; ADR-036 later adds that bounded process-local slice.
+Control Plane metrics are handled by ADR-030; durable/remote storage,
 dashboards, alerts, and nonblocking log shipping remain outside this decision.
 
 ---
@@ -963,3 +964,31 @@ ordering is preserved, and the configured DATA bound remains global to the
 writer pipeline. This is local frame fairness, not byte fairness: no protocol
 fields, ALPN, peer credits, stream weights, or cross-process coordination are
 introduced.
+
+---
+
+## ADR-036 — Transport fairness is measured with process-local atomic telemetry
+
+**Status:** Accepted (Session 36).
+
+**Context:** Session 35 prevents frame starvation, but DEBT-014 requires
+measurement before introducing peer credits or a weighted scheduler. Queue
+length sampled at one point would miss time spent waiting for admission and
+could leak gauges on writer failure. Dynamic stream/session labels would also
+create unbounded Prometheus cardinality.
+
+**Decision:** Agent and Edge aggregate transport metrics in one atomic handle
+per process runtime. DATA direction uses only the fixed `sent` and `received`
+label values. Stream and admitted-pipeline gauges are RAII-owned; the latter
+travels with the semaphore permit until the frame leaves the writer pipeline.
+One counter records failure of the first immediate admission attempt, while
+flow-control resets and control-burst DATA yields are explicit counters.
+Existing loopback operations endpoints read snapshots without session locks,
+storage, or external I/O.
+
+**Consequences:** Operators can distinguish payload volume, concurrency,
+saturation, overflow, and scheduler intervention without identity or payload
+labels. Metrics aggregate reconnects and Edge sessions and reset on process
+restart. They provide evidence for a later flow-control decision but do not
+add peer credits, byte fairness, protocol fields, remote persistence,
+dashboards, or alerts.
