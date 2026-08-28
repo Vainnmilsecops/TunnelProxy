@@ -14,6 +14,8 @@
 - Cross-platform process termination observation shared by Edge and Agent.
 - Process-wide text/JSON stderr logging configuration shared by runnable
   components and development examples.
+- Fixed-cardinality process-local multiplex telemetry and RAII lifecycle
+  guards shared by Agent and Edge.
 
 **Prohibited**
 

@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tunnelproxy_common::{
     bounded_queue_channel_with_telemetry, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
-    MultiplexTelemetry, RuntimeShutdownConfig, ShutdownSignal,
+    MultiplexSessionCapacityGuard, MultiplexTelemetry, RuntimeShutdownConfig, ShutdownSignal,
 };
 
 use tunnelproxy_protocol::{
@@ -165,6 +165,9 @@ impl AgentSession {
                 },
             })?;
 
+        let session_capacity = config
+            .telemetry
+            .session_capacity(config.data_queue_capacity);
         let (mut reader, writer) = tokio::io::split(self.socket);
         let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
         let data_capacity = NonZeroUsize::new(config.data_queue_capacity)
@@ -179,6 +182,7 @@ impl AgentSession {
             data_rx,
             data_capacity,
             config.telemetry.clone(),
+            session_capacity,
         ));
         let (event_tx, mut event_rx) = mpsc::channel(config.max_concurrent_streams);
         let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
@@ -443,6 +447,7 @@ async fn writer_actor(
     mut data_rx: mpsc::Receiver<BoundedQueueItem<Frame>>,
     data_capacity: NonZeroUsize,
     telemetry: MultiplexTelemetry,
+    _session_capacity: MultiplexSessionCapacityGuard,
 ) -> Result<(), AgentError> {
     let mut control_open = true;
     let mut data_open = true;
@@ -656,6 +661,7 @@ mod tests {
             data_rx,
             data_capacity,
             telemetry.clone(),
+            telemetry.session_capacity(data_capacity.get()),
         ));
         let mut decoder = FrameDecoder::new();
         let mut output = Vec::new();
@@ -715,5 +721,43 @@ mod tests {
         assert_eq!(telemetry.data_pipeline_frames, 0);
         assert_eq!(telemetry.peak_data_pipeline_frames, 4);
         assert_eq!(telemetry.control_burst_yields, 1);
+    }
+
+    #[tokio::test]
+    async fn writer_error_releases_pipeline_occupancy_and_session_capacity() {
+        let data_capacity = NonZeroUsize::new(1).unwrap();
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let telemetry = MultiplexTelemetry::default();
+        let (data_tx, data_rx) =
+            bounded_queue_channel_with_telemetry(data_capacity, telemetry.data_queue_telemetry());
+        send_data(
+            &data_tx,
+            FrameType::Data,
+            StreamId::new(1).unwrap(),
+            b"writer-error".to_vec(),
+        )
+        .await
+        .unwrap();
+        drop(control_tx);
+        drop(data_tx);
+
+        let (transport, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let transport: BoxedTransport = Box::new(transport);
+        let (_, writer) = tokio::io::split(transport);
+        let task = tokio::spawn(writer_actor(
+            writer,
+            control_rx,
+            data_rx,
+            data_capacity,
+            telemetry.clone(),
+            telemetry.session_capacity(data_capacity.get()),
+        ));
+
+        assert!(task.await.unwrap().is_err());
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.data_pipeline_frames, 0);
+        assert_eq!(snapshot.data_pipeline_capacity_frames, 0);
+        assert_eq!(snapshot.peak_data_pipeline_frames, 1);
     }
 }

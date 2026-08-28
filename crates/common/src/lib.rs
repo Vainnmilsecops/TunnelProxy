@@ -31,7 +31,8 @@ pub use bounded_fair_queue::{
 };
 
 pub use multiplex_telemetry::{
-    MultiplexStreamGuard, MultiplexTelemetry, MultiplexTelemetrySnapshot,
+    MultiplexSessionCapacityGuard, MultiplexStreamGuard, MultiplexTelemetry,
+    MultiplexTelemetrySnapshot,
 };
 
 pub use process_logging::{

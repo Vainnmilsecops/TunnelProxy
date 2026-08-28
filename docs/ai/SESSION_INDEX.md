@@ -1179,3 +1179,29 @@ Out of scope:
 
 - Wire-protocol or ALPN changes, peer byte-credit windows, weighted/deficit
   scheduling, remote write, durable metric history, dashboards, and alerts.
+
+## Session 37 — Transport Capacity Telemetry & Operator Runbook — complete
+
+Scope delivered:
+
+- Added a live aggregate DATA writer-capacity gauge to shared multiplex
+  telemetry. A per-session RAII guard publishes capacity before queue creation
+  and removes it after close, reconnect, writer error, or shutdown cleanup.
+- Integrated capacity lifecycle into Agent and Edge without changing Tunnel
+  Protocol v2. Agent reports zero while offline; Edge sums bounds across live
+  sessions.
+- Exported fixed-cardinality Agent and Edge
+  `transport_data_pipeline_capacity_frames` metrics so current utilization can
+  be calculated from occupancy divided by live capacity.
+- Added unit, operations reconnect, and concurrent real-TCP coverage for
+  aggregation, release/republication, exact configured capacity, and continued
+  identity/payload exclusion. The workspace now contains 343 explicit tests.
+- Added an operator runbook for loopback collection topology, external
+  retention, restart-safe PromQL, alert baselines, privacy, capacity tuning,
+  and the evidence required before proposing peer byte credits.
+
+Out of scope:
+
+- Tunnel Protocol or ALPN changes, peer byte-credit windows, weighted/deficit
+  scheduling, embedded remote write/storage, dashboards, paging, public
+  operations access, and changes to default queue capacity.

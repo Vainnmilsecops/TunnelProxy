@@ -523,16 +523,18 @@ running. `GET /readyz` returns `200` only while the configured TunnelId resolves
 to a live Agent session and shutdown drain has not started; otherwise it
 returns `503`. `GET /metrics` uses Prometheus text format and exports only
 fixed-cardinality Edge authorization, raw/HTTPS ingress, operations, and HTTP
-rate-limit state. `HEAD` is also accepted; other methods return `405` and
-unknown paths return `404`.
+rate-limit state, plus aggregate multiplexed transport occupancy and live
+capacity. `HEAD` is also accepted; other methods return `405` and unknown paths
+return `404`.
 
 The endpoint is disabled unless `--ops-listen` is supplied and rejects every
 non-loopback bind. It has explicit connection/header/time/drain bounds, closes
 after one HTTP/1.1 request, and is intentionally unauthenticated because it is
 local-only. Do not expose it through a public port forward. Metric labels never
 contain peer IPs, hostnames, TunnelIds, AgentIds, session IDs, certificates, or
-payload data. Remote write, persistence, dashboards, alerts, and Agent/Control
-Plane exporters are not implemented.
+payload data. Remote write, persistence, dashboards, and an embedded alert
+engine are not implemented. See [`OPERATIONS.md`](OPERATIONS.md) for the
+operator-owned collection and alert baseline.
 
 ## 19. Configuring process logs
 
@@ -584,8 +586,9 @@ tunnelproxy-agent \
 its outbound session is active; it returns `503` during initial connection,
 reconnect backoff, disconnect, and shutdown drain. `GET /metrics` reports
 connection attempts, established sessions, reconnects, disconnects, failures,
-the current fixed connection phase, and operations admission counters. `HEAD`
-is supported; other methods return `405` and unknown paths return `404`.
+the current fixed connection phase, operations admission counters, and
+aggregate multiplexed transport occupancy/capacity. `HEAD` is supported; other
+methods return `405` and unknown paths return `404`.
 
 The endpoint is disabled by default, rejects non-loopback addresses, closes
 after one HTTP/1.1 request, and has explicit connection/header/request/drain
@@ -594,7 +597,8 @@ During orderly shutdown readiness becomes false first; the endpoint remains
 available while Agent-owned supervisors drain and is stopped last. Metrics do
 not contain AgentId, TunnelId, addresses, session IDs, certificates, secrets,
 or traffic payloads. Do not expose this unauthenticated endpoint through a
-public port forward.
+public port forward. Collection and alert guidance is in
+[`OPERATIONS.md`](OPERATIONS.md).
 
 ## 21. Running the Control Plane operations endpoint
 
