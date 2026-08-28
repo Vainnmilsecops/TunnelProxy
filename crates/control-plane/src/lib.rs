@@ -62,7 +62,9 @@ pub use https_route_protocol::{
 pub use https_route_repository::{
     HttpsRouteCatalog, HttpsRouteCatalogError, HttpsRouteCatalogVersion, HttpsRouteMutationOutcome,
     HttpsRouteRecord, HttpsRouteRepository, HttpsRouteRepositoryError, HttpsRouteStatus,
-    HttpsRouteStatusParseError, MAX_HTTPS_ROUTE_RECORDS,
+    HttpsRouteStatusParseError, ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain,
+    ManagedHostnameBaseDomainError, ManagedHostnameReleaseOutcome, MANAGED_HOSTNAME_ENTROPY_BYTES,
+    MAX_HTTPS_ROUTE_RECORDS, MAX_MANAGED_HOSTNAME_ALLOCATION_ATTEMPTS,
 };
 pub use operations::{
     ControlPlaneOperationsConfig, ControlPlaneOperationsConfigError, ControlPlaneOperationsError,

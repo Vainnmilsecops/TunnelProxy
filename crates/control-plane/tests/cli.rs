@@ -427,3 +427,137 @@ fn https_route_cli_is_canonical_idempotent_sorted_and_validates_before_mutation(
     assert_eq!(catalog.routes()[0].status, HttpsRouteStatus::Enabled);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn managed_hostname_cli_allocates_reuses_protects_and_releases() {
+    let directory = temp_directory();
+    let invalid_database = directory.join("must-not-exist.sqlite");
+    let invalid = Command::new(binary())
+        .args([
+            "https-hostname-allocate",
+            "--database",
+            invalid_database.to_str().unwrap(),
+            "--base-domain",
+            "*.example.test",
+            "--tunnel-id",
+            "managed-tunnel",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!invalid_database.exists());
+
+    let database = directory.join("state.sqlite");
+    let allocated = Command::new(binary())
+        .args([
+            "https-hostname-allocate",
+            "--database",
+            database.to_str().unwrap(),
+            "--base-domain",
+            "Example.TEST.",
+            "--tunnel-id",
+            "managed-tunnel",
+        ])
+        .output()
+        .unwrap();
+    assert!(allocated.status.success());
+    let allocated_stdout = String::from_utf8(allocated.stdout).unwrap();
+    assert!(allocated_stdout.ends_with(" catalog_version=2 changed=true\n"));
+    let hostname = allocated_stdout
+        .split_ascii_whitespace()
+        .next()
+        .unwrap()
+        .strip_prefix("hostname=")
+        .unwrap()
+        .to_owned();
+    assert!(hostname.starts_with("tp-"));
+    assert!(hostname.ends_with(".example.test"));
+    assert_eq!(hostname.len(), 35 + 1 + "example.test".len());
+    assert!(PublicHostname::new(&hostname).is_ok());
+
+    let repeated = Command::new(binary())
+        .args([
+            "https-hostname-allocate",
+            "--database",
+            database.to_str().unwrap(),
+            "--base-domain",
+            "example.test",
+            "--tunnel-id",
+            "managed-tunnel",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stdout).unwrap(),
+        format!("hostname={hostname} catalog_version=2 changed=false\n")
+    );
+
+    for command in ["https-route-upsert", "https-route-remove"] {
+        let mut process = Command::new(binary());
+        process.args([command, "--database", database.to_str().unwrap()]);
+        if command == "https-route-upsert" {
+            process.args([
+                "--hostname",
+                &hostname,
+                "--tunnel-id",
+                "other-tunnel",
+                "--status",
+                "enabled",
+            ]);
+        } else {
+            process.args(["--hostname", &hostname]);
+        }
+        let protected = process.output().unwrap();
+        assert_eq!(protected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&protected.stderr)
+            .contains("managed hostname must be changed through its lifecycle commands"));
+    }
+
+    let listed = Command::new(binary())
+        .args(["https-route-list", "--database", database.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap(),
+        format!("catalog_version=2\nhostname={hostname} tunnel_id=managed-tunnel status=enabled\n")
+    );
+
+    let released = Command::new(binary())
+        .args([
+            "https-hostname-release",
+            "--database",
+            database.to_str().unwrap(),
+            "--tunnel-id",
+            "managed-tunnel",
+        ])
+        .output()
+        .unwrap();
+    assert!(released.status.success());
+    assert_eq!(
+        String::from_utf8(released.stdout).unwrap(),
+        format!("hostname={hostname} catalog_version=3 changed=true\n")
+    );
+    let absent = Command::new(binary())
+        .args([
+            "https-hostname-release",
+            "--database",
+            database.to_str().unwrap(),
+            "--tunnel-id",
+            "managed-tunnel",
+        ])
+        .output()
+        .unwrap();
+    assert!(absent.status.success());
+    assert_eq!(
+        String::from_utf8(absent.stdout).unwrap(),
+        "hostname=- catalog_version=3 changed=false\n"
+    );
+    assert!(HttpsRouteRepository::open(&database)
+        .unwrap()
+        .load()
+        .unwrap()
+        .is_empty());
+    std::fs::remove_dir_all(directory).unwrap();
+}

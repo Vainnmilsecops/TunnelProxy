@@ -17,7 +17,8 @@ use tunnelproxy_control_plane::{
     EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig,
     HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
     HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig, HttpsRouteServerTlsReloadRuntime,
-    HttpsRouteStatus, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
+    HttpsRouteStatus, ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain,
+    ManagedHostnameReleaseOutcome, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
     SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
     SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
     MAX_SNAPSHOT_BYTES,
@@ -33,6 +34,8 @@ Usage:
   tunnelproxy-control-plane https-route-upsert [OPTIONS]
   tunnelproxy-control-plane https-route-remove [OPTIONS]
   tunnelproxy-control-plane https-route-list [OPTIONS]
+  tunnelproxy-control-plane https-hostname-allocate [OPTIONS]
+  tunnelproxy-control-plane https-hostname-release [OPTIONS]
 
 Serve options:
   --database <path>                  SQLite snapshot database (required)
@@ -88,6 +91,11 @@ HTTPS route upsert options:
 HTTPS route remove/list options:
   --database <path>                  SQLite state database (required)
   --hostname <name>                  exact hostname (remove only, required)
+
+Managed HTTPS hostname options:
+  --database <path>                  SQLite state database (required)
+  --tunnel-id <id>                   target Tunnel ID (required)
+  --base-domain <name>               allocation suffix (allocate only, required)
 
   --help                             print this help and exit
 ";
@@ -192,6 +200,30 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 error!(%error, "HTTPS route listing failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::HttpsHostnameAllocate(args) => {
+            match run_https_hostname_allocate(args).await {
+                Ok(outcome) => {
+                    print_managed_hostname_allocation(outcome);
+                    info!("managed HTTPS hostname allocation completed");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    error!(%error, "managed HTTPS hostname allocation failed");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        ParsedCommand::HttpsHostnameRelease(args) => match run_https_hostname_release(args).await {
+            Ok(outcome) => {
+                print_managed_hostname_release(outcome);
+                info!("managed HTTPS hostname release completed");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "managed HTTPS hostname release failed");
                 ExitCode::from(1)
             }
         },
@@ -507,6 +539,8 @@ enum ParsedCommand {
     HttpsRouteUpsert(HttpsRouteUpsertArgs),
     HttpsRouteRemove(HttpsRouteRemoveArgs),
     HttpsRouteList(HttpsRouteListArgs),
+    HttpsHostnameAllocate(HttpsHostnameAllocateArgs),
+    HttpsHostnameRelease(HttpsHostnameReleaseArgs),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -631,6 +665,29 @@ async fn run_https_route_list(args: HttpsRouteListArgs) -> Result<(), HttpsRoute
     Ok(())
 }
 
+async fn run_https_hostname_allocate(
+    args: HttpsHostnameAllocateArgs,
+) -> Result<ManagedHostnameAllocationOutcome, HttpsRouteCommandError> {
+    tokio::task::spawn_blocking(move || {
+        HttpsRouteRepository::open(args.database)?
+            .allocate_managed_hostname(&args.tunnel_id, &args.base_domain)
+    })
+    .await
+    .map_err(|_| HttpsRouteCommandError::StorageTask)?
+    .map_err(HttpsRouteCommandError::Repository)
+}
+
+async fn run_https_hostname_release(
+    args: HttpsHostnameReleaseArgs,
+) -> Result<ManagedHostnameReleaseOutcome, HttpsRouteCommandError> {
+    tokio::task::spawn_blocking(move || {
+        HttpsRouteRepository::open(args.database)?.release_managed_hostname(&args.tunnel_id)
+    })
+    .await
+    .map_err(|_| HttpsRouteCommandError::StorageTask)?
+    .map_err(HttpsRouteCommandError::Repository)
+}
+
 fn print_route_mutation(outcome: HttpsRouteMutationOutcome) {
     match outcome {
         HttpsRouteMutationOutcome::Applied { current, .. } => {
@@ -638,6 +695,32 @@ fn print_route_mutation(outcome: HttpsRouteMutationOutcome) {
         }
         HttpsRouteMutationOutcome::Unchanged { version } => {
             println!("catalog_version={version} changed=false");
+        }
+    }
+}
+
+fn print_managed_hostname_allocation(outcome: ManagedHostnameAllocationOutcome) {
+    match outcome {
+        ManagedHostnameAllocationOutcome::Allocated {
+            hostname, current, ..
+        } => {
+            println!("hostname={hostname} catalog_version={current} changed=true");
+        }
+        ManagedHostnameAllocationOutcome::Existing { hostname, version } => {
+            println!("hostname={hostname} catalog_version={version} changed=false");
+        }
+    }
+}
+
+fn print_managed_hostname_release(outcome: ManagedHostnameReleaseOutcome) {
+    match outcome {
+        ManagedHostnameReleaseOutcome::Released {
+            hostname, current, ..
+        } => {
+            println!("hostname={hostname} catalog_version={current} changed=true");
+        }
+        ManagedHostnameReleaseOutcome::Absent { version } => {
+            println!("hostname=- catalog_version={version} changed=false");
         }
     }
 }
@@ -683,6 +766,19 @@ struct HttpsRouteListArgs {
     database: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpsHostnameAllocateArgs {
+    database: PathBuf,
+    base_domain: ManagedHostnameBaseDomain,
+    tunnel_id: TunnelId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpsHostnameReleaseArgs {
+    database: PathBuf,
+    tunnel_id: TunnelId,
+}
+
 fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(ArgError::MissingCommand);
@@ -705,6 +801,12 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
             parse_https_route_remove(&args[1..]).map(ParsedCommand::HttpsRouteRemove)
         }
         "https-route-list" => parse_https_route_list(&args[1..]).map(ParsedCommand::HttpsRouteList),
+        "https-hostname-allocate" => {
+            parse_https_hostname_allocate(&args[1..]).map(ParsedCommand::HttpsHostnameAllocate)
+        }
+        "https-hostname-release" => {
+            parse_https_hostname_release(&args[1..]).map(ParsedCommand::HttpsHostnameRelease)
+        }
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
 }
@@ -1031,6 +1133,62 @@ fn parse_https_route_list(args: &[String]) -> Result<HttpsRouteListArgs, ArgErro
     }
     Ok(HttpsRouteListArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
+    })
+}
+
+fn parse_https_hostname_allocate(args: &[String]) -> Result<HttpsHostnameAllocateArgs, ArgError> {
+    let mut database = None;
+    let mut base_domain = None;
+    let mut tunnel_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--base-domain" => {
+                base_domain = Some(
+                    ManagedHostnameBaseDomain::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            "--tunnel-id" => {
+                tunnel_id = Some(
+                    TunnelId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HttpsHostnameAllocateArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        base_domain: base_domain.ok_or(ArgError::MissingRequired("--base-domain"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
+    })
+}
+
+fn parse_https_hostname_release(args: &[String]) -> Result<HttpsHostnameReleaseArgs, ArgError> {
+    let mut database = None;
+    let mut tunnel_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--database" => database = Some(parse_path(args, index, flag)?),
+            "--tunnel-id" => {
+                tunnel_id = Some(
+                    TunnelId::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HttpsHostnameReleaseArgs {
+        database: database.ok_or(ArgError::MissingRequired("--database"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
     })
 }
 
@@ -1540,6 +1698,39 @@ mod tests {
                 database: PathBuf::from("state.db"),
             }))
         );
+        assert_eq!(
+            parse_args(&args(&[
+                "https-hostname-allocate",
+                "--database",
+                "state.db",
+                "--base-domain",
+                "Example.TEST.",
+                "--tunnel-id",
+                "tunnel-managed",
+            ])),
+            Ok(ParsedCommand::HttpsHostnameAllocate(
+                HttpsHostnameAllocateArgs {
+                    database: PathBuf::from("state.db"),
+                    base_domain: ManagedHostnameBaseDomain::new("example.test").unwrap(),
+                    tunnel_id: TunnelId::new("tunnel-managed").unwrap(),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "https-hostname-release",
+                "--database",
+                "state.db",
+                "--tunnel-id",
+                "tunnel-managed",
+            ])),
+            Ok(ParsedCommand::HttpsHostnameRelease(
+                HttpsHostnameReleaseArgs {
+                    database: PathBuf::from("state.db"),
+                    tunnel_id: TunnelId::new("tunnel-managed").unwrap(),
+                }
+            ))
+        );
         assert!(matches!(
             parse_args(&args(&[
                 "https-route-upsert",
@@ -1567,6 +1758,28 @@ mod tests {
                 "active",
             ])),
             Err(ArgError::InvalidValue(flag)) if flag == "--status"
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "https-hostname-allocate",
+                "--database",
+                "must-not-exist.db",
+                "--base-domain",
+                "*.example.test",
+                "--tunnel-id",
+                "tunnel-managed",
+            ])),
+            Err(ArgError::InvalidValue(flag)) if flag == "--base-domain"
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "https-hostname-allocate",
+                "--database",
+                "state.db",
+                "--base-domain",
+                "example.test",
+            ])),
+            Err(ArgError::MissingRequired("--tunnel-id"))
         ));
     }
 }

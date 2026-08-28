@@ -65,6 +65,9 @@ correct agent, which in turn proxies them into the local service.
 - A transactional, versioned SQLite HTTPS route catalog with exact canonical
   hostname records, idempotent operator commands, and an independent bounded
   mutual-TLS latest-value stream for atomic Edge activation.
+- Durable managed-hostname allocation for one hostname per TunnelId using a
+  bounded 128-bit OS-random DNS label, transactional release, collision retry,
+  and live propagation through the existing Edge route stream.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, and HTTPS route transports with last-known-good rollback, expiry
   enforcement, and static Agent-certificate authorization rotation.
@@ -75,7 +78,8 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
-- Automatic hostname allocation, custom-domain administration, and HTTP/2.
+- Agent-facing automatic hostname requests, custom-domain administration, DNS
+  or certificate automation, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA
@@ -143,10 +147,11 @@ $ tunnelproxy http 3000
 https://blue-cat.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
-This automatic hostname-allocation UX does not work yet. Session 25 provides
-the Edge ingress path, Session 31 provides durable operator-managed route
-intent, and Session 32 distributes that intent to Edge. Automatic allocation
-remains future work.
+This end-user command does not work yet. Session 25 provides the Edge ingress
+path, Sessions 31–32 provide durable route intent and distribution, and
+Session 39 provides operator-invoked durable managed-hostname allocation. An
+authenticated Agent-facing allocation API and local CLI orchestration remain
+future work, as do DNS and certificate automation.
 
 ## Repository structure
 
@@ -231,6 +236,7 @@ and Definition of Done.
 | 36 _(complete)_ | multiplexed transport fairness and saturation telemetry |
 | 37 _(complete)_ | live transport capacity telemetry and operator runbook |
 | 38 _(complete)_ | bounded nonblocking process logging and sink telemetry |
+| 39 _(complete)_ | durable managed-hostname allocation and release lifecycle |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

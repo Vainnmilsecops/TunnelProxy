@@ -726,3 +726,49 @@ their snapshot ALPN. A rejected route generation leaves the active generation
 serving, and expiry without a valid replacement terminates the process
 supervisor. Existing authenticated connections are not renegotiated; the next
 connection or normal reconnect uses the new generation.
+
+## 24. Allocating and releasing managed HTTPS hostnames
+
+Session 39 adds an operator-invoked lifecycle on top of the durable route
+catalog. Supply a base domain that already has wildcard DNS and TLS coverage:
+
+```text
+tunnelproxy-control-plane https-hostname-allocate \
+  --database state.sqlite \
+  --base-domain tunnelproxy.dev \
+  --tunnel-id tunnel-a
+```
+
+Successful first allocation prints one DNS-safe hostname plus the new catalog
+version:
+
+```text
+hostname=tp-<32-lowercase-hex>.tunnelproxy.dev catalog_version=7 changed=true
+```
+
+The label contains 128 bits from the operating-system random source. The
+allocator checks the complete hostname against the catalog and retries a
+collision at most 16 times. One TunnelId owns at most one managed hostname.
+Repeating the command with the same canonical base domain returns the same
+hostname with `changed=false`; requesting a different base domain is an
+explicit conflict and requires release first.
+
+Release by durable tunnel identity:
+
+```text
+tunnelproxy-control-plane https-hostname-release \
+  --database state.sqlite \
+  --tunnel-id tunnel-a
+```
+
+Allocation/release, route content, and catalog version are one immediate
+SQLite transaction. A release removes the route and advances the catalog once;
+an absent release returns `hostname=- ... changed=false`. The existing route
+distribution supervisor publishes effective mutations to Edge without a
+restart. `https-route-upsert` and `https-route-remove` reject managed names so
+generic administration cannot silently steal or delete lifecycle ownership.
+Routes created before Session 39 migrate as operator-owned routes.
+
+This command does not create DNS records or certificates and is not yet
+available to an Agent. Keep wildcard DNS/TLS provisioning, base-domain policy,
+and access to the Control Plane database under operator control.

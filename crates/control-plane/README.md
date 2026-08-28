@@ -37,6 +37,9 @@ service metrics. Session 31 adds a separate 64-record, monotonically versioned
 SQLite catalog for exact public HTTPS hostname routes plus idempotent
 `https-route-upsert`, `https-route-remove`, and `https-route-list` operator
 commands. Operations scrapes read only in-memory atomics. Catalog distribution
-to Edge, automatic hostname allocation, a general administrative API,
-protected issuer-key service, durable metrics, and multi-edge coordination are
-still absent.
+to Edge uses a separate authenticated latest-value stream. Session 39 adds
+transactional `https-hostname-allocate`/`https-hostname-release` commands for
+one OS-random managed hostname per TunnelId under an operator-supplied base
+domain. An Agent-facing allocation API, DNS/TLS automation, a general
+administrative API, protected issuer-key service, durable metrics, and
+multi-edge coordination are still absent.

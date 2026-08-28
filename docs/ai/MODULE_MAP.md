@@ -101,7 +101,8 @@ during ingress drain, and performs no Control Plane or storage lookup.
 
 **Responsibility (future)**
 
-- Allocate and administer `*.tunnelproxy.dev` hostnames and future custom domains.
+- Terminate and route managed `*.tunnelproxy.dev` hostnames and future custom
+  domains distributed by the Control Plane.
 - Authenticate / authorise incoming public requests.
 - Route requests to the correct agent tunnel using **cached** state.
 - Stream request and response bodies with bounded buffers (INV-002).
@@ -132,7 +133,10 @@ loopback-only operations listener reports in-memory readiness and
 fixed-cardinality snapshot, refresh, enrollment, and reconciliation metrics
 without querying SQLite during a scrape. A separate transactional SQLite HTTPS
 route catalog holds at most 64 exact hostname-to-TunnelId/status records with
-its own monotonic version and idempotent operator CLI administration. A
+its own monotonic version and idempotent operator CLI administration. Managed
+hostname commands allocate one durable `tp-<128-bit hex>` name per TunnelId
+under an explicit base domain, protect it from generic route mutation, and
+release ownership plus route content transactionally. A
 separate bounded mutual-TLS service distributes complete latest-value route
 catalogs to Edge without changing authorization snapshots or Tunnel Protocol
 v2. Its server and Edge client configurations support separate digest-manifest

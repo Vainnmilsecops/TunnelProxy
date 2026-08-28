@@ -1047,3 +1047,39 @@ memory and shutdown latency have explicit ceilings, JSON Lines remain whole,
 and event loss is observable. Buffered mode may lose the newest events under
 pressure and is not durable. Rotation, retention, encryption, and remote
 shipping remain operator-owned; no Tunnel Protocol or snapshot schema changes.
+
+---
+
+## ADR-039 — Managed hostnames are durable Control Plane route ownership
+
+**Status:** Accepted (Session 39).
+
+**Context:** The route catalog can activate exact operator-supplied hostnames,
+but it cannot safely create the managed `*.tunnelproxy.dev`-style names needed
+by the future one-command UX. Allocation must survive restart, remain
+idempotent under retries, avoid partial route/version state, and not let the
+generic route commands silently overwrite or remove an allocated name. Adding
+allocation fields to the Edge protocol would expose storage-only provenance to
+the request path without changing how Edge routes.
+
+**Decision:** Control Plane stores managed ownership in a separate SQLite
+table linked one-to-one from TunnelId to an enabled route hostname. A caller
+supplies one canonical base domain. Production allocation reads 128 bits from
+the operating-system CSPRNG, encodes a lowercase `tp-<hex>` DNS label, and
+checks the complete exact hostname against the route catalog under one
+immediate transaction. Collisions retry at most 16 times. Allocation plus one
+catalog-version increment commits atomically; the same tunnel/base-domain pair
+returns the existing hostname without requesting entropy or advancing the
+version. A different base domain is an explicit conflict. Release removes
+ownership and the route in one transaction and is an idempotent no-op when
+absent. Generic route mutation rejects managed names. Existing catalog rows
+migrate as operator-owned records.
+
+**Consequences:** Operator tooling can allocate, distribute, restart, inspect,
+and release one managed hostname per tunnel without changing the authenticated
+route wire format or Edge hot path. Capacity, version exhaustion, entropy
+failure, collision exhaustion, corruption, and ownership conflicts fail
+without partial state. The base domain still requires operator-provisioned
+wildcard DNS and TLS. Agent-facing allocation, DNS/certificate automation,
+friendly-name generation, rename/rotation, custom-domain proof, administrative
+APIs, and multi-edge ownership remain outside this decision.

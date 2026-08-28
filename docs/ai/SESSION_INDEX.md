@@ -1232,3 +1232,34 @@ Out of scope:
 - Durable spooling, file rotation, remote log/metric shipping, dashboards,
   paging, public operations access, protocol/schema changes, and hostname
   lifecycle.
+
+## Session 39 — Durable Managed Hostname Allocation — complete
+
+Scope delivered:
+
+- Added a canonical managed base-domain type and one 128-bit OS-random
+  lowercase `tp-<hex>` allocation label. Complete hostname collisions retry
+  under a hard 16-attempt ceiling.
+- Added durable one-hostname-per-TunnelId ownership metadata alongside the
+  existing route catalog. Allocation/release, enabled route content, and one
+  monotonic catalog-version change commit in a single immediate SQLite
+  transaction; same-input allocation and absent release are idempotent.
+- Migrated existing route databases without claiming legacy records. Generic
+  route commands reject managed names, different-base reallocation is an
+  explicit conflict, and repository validation fails closed on inconsistent
+  ownership metadata.
+- Added `https-hostname-allocate` and `https-hostname-release` Control Plane
+  commands with canonical pre-storage validation, stable stdout, and existing
+  exit-code/logging contracts.
+- Kept the route protocol unchanged: the existing Control Plane refresh and
+  authenticated full-catalog stream publish allocation and release live to
+  Edge. Repository, subprocess CLI, and real route-stream coverage bring the
+  workspace to 357 explicit tests.
+- Documented wildcard DNS/TLS prerequisites, rollback, ownership, collision,
+  restart, privacy, and failure semantics.
+
+Out of scope:
+
+- Agent-facing allocation, the complete `tunnelproxy http` UX, DNS or
+  certificate automation, friendly names, hostname rename/rotation, custom
+  domains, administrative APIs, HTTP/2, and multi-edge ownership.
