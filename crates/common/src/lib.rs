@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 mod bounded_fair_queue;
 mod credential_bundle;
+mod multiplex_telemetry;
 mod process_logging;
 mod public_hostname;
 mod tls_reload;
@@ -24,8 +25,13 @@ pub use credential_bundle::{
 };
 
 pub use bounded_fair_queue::{
-    bounded_queue_channel, BoundedFairQueue, BoundedQueueClosed, BoundedQueueItem,
-    BoundedQueueSender, FairQueueFull,
+    bounded_queue_channel, bounded_queue_channel_with_telemetry, BoundedFairQueue,
+    BoundedQueueClosed, BoundedQueueItem, BoundedQueueSender, BoundedQueueTelemetry,
+    BoundedQueueTelemetrySnapshot, FairQueueFull,
+};
+
+pub use multiplex_telemetry::{
+    MultiplexStreamGuard, MultiplexTelemetry, MultiplexTelemetrySnapshot,
 };
 
 pub use process_logging::{

@@ -25,9 +25,10 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 use tunnelproxy_agent::{
-    connect_registered_with_security, AgentError, AgentRuntime, AgentRuntimeConfig,
-    AgentRuntimeError, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig,
-    AgentTlsReloadRuntime, AgentTransportSecurity, ConnectOutcome, RuntimeShutdownConfig,
+    connect_registered_with_security, AgentError, AgentOperationsConfig, AgentOperationsRuntime,
+    AgentRuntime, AgentRuntimeConfig, AgentRuntimeError, AgentRuntimeOutcome, AgentTlsConfig,
+    AgentTlsReloadConfig, AgentTlsReloadRuntime, AgentTransportSecurity, ConnectOutcome,
+    RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{AgentId, TlsConfigHealth, TunnelId};
 use tunnelproxy_control_plane::{
@@ -393,6 +394,34 @@ async fn spawn_echo_connections(
     (addr, task)
 }
 
+async fn spawn_concurrent_echo(
+    connection_count: usize,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut handlers = Vec::with_capacity(connection_count);
+        for _ in 0..connection_count {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            handlers.push(tokio::spawn(async move {
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        let _ = socket.shutdown().await;
+                        break;
+                    }
+                    socket.write_all(&buffer[..count]).await.unwrap();
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+    (addr, task)
+}
+
 async fn round_trip(raw_addr: SocketAddr, payload: &[u8]) {
     timeout(Duration::from_secs(2), async {
         loop {
@@ -554,6 +583,94 @@ async fn operations_endpoint_tracks_raw_readiness_metrics_and_lifecycle() {
     local_task.await.unwrap();
     wait_until_bindable(raw_addr).await;
     wait_until_bindable(operations_addr).await;
+}
+
+#[tokio::test]
+async fn concurrent_transport_load_is_visible_without_identity_or_payload_labels() {
+    let stream_count = 4_usize;
+    let payload_size = 256 * 1024;
+    let expected_bytes = stream_count * payload_size;
+    let (local_addr, local_task) = spawn_concurrent_echo(stream_count).await;
+    let raw_addr = unused_addr().await;
+    let edge_operations_addr = unused_addr().await;
+    let mut edge_config = edge_config(raw_addr);
+    edge_config.multiplex.data_queue_capacity = 2;
+    edge_config.multiplex.per_stream_queue_capacity = 64;
+    edge_config.operations = Some(EdgeOperationsConfig::loopback(edge_operations_addr));
+    let edge = EdgeRuntime::bind(edge_config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let mut agent_config = AgentRuntimeConfig::new(edge_addr, local_addr);
+    agent_config.connect_timeout = Duration::from_secs(1);
+    agent_config.handshake_timeout = Duration::from_secs(1);
+    agent_config.multiplex.connect_timeout = Duration::from_secs(1);
+    agent_config.multiplex.stream_idle_timeout = Duration::from_secs(5);
+    agent_config.multiplex.data_queue_capacity = 2;
+    agent_config.multiplex.per_stream_queue_capacity = 64;
+    agent_config.shutdown = RuntimeShutdownConfig::new(Duration::from_secs(1));
+    agent_config.reconnect.initial_delay = Duration::from_millis(10);
+    agent_config.reconnect.max_delay = Duration::from_millis(40);
+    agent_config.reconnect.jitter_percent = 0;
+    let agent = AgentRuntime::new(agent_config).unwrap();
+    let agent_operations = AgentOperationsRuntime::bind(
+        AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap()),
+        agent.status_handle(),
+    )
+    .await
+    .unwrap();
+    let agent_operations_addr = agent_operations.local_addr();
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let (agent_operations_trigger, agent_operations_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    let agent_operations_task =
+        tokio::spawn(agent_operations.run_until_shutdown(agent_operations_signal));
+
+    wait_for_tunnel(&router, "tunnel-dev").await;
+    let mut streams = Vec::with_capacity(stream_count);
+    for index in 0..stream_count {
+        let payload: Vec<u8> = (0..payload_size)
+            .map(|offset| ((offset + index * 31) % 251) as u8)
+            .collect();
+        streams.push(tokio::spawn(async move {
+            round_trip(raw_addr, &payload).await;
+        }));
+    }
+    for stream in streams {
+        stream.await.unwrap();
+    }
+    local_task.await.unwrap();
+
+    let edge_metrics = operations_request(edge_operations_addr, "GET", "/metrics").await;
+    let agent_metrics = operations_request(agent_operations_addr, "GET", "/metrics").await;
+    let expected_bytes = expected_bytes.to_string();
+    for (metrics, prefix) in [
+        (&edge_metrics, "tunnelproxy_edge_transport"),
+        (&agent_metrics, "tunnelproxy_agent_transport"),
+    ] {
+        assert!(metrics.contains(&format!(
+            "{prefix}_data_bytes_total{{direction=\"sent\"}} {expected_bytes}"
+        )));
+        assert!(metrics.contains(&format!(
+            "{prefix}_data_bytes_total{{direction=\"received\"}} {expected_bytes}"
+        )));
+        assert!(metrics.contains(&format!("{prefix}_data_frames_total")));
+        assert!(metrics.contains(&format!("{prefix}_peak_data_pipeline_frames")));
+        assert!(metrics.contains(&format!("{prefix}_data_pipeline_frames 0")));
+        assert!(metrics.contains(&format!("{prefix}_data_admission_waits_total")));
+        assert!(!metrics.contains("agent-dev"));
+        assert!(!metrics.contains("tunnel-dev"));
+        assert!(!metrics.contains("session36-secret-payload"));
+    }
+
+    agent_trigger.shutdown();
+    agent_operations_trigger.shutdown();
+    edge_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    agent_operations_task.await.unwrap().unwrap();
+    edge_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

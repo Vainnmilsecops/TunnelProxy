@@ -17,7 +17,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
+use tunnelproxy_common::{
+    MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
+    TunnelId,
+};
 use tunnelproxy_control_plane::HttpsRouteSourceHealth;
 
 use crate::http_ingress::{HttpHostRoutes, HttpIngressStatus, HttpIngressStatusHandle};
@@ -487,6 +490,7 @@ struct EdgeMetricSnapshot {
     authorization_source: AuthorizationSourceStatus,
     authorization_version: u64,
     revoked_sessions: u64,
+    transport: MultiplexTelemetrySnapshot,
     operations: OperationsCounterSnapshot,
     ingress: IngressMetricSnapshot,
 }
@@ -518,6 +522,7 @@ async fn collect_metrics(
         authorization_source: authorization.source,
         authorization_version: authorization.version.map_or(0, |version| version.get()),
         revoked_sessions: authorization.revoked_sessions,
+        transport: router.transport_telemetry(),
         operations: OperationsCounterSnapshot {
             active_connections: counters.active_connections.load(Ordering::Relaxed),
             accepted_connections: counters.accepted_connections.load(Ordering::Relaxed),
@@ -627,6 +632,7 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
         "counter",
         snapshot.operations.capacity_rejections,
     );
+    render_transport_metrics(&mut output, snapshot.transport);
     match snapshot.ingress {
         IngressMetricSnapshot::Raw(status) => render_raw_metrics(&mut output, status.as_ref()),
         IngressMetricSnapshot::Https {
@@ -643,6 +649,78 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
         ),
     }
     output
+}
+
+fn render_transport_metrics(output: &mut String, transport: MultiplexTelemetrySnapshot) {
+    metric(
+        output,
+        "tunnelproxy_edge_transport_active_streams",
+        "gauge",
+        transport.active_streams,
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_transport_peak_active_streams",
+        "gauge",
+        transport.peak_active_streams,
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_edge_transport_data_frames_total counter"
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_edge_transport_data_frames_total{{direction=\"sent\"}} {}",
+        transport.sent_data_frames
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_edge_transport_data_frames_total{{direction=\"received\"}} {}",
+        transport.received_data_frames
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_edge_transport_data_bytes_total counter"
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_edge_transport_data_bytes_total{{direction=\"sent\"}} {}",
+        transport.sent_data_bytes
+    );
+    let _ = writeln!(
+        output,
+        "tunnelproxy_edge_transport_data_bytes_total{{direction=\"received\"}} {}",
+        transport.received_data_bytes
+    );
+    for (name, kind, value) in [
+        (
+            "tunnelproxy_edge_transport_data_admission_waits_total",
+            "counter",
+            transport.data_admission_waits,
+        ),
+        (
+            "tunnelproxy_edge_transport_data_pipeline_frames",
+            "gauge",
+            transport.data_pipeline_frames,
+        ),
+        (
+            "tunnelproxy_edge_transport_peak_data_pipeline_frames",
+            "gauge",
+            transport.peak_data_pipeline_frames,
+        ),
+        (
+            "tunnelproxy_edge_transport_flow_control_resets_total",
+            "counter",
+            transport.flow_control_resets,
+        ),
+        (
+            "tunnelproxy_edge_transport_control_burst_yields_total",
+            "counter",
+            transport.control_burst_yields,
+        ),
+    ] {
+        metric(output, name, kind, value);
+    }
 }
 
 fn render_raw_metrics(output: &mut String, status: Option<&RawIngressRouteStatus>) {
@@ -845,6 +923,13 @@ mod tests {
             authorization_source: AuthorizationSourceStatus::Live,
             authorization_version: 7,
             revoked_sessions: 2,
+            transport: MultiplexTelemetrySnapshot {
+                sent_data_frames: 2,
+                sent_data_bytes: 17,
+                received_data_frames: 3,
+                received_data_bytes: 29,
+                ..MultiplexTelemetrySnapshot::default()
+            },
             operations: OperationsCounterSnapshot {
                 active_connections: 1,
                 accepted_connections: 3,
@@ -863,6 +948,11 @@ mod tests {
             1
         );
         assert!(rendered.contains("tunnelproxy_edge_raw_route_present 0\n"));
+        assert!(rendered
+            .contains("tunnelproxy_edge_transport_data_frames_total{direction=\"received\"} 3"));
+        assert!(
+            rendered.contains("tunnelproxy_edge_transport_data_bytes_total{direction=\"sent\"} 17")
+        );
         assert!(!rendered.contains("TunnelId"));
         assert!(!rendered.contains("127.0.0.1"));
     }

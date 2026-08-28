@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Fair DATA Scheduling** (Session 35).
+**Multiplexed Transport Fairness Telemetry** (Session 36).
 
 ## Completed
 
@@ -66,6 +66,11 @@
   Active streams are served round-robin with per-stream FIFO ordering, so
   END_STREAM cannot overtake payloads. Lifecycle/heartbeat traffic retains
   priority with a bounded eight-frame control burst.
+- Agent and Edge aggregate fixed-cardinality multiplexed telemetry for active
+  and peak streams, directional DATA frames/bytes, admission waits, current
+  and peak writer-pipeline depth, locally initiated flow-control resets, and
+  control-burst DATA yields. Queue and stream gauges use RAII and return to
+  zero on close/error paths.
 - Per-stream inbound queues, a 16 KiB DATA-frame limit, bounded session queues,
   capacity admission, and open/connect/idle deadlines bound memory and failure
   scope.
@@ -379,7 +384,7 @@
   on rejection, and terminate supervision after certificate expiry.
 - Edge readiness and fixed-cardinality metrics report dynamic route source,
   catalog version, enabled route count, and fail closed after expiry.
-- 338 explicit workspace tests are present; all prior behavior is preserved.
+- 341 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -392,7 +397,8 @@
 - General administrative mutation API and snapshot signing/hardware-backed
   rollback protection.
 - Peer-negotiated credit/window flow control and weighted byte fairness.
-  Session 35 implements bounded process-local frame round-robin scheduling.
+  Session 35 implements bounded process-local frame round-robin scheduling;
+  Session 36 exposes its saturation/fairness measurements.
 - Multiple tunnel registrations on one Agent transport.
 - Automatic public port/hostname allocation. Durable operator-managed HTTPS
   route distribution and activation are implemented.
@@ -409,8 +415,8 @@
 
 ## Next planned session
 
-Session 36 has not been selected. The next plan should choose one bounded scope
-from peer-negotiated transport flow control, operator-owned telemetry
-collection guidance, or the next hostname lifecycle slice; automatic
-allocation, HTTP/2, signed access URLs, and multi-edge ownership remain
-separate larger scopes.
+Session 37 has not been selected. The next plan should use Session 36 metrics
+to decide whether peer-negotiated transport flow control is justified, or
+choose operator-owned telemetry collection guidance or the next hostname
+lifecycle slice. Automatic allocation, HTTP/2, signed access URLs, and
+multi-edge ownership remain separate larger scopes.

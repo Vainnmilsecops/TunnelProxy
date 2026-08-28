@@ -15,8 +15,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use tunnelproxy_common::{
-    bounded_queue_channel, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
-    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
+    bounded_queue_channel_with_telemetry, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
+    MultiplexTelemetry, MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome,
+    ShutdownSignal, TunnelId,
 };
 use tunnelproxy_control_plane::{
     AuthorizationSnapshotSubscription, CertificateFingerprint, SnapshotSourceClosed,
@@ -223,6 +224,7 @@ pub struct EdgeSessionRouter {
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
     authorization_updates: watch::Sender<EdgeAuthorizationStatus>,
     accepting_streams: Arc<AtomicBool>,
+    telemetry: MultiplexTelemetry,
 }
 
 impl EdgeSessionRouter {
@@ -271,6 +273,11 @@ impl EdgeSessionRouter {
 
     pub fn subscribe_authorization_status(&self) -> watch::Receiver<EdgeAuthorizationStatus> {
         self.authorization_updates.subscribe()
+    }
+
+    /// Returns fixed-cardinality transport counters without locking a session.
+    pub fn transport_telemetry(&self) -> MultiplexTelemetrySnapshot {
+        self.telemetry.snapshot()
     }
 
     /// Resolves a durable tunnel to its current ephemeral session and opens a
@@ -480,6 +487,7 @@ pub struct MultiplexedEdgeRuntime {
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
     authorization_updates: watch::Sender<EdgeAuthorizationStatus>,
     accepting_streams: Arc<AtomicBool>,
+    telemetry: MultiplexTelemetry,
 }
 
 impl MultiplexedEdgeRuntime {
@@ -520,6 +528,7 @@ impl MultiplexedEdgeRuntime {
             tunnel_updates,
             authorization_updates,
             accepting_streams: Arc::new(AtomicBool::new(true)),
+            telemetry: MultiplexTelemetry::default(),
         })
     }
 
@@ -536,6 +545,7 @@ impl MultiplexedEdgeRuntime {
             tunnel_updates: self.tunnel_updates.clone(),
             authorization_updates: self.authorization_updates.clone(),
             accepting_streams: Arc::clone(&self.accepting_streams),
+            telemetry: self.telemetry.clone(),
         }
     }
 
@@ -561,6 +571,7 @@ impl MultiplexedEdgeRuntime {
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
                         self.tunnel_updates.clone(),
+                        self.telemetry.clone(),
                     );
                 }
                 update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
@@ -617,6 +628,7 @@ impl MultiplexedEdgeRuntime {
                         Arc::clone(&self.session_ids),
                         self.session_updates.clone(),
                         self.tunnel_updates.clone(),
+                        self.telemetry.clone(),
                     );
                 }
                 update = next_snapshot_update(&mut snapshot_updates), if snapshot_updates.is_some() => {
@@ -798,6 +810,7 @@ fn spawn_accepted_session(
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    telemetry: MultiplexTelemetry,
 ) {
     let permit = match permits.try_acquire_owned() {
         Ok(permit) => permit,
@@ -819,6 +832,7 @@ fn spawn_accepted_session(
         session_ids,
         session_updates,
         tunnel_updates,
+        telemetry,
     ));
 }
 
@@ -849,6 +863,7 @@ async fn run_accepted_session(
     session_ids: Arc<TransportSessionIdAllocator>,
     session_updates: watch::Sender<Arc<Vec<TransportSessionId>>>,
     tunnel_updates: watch::Sender<Arc<Vec<(TunnelId, TransportSessionId)>>>,
+    telemetry: MultiplexTelemetry,
 ) {
     let (mut socket, peer_certificate): (BoxedTransport, Option<CertificateFingerprint>) =
         match &config.security {
@@ -955,7 +970,7 @@ async fn run_accepted_session(
         event = "multiplexed_session_registered"
     );
 
-    if let Err(error) = run_edge_session(socket, session_id, config, command_rx).await {
+    if let Err(error) = run_edge_session(socket, session_id, config, command_rx, telemetry).await {
         warn!(%session_id, error = %error, event = "multiplexed_session_failed");
     }
     let gate = authorization_gate.lock().await;
@@ -982,13 +997,21 @@ async fn run_edge_session(
     session_id: TransportSessionId,
     config: MultiplexedEdgeConfig,
     mut command_rx: mpsc::Receiver<SessionCommand>,
+    telemetry: MultiplexTelemetry,
 ) -> Result<(), AgentTransportError> {
     let (mut reader, writer) = tokio::io::split(socket);
     let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
     let data_capacity = NonZeroUsize::new(config.data_queue_capacity)
         .expect("validated DATA queue capacity must be non-zero");
-    let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
-    let mut writer_task = tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
+    let (data_tx, data_rx) =
+        bounded_queue_channel_with_telemetry(data_capacity, telemetry.data_queue_telemetry());
+    let mut writer_task = tokio::spawn(writer_actor(
+        writer,
+        control_rx,
+        data_rx,
+        data_capacity,
+        telemetry.clone(),
+    ));
     let (event_tx, mut event_rx) = mpsc::channel(config.max_streams_per_session);
     let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
     let mut next_stream_id = 1_u32;
@@ -1026,14 +1049,19 @@ async fn run_edge_session(
                         if frame.frame_type == FrameType::Data
                             && frame.payload.len() > MULTIPLEXED_DATA_PAYLOAD_SIZE
                         {
+                            telemetry.flow_control_reset();
                             streams.remove(&frame.stream_id);
                             send_reset(&control_tx, frame.stream_id, StreamResetCode::FlowControlExceeded).await?;
                             continue;
+                        }
+                        if frame.frame_type == FrameType::Data {
+                            telemetry.data_received(frame.payload.len());
                         }
                         match streams.get(&frame.stream_id) {
                             Some(sender) => match sender.try_send(frame) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(frame)) => {
+                                    telemetry.flow_control_reset();
                                     streams.remove(&frame.stream_id);
                                     send_reset(&control_tx, frame.stream_id, StreamResetCode::FlowControlExceeded).await?;
                                 }
@@ -1100,6 +1128,7 @@ async fn run_edge_session(
                     control_tx.clone(),
                     data_tx.clone(),
                     event_tx.clone(),
+                    telemetry.clone(),
                 ));
             }
             event = event_rx.recv() => {
@@ -1148,7 +1177,9 @@ async fn run_ingress_stream(
     control_tx: mpsc::Sender<Frame>,
     data_tx: BoundedQueueSender<Frame>,
     event_tx: mpsc::Sender<StreamEvent>,
+    telemetry: MultiplexTelemetry,
 ) {
+    let _stream = telemetry.stream_opened();
     if send_stream(&control_tx, FrameType::OpenStream, stream_id, Vec::new())
         .await
         .is_err()
@@ -1282,6 +1313,7 @@ async fn writer_actor(
     mut control_rx: mpsc::Receiver<Frame>,
     mut data_rx: mpsc::Receiver<BoundedQueueItem<Frame>>,
     data_capacity: NonZeroUsize,
+    telemetry: MultiplexTelemetry,
 ) -> Result<(), AgentTransportError> {
     let mut control_open = true;
     let mut data_open = true;
@@ -1313,9 +1345,15 @@ async fn writer_actor(
         }
 
         if let Some(frame) = scheduled.pop() {
+            if control_burst >= MAX_CONTROL_FRAME_BURST && control_open && !control_rx.is_empty() {
+                telemetry.control_burst_yielded();
+            }
             FrameEncoder::encode(&mut writer, frame.value())
                 .await
                 .map_err(AgentTransportError::ProtocolDecode)?;
+            if frame.value().frame_type == FrameType::Data {
+                telemetry.data_sent(frame.value().payload.len());
+            }
             control_burst = 0;
             continue;
         }
@@ -1465,7 +1503,9 @@ mod tests {
     async fn writer_preserves_end_stream_order_while_round_robining() {
         let data_capacity = NonZeroUsize::new(8).unwrap();
         let (control_tx, control_rx) = mpsc::channel(1);
-        let (data_tx, data_rx) = bounded_queue_channel(data_capacity);
+        let telemetry = MultiplexTelemetry::default();
+        let (data_tx, data_rx) =
+            bounded_queue_channel_with_telemetry(data_capacity, telemetry.data_queue_telemetry());
         let stream_a = StreamId::new(1).unwrap();
         let stream_b = StreamId::new(2).unwrap();
         send_data(&data_tx, FrameType::Data, stream_a, b"a1".to_vec())
@@ -1486,7 +1526,13 @@ mod tests {
         let (transport, mut peer) = tokio::io::duplex(64 * 1024);
         let transport: BoxedTransport = Box::new(transport);
         let (_, writer) = tokio::io::split(transport);
-        let task = tokio::spawn(writer_actor(writer, control_rx, data_rx, data_capacity));
+        let task = tokio::spawn(writer_actor(
+            writer,
+            control_rx,
+            data_rx,
+            data_capacity,
+            telemetry.clone(),
+        ));
         let mut decoder = FrameDecoder::new();
         let mut output = Vec::new();
         while let Some(frame) = decoder.decode(&mut peer).await.unwrap() {
@@ -1503,5 +1549,10 @@ mod tests {
                 (stream_b, FrameType::EndStream, Vec::new()),
             ]
         );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.sent_data_frames, 2);
+        assert_eq!(snapshot.sent_data_bytes, 4);
+        assert_eq!(snapshot.data_pipeline_frames, 0);
+        assert_eq!(snapshot.peak_data_pipeline_frames, 4);
     }
 }

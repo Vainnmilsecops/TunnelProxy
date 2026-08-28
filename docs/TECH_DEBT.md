@@ -191,16 +191,18 @@
   Edge production data path. Session 28 gives Agent, Edge, and Control Plane a
   common secret-safe JSON Lines stderr sink and filter. Session 29 adds bounded
   Agent connection/readiness metrics. Session 30 adds bounded Control Plane
-  readiness and service metrics. Metrics remain process-local, stderr emission
-  is synchronous, and there is no remote write, durable history, dashboard, or
-  alert policy.
+  readiness and service metrics. Session 36 adds multiplexed stream, byte,
+  admission, pipeline-depth, reset, and fairness-yield metrics to Agent and
+  Edge. Metrics remain process-local, stderr emission is synchronous, and
+  there is no remote write, durable history, dashboard, or alert policy.
 - **Exit plan:** Add operator-owned collection/retention guidance and an
   optional bounded nonblocking sink before
   claiming complete production observability. Keep external backend I/O off
   request routing.
 - **Tracking:** partially resolved by Edge metrics in Session 27, shared logs
   in Session 28, Agent metrics in Session 29, and Control Plane metrics in
-  Session 30; open for durable backend integration.
+  Session 30, plus transport telemetry in Session 36; open for durable backend
+  integration.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 
@@ -242,8 +244,9 @@
 - **Exit plan:** Add explicit per-stream/session byte credits and a deficit
   round-robin writer only after measurements show the bounded FIFO policy is
   insufficient.
-- **Tracking:** partially resolved in Session 35; peer credit windows and
-  weighted/deficit byte scheduling remain open.
+- **Tracking:** Session 35 resolves local frame starvation and Session 36 adds
+  the measurements required by the exit plan; peer credit windows and
+  weighted/deficit byte scheduling remain open pending operational evidence.
 
 ### DEBT-015 — Durable route snapshots are not persisted across restarts — resolved
 
