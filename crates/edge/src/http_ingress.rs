@@ -731,6 +731,7 @@ async fn run_connection(
                     }
                     Ok(response)
                 }
+                Ok(Err(infallible)) => match infallible {},
                 Err(_) => {
                     counters.request_timeouts.fetch_add(1, Ordering::Relaxed);
                     counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
