@@ -18,8 +18,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use tunnelproxy_common::{
-    MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
-    TunnelId,
+    process_logging_snapshot, MultiplexTelemetrySnapshot, ProcessLoggingSnapshot,
+    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
 };
 use tunnelproxy_control_plane::HttpsRouteSourceHealth;
 
@@ -632,6 +632,7 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
         "counter",
         snapshot.operations.capacity_rejections,
     );
+    render_logging_metrics(&mut output, process_logging_snapshot());
     render_transport_metrics(&mut output, snapshot.transport);
     match snapshot.ingress {
         IngressMetricSnapshot::Raw(status) => render_raw_metrics(&mut output, status.as_ref()),
@@ -649,6 +650,43 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
         ),
     }
     output
+}
+
+fn render_logging_metrics(output: &mut String, logging: ProcessLoggingSnapshot) {
+    for (name, kind, value) in [
+        (
+            "tunnelproxy_edge_logging_nonblocking_enabled",
+            "gauge",
+            u64::from(logging.buffer_capacity_events > 0),
+        ),
+        (
+            "tunnelproxy_edge_logging_buffer_capacity_events",
+            "gauge",
+            logging.buffer_capacity_events,
+        ),
+        (
+            "tunnelproxy_edge_logging_accepted_events_total",
+            "counter",
+            logging.accepted_events,
+        ),
+        (
+            "tunnelproxy_edge_logging_dropped_events_total",
+            "counter",
+            logging.dropped_events,
+        ),
+        (
+            "tunnelproxy_edge_logging_oversized_events_total",
+            "counter",
+            logging.oversized_events,
+        ),
+        (
+            "tunnelproxy_edge_logging_write_failures_total",
+            "counter",
+            logging.write_failures,
+        ),
+    ] {
+        metric(output, name, kind, value);
+    }
 }
 
 fn render_transport_metrics(output: &mut String, transport: MultiplexTelemetrySnapshot) {
@@ -946,6 +984,18 @@ mod tests {
             ingress: IngressMetricSnapshot::Raw(None),
         });
         assert!(rendered.contains("tunnelproxy_edge_ready 1\n"));
+        assert!(rendered.contains("tunnelproxy_edge_logging_nonblocking_enabled 0\n"));
+        let mut logging = String::new();
+        render_logging_metrics(
+            &mut logging,
+            ProcessLoggingSnapshot {
+                buffer_capacity_events: 8,
+                oversized_events: 2,
+                ..ProcessLoggingSnapshot::default()
+            },
+        );
+        assert!(logging.contains("tunnelproxy_edge_logging_nonblocking_enabled 1"));
+        assert!(logging.contains("tunnelproxy_edge_logging_oversized_events_total 2"));
         assert!(rendered.contains("tunnelproxy_edge_authorization_source{source=\"live\"} 1\n"));
         assert_eq!(
             rendered

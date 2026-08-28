@@ -545,10 +545,22 @@ events to stderr. Human-readable text is the default. Set
 mode. `RUST_LOG` uses tracing-subscriber filter directives in both modes and
 defaults to `info`.
 
+Synchronous stderr remains the default. Set
+`TUNNELPROXY_LOG_BUFFER_CAPACITY` to an integer from 1 through 1024 to move
+stderr writes onto one dedicated worker with a bounded FIFO. Each formatted
+event is capped at 16 KiB. Producers use nonblocking admission and drop the
+newest event when the queue is full; oversized events are dropped whole so a
+partial JSON object is never emitted. Optionally set
+`TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS` from 1 through 5000 (default 500) to bound
+shutdown draining. Supplying a drain timeout without enabling the buffer is a
+configuration error.
+
 PowerShell:
 
 ```powershell
 $env:TUNNELPROXY_LOG_FORMAT = "json"
+$env:TUNNELPROXY_LOG_BUFFER_CAPACITY = "256"
+$env:TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS = "1000"
 $env:RUST_LOG = "info,tunnelproxy_edge=debug"
 cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- --help
 ```
@@ -557,6 +569,8 @@ Bash:
 
 ```bash
 TUNNELPROXY_LOG_FORMAT=json \
+TUNNELPROXY_LOG_BUFFER_CAPACITY=256 \
+TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS=1000 \
 RUST_LOG=info,tunnelproxy_edge=debug \
 cargo run -p tunnelproxy-edge --bin tunnelproxy-edge -- --help
 ```
@@ -566,7 +580,10 @@ stderr. In JSON mode, invalid CLI arguments produce a JSON error event without
 appending multiline usage text. Invalid `TUNNELPROXY_LOG_FORMAT` or `RUST_LOG`
 stops the process with exit code 2 before CLI-driven listener binding or file
 mutation. Never place tokens, keys, certificates, payloads, or traffic bodies
-in filter directives or event fields.
+in filter directives or event fields. Agent, Edge, and Control Plane
+operations endpoints expose buffer capacity plus accepted, dropped, oversized,
+and write-failure event counters. See [`OPERATIONS.md`](OPERATIONS.md) for
+queries and alert guidance.
 
 ## 20. Running the Agent operations endpoint
 

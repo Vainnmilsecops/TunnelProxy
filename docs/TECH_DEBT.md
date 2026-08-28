@@ -182,7 +182,7 @@
   public raw-ingress production path. This debt remains open only for the
   legacy standalone `Forwarder`, which is not used by that public route.
 
-### DEBT-010 — Production telemetry is non-durable
+### DEBT-010 — Production telemetry is non-durable — resolved
 
 - **Introduced in:** Session 04
 - **Category:** ops
@@ -195,16 +195,17 @@
   admission, pipeline-depth, reset, and fairness-yield metrics to Agent and
   Edge. Session 37 adds live pipeline capacity plus operator-owned collection,
   retention, query, and alert-baseline guidance. Metrics remain process-local,
-  stderr emission is synchronous, and there is no embedded remote write,
-  durable history, dashboard, or alert engine.
-- **Exit plan:** Add an optional bounded nonblocking sink before claiming
-  complete production observability. Keep external backend I/O off request
-  routing.
-- **Tracking:** partially resolved by Edge metrics in Session 27, shared logs
-  in Session 28, Agent metrics in Session 29, and Control Plane metrics in
-  Session 30, transport telemetry in Session 36, and capacity/runbook guidance
-  in Session 37; open for the optional nonblocking sink and operator-selected
-  durable backend integration.
+  and there is no embedded remote write, durable history, dashboard, or alert
+  engine. Session 38 adds an optional bounded nonblocking stderr sink with
+  fixed-cardinality loss/failure telemetry and bounded shutdown.
+- **Resolution:** Session 37 defines operator-owned local collection,
+  retention, and alert baselines. Session 38 keeps external backend I/O off
+  request routing while isolating slow stderr behind a bounded drop-newest
+  worker. Durable storage/remote shipping is deliberately owned by the local
+  collector rather than embedded in TunnelProxy.
+- **Tracking:** resolved by the Session 27–30 exporters/log contract, Session
+  36–37 transport capacity and collection guidance, and Session 38 bounded
+  nonblocking sink.
 
 ### DEBT-012 — No graceful shutdown for Agent transport runtimes — resolved
 

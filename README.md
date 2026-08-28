@@ -54,6 +54,8 @@ correct agent, which in turn proxies them into the local service.
 - Secret-safe process logging for Agent, Edge, and Control Plane with
   human-readable stderr output by default or schema-stable JSON Lines selected
   through `TUNNELPROXY_LOG_FORMAT=json` and filtered through `RUST_LOG`.
+  Optional bounded nonblocking buffering isolates runtime tasks from slow
+  stderr and exports fixed-cardinality loss/failure counters.
 - Versioned latest-value authorization snapshot distribution with atomic Edge
   apply, stale/conflict protection, live grant revocation, and cached-state
   operation when the producer disconnects.
@@ -228,6 +230,7 @@ and Definition of Done.
 | 35 _(complete)_ | bounded per-stream fair DATA scheduling |
 | 36 _(complete)_ | multiplexed transport fairness and saturation telemetry |
 | 37 _(complete)_ | live transport capacity telemetry and operator runbook |
+| 38 _(complete)_ | bounded nonblocking process logging and sink telemetry |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

@@ -15,6 +15,17 @@ fn run(args: &[&str], format: &str, filter: &str) -> Output {
         .unwrap()
 }
 
+fn run_buffered(args: &[&str], format: &str) -> Output {
+    Command::new(binary())
+        .args(args)
+        .env("TUNNELPROXY_LOG_FORMAT", format)
+        .env("TUNNELPROXY_LOG_BUFFER_CAPACITY", "4")
+        .env("TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS", "1000")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap()
+}
+
 fn assert_error_event(output: &Output, expected_target: &str) {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -75,4 +86,14 @@ fn invalid_operations_config_fails_before_outbound_connect() {
 
     let non_loopback = run(&["--ops-listen", "0.0.0.0:9091"], "json", "info");
     assert_eq!(non_loopback.status.code(), Some(2));
+}
+
+#[test]
+fn buffered_text_and_json_errors_are_drained_before_exit() {
+    let text = run_buffered(&["--unknown"], "text");
+    assert_eq!(text.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&text.stderr).contains("invalid Agent CLI arguments"));
+
+    let json = run_buffered(&["--unknown"], "json");
+    assert_error_event(&json, "tunnelproxy_agent");
 }

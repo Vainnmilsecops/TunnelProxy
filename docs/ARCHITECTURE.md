@@ -633,6 +633,23 @@ decision threshold for a future flow-control proposal. TunnelProxy still does
 not perform remote write, durable metric storage, dashboard rendering, or
 paging, and Tunnel Protocol v2 is unchanged.
 
+### 2.36 Bounded nonblocking process logging (Session 38)
+
+Synchronous stderr remains the compatibility default. When explicitly
+enabled, tracing formats each complete event into a 16 KiB-bounded buffer and
+uses `try_send` to admit it to one process-wide FIFO of at most 1024 events.
+One dedicated OS thread owns stderr writes. Full queues drop the newest event;
+oversized events are discarded whole so JSON Lines cannot be truncated.
+
+A process-lifetime guard stops new admission and waits only for the configured
+bounded drain deadline. A blocked stderr writer is detached after that
+deadline rather than holding process shutdown. Agent, Edge, and Control Plane
+operations endpoints read shared atomics for enabled capacity, accepted,
+dropped, oversized, and write-failure events. No request/session labels,
+storage query, remote write, file rotation, or network backend is introduced.
+Together with Session 37's operator-owned collection/retention runbook, this
+resolves DEBT-010 without coupling external observability I/O to data routing.
+
 ### 2.24 Bounded HTTP request-rate admission (Session 26)
 
 After TLS and exact Host/SNI/absolute-authority validation, but before reading
@@ -710,10 +727,10 @@ receive mixed JSON/text stderr. Existing invariant INV-003 still governs event
 construction: tokens, private keys, certificates, paths to secret material,
 and traffic bodies are not event fields.
 
-The sink is deliberately local and synchronous. File rotation, durable or
-remote shipping, dashboards/alerts, and an asynchronous buffering queue remain
-operator/backend work tracked by DEBT-010. Protocol and snapshot schemas are
-unchanged.
+The compatibility sink is deliberately local and synchronous by default.
+Session 38 adds an optional bounded nonblocking worker and loss telemetry;
+file rotation plus durable/remote shipping remain operator/backend work.
+Protocol and snapshot schemas are unchanged.
 
 ### 2.27 Bounded Agent operations endpoint (Session 29)
 
@@ -738,8 +755,8 @@ failure creates no outbound connection. Shutdown marks Agent readiness false,
 drains the transport/TLS/enrollment supervisors while operations remains
 available, then stops operations and releases its port. Metrics are
 process-local and reset on restart. Control Plane metrics arrive in Session 30;
-remote write, durability, dashboards, and alerting remain tracked by DEBT-010; protocol and
-snapshot formats are unchanged.
+Session 37 documents external collection and Session 38 exposes optional
+nonblocking-sink loss. Protocol and snapshot formats are unchanged.
 
 ### 2.28 Bounded Control Plane operations endpoint (Session 30)
 

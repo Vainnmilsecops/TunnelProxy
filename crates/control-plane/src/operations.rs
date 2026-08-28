@@ -17,7 +17,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal};
+use tunnelproxy_common::{
+    process_logging_snapshot, ProcessLoggingSnapshot, RuntimeShutdownConfig,
+    RuntimeShutdownOutcome, ShutdownSignal,
+};
 
 pub const MIN_OPERATIONS_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_OPERATIONS_HEADER_BYTES: usize = 64 * 1024;
@@ -704,6 +707,7 @@ fn render_metrics(s: TelemetrySnapshot) -> String {
     ] {
         metric(&mut output, name, kind, value);
     }
+    render_logging_metrics(&mut output, process_logging_snapshot());
     labeled_metrics(
         &mut output,
         "tunnelproxy_control_plane_refresh_total",
@@ -724,6 +728,42 @@ fn render_metrics(s: TelemetrySnapshot) -> String {
         ],
     );
     output
+}
+fn render_logging_metrics(output: &mut String, logging: ProcessLoggingSnapshot) {
+    for (name, kind, value) in [
+        (
+            "tunnelproxy_control_plane_logging_nonblocking_enabled",
+            "gauge",
+            u64::from(logging.buffer_capacity_events > 0),
+        ),
+        (
+            "tunnelproxy_control_plane_logging_buffer_capacity_events",
+            "gauge",
+            logging.buffer_capacity_events,
+        ),
+        (
+            "tunnelproxy_control_plane_logging_accepted_events_total",
+            "counter",
+            logging.accepted_events,
+        ),
+        (
+            "tunnelproxy_control_plane_logging_dropped_events_total",
+            "counter",
+            logging.dropped_events,
+        ),
+        (
+            "tunnelproxy_control_plane_logging_oversized_events_total",
+            "counter",
+            logging.oversized_events,
+        ),
+        (
+            "tunnelproxy_control_plane_logging_write_failures_total",
+            "counter",
+            logging.write_failures,
+        ),
+    ] {
+        metric(output, name, kind, value);
+    }
 }
 fn metric(output: &mut String, name: &str, kind: &str, value: impl std::fmt::Display) {
     let _ = writeln!(output, "# TYPE {name} {kind}");
@@ -764,6 +804,18 @@ mod tests {
         telemetry.enrollment_outcome(EnrollmentRequestOutcome::Issued);
         let rendered = render_metrics(telemetry.snapshot());
         assert!(rendered.contains("tunnelproxy_control_plane_ready 1\n"));
+        assert!(rendered.contains("tunnelproxy_control_plane_logging_nonblocking_enabled 0\n"));
+        let mut logging = String::new();
+        render_logging_metrics(
+            &mut logging,
+            ProcessLoggingSnapshot {
+                buffer_capacity_events: 8,
+                write_failures: 1,
+                ..ProcessLoggingSnapshot::default()
+            },
+        );
+        assert!(logging.contains("tunnelproxy_control_plane_logging_nonblocking_enabled 1"));
+        assert!(logging.contains("tunnelproxy_control_plane_logging_write_failures_total 1"));
         assert!(rendered.contains("outcome=\"issued\""));
         assert!(!rendered.contains("agent-dev"));
         assert!(!rendered.contains("tunnel-dev"));

@@ -15,6 +15,17 @@ fn run(args: &[&str], format: &str, filter: &str) -> Output {
         .unwrap()
 }
 
+fn run_buffered(args: &[&str], format: &str) -> Output {
+    Command::new(binary())
+        .args(args)
+        .env("TUNNELPROXY_LOG_FORMAT", format)
+        .env("TUNNELPROXY_LOG_BUFFER_CAPACITY", "4")
+        .env("TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS", "1000")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn json_mode_emits_one_schema_stable_error_event_to_stderr() {
     let output = run(&["--unknown"], "json", "info");
@@ -42,4 +53,17 @@ fn filter_and_stdout_stderr_contracts_hold() {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).starts_with("Usage:"));
     assert!(help.stderr.is_empty());
+}
+
+#[test]
+fn buffered_text_and_json_errors_are_drained_before_exit() {
+    let text = run_buffered(&["--unknown"], "text");
+    assert_eq!(text.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&text.stderr).contains("invalid Edge CLI arguments"));
+
+    let json = run_buffered(&["--unknown"], "json");
+    assert_eq!(json.status.code(), Some(2));
+    let stderr = String::from_utf8(json.stderr).unwrap();
+    let event: Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(event["target"], "tunnelproxy_edge");
 }

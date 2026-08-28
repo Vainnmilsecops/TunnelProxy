@@ -12,10 +12,13 @@ use tunnelproxy_common::init_process_logging;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if let Err(error) = init_process_logging() {
-        eprintln!("failed to configure logging: {error}");
-        return ExitCode::from(2);
-    }
+    let _logging = match init_process_logging() {
+        Ok(logging) => logging,
+        Err(error) => {
+            eprintln!("failed to configure logging: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     let target: SocketAddr = match std::env::var("TUNNELPROXY_AGENT_TARGET") {
         Ok(raw) => match raw.parse() {
