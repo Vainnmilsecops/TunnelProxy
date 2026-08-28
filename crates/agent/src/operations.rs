@@ -18,7 +18,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use tunnelproxy_common::{
-    MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
+    process_logging_snapshot, MultiplexTelemetrySnapshot, ProcessLoggingSnapshot,
+    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
 };
 
 use crate::{AgentConnectionState, AgentRuntimeStatus, AgentRuntimeStatusHandle};
@@ -490,8 +491,46 @@ fn render_metrics(
     ] {
         metric(&mut output, name, kind, value);
     }
+    render_logging_metrics(&mut output, process_logging_snapshot());
     render_transport_metrics(&mut output, transport);
     output
+}
+
+fn render_logging_metrics(output: &mut String, logging: ProcessLoggingSnapshot) {
+    for (name, kind, value) in [
+        (
+            "tunnelproxy_agent_logging_nonblocking_enabled",
+            "gauge",
+            u64::from(logging.buffer_capacity_events > 0),
+        ),
+        (
+            "tunnelproxy_agent_logging_buffer_capacity_events",
+            "gauge",
+            logging.buffer_capacity_events,
+        ),
+        (
+            "tunnelproxy_agent_logging_accepted_events_total",
+            "counter",
+            logging.accepted_events,
+        ),
+        (
+            "tunnelproxy_agent_logging_dropped_events_total",
+            "counter",
+            logging.dropped_events,
+        ),
+        (
+            "tunnelproxy_agent_logging_oversized_events_total",
+            "counter",
+            logging.oversized_events,
+        ),
+        (
+            "tunnelproxy_agent_logging_write_failures_total",
+            "counter",
+            logging.write_failures,
+        ),
+    ] {
+        metric(output, name, kind, value);
+    }
 }
 
 fn render_transport_metrics(output: &mut String, transport: MultiplexTelemetrySnapshot) {
@@ -638,6 +677,18 @@ mod tests {
             assert!(rendered.contains(&format!("state=\"{}\"", state.as_str())));
         }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
+        assert!(rendered.contains("tunnelproxy_agent_logging_nonblocking_enabled 0"));
+        let mut logging = String::new();
+        render_logging_metrics(
+            &mut logging,
+            ProcessLoggingSnapshot {
+                buffer_capacity_events: 8,
+                dropped_events: 3,
+                ..ProcessLoggingSnapshot::default()
+            },
+        );
+        assert!(logging.contains("tunnelproxy_agent_logging_nonblocking_enabled 1"));
+        assert!(logging.contains("tunnelproxy_agent_logging_dropped_events_total 3"));
         assert!(rendered
             .contains("tunnelproxy_agent_transport_data_frames_total{direction=\"sent\"} 2"));
         assert!(rendered

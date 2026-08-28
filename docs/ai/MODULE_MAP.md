@@ -13,7 +13,8 @@
 - Small allocation-light helpers used by more than one other crate.
 - Cross-platform process termination observation shared by Edge and Agent.
 - Process-wide text/JSON stderr logging configuration shared by runnable
-  components and development examples.
+  components and development examples, including the optional bounded
+  nonblocking writer, lifetime guard, and fixed-cardinality sink telemetry.
 - Fixed-cardinality process-local multiplex telemetry and RAII lifecycle
   guards shared by Agent and Edge.
 

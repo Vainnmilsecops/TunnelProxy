@@ -145,3 +145,42 @@ Operations scrapes read process-local atomic snapshots. They do not acquire a
 live session lock, query SQLite, or perform remote backend I/O. Exported labels
 use bounded enumerations only. Never add tokens, certificates, payloads,
 hostnames, durable IDs, session IDs, stream IDs, or addresses as metric labels.
+
+## Nonblocking process-log sink
+
+Synchronous stderr is the compatibility default. For long-running processes,
+enable the bounded worker documented in `DEVELOPMENT.md` so a slow local log
+collector cannot block Tokio runtime tasks. The queue drops the newest event
+when full, rejects any formatted event larger than 16 KiB, and drains only
+within the configured shutdown deadline. A permanently blocked stderr writer
+is detached at the deadline so process exit is not held indefinitely.
+
+Every operations endpoint exports role-prefixed logging metrics:
+
+- `*_logging_nonblocking_enabled`
+- `*_logging_buffer_capacity_events`
+- `*_logging_accepted_events_total`
+- `*_logging_dropped_events_total`
+- `*_logging_oversized_events_total`
+- `*_logging_write_failures_total`
+
+Alert on any new event loss or sink failure, using the appropriate
+`tunnelproxy_agent_`, `tunnelproxy_edge_`, or `tunnelproxy_control_plane_`
+prefix:
+
+```promql
+increase(tunnelproxy_edge_logging_dropped_events_total[5m]) > 0
+or
+increase(tunnelproxy_edge_logging_oversized_events_total[5m]) > 0
+or
+increase(tunnelproxy_edge_logging_write_failures_total[5m]) > 0
+```
+
+Queue capacity bounds event count, not total payload alone. The hard 16 KiB
+event ceiling bounds queued payload memory to approximately
+`capacity * 16 KiB`, plus one worker event and small formatting/channel
+overhead. Increase capacity only after confirming the process memory budget.
+
+The worker is not a durable spool. Collection, rotation, retention, encryption,
+remote shipping, and access policy remain responsibilities of the local
+collector and its operator-owned backend.

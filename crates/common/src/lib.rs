@@ -36,7 +36,9 @@ pub use multiplex_telemetry::{
 };
 
 pub use process_logging::{
-    init_process_logging, ProcessLogFormat, ProcessLoggingConfigError, LOG_FORMAT_ENV,
+    init_process_logging, process_logging_snapshot, ProcessLogFormat, ProcessLoggingConfigError,
+    ProcessLoggingGuard, ProcessLoggingSnapshot, LOG_BUFFER_CAPACITY_ENV, LOG_DRAIN_TIMEOUT_ENV,
+    LOG_FORMAT_ENV, MAX_LOG_BUFFER_CAPACITY, MAX_LOG_DRAIN_TIMEOUT, MAX_LOG_EVENT_BYTES,
 };
 
 pub use public_hostname::{

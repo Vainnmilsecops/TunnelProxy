@@ -1205,3 +1205,30 @@ Out of scope:
 - Tunnel Protocol or ALPN changes, peer byte-credit windows, weighted/deficit
   scheduling, embedded remote write/storage, dashboards, paging, public
   operations access, and changes to default queue capacity.
+
+## Session 38 — Bounded Nonblocking Process Logging — complete
+
+Scope delivered:
+
+- Preserved synchronous stderr as the default and added strict opt-in
+  `TUNNELPROXY_LOG_BUFFER_CAPACITY` plus bounded
+  `TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS` configuration.
+- Added one process-wide FIFO and stderr worker. Events are formatted under a
+  16 KiB hard ceiling, admitted with nonblocking `try_send`, kept FIFO, and
+  dropped newest when full; oversized events are discarded whole.
+- Added a process-lifetime guard that drains healthy sinks and detaches a
+  blocked writer after the configured deadline. Agent, Edge, Control Plane,
+  and runnable examples retain it through process exit.
+- Exported fixed-cardinality nonblocking-enabled, capacity, accepted, dropped,
+  oversized, and write-failure metrics through all three operations endpoints.
+- Added fake healthy/failed/blocked sink tests and buffered text/JSON subprocess
+  coverage for all production binaries while preserving startup rollback and
+  secret-safe stderr. The workspace now contains 351 explicit tests.
+- Documented memory, loss, shutdown, scrape, and operator-owned retention
+  semantics and resolved DEBT-010 without embedding remote backend I/O.
+
+Out of scope:
+
+- Durable spooling, file rotation, remote log/metric shipping, dashboards,
+  paging, public operations access, protocol/schema changes, and hostname
+  lifecycle.

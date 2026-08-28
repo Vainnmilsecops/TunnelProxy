@@ -779,9 +779,10 @@ exits before component parsing, listener bind, or file mutation.
 **Consequences:** All runnable components and development examples have the
 same operational contract and can feed ordinary stderr collectors without a
 wire or domain schema change. Event authors remain responsible for excluding
-tokens, certificates, private keys, payloads, and bodies. The synchronous
-stderr sink has no rotation, durable retention, remote shipping, backpressure
-queue, dashboard, or alert policy; those remain under DEBT-010.
+tokens, certificates, private keys, payloads, and bodies. At Session 28 the
+synchronous stderr sink had no rotation, durable retention, remote shipping,
+backpressure queue, dashboard, or alert policy; ADR-038 later adds only the
+optional bounded queue and sink telemetry.
 
 ---
 
@@ -1020,3 +1021,29 @@ Operators can calculate current utilization without dynamic labels and can
 distinguish no-session from saturation by correlating readiness. The high-water
 mark remains process-lifetime state, counters reset on restart, and aggregate
 telemetry alone cannot justify peer byte credits or weighted scheduling.
+
+---
+
+## ADR-038 — Slow stderr is isolated by an opt-in bounded drop-newest worker
+
+**Status:** Accepted (Session 38).
+
+**Context:** The shared Session 28 subscriber writes synchronously to stderr.
+When a pipe or local collector is slow, formatting callers can block Tokio
+runtime threads. An unbounded asynchronous logger would move the outage into
+memory growth, while a durable/remote sink would couple TunnelProxy to an
+operator-specific backend.
+
+**Decision:** Preserve synchronous stderr by default. An explicit bounded
+capacity enables one FIFO and one stderr worker. Each event is formatted into
+a hard-bounded buffer; producers use nonblocking `try_send`, full queues drop
+the newest event, and oversized events are discarded whole. A lifetime guard
+drains only until a configured deadline and then detaches a blocked writer.
+Fixed-cardinality operations metrics expose capacity, accepted, dropped,
+oversized, and write-failure totals.
+
+**Consequences:** Slow stderr cannot indefinitely block enabled runtime paths,
+memory and shutdown latency have explicit ceilings, JSON Lines remain whole,
+and event loss is observable. Buffered mode may lose the newest events under
+pressure and is not durable. Rotation, retention, encryption, and remote
+shipping remain operator-owned; no Tunnel Protocol or snapshot schema changes.

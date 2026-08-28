@@ -94,13 +94,14 @@ HTTPS route remove/list options:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let log_format = match init_process_logging() {
-        Ok(format) => format,
+    let logging = match init_process_logging() {
+        Ok(logging) => logging,
         Err(error) => {
             eprintln!("failed to configure logging: {error}");
             return ExitCode::from(2);
         }
     };
+    let log_format = logging.format();
     let args: Vec<_> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
         Ok(command) => command,

@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Transport Capacity Telemetry & Operator Runbook** (Session 37).
+**Bounded Nonblocking Process Logging** (Session 38).
 
 ## Completed
 
@@ -345,6 +345,14 @@
 - Invalid logging configuration fails with exit code 2 before CLI-driven
   network binding or file mutation. JSON-mode argument failures omit multiline
   usage text so stderr remains parseable JSON Lines.
+- Synchronous stderr remains the compatibility default. Optional bounded
+  nonblocking mode formats whole events under a 16 KiB ceiling, uses a strict
+  drop-newest FIFO of at most 1024 events, and owns stderr on one worker thread.
+  Shutdown drain is bounded to 1..=5000 ms; a blocked writer is detached after
+  the deadline.
+- Agent, Edge, and Control Plane operations metrics expose fixed-cardinality
+  logging enabled/capacity, accepted, dropped, oversized, and write-failure
+  values without querying or writing the sink during a scrape.
 - The runnable Agent optionally binds a loopback-only, connection/header/time
   bounded HTTP/1.1 operations endpoint. `/healthz`, `/readyz`, and `/metrics`
   expose process liveness, established-session readiness, and connection
@@ -389,7 +397,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 343 explicit workspace tests are present; all prior behavior is preserved.
+- 351 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -416,13 +424,14 @@
 - Upstream connection pool (DEBT-008 open).
 - Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
-- Durable/remote-write telemetry, nonblocking log sinks,
-  dashboards, and alerting (DEBT-010 partially resolved).
+- Embedded durable/remote-write telemetry, log rotation/shipping, dashboards,
+  and alerting. Collection and retention remain operator-owned (DEBT-010
+  resolved by Sessions 37–38).
 
 ## Next planned session
 
-Session 38 has not been selected. Collect workload evidence using the Session
+Session 39 has not been selected. Collect workload evidence using the Session
 37 runbook before proposing peer-negotiated transport flow control. The next
-bounded slice may instead address the optional nonblocking telemetry/log sink
-or hostname lifecycle. Automatic allocation, HTTP/2, signed access URLs, and
-multi-edge ownership remain separate larger scopes.
+bounded slice may address hostname lifecycle or another open, measured debt.
+Automatic allocation, HTTP/2, signed access URLs, and multi-edge ownership
+remain separate larger scopes.

@@ -55,11 +55,34 @@ fn help_and_invalid_arguments_have_stable_exit_codes() {
 }
 
 #[test]
+fn buffered_text_and_json_errors_are_drained_before_exit() {
+    for format in ["text", "json"] {
+        let output = Command::new(binary())
+            .arg("serve")
+            .env("TUNNELPROXY_LOG_FORMAT", format)
+            .env("TUNNELPROXY_LOG_BUFFER_CAPACITY", "4")
+            .env("TUNNELPROXY_LOG_DRAIN_TIMEOUT_MS", "1000")
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if format == "json" {
+            let event: Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert_eq!(event["target"], "tunnelproxy_control_plane");
+        } else {
+            assert!(stderr.contains("invalid Control Plane CLI arguments"));
+        }
+    }
+}
+
+#[test]
 fn invalid_logging_configuration_stops_before_file_mutation() {
     let directory = temp_directory();
-    for (suffix, format, filter) in [
-        ("format", "secret-format", None),
-        ("filter", "json", Some("secret-filter[")),
+    for (suffix, format, filter, capacity) in [
+        ("format", "secret-format", None, None),
+        ("filter", "json", Some("secret-filter["), None),
+        ("buffer", "json", None, Some("secret-capacity")),
     ] {
         let database = directory.join(format!("must-not-exist-{suffix}.sqlite"));
         let token = directory.join(format!("must-not-exist-{suffix}.token"));
@@ -79,6 +102,9 @@ fn invalid_logging_configuration_stops_before_file_mutation() {
             .env("TUNNELPROXY_LOG_FORMAT", format);
         if let Some(filter) = filter {
             command.env("RUST_LOG", filter);
+        }
+        if let Some(capacity) = capacity {
+            command.env("TUNNELPROXY_LOG_BUFFER_CAPACITY", capacity);
         }
         let result = command.output().unwrap();
         assert_eq!(result.status.code(), Some(2));
