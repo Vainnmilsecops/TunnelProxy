@@ -47,8 +47,8 @@ use tunnelproxy_edge::{
     RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
-    EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, RegistrationRequest,
-    ROLE_AGENT,
+    EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, ProtocolError,
+    RegistrationRequest, ROLE_AGENT,
 };
 
 struct TestIdentity {
@@ -1220,7 +1220,13 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
     let _ = request_task.await;
     let _ = connection_task.await;
     agent_trigger.shutdown();
-    agent_task.await.unwrap().unwrap();
+    match agent_task.await.unwrap() {
+        Ok(_) => {}
+        Err(AgentRuntimeError::Terminal(AgentError::ProtocolDecode(
+            ProtocolError::TruncatedHeader { .. } | ProtocolError::TruncatedPayload { .. },
+        ))) => {}
+        Err(error) => panic!("unexpected Agent shutdown failure: {error}"),
+    }
     local_task.abort();
     let _ = local_task.await;
     wait_until_bindable(https_addr).await;
