@@ -939,3 +939,27 @@ default behavior remains compatible, requests are never automatically
 replayed, and metrics remain fixed-cardinality. HTTP/2, pipelining guarantees,
 WebSocket/upgrade, CONNECT, distributed quotas, and multi-edge coordination
 remain outside this decision.
+
+---
+
+## ADR-035 — DATA writers use bounded per-stream round-robin scheduling
+
+**Status:** Accepted (Session 35).
+
+**Context:** The multiplexed writer had separate control and DATA channels, but
+all streams shared FIFO DATA service. A backlogged stream could occupy the
+queue ahead of later streams, and moving admitted frames into an additional
+scheduler must not silently multiply memory capacity. Unlimited control
+priority could also starve application DATA.
+
+**Decision:** Agent and Edge share a semaphore-backed DATA admission bound whose
+permit remains attached through channel, scheduler, and frame encoding. The
+writer groups DATA and END_STREAM by StreamId, preserves per-stream FIFO, and
+serves active streams round-robin. Control frames remain preferred for at most
+eight consecutive writes while DATA is queued.
+
+**Consequences:** Backlogged streams cannot monopolize frame service, half-close
+ordering is preserved, and the configured DATA bound remains global to the
+writer pipeline. This is local frame fairness, not byte fairness: no protocol
+fields, ALPN, peer credits, stream weights, or cross-process coordination are
+introduced.

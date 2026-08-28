@@ -67,6 +67,8 @@ async fn connect_as(edge_addr: SocketAddr, label: &str) -> tunnelproxy_agent::Ag
 }
 
 async fn spawn_harness(local_addr: SocketAddr, edge_config: MultiplexedEdgeConfig) -> Harness {
+    let data_queue_capacity = edge_config.data_queue_capacity;
+    let per_stream_queue_capacity = edge_config.per_stream_queue_capacity;
     let runtime = MultiplexedEdgeRuntime::bind(edge_config).await.unwrap();
     let edge_addr = runtime.agent_addr();
     let router = runtime.router();
@@ -80,6 +82,8 @@ async fn spawn_harness(local_addr: SocketAddr, edge_config: MultiplexedEdgeConfi
     let session_id = session.session_id;
     let mut agent_config = MultiplexedAgentConfig::new(local_addr);
     agent_config.connect_timeout = Duration::from_millis(300);
+    agent_config.data_queue_capacity = data_queue_capacity;
+    agent_config.per_stream_queue_capacity = per_stream_queue_capacity;
     agent_config.stream_idle_timeout = Duration::from_secs(2);
     let agent = tokio::spawn(session.run_multiplexed(agent_config));
     wait_until_registered(&router, session_id).await;
@@ -297,6 +301,50 @@ async fn eight_streams_run_concurrently_without_cross_talk() {
     for task in tasks {
         task.await.unwrap();
     }
+    timeout(Duration::from_secs(2), local)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!harness.edge.is_finished());
+    assert!(!harness.agent.is_finished());
+}
+
+#[tokio::test]
+async fn saturated_data_queues_preserve_all_stream_progress_and_heartbeat() {
+    let stream_count = 8;
+    let (local_addr, local) = spawn_echo_service(stream_count).await;
+    let mut config = fast_edge_config();
+    config.data_queue_capacity = 2;
+    config.per_stream_queue_capacity = 64;
+    config.stream_idle_timeout = Duration::from_secs(5);
+    let harness = spawn_harness(local_addr, config).await;
+    let mut tasks = Vec::new();
+
+    for index in 0..stream_count {
+        let client = route_client(&harness.router, harness.session_id)
+            .await
+            .unwrap();
+        let payload: Vec<u8> = (0..256 * 1024)
+            .map(|offset| ((offset + index * 29) % 251) as u8)
+            .collect();
+        tasks.push(tokio::spawn(async move {
+            let received = round_trip(client, payload.clone()).await;
+            assert!(
+                received == payload,
+                "stream {index} response mismatch: received {} of {} bytes",
+                received.len(),
+                payload.len()
+            );
+        }));
+    }
+
+    timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .expect("saturated fair DATA queues did not make bounded progress");
     timeout(Duration::from_secs(2), local)
         .await
         .unwrap()

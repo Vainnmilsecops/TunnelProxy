@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+mod bounded_fair_queue;
 mod credential_bundle;
 mod process_logging;
 mod public_hostname;
@@ -20,6 +21,11 @@ mod tls_reload;
 pub use credential_bundle::{
     publish_agent_credential_bundle, replace_secret_file, AgentCredentialPaths,
     CredentialBundleError,
+};
+
+pub use bounded_fair_queue::{
+    bounded_queue_channel, BoundedFairQueue, BoundedQueueClosed, BoundedQueueItem,
+    BoundedQueueSender, FairQueueFull,
 };
 
 pub use process_logging::{
