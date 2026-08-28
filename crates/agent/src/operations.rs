@@ -547,6 +547,11 @@ fn render_transport_metrics(output: &mut String, transport: MultiplexTelemetrySn
             transport.data_pipeline_frames,
         ),
         (
+            "tunnelproxy_agent_transport_data_pipeline_capacity_frames",
+            "gauge",
+            transport.data_pipeline_capacity_frames,
+        ),
+        (
             "tunnelproxy_agent_transport_peak_data_pipeline_frames",
             "gauge",
             transport.peak_data_pipeline_frames,
@@ -618,6 +623,7 @@ mod tests {
                 sent_data_bytes: 17,
                 received_data_frames: 3,
                 received_data_bytes: 29,
+                data_pipeline_capacity_frames: 128,
                 ..MultiplexTelemetrySnapshot::default()
             },
             OperationsCounterSnapshot {
@@ -636,6 +642,7 @@ mod tests {
             .contains("tunnelproxy_agent_transport_data_frames_total{direction=\"sent\"} 2"));
         assert!(rendered
             .contains("tunnelproxy_agent_transport_data_bytes_total{direction=\"received\"} 29"));
+        assert!(rendered.contains("tunnelproxy_agent_transport_data_pipeline_capacity_frames 128"));
         assert!(!rendered.contains("agent-dev"));
         assert!(!rendered.contains("tunnel-dev"));
         assert!(!rendered.contains("127.0.0.1"));

@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Multiplexed Transport Fairness Telemetry** (Session 36).
+**Transport Capacity Telemetry & Operator Runbook** (Session 37).
 
 ## Completed
 
@@ -68,9 +68,10 @@
   priority with a bounded eight-frame control burst.
 - Agent and Edge aggregate fixed-cardinality multiplexed telemetry for active
   and peak streams, directional DATA frames/bytes, admission waits, current
-  and peak writer-pipeline depth, locally initiated flow-control resets, and
-  control-burst DATA yields. Queue and stream gauges use RAII and return to
-  zero on close/error paths.
+  and peak writer-pipeline depth, live aggregate writer-pipeline capacity,
+  locally initiated flow-control resets, and control-burst DATA yields. Queue,
+  stream, and session-capacity gauges use RAII and return to zero on
+  close/error paths.
 - Per-stream inbound queues, a 16 KiB DATA-frame limit, bounded session queues,
   capacity admission, and open/connect/idle deadlines bound memory and failure
   scope.
@@ -384,7 +385,11 @@
   on rejection, and terminate supervision after certificate expiry.
 - Edge readiness and fixed-cardinality metrics report dynamic route source,
   catalog version, enabled route count, and fail closed after expiry.
-- 341 explicit workspace tests are present; all prior behavior is preserved.
+- Operator-owned collection, retention, query, and alert-baseline guidance
+  documents loopback scrape topology, process-restart semantics, capacity
+  utilization, privacy constraints, and the evidence required before adding
+  peer credits.
+- 343 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -398,7 +403,8 @@
   rollback protection.
 - Peer-negotiated credit/window flow control and weighted byte fairness.
   Session 35 implements bounded process-local frame round-robin scheduling;
-  Session 36 exposes its saturation/fairness measurements.
+  Sessions 36–37 expose saturation/fairness measurements plus their live
+  capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
 - Automatic public port/hostname allocation. Durable operator-managed HTTPS
   route distribution and activation are implemented.
@@ -415,8 +421,8 @@
 
 ## Next planned session
 
-Session 37 has not been selected. The next plan should use Session 36 metrics
-to decide whether peer-negotiated transport flow control is justified, or
-choose operator-owned telemetry collection guidance or the next hostname
-lifecycle slice. Automatic allocation, HTTP/2, signed access URLs, and
+Session 38 has not been selected. Collect workload evidence using the Session
+37 runbook before proposing peer-negotiated transport flow control. The next
+bounded slice may instead address the optional nonblocking telemetry/log sink
+or hostname lifecycle. Automatic allocation, HTTP/2, signed access URLs, and
 multi-edge ownership remain separate larger scopes.

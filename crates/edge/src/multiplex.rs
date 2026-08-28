@@ -16,8 +16,8 @@ use tracing::{info, warn};
 
 use tunnelproxy_common::{
     bounded_queue_channel_with_telemetry, BoundedFairQueue, BoundedQueueItem, BoundedQueueSender,
-    MultiplexTelemetry, MultiplexTelemetrySnapshot, RuntimeShutdownConfig, RuntimeShutdownOutcome,
-    ShutdownSignal, TunnelId,
+    MultiplexSessionCapacityGuard, MultiplexTelemetry, MultiplexTelemetrySnapshot,
+    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
 };
 use tunnelproxy_control_plane::{
     AuthorizationSnapshotSubscription, CertificateFingerprint, SnapshotSourceClosed,
@@ -999,6 +999,7 @@ async fn run_edge_session(
     mut command_rx: mpsc::Receiver<SessionCommand>,
     telemetry: MultiplexTelemetry,
 ) -> Result<(), AgentTransportError> {
+    let session_capacity = telemetry.session_capacity(config.data_queue_capacity);
     let (mut reader, writer) = tokio::io::split(socket);
     let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity);
     let data_capacity = NonZeroUsize::new(config.data_queue_capacity)
@@ -1011,6 +1012,7 @@ async fn run_edge_session(
         data_rx,
         data_capacity,
         telemetry.clone(),
+        session_capacity,
     ));
     let (event_tx, mut event_rx) = mpsc::channel(config.max_streams_per_session);
     let mut streams: HashMap<StreamId, mpsc::Sender<Frame>> = HashMap::new();
@@ -1314,6 +1316,7 @@ async fn writer_actor(
     mut data_rx: mpsc::Receiver<BoundedQueueItem<Frame>>,
     data_capacity: NonZeroUsize,
     telemetry: MultiplexTelemetry,
+    _session_capacity: MultiplexSessionCapacityGuard,
 ) -> Result<(), AgentTransportError> {
     let mut control_open = true;
     let mut data_open = true;
@@ -1532,6 +1535,7 @@ mod tests {
             data_rx,
             data_capacity,
             telemetry.clone(),
+            telemetry.session_capacity(data_capacity.get()),
         ));
         let mut decoder = FrameDecoder::new();
         let mut output = Vec::new();

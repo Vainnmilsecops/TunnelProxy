@@ -20,6 +20,7 @@ struct MultiplexTelemetryInner {
     sent_data_bytes: AtomicU64,
     received_data_frames: AtomicU64,
     received_data_bytes: AtomicU64,
+    data_pipeline_capacity_frames: AtomicU64,
     flow_control_resets: AtomicU64,
     control_burst_yields: AtomicU64,
 }
@@ -35,6 +36,7 @@ pub struct MultiplexTelemetrySnapshot {
     pub received_data_bytes: u64,
     pub data_admission_waits: u64,
     pub data_pipeline_frames: u64,
+    pub data_pipeline_capacity_frames: u64,
     pub peak_data_pipeline_frames: u64,
     pub flow_control_resets: u64,
     pub control_burst_yields: u64,
@@ -42,6 +44,14 @@ pub struct MultiplexTelemetrySnapshot {
 
 impl MultiplexTelemetry {
     pub fn snapshot(&self) -> MultiplexTelemetrySnapshot {
+        // Capacity is published before a session can admit DATA and released
+        // only after its queue has drained. Reading it first preserves the
+        // observable `pipeline_frames <= capacity_frames` relationship while
+        // sessions concurrently start or stop.
+        let data_pipeline_capacity_frames = self
+            .inner
+            .data_pipeline_capacity_frames
+            .load(Ordering::Acquire);
         let queue = self.data_queue.snapshot();
         MultiplexTelemetrySnapshot {
             active_streams: self.inner.active_streams.load(Ordering::Relaxed),
@@ -52,6 +62,7 @@ impl MultiplexTelemetry {
             received_data_bytes: self.inner.received_data_bytes.load(Ordering::Relaxed),
             data_admission_waits: to_u64(queue.admission_waits),
             data_pipeline_frames: to_u64(queue.admitted_items),
+            data_pipeline_capacity_frames,
             peak_data_pipeline_frames: to_u64(queue.peak_admitted_items),
             flow_control_resets: self.inner.flow_control_resets.load(Ordering::Relaxed),
             control_burst_yields: self.inner.control_burst_yields.load(Ordering::Relaxed),
@@ -60,6 +71,22 @@ impl MultiplexTelemetry {
 
     pub fn data_queue_telemetry(&self) -> BoundedQueueTelemetry {
         self.data_queue.clone()
+    }
+
+    /// Registers one live session's DATA pipeline capacity.
+    ///
+    /// Dropping the returned guard removes the same capacity from the
+    /// process-local aggregate, including close, reconnect, error, and
+    /// shutdown paths.
+    pub fn session_capacity(&self, frames: usize) -> MultiplexSessionCapacityGuard {
+        let frames = to_u64(frames);
+        self.inner
+            .data_pipeline_capacity_frames
+            .fetch_add(frames, Ordering::AcqRel);
+        MultiplexSessionCapacityGuard {
+            inner: Arc::clone(&self.inner),
+            frames,
+        }
     }
 
     pub fn stream_opened(&self) -> MultiplexStreamGuard {
@@ -110,6 +137,20 @@ impl Drop for MultiplexStreamGuard {
     }
 }
 
+/// Live-session DATA capacity guard.
+pub struct MultiplexSessionCapacityGuard {
+    inner: Arc<MultiplexTelemetryInner>,
+    frames: u64,
+}
+
+impl Drop for MultiplexSessionCapacityGuard {
+    fn drop(&mut self) {
+        self.inner
+            .data_pipeline_capacity_frames
+            .fetch_sub(self.frames, Ordering::Release);
+    }
+}
+
 fn update_peak(peak: &AtomicU64, candidate: u64) {
     let mut current = peak.load(Ordering::Relaxed);
     while candidate > current {
@@ -156,5 +197,20 @@ mod tests {
         drop(second);
         assert_eq!(telemetry.snapshot().active_streams, 0);
         assert_eq!(telemetry.snapshot().peak_active_streams, 2);
+    }
+
+    #[test]
+    fn live_session_capacity_is_aggregated_and_released_by_raii() {
+        let telemetry = MultiplexTelemetry::default();
+        let first = telemetry.session_capacity(2);
+        assert_eq!(telemetry.snapshot().data_pipeline_capacity_frames, 2);
+
+        let second = telemetry.session_capacity(5);
+        assert_eq!(telemetry.snapshot().data_pipeline_capacity_frames, 7);
+
+        drop(first);
+        assert_eq!(telemetry.snapshot().data_pipeline_capacity_frames, 5);
+        drop(second);
+        assert_eq!(telemetry.snapshot().data_pipeline_capacity_frames, 0);
     }
 }

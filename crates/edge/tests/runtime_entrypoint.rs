@@ -659,6 +659,7 @@ async fn concurrent_transport_load_is_visible_without_identity_or_payload_labels
         assert!(metrics.contains(&format!("{prefix}_data_frames_total")));
         assert!(metrics.contains(&format!("{prefix}_peak_data_pipeline_frames")));
         assert!(metrics.contains(&format!("{prefix}_data_pipeline_frames 0")));
+        assert!(metrics.contains(&format!("{prefix}_data_pipeline_capacity_frames 2")));
         assert!(metrics.contains(&format!("{prefix}_data_admission_waits_total")));
         assert!(!metrics.contains("agent-dev"));
         assert!(!metrics.contains("tunnel-dev"));

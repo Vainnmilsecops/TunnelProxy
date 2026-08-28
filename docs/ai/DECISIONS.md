@@ -992,3 +992,31 @@ labels. Metrics aggregate reconnects and Edge sessions and reset on process
 restart. They provide evidence for a later flow-control decision but do not
 add peer credits, byte fairness, protocol fields, remote persistence,
 dashboards, or alerts.
+
+---
+
+## ADR-037 — Live session capacity is an RAII aggregate; collection stays operator-owned
+
+**Status:** Accepted (Session 37).
+
+**Context:** Pipeline depth and admission waits from Session 36 have no useful
+utilization denominator when the number of live sessions changes. Exporting
+configured process capacity would incorrectly report capacity while Agent is
+offline, while per-session labels would expose identity and create cardinality
+risk. Embedding remote-write/backend I/O would also couple request routing to
+an operator-specific observability system.
+
+**Decision:** Every established multiplex session registers its configured
+DATA queue slots in the shared process telemetry before queue creation and
+holds an RAII capacity guard until its writer pipeline is gone. Agent and Edge
+export the resulting fixed-cardinality capacity gauge through their existing
+loopback endpoints. Collection, retention, PromQL evaluation, dashboards, and
+paging remain external operator responsibilities documented in the operations
+runbook.
+
+**Consequences:** Agent capacity becomes zero across disconnect/backoff and is
+restored on reconnect; Edge capacity is the sum of live session bounds.
+Operators can calculate current utilization without dynamic labels and can
+distinguish no-session from saturation by correlating readiness. The high-water
+mark remains process-lifetime state, counters reset on restart, and aggregate
+telemetry alone cannot justify peer byte credits or weighted scheduling.

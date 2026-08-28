@@ -87,6 +87,8 @@ async fn readiness_tracks_offline_connected_reconnect_and_ordered_shutdown() {
     wait_for_status(operations_addr, 503).await;
     let (edge_trigger, edge_task) = start_edge(edge_addr).await;
     wait_for_status(operations_addr, 200).await;
+    let metrics = request(operations_addr, "/metrics").await.unwrap();
+    assert!(metrics.contains("tunnelproxy_agent_transport_data_pipeline_capacity_frames 128"));
 
     edge_trigger.shutdown();
     edge_task.await.unwrap();
@@ -94,6 +96,7 @@ async fn readiness_tracks_offline_connected_reconnect_and_ordered_shutdown() {
     let metrics = request(operations_addr, "/metrics").await.unwrap();
     assert!(metrics.contains("tunnelproxy_agent_disconnects_total 1"));
     assert!(metrics.contains("tunnelproxy_agent_connection_failures_total"));
+    assert!(metrics.contains("tunnelproxy_agent_transport_data_pipeline_capacity_frames 0"));
     assert!(!metrics.contains("agent-dev"));
     assert!(!metrics.contains("tunnel-dev"));
     assert!(!metrics.contains(&edge_addr.to_string()));
@@ -102,6 +105,7 @@ async fn readiness_tracks_offline_connected_reconnect_and_ordered_shutdown() {
     wait_for_status(operations_addr, 200).await;
     let metrics = request(operations_addr, "/metrics").await.unwrap();
     assert!(metrics.contains("tunnelproxy_agent_reconnects_total 1"));
+    assert!(metrics.contains("tunnelproxy_agent_transport_data_pipeline_capacity_frames 128"));
 
     control.begin_draining();
     wait_for_status(operations_addr, 503).await;

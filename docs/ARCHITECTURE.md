@@ -614,6 +614,25 @@ Tunnel Protocol v2 frame, payload, handshake, or ALPN value changes; remote
 write, durable history, alerting, peer credits, and weighted byte scheduling
 remain outside this slice.
 
+### 2.35 Live transport capacity and operator interpretation (Session 37)
+
+Each running multiplex session registers its configured DATA writer capacity
+with the process aggregate before creating its bounded queue. An RAII guard
+removes exactly that capacity only after the session writer and its admitted
+items have drained. Agent therefore reports zero capacity while offline and
+its configured capacity while connected; Edge reports the sum across live
+sessions. Snapshot ordering preserves the observable relationship that current
+pipeline occupancy cannot exceed live aggregate capacity.
+
+The Agent and Edge loopback exporters expose the aggregate as
+`*_transport_data_pipeline_capacity_frames` without a session or identity
+label. Operators calculate utilization against current pipeline frames and
+correlate waits, resets, fairness yields, readiness, and reconnects. The
+operator runbook owns scrape topology, retention, baseline queries, and the
+decision threshold for a future flow-control proposal. TunnelProxy still does
+not perform remote write, durable metric storage, dashboard rendering, or
+paging, and Tunnel Protocol v2 is unchanged.
+
 ### 2.24 Bounded HTTP request-rate admission (Session 26)
 
 After TLS and exact Host/SNI/absolute-authority validation, but before reading
