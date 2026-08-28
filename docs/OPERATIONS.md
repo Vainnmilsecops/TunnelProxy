@@ -184,3 +184,37 @@ overhead. Increase capacity only after confirming the process memory budget.
 The worker is not a durable spool. Collection, rotation, retention, encryption,
 remote shipping, and access policy remain responsibilities of the local
 collector and its operator-owned backend.
+
+## Managed hostname prerequisites and rollback
+
+Before allocation, provision wildcard DNS and a matching public certificate
+for the chosen base domain. For `tunnelproxy.dev`, both
+`*.tunnelproxy.dev` DNS and TLS coverage must already direct clients to the
+Edge HTTPS listener. TunnelProxy does not modify DNS or request certificates.
+
+Allocate only after the target TunnelId is present in the authorization
+snapshot and the corresponding Agent can connect. The new route is enabled
+immediately and is published by the existing Control Plane refresh loop:
+
+```text
+tunnelproxy-control-plane https-hostname-allocate \
+  --database state.sqlite \
+  --base-domain tunnelproxy.dev \
+  --tunnel-id tunnel-a
+```
+
+Record the returned hostname and catalog version in the operator change log.
+Repeating the same allocation is safe and returns `changed=false`. A collision,
+catalog/version limit, entropy failure, database failure, or base-domain
+conflict leaves both the route and catalog version unchanged.
+
+Rollback with `https-hostname-release --database state.sqlite --tunnel-id
+tunnel-a`. Release removes the route transactionally; after Edge observes the
+new catalog version, exact-host routing fails closed. An absent release is a
+successful no-op. Generic route upsert/remove commands intentionally reject a
+managed hostname, so use the lifecycle command rather than editing its route.
+
+Allocation hostnames and TunnelIds are operator-visible identity, not metric
+labels. Do not add either to Prometheus labels or emit database paths through
+failure messages. Protect database access because these CLI commands are the
+current administrative boundary; there is no authenticated remote admin API.

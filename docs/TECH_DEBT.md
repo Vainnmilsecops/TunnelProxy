@@ -288,6 +288,27 @@
 
 ## Resolved items
 
+### DEBT-024 — Durable HTTPS routes require operator-chosen hostnames — resolved
+
+- **Introduced in:** Session 31
+- **Resolved in:** Session 39
+- **Category:** product / reliability
+- **Impact:** medium for the future one-command HTTP tunnel workflow
+- **Rationale:** Sessions 31–32 established exact durable route ownership and
+  authenticated Edge distribution but required an operator to choose every
+  hostname. Adding allocation before transactional provenance and collision
+  semantics were explicit could have created orphaned or silently reassigned
+  routes.
+- **Resolution:** Session 39 adds one durable managed hostname per TunnelId
+  under an operator-supplied base domain. A bounded 128-bit OS-random allocator,
+  ownership metadata, enabled route, and catalog version share one immediate
+  transaction; retries, release, restart, migration, and generic-mutation
+  conflicts are covered. The existing authenticated route stream distributes
+  the result without a protocol change.
+- **Residual boundary:** Agent-facing requests, the end-user CLI workflow,
+  wildcard DNS/TLS automation, rename/rotation, and custom domains remain
+  future product surfaces rather than implicit behavior of this allocator.
+
 ### DEBT-002 — No CI configuration — resolved
 
 - **Introduced in:** Session 01

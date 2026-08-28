@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Nonblocking Process Logging** (Session 38).
+**Durable Managed Hostname Allocation** (Session 39).
 
 ## Completed
 
@@ -381,6 +381,15 @@
 - Control Plane CLI commands `https-route-upsert`, `https-route-remove`, and
   `https-route-list` validate before storage mutation, produce deterministic
   secret-safe output, and preserve the existing snapshot schema/state.
+- Control Plane CLI commands `https-hostname-allocate` and
+  `https-hostname-release` own one durable managed hostname per TunnelId under
+  an explicit base domain. Allocation uses 128 bits of OS randomness in a
+  DNS-safe `tp-<hex>` label, retries collisions at most 16 times, and is
+  idempotent for the same tunnel/base-domain pair.
+- Managed allocation metadata and its enabled route are committed in the same
+  immediate SQLite transaction as one catalog-version increment. Release is
+  likewise atomic; legacy/manual routes remain operator-owned, and generic
+  route commands cannot overwrite or remove managed names.
 - The Control Plane may expose an independent bounded mutual-TLS route service
   using a strict versioned full-catalog protocol and latest-value publication.
 - Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
@@ -397,7 +406,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 351 explicit workspace tests are present; all prior behavior is preserved.
+- 357 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -414,8 +423,9 @@
   Sessions 36–37 expose saturation/fairness measurements plus their live
   capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
-- Automatic public port/hostname allocation. Durable operator-managed HTTPS
-  route distribution and activation are implemented.
+- Agent-facing automatic public port/hostname requests and CLI orchestration.
+  Durable operator-invoked managed-hostname allocation, route distribution,
+  and Edge activation are implemented; DNS/TLS automation is not.
 - HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -430,8 +440,8 @@
 
 ## Next planned session
 
-Session 39 has not been selected. Collect workload evidence using the Session
-37 runbook before proposing peer-negotiated transport flow control. The next
-bounded slice may address hostname lifecycle or another open, measured debt.
-Automatic allocation, HTTP/2, signed access URLs, and multi-edge ownership
-remain separate larger scopes.
+Session 40 has not been selected. Collect workload evidence using the Session
+37 runbook before proposing peer-negotiated transport flow control. A later
+bounded slice may expose managed allocation through an authenticated
+Agent-facing API, but DNS/TLS automation, the complete `tunnelproxy http` UX,
+HTTP/2, signed access URLs, and multi-edge ownership remain separate scopes.

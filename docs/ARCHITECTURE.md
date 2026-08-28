@@ -846,6 +846,35 @@ their negotiated generation; new connections and reconnects use the latest
 published generation. Route catalog versions and TLS generations remain
 independent domains.
 
+### 2.37 Durable managed hostname lifecycle (Session 39)
+
+Managed hostname provenance is Control Plane storage metadata, not Edge route
+state. A separate `managed_https_hostnames` table maps one durable TunnelId to
+one exact enabled route and its canonical base domain. Existing route rows have
+no mapping and therefore remain operator-owned after migration. A foreign key
+ties managed ownership to the route while repository validation also checks
+canonical values, exact TunnelId/status agreement, and the `tp-<32 hex>` label
+shape on every open and mutation.
+
+Allocation takes an immediate SQLite transaction, returns an existing mapping
+for the same tunnel/base-domain pair, or checks capacity and the next catalog
+version before requesting randomness. It encodes 16 OS-random bytes into a
+lowercase DNS label and checks the complete hostname against all routes,
+retrying at most 16 collisions. The enabled route, ownership metadata, and one
+catalog-version increment commit together. Entropy, collision, capacity,
+version, storage, or validation failure rolls the transaction back. Release
+deletes metadata first, then its exact route, and advances the catalog once;
+an absent mapping is an idempotent no-op. Generic route mutation rejects names
+with managed ownership.
+
+The existing `TPR1` full-catalog stream needs no new field: Edge only requires
+the exact hostname, TunnelId, and enabled status for request routing. The
+Control Plane refresh loop therefore distributes allocation and release like
+any other catalog update, and Edge applies or removes the exact route without
+restart or hot-path storage access. Wildcard DNS/TLS provisioning,
+Agent-facing allocation, rename/rotation, custom domains, and multi-edge
+ownership remain separate control-plane concerns.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

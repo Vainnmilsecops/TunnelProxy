@@ -19,8 +19,9 @@ use tunnelproxy_control_plane::{
     HttpsRouteDistributionServer, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
     HttpsRouteServerError, HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig,
     HttpsRouteServerTlsReloadRuntime, HttpsRouteSourceHealth, HttpsRouteStatus,
-    PersistentHttpsRouteCatalog, SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
-    SnapshotVersion, SqliteSnapshotRepository, VersionedAuthorizationSnapshot,
+    ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain, PersistentHttpsRouteCatalog,
+    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig, SnapshotVersion,
+    SqliteSnapshotRepository, VersionedAuthorizationSnapshot,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -329,15 +330,41 @@ async fn control_plane_runtime_refreshes_and_supervises_route_distribution() {
     let (client_trigger, client_signal) = shutdown_channel();
     let client_task = tokio::spawn(client.run_until_shutdown(client_signal));
 
-    repository
-        .upsert(&route("tunnel-b", HttpsRouteStatus::Enabled))
+    let managed_tunnel = TunnelId::new("tunnel-managed").unwrap();
+    let allocated = repository
+        .allocate_managed_hostname(
+            &managed_tunnel,
+            &ManagedHostnameBaseDomain::new("example.test").unwrap(),
+        )
         .unwrap();
+    let ManagedHostnameAllocationOutcome::Allocated {
+        hostname, current, ..
+    } = allocated
+    else {
+        panic!("first managed hostname allocation must change the catalog");
+    };
+    assert_eq!(current.get(), 3);
     wait_for_version(&mut routes, 3).await;
+    assert!(routes.current().routes().iter().any(|candidate| {
+        candidate.hostname == hostname
+            && candidate.tunnel_id == managed_tunnel
+            && candidate.status == HttpsRouteStatus::Enabled
+    }));
+
+    repository
+        .release_managed_hostname(&managed_tunnel)
+        .unwrap();
+    wait_for_version(&mut routes, 4).await;
+    assert!(routes
+        .current()
+        .routes()
+        .iter()
+        .all(|candidate| candidate.hostname != hostname));
 
     server_trigger.shutdown();
     let outcome = server_task.await.unwrap().unwrap();
     assert_eq!(outcome.https_route_addr, Some(route_addr));
-    assert_eq!(outcome.applied_route_refreshes, 1);
+    assert_eq!(outcome.applied_route_refreshes, 2);
     client_trigger.shutdown();
     client_task.await.unwrap().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
