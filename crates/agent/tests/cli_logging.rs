@@ -63,6 +63,19 @@ fn help_remains_plain_stdout_in_json_mode() {
 }
 
 #[test]
+fn managed_http_help_and_configuration_errors_preserve_cli_contracts() {
+    let help = run(&["http", "--help"], "json", "info");
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    assert!(stdout.contains("tunnelproxy-agent http <port> [OPTIONS]"));
+    assert!(stdout.contains("managed hostname remains allocated on exit"));
+    assert!(help.stderr.is_empty());
+
+    let invalid = run(&["http", "0"], "json", "info");
+    assert_error_event(&invalid, "tunnelproxy_agent");
+}
+
+#[test]
 fn invalid_operations_config_fails_before_outbound_connect() {
     let edge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     edge.set_nonblocking(true).unwrap();

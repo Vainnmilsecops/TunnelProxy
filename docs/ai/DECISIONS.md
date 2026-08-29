@@ -1110,9 +1110,10 @@ connect, handshake, and request deadlines.
 managed-hostname lifecycle without database access, arbitrary namespace
 selection, or Edge hot-path lookups. Retries remain idempotent and Edge route
 distribution retains its existing protocol. Static hostname-service TLS
-configuration (resolved by Session 41), wildcard DNS/certificate provisioning, the complete
-`tunnelproxy http` orchestration, custom domains, and multi-edge coordination
-remain outside this decision.
+configuration (resolved by Session 41) and single-process Agent orchestration
+(resolved by Session 42) build on this boundary. Wildcard DNS/certificate
+provisioning, custom domains, and multi-edge coordination remain outside this
+decision.
 
 ---
 
@@ -1141,3 +1142,33 @@ credentials stop authenticating on new connections once their CA is removed.
 Manifest/file publication ordering and CA overlap remain operator policy;
 CRL/OCSP, protected key custody, DNS/public-certificate automation, and active
 TLS renegotiation remain outside this decision.
+
+---
+
+## ADR-042 — Managed HTTP orchestration preserves durable hostname lifetime
+
+**Status:** Accepted (Session 42).
+
+**Context:** The Agent could request a durable hostname and could independently
+run a reconnecting tunnel, but operators had to coordinate two commands with
+matching credentials and identifiers. Automatically releasing a new hostname
+when a later client-side phase failed would make ambiguous network outcomes
+destructive and change the public URL across ordinary restart/recovery.
+
+**Decision:** Add `tunnelproxy-agent http <port>` as process composition over
+the existing `TPH1` client and Protocol v2 runtime. It accepts a non-zero
+loopback port, requires complete Edge and hostname-service mTLS inputs, and
+validates all runtime configuration before allocation. Startup performs one
+idempotent Allocate with the same AgentId/TunnelId, then starts the normal
+supervisor. A shutdown-aware observer prints one stable mapping after runtime
+state first becomes `Connected`. No shutdown or transport failure sends an
+implicit Release.
+
+**Consequences:** One process now joins durable route intent and live local
+forwarding without a new wire format, database lookup on ingress, or separate
+reconnect policy. Repeated runs reuse the hostname and offline tunnels fail
+closed while retaining their URL. The printed mapping is not a DNS, public
+certificate, Edge-catalog acknowledgement, local-application, or external
+reachability probe. Explicit release, operator-provisioned wildcard DNS/TLS,
+the short `tunnelproxy` executable/config profile, custom domains, and
+multi-edge ownership remain separate concerns.

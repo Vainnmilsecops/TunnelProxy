@@ -72,6 +72,10 @@ correct agent, which in turn proxies them into the local service.
   mTLS/ALPN, exact certificate/AgentId/TunnelId authorization, server-owned
   base domains, durable-before-live publication, atomic server TLS/Agent-CA
   rotation, and Agent allocate/release commands.
+- A managed HTTP Agent command that validates all local, Edge, hostname, and
+  TLS configuration before allocation, idempotently creates or reuses the
+  durable hostname, starts the reconnecting Agent runtime, and prints the
+  public URL once Protocol v2 registration succeeds.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, HTTPS route, and Agent hostname transports with last-known-good
   rollback, expiry enforcement, and static Agent-certificate authorization
@@ -83,8 +87,8 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
-- Complete `tunnelproxy http` orchestration, custom-domain administration, DNS
-  or certificate automation, and HTTP/2.
+- The final short `tunnelproxy http` executable/config-profile UX,
+  custom-domain administration, DNS or certificate automation, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA
@@ -143,20 +147,33 @@ bounded loopback health/readiness and fixed-cardinality Prometheus metrics. See
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for collection, alert baselines, and
 capacity interpretation.
 
-## Future UX (not implemented yet)
+## Managed HTTP orchestration
 
-Eventually, exposing a local port should be as simple as:
+With operator-provisioned wildcard DNS/public TLS and the authenticated
+services already running, one Agent process can allocate or reuse its hostname
+and expose a loopback HTTP port:
 
 ```text
-$ tunnelproxy http 3000
-https://blue-cat.tunnelproxy.dev -> http://127.0.0.1:3000
+tunnelproxy-agent http 3000 \
+  --edge edge.example.test:7100 \
+  --hostname-server control.example.test:7400 \
+  --hostname-ca control-plane-ca.pem \
+  --hostname-server-name control.example.test \
+  --tls-ca edge-ca.pem \
+  --tls-client-cert agent.pem \
+  --tls-client-key agent-key.pem \
+  --tls-server-name edge.example.test \
+  --agent-id agent-a \
+  --tunnel-id tunnel-a
+https://tp-0123456789abcdef0123456789abcdef.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
-This end-user command does not work yet. Session 25 provides the Edge ingress
-path, Sessions 31–32 provide durable route intent and distribution, and
-Session 40 provides authenticated Agent-facing allocate/release commands over
-a dedicated Control Plane service. The single-command local-port orchestration,
-DNS provisioning, and certificate automation remain future work.
+The URL is printed once the allocation response has durably published the
+catalog and the Agent transport is connected. Shutdown and reconnect never
+release or rename the hostname; use `hostname-release` explicitly. This is not
+an external reachability probe and does not create DNS records or public
+certificates. A persisted account/config profile and the shorter
+`tunnelproxy http 3000` packaging remain future ergonomics.
 
 ## Repository structure
 
@@ -244,6 +261,7 @@ and Definition of Done.
 | 39 _(complete)_ | durable managed-hostname allocation and release lifecycle |
 | 40 _(complete)_ | authenticated Agent managed-hostname lifecycle service |
 | 41 _(complete)_ | atomic TLS and Agent-CA rotation for the hostname service |
+| 42 _(complete)_ | single-process managed HTTP hostname and Agent orchestration |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

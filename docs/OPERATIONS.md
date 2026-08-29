@@ -237,6 +237,24 @@ rollback, issue `hostname-release`, record the returned catalog version, and
 confirm Edge route-source/catalog metrics have advanced before considering the
 hostname withdrawn everywhere.
 
+### Managed HTTP Agent lifecycle
+
+`tunnelproxy-agent http <port>` validates its complete runtime and TLS inputs,
+binds any requested loopback operations listener, and only then requests the
+managed hostname. It emits `managed_http_allocation_started`,
+`managed_http_hostname_published`, and `managed_http_ready` structured events.
+The stable public mapping is the only stdout output and appears after the Agent
+transport becomes ready.
+
+Do not interpret that stdout line as an external availability check. Alert and
+debug the Control Plane route-source version, Edge route-source health, Agent
+readiness, DNS, and public certificate separately. Allocation is durable:
+normal shutdown, reconnect backoff, local-port refusal, and Agent runtime
+failure intentionally leave the route present but fail closed while its tunnel
+is offline. This makes restart URL-stable and avoids destructive rollback after
+an ambiguous client failure. Permanent withdrawal remains an explicit
+`hostname-release` operation.
+
 ### Hostname TLS and Agent-CA rotation
 
 Use an independent `--hostname-tls-reload-manifest` when the hostname endpoint

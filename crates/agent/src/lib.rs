@@ -23,7 +23,9 @@
 //! 13 adds reconnect, Session 14 adds mutual TLS, and Session 15 binds durable
 //! Agent/tunnel registration to the authenticated certificate. Session 29 adds
 //! a bounded loopback operations endpoint and connection-lifecycle metrics.
-//! The final `tunnelproxy http` UX remains out of scope. See
+//! Session 42 composes managed-hostname allocation with the runnable Agent in
+//! `tunnelproxy-agent http <port>`. Short executable/config-profile ergonomics
+//! remain out of scope. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
