@@ -1,8 +1,8 @@
-# `tunnelproxy-agent`
+# `tunnelproxy-agent` / `tunnelproxy`
 
-Future local TunnelProxy agent / CLI runtime.
+Local TunnelProxy Agent library and shared CLI runtime.
 
-## Responsibility (future)
+## Responsibility
 
 - Initiate outbound tunnel to Edge (INV-001).
 - Register tunnel metadata with the control plane.
@@ -35,5 +35,12 @@ certificate/authentication failures. Plaintext process configuration is limited
 to loopback. Session 15 sends bounded `AgentId`/`TunnelId` registration intent,
 classifies authorization rejection for reconnect, and preserves the durable
 tunnel identity across fresh ephemeral sessions. Persistent control-plane
-configuration, certificate lifecycle automation, and the final
-`tunnelproxy http` UX remain unimplemented.
+configuration. Sessions 40–42 add authenticated managed-hostname lifecycle and
+single-process HTTP orchestration. Session 43 moves the driver into the library
+so the backwards-compatible `tunnelproxy-agent` and canonical `tunnelproxy`
+wrappers cannot diverge, then adds strict bounded local config v1 and offline
+TLS validation. Automatic account/config provisioning, DNS/public-certificate
+automation, and external reachability probing remain unimplemented.
+
+See [`../../docs/AGENT_CONFIG.md`](../../docs/AGENT_CONFIG.md) for the local
+config schema and platform path resolution.

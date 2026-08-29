@@ -1,6 +1,7 @@
 [package]
 name = "tunnelproxy-agent"
 description = "TunnelProxy local agent / CLI runtime."
+autobins = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,11 +24,20 @@ bytes = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tunnelproxy-protocol = { path = "../protocol" }
 tunnelproxy-common = { path = "../common" }
 
+[[bin]]
+name = "tunnelproxy-agent"
+path = "src/bin/tunnelproxy-agent.rs"
+
+[[bin]]
+name = "tunnelproxy"
+path = "src/bin/tunnelproxy.rs"
+
 [dev-dependencies]
-serde_json = { workspace = true }
 # Used only by the in-crate integration tests that drive the edge
 # listener and the agent client together.
 tunnelproxy-edge = { path = "../edge" }

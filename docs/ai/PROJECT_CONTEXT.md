@@ -73,15 +73,17 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-The short `tunnelproxy http` executable/config-profile UX, DNS/TLS automation,
-custom domains, dashboard, billing, distributed/shared request-rate
+Automated account provisioning, DNS/TLS automation, custom domains, dashboard,
+billing, distributed/shared request-rate
 coordination, request inspection, stream replay, protected issuer custody,
 multi-edge ownership, and cloud deployment are explicitly **not implemented**.
 Sessions 39–42 provide
 durable managed-hostname allocation plus authenticated Agent-facing
 allocate/release and independent atomic hostname server identity/Agent-CA
 rotation on the existing route catalog, followed by single-process
-`tunnelproxy-agent http <port>` orchestration. The implemented public surfaces are opt-in opaque raw
+`tunnelproxy-agent http <port>` orchestration. Session 43 adds the canonical
+`tunnelproxy http <port>` wrapper and strict local config v1 with offline
+validation. The implemented public surfaces are opt-in opaque raw
 TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI

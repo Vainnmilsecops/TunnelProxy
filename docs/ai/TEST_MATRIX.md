@@ -12,6 +12,7 @@
 
 | Capability                                | Unit | Integration | E2E | Notes                                                                                                                       |
 | ----------------------------------------- | ---- | ----------- | --- | --------------------------------------------------------------------------------------------------------------------------- |
+| Canonical Agent CLI and local config      | unit | integration | —   | Unit tests cover strict schema, duplicate/unknown/version rejection, 64 KiB bounds, platform path precedence, relative paths, and CLI layering; subprocess tests cover canonical help, offline TLS validation, no network connection, stable stdout, exit 2, and secret-safe errors. |
 | Workspace compiles and lints              | ✅   | —           | —   | Foundation checks; Session 04 keeps networking deps and lint-clean code.                                                    |
 | Reproducible cross-platform CI             | ✅   | ✅          | —   | GitHub Actions enforces locked format/check/Clippy on Ubuntu, test/build on Ubuntu and Windows MSVC, plus a Rust 1.75 MSRV check. |
 | Per-crate placeholder unit tests          | ✅   | —           | —   | Identifiers / status enums.                                                                                                 |
