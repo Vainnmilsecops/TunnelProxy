@@ -236,3 +236,24 @@ received the catalog, nor does it provision wildcard DNS or public TLS. During
 rollback, issue `hostname-release`, record the returned catalog version, and
 confirm Edge route-source/catalog metrics have advanced before considering the
 hostname withdrawn everywhere.
+
+### Hostname TLS and Agent-CA rotation
+
+Use an independent `--hostname-tls-reload-manifest` when the hostname endpoint
+must rotate without a Control Plane restart. The generation binds
+`server_certificate`, `server_private_key`, and `client_ca`; publish PEM files
+before the matching manifest. Never increment the manifest before every file
+is durable and its digest has been verified.
+
+For a no-outage Agent CA change, first publish a CA bundle containing old and
+new roots, migrate Agent credentials, then publish a higher generation with
+only the new root. After that publication, new connections using the removed
+CA fail at mTLS before a hostname request is parsed. Existing one-request
+connections retain their negotiated generation only until that request ends.
+
+Watch secret-safe `tls_reload_applied` and `tls_reload_health` events for the
+new generation. `ReloadFailed` means last-known-good is still active; it is not
+permission to ignore the failure because expiry of that active server leaf is
+terminal and initiates ordered Control Plane shutdown. Roll back by restoring
+the last valid three-file set and publishing it as a new, higher generation;
+never lower or reuse a generation number.

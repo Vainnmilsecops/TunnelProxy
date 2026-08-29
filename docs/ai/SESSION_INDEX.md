@@ -1295,3 +1295,32 @@ Out of scope:
 - The complete `tunnelproxy http <port>` orchestration, DNS or public
   certificate automation, hostname rename/rotation, friendly names, custom
   domains, general administrative APIs, HTTP/2, and multi-edge ownership.
+
+## Session 41 — Atomic Agent Hostname Service TLS Rotation — complete
+
+Scope delivered:
+
+- Added hostname-specific server TLS reload config/runtime on the shared
+  atomic protocol TLS engine while fixing ALPN to
+  `tunnelproxy-hostname/1` for every generation.
+- Bound each strict digest manifest to exactly the hostname server certificate,
+  private key, and Agent client CA. Only complete valid increasing generations
+  publish for new handshakes; rejected candidates retain last-known-good.
+- Added optional hostname-specific certificate/key paths with compatible
+  fallback to the existing Control Plane paths, plus a dedicated
+  `--hostname-tls-reload-manifest` and existing bounded poll/expiry tuning.
+- Supervised hostname reload with snapshot and route reloaders so active
+  server-leaf expiry triggers ordered Control Plane shutdown and listener
+  release. Shared structured events remain generation/health-only.
+- Added parser coverage and real mTLS tests for simultaneous server identity
+  and Agent-CA rotation, old-client rejection, invalid-generation rollback,
+  continued allocate/release, and terminal expiry. The workspace now contains
+  367 explicit tests.
+- Documented manifest schema, publication ordering, CA overlap, rollback,
+  expiry, trust boundaries, and the one-shot Agent client behavior.
+
+Out of scope:
+
+- CRL/OCSP, protected key custody, automatic CA orchestration, active TLS
+  renegotiation, DNS/public-certificate automation, the complete
+  `tunnelproxy http` UX, custom domains, HTTP/2, and multi-edge ownership.

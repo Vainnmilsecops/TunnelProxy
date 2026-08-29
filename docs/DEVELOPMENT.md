@@ -814,3 +814,51 @@ publishes the durable catalog to live route subscribers before responding.
 These commands do not start the tunnel, inspect a local port, change DNS, or
 issue public certificates; they are the authenticated lifecycle slice beneath
 the future `tunnelproxy http` UX.
+
+## 26. Rotating hostname-service TLS without restart
+
+Session 41 gives the Agent hostname listener its own optional digest manifest.
+The hostname certificate/key may remain the shared `--tls-cert`/`--tls-key`
+paths, or use independent paths:
+
+```text
+tunnelproxy-control-plane serve \
+  --database state.sqlite \
+  --listen 127.0.0.1:7200 \
+  --https-route-listen 127.0.0.1:7201 \
+  --hostname-listen 127.0.0.1:7400 \
+  --hostname-base-domain tunnelproxy.dev \
+  --hostname-agent-ca hostname-agent-ca.pem \
+  --hostname-tls-cert hostname-server.pem \
+  --hostname-tls-key hostname-server-key.pem \
+  --hostname-tls-reload-manifest hostname-tls.json \
+  --tls-cert control-plane.pem \
+  --tls-key control-plane-key.pem \
+  --edge-client-ca edge-ca.pem
+```
+
+The manifest uses the shared strict schema and exactly these logical names:
+
+```json
+{
+  "generation": 2,
+  "files": {
+    "server_certificate": "<sha256-hex>",
+    "server_private_key": "<sha256-hex>",
+    "client_ca": "<sha256-hex>"
+  }
+}
+```
+
+Write and synchronize all three PEM files first, then atomically replace the
+manifest last. A valid higher generation changes only new TLS handshakes.
+Invalid PEM, incompatible key/certificate, stale generation, unexpected file
+set, or digest mismatch keeps the prior generation active and marks reload
+health failed. If that last-known-good server certificate expires before a
+valid replacement is published, the Control Plane supervisor exits non-zero
+and releases its listeners.
+
+The Agent commands are one-shot clients and read their CA/certificate/key files
+on every invocation, so they need no separate reload daemon. During Agent CA
+rotation, publish an overlap bundle when both old and new credentials must be
+accepted temporarily; publish the new-only bundle when the overlap ends.

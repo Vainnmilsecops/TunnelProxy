@@ -140,6 +140,9 @@ release ownership plus route content transactionally. A dedicated bounded
 `TPH1` mutual-TLS service authorizes the Agent certificate, AgentId, and
 enabled TunnelId against the current snapshot, applies the server-owned base
 domain, and publishes durable route state before success. A
+hostname-specific digest-manifest runtime can atomically replace its server
+identity and Agent CA for new handshakes while preserving last-known-good and
+expiry termination. A
 separate bounded mutual-TLS service distributes complete latest-value route
 catalogs to Edge without changing authorization snapshots or Tunnel Protocol
 v2. Its server and Edge client configurations support separate digest-manifest
