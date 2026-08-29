@@ -14,14 +14,14 @@ use tunnelproxy_common::{
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
     ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
-    EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig,
-    HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
-    HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig, HttpsRouteServerTlsReloadRuntime,
-    HttpsRouteStatus, ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain,
-    ManagedHostnameReleaseOutcome, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
-    SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
-    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
-    MAX_SNAPSHOT_BYTES,
+    EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig, HostnameServerConfig,
+    HostnameServerTlsConfig, HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository,
+    HttpsRouteServerConfig, HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig,
+    HttpsRouteServerTlsReloadRuntime, HttpsRouteStatus, ManagedHostnameAllocationOutcome,
+    ManagedHostnameBaseDomain, ManagedHostnameReleaseOutcome, SnapshotCommitOutcome,
+    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
+    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
+    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -48,6 +48,11 @@ Serve options:
   --request-timeout-ms <ms>          protocol I/O timeout (default 5000)
   --refresh-interval-ms <ms>         SQLite refresh interval (default 500)
   --https-route-listen <addr>        opt-in HTTPS route distribution listener
+  --hostname-listen <addr>           opt-in authenticated Agent hostname listener
+  --hostname-base-domain <name>      server-owned managed hostname suffix
+  --hostname-agent-ca <path>         trusted Agent client CA PEM
+  --max-hostname-clients <usize>     hostname client limit (default 32)
+  --hostname-request-timeout-ms <ms> hostname request deadline (default 5000)
   --ops-listen <addr>                opt-in loopback operations listener
   --max-ops-connections <usize>      operations connection limit (default 8)
   --ops-header-timeout-ms <ms>       operations header timeout (default 2000)
@@ -267,6 +272,7 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (tls, reloader) = load_server_tls(&args).await?;
     let (https_route_server, https_route_reloader) = load_https_route_server_config(&args).await?;
     let enrollment = load_enrollment_server_config(&args).await?;
+    let hostname = load_hostname_server_config(&args).await?;
     let runtime_config = ControlPlaneRuntimeConfig {
         database_path: args.database.clone(),
         refresh_interval: args.refresh_interval,
@@ -285,11 +291,22 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
             config
         }),
     };
-    let runtime = match enrollment {
-        Some(enrollment) => {
+    let runtime = match (enrollment, hostname) {
+        (Some(enrollment), Some(hostname)) => {
+            ControlPlaneRuntime::bind_with_enrollment_and_hostname(
+                runtime_config,
+                enrollment,
+                hostname,
+            )
+            .await
+        }
+        (Some(enrollment), None) => {
             ControlPlaneRuntime::bind_with_enrollment(runtime_config, enrollment).await
         }
-        None => ControlPlaneRuntime::bind(runtime_config).await,
+        (None, Some(hostname)) => {
+            ControlPlaneRuntime::bind_with_hostname(runtime_config, hostname).await
+        }
+        (None, None) => ControlPlaneRuntime::bind(runtime_config).await,
     }
     .map_err(ServeError::Runtime)?;
     info!(
@@ -302,6 +319,9 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     }
     if let Some(addr) = runtime.https_route_addr() {
         info!(%addr, "Control Plane HTTPS route distribution service started");
+    }
+    if let Some(addr) = runtime.hostname_addr() {
+        info!(%addr, "Control Plane Agent hostname service started");
     }
     if let Some(addr) = runtime.operations_addr() {
         info!(%addr, "Control Plane operations service started");
@@ -435,6 +455,33 @@ async fn load_enrollment_server_config(
     }))
 }
 
+async fn load_hostname_server_config(
+    args: &ServeArgs,
+) -> Result<Option<HostnameServerConfig>, ServeError> {
+    let Some(hostname) = &args.hostname else {
+        return Ok(None);
+    };
+    let (server_certificate, server_private_key, agent_ca) = tokio::try_join!(
+        read_pem(args.tls_cert.clone(), "hostname server certificate"),
+        read_pem(args.tls_key.clone(), "hostname server private key"),
+        read_pem(hostname.agent_ca.clone(), "hostname Agent client CA"),
+    )?;
+    let tls = HostnameServerTlsConfig::from_pem(
+        &server_certificate,
+        &server_private_key,
+        &agent_ca,
+        args.tls_handshake_timeout,
+    )
+    .map_err(ServeError::Tls)?;
+    Ok(Some(HostnameServerConfig {
+        listen_addr: hostname.listen,
+        max_clients: hostname.max_clients,
+        request_timeout: hostname.request_timeout,
+        base_domain: hostname.base_domain.clone(),
+        tls,
+    }))
+}
+
 async fn run_create_token(args: CreateTokenArgs) -> Result<(), CreateTokenError> {
     tokio::task::spawn_blocking(move || {
         provision_bootstrap_token(
@@ -560,7 +607,17 @@ struct ServeArgs {
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
     enrollment: Option<EnrollmentArgs>,
+    hostname: Option<HostnameArgs>,
     operations: Option<OperationsArgs>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HostnameArgs {
+    listen: SocketAddr,
+    base_domain: ManagedHostnameBaseDomain,
+    agent_ca: PathBuf,
+    max_clients: usize,
+    request_timeout: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -837,6 +894,12 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut enrollment_activation_grace = Duration::from_secs(10 * 60);
     let mut enrollment_reconcile_interval = Duration::from_secs(30);
     let mut enrollment_options_present = false;
+    let mut hostname_listen = None;
+    let mut hostname_base_domain = None;
+    let mut hostname_agent_ca = None;
+    let mut max_hostname_clients = 32;
+    let mut hostname_request_timeout = Duration::from_secs(5);
+    let mut hostname_options_present = false;
     let mut operations_listen = None;
     let mut max_operations_connections = 8;
     let mut operations_header_timeout = Duration::from_secs(2);
@@ -850,6 +913,29 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             "--listen" => listen = parse_addr(args, index, flag)?,
             "--https-route-listen" => {
                 https_route_listen = Some(parse_addr(args, index, flag)?);
+            }
+            "--hostname-listen" => {
+                hostname_listen = Some(parse_addr(args, index, flag)?);
+                hostname_options_present = true;
+            }
+            "--hostname-base-domain" => {
+                hostname_base_domain = Some(
+                    ManagedHostnameBaseDomain::new(value(args, index, flag)?)
+                        .map_err(|_| ArgError::InvalidValue(flag.to_owned()))?,
+                );
+                hostname_options_present = true;
+            }
+            "--hostname-agent-ca" => {
+                hostname_agent_ca = Some(parse_path(args, index, flag)?);
+                hostname_options_present = true;
+            }
+            "--max-hostname-clients" => {
+                max_hostname_clients = parse_positive(args, index, flag)?;
+                hostname_options_present = true;
+            }
+            "--hostname-request-timeout-ms" => {
+                hostname_request_timeout = parse_duration(args, index, flag)?;
+                hostname_options_present = true;
             }
             "--tls-cert" => tls_cert = Some(parse_path(args, index, flag)?),
             "--tls-key" => tls_key = Some(parse_path(args, index, flag)?),
@@ -939,6 +1025,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     if https_route_tls_reload_manifest.is_some() && https_route_listen.is_none() {
         return Err(ArgError::MissingRequired("--https-route-listen"));
     }
+    if hostname_options_present && https_route_listen.is_none() {
+        return Err(ArgError::MissingRequired("--https-route-listen"));
+    }
     let enrollment = if enrollment_options_present {
         Some(EnrollmentArgs {
             listen: enrollment_listen.ok_or(ArgError::MissingRequired("--enrollment-listen"))?,
@@ -965,6 +1054,18 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     } else {
         None
     };
+    let hostname = if hostname_options_present {
+        Some(HostnameArgs {
+            listen: hostname_listen.ok_or(ArgError::MissingRequired("--hostname-listen"))?,
+            base_domain: hostname_base_domain
+                .ok_or(ArgError::MissingRequired("--hostname-base-domain"))?,
+            agent_ca: hostname_agent_ca.ok_or(ArgError::MissingRequired("--hostname-agent-ca"))?,
+            max_clients: max_hostname_clients,
+            request_timeout: hostname_request_timeout,
+        })
+    } else {
+        None
+    };
     Ok(ServeArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
         listen,
@@ -981,6 +1082,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
         tls_reload_interval,
         tls_expiry_warning,
         enrollment,
+        hostname,
         operations,
     })
 }
@@ -1483,6 +1585,62 @@ mod tests {
                 snapshot: PathBuf::from("state.json"),
             }))
         );
+    }
+
+    #[test]
+    fn hostname_service_flags_require_route_distribution_and_complete_tls_authority() {
+        let ParsedCommand::Serve(serve) = parse_args(&args(&[
+            "serve",
+            "--database",
+            "state.db",
+            "--tls-cert",
+            "server.pem",
+            "--tls-key",
+            "server-key.pem",
+            "--edge-client-ca",
+            "edge-ca.pem",
+            "--https-route-listen",
+            "127.0.0.1:17201",
+            "--hostname-listen",
+            "127.0.0.1:17400",
+            "--hostname-base-domain",
+            "Agents.Example.Test.",
+            "--hostname-agent-ca",
+            "agent-ca.pem",
+            "--max-hostname-clients",
+            "7",
+            "--hostname-request-timeout-ms",
+            "800",
+        ]))
+        .unwrap() else {
+            panic!("expected serve command");
+        };
+        let hostname = serve.hostname.unwrap();
+        assert_eq!(hostname.listen.port(), 17400);
+        assert_eq!(hostname.base_domain.as_str(), "agents.example.test");
+        assert_eq!(hostname.max_clients, 7);
+        assert_eq!(hostname.request_timeout, Duration::from_millis(800));
+
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server-key.pem",
+                "--edge-client-ca",
+                "edge-ca.pem",
+                "--hostname-listen",
+                "127.0.0.1:17400",
+                "--hostname-base-domain",
+                "agents.example.test",
+                "--hostname-agent-ca",
+                "agent-ca.pem",
+            ])),
+            Err(ArgError::MissingRequired("--https-route-listen"))
+        ));
     }
 
     #[test]

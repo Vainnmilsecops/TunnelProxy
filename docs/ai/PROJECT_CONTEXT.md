@@ -73,12 +73,12 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-Agent-facing automatic hostname requests, DNS/TLS automation, custom domains,
-dashboard, billing, distributed/shared request-rate coordination, request
+Complete local-port-to-public-URL orchestration, DNS/TLS automation, custom
+domains, dashboard, billing, distributed/shared request-rate coordination, request
 inspection, stream replay, protected issuer custody, multi-edge ownership, and
-cloud deployment are explicitly **not implemented**. Session 39 does provide
-operator-invoked durable managed-hostname allocation and release on the
-existing route catalog. The implemented public surfaces are opt-in opaque raw
+cloud deployment are explicitly **not implemented**. Sessions 39–40 provide
+durable managed-hostname allocation plus authenticated Agent-facing
+allocate/release on the existing route catalog. The implemented public surfaces are opt-in opaque raw
 TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI

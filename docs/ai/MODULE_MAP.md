@@ -136,7 +136,10 @@ route catalog holds at most 64 exact hostname-to-TunnelId/status records with
 its own monotonic version and idempotent operator CLI administration. Managed
 hostname commands allocate one durable `tp-<128-bit hex>` name per TunnelId
 under an explicit base domain, protect it from generic route mutation, and
-release ownership plus route content transactionally. A
+release ownership plus route content transactionally. A dedicated bounded
+`TPH1` mutual-TLS service authorizes the Agent certificate, AgentId, and
+enabled TunnelId against the current snapshot, applies the server-owned base
+domain, and publishes durable route state before success. A
 separate bounded mutual-TLS service distributes complete latest-value route
 catalogs to Edge without changing authorization snapshots or Tunnel Protocol
 v2. Its server and Edge client configurations support separate digest-manifest

@@ -169,6 +169,18 @@ struct TelemetryInner {
     enrollment_activated: AtomicU64,
     enrollment_rejected: AtomicU64,
     enrollment_failed: AtomicU64,
+    hostname_enabled: AtomicBool,
+    hostname_active: AtomicUsize,
+    hostname_accepted: AtomicU64,
+    hostname_capacity_rejected: AtomicU64,
+    hostname_tls_rejected: AtomicU64,
+    hostname_invalid_requests: AtomicU64,
+    hostname_unauthorized: AtomicU64,
+    hostname_allocate_applied: AtomicU64,
+    hostname_allocate_unchanged: AtomicU64,
+    hostname_release_applied: AtomicU64,
+    hostname_release_unchanged: AtomicU64,
+    hostname_failed: AtomicU64,
     reconciliation_runs: AtomicU64,
     reconciliation_failures: AtomicU64,
     reconciliation_credentials: AtomicU64,
@@ -183,11 +195,19 @@ struct TelemetryInner {
 pub(crate) struct ControlPlaneTelemetry(Arc<TelemetryInner>);
 
 impl ControlPlaneTelemetry {
-    pub(crate) fn initialize(&self, version: u64, enrollment_enabled: bool) {
+    pub(crate) fn initialize(
+        &self,
+        version: u64,
+        enrollment_enabled: bool,
+        hostname_enabled: bool,
+    ) {
         self.0.snapshot_version.store(version, Ordering::Release);
         self.0
             .enrollment_enabled
             .store(enrollment_enabled, Ordering::Release);
+        self.0
+            .hostname_enabled
+            .store(hostname_enabled, Ordering::Release);
     }
 
     pub(crate) fn mark_ready(&self) {
@@ -270,6 +290,38 @@ impl ControlPlaneTelemetry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn hostname_accepted(&self) -> ActiveTelemetryGuard {
+        self.0.hostname_accepted.fetch_add(1, Ordering::Relaxed);
+        self.0.hostname_active.fetch_add(1, Ordering::Relaxed);
+        ActiveTelemetryGuard::new(Arc::clone(&self.0), ActiveKind::Hostname)
+    }
+    pub(crate) fn hostname_capacity_rejected(&self) {
+        self.0
+            .hostname_capacity_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn hostname_tls_rejected(&self) {
+        self.0.hostname_tls_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn hostname_invalid_request(&self) {
+        self.0
+            .hostname_invalid_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn hostname_unauthorized(&self) {
+        self.0.hostname_unauthorized.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn hostname_outcome(&self, outcome: HostnameRequestOutcome) {
+        let counter = match outcome {
+            HostnameRequestOutcome::AllocateApplied => &self.0.hostname_allocate_applied,
+            HostnameRequestOutcome::AllocateUnchanged => &self.0.hostname_allocate_unchanged,
+            HostnameRequestOutcome::ReleaseApplied => &self.0.hostname_release_applied,
+            HostnameRequestOutcome::ReleaseUnchanged => &self.0.hostname_release_unchanged,
+            HostnameRequestOutcome::Failed => &self.0.hostname_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn reconciliation_completed(&self, affected: u64, version: u64) {
         self.0.reconciliation_runs.fetch_add(1, Ordering::Relaxed);
         self.0
@@ -310,6 +362,18 @@ impl ControlPlaneTelemetry {
             enrollment_activated: inner.enrollment_activated.load(Ordering::Relaxed),
             enrollment_rejected: inner.enrollment_rejected.load(Ordering::Relaxed),
             enrollment_failed: inner.enrollment_failed.load(Ordering::Relaxed),
+            hostname_enabled: inner.hostname_enabled.load(Ordering::Acquire),
+            hostname_active: inner.hostname_active.load(Ordering::Relaxed),
+            hostname_accepted: inner.hostname_accepted.load(Ordering::Relaxed),
+            hostname_capacity_rejected: inner.hostname_capacity_rejected.load(Ordering::Relaxed),
+            hostname_tls_rejected: inner.hostname_tls_rejected.load(Ordering::Relaxed),
+            hostname_invalid_requests: inner.hostname_invalid_requests.load(Ordering::Relaxed),
+            hostname_unauthorized: inner.hostname_unauthorized.load(Ordering::Relaxed),
+            hostname_allocate_applied: inner.hostname_allocate_applied.load(Ordering::Relaxed),
+            hostname_allocate_unchanged: inner.hostname_allocate_unchanged.load(Ordering::Relaxed),
+            hostname_release_applied: inner.hostname_release_applied.load(Ordering::Relaxed),
+            hostname_release_unchanged: inner.hostname_release_unchanged.load(Ordering::Relaxed),
+            hostname_failed: inner.hostname_failed.load(Ordering::Relaxed),
             reconciliation_runs: inner.reconciliation_runs.load(Ordering::Relaxed),
             reconciliation_failures: inner.reconciliation_failures.load(Ordering::Relaxed),
             reconciliation_credentials: inner.reconciliation_credentials.load(Ordering::Relaxed),
@@ -337,9 +401,18 @@ pub(crate) enum EnrollmentRequestOutcome {
     Rejected,
     Failed,
 }
+#[derive(Clone, Copy)]
+pub(crate) enum HostnameRequestOutcome {
+    AllocateApplied,
+    AllocateUnchanged,
+    ReleaseApplied,
+    ReleaseUnchanged,
+    Failed,
+}
 enum ActiveKind {
     Snapshot,
     Enrollment,
+    Hostname,
     Operations,
 }
 
@@ -357,6 +430,7 @@ impl Drop for ActiveTelemetryGuard {
         match self.kind {
             ActiveKind::Snapshot => &self.inner.snapshot_active,
             ActiveKind::Enrollment => &self.inner.enrollment_active,
+            ActiveKind::Hostname => &self.inner.hostname_active,
             ActiveKind::Operations => &self.inner.operations_active,
         }
         .fetch_sub(1, Ordering::Relaxed);
@@ -575,6 +649,18 @@ struct TelemetrySnapshot {
     enrollment_activated: u64,
     enrollment_rejected: u64,
     enrollment_failed: u64,
+    hostname_enabled: bool,
+    hostname_active: usize,
+    hostname_accepted: u64,
+    hostname_capacity_rejected: u64,
+    hostname_tls_rejected: u64,
+    hostname_invalid_requests: u64,
+    hostname_unauthorized: u64,
+    hostname_allocate_applied: u64,
+    hostname_allocate_unchanged: u64,
+    hostname_release_applied: u64,
+    hostname_release_unchanged: u64,
+    hostname_failed: u64,
     reconciliation_runs: u64,
     reconciliation_failures: u64,
     reconciliation_credentials: u64,
@@ -665,6 +751,41 @@ fn render_metrics(s: TelemetrySnapshot) -> String {
             s.enrollment_tls_rejected,
         ),
         (
+            "tunnelproxy_control_plane_hostname_enabled",
+            "gauge",
+            u64::from(s.hostname_enabled),
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_active_clients",
+            "gauge",
+            s.hostname_active as u64,
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_accepted_connections_total",
+            "counter",
+            s.hostname_accepted,
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_capacity_rejections_total",
+            "counter",
+            s.hostname_capacity_rejected,
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_tls_rejections_total",
+            "counter",
+            s.hostname_tls_rejected,
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_invalid_requests_total",
+            "counter",
+            s.hostname_invalid_requests,
+        ),
+        (
+            "tunnelproxy_control_plane_hostname_unauthorized_total",
+            "counter",
+            s.hostname_unauthorized,
+        ),
+        (
             "tunnelproxy_control_plane_reconciliation_runs_total",
             "counter",
             s.reconciliation_runs,
@@ -725,6 +846,17 @@ fn render_metrics(s: TelemetrySnapshot) -> String {
             ("activated", s.enrollment_activated),
             ("rejected", s.enrollment_rejected),
             ("failed", s.enrollment_failed),
+        ],
+    );
+    labeled_metrics(
+        &mut output,
+        "tunnelproxy_control_plane_hostname_requests_total",
+        &[
+            ("allocate_applied", s.hostname_allocate_applied),
+            ("allocate_unchanged", s.hostname_allocate_unchanged),
+            ("release_applied", s.hostname_release_applied),
+            ("release_unchanged", s.hostname_release_unchanged),
+            ("failed", s.hostname_failed),
         ],
     );
     output
@@ -799,9 +931,10 @@ mod tests {
     #[test]
     fn metrics_have_only_fixed_labels_and_no_identity_values() {
         let telemetry = ControlPlaneTelemetry::default();
-        telemetry.initialize(7, true);
+        telemetry.initialize(7, true, true);
         telemetry.mark_ready();
         telemetry.enrollment_outcome(EnrollmentRequestOutcome::Issued);
+        telemetry.hostname_outcome(HostnameRequestOutcome::AllocateApplied);
         let rendered = render_metrics(telemetry.snapshot());
         assert!(rendered.contains("tunnelproxy_control_plane_ready 1\n"));
         assert!(rendered.contains("tunnelproxy_control_plane_logging_nonblocking_enabled 0\n"));
@@ -817,6 +950,8 @@ mod tests {
         assert!(logging.contains("tunnelproxy_control_plane_logging_nonblocking_enabled 1"));
         assert!(logging.contains("tunnelproxy_control_plane_logging_write_failures_total 1"));
         assert!(rendered.contains("outcome=\"issued\""));
+        assert!(rendered.contains("tunnelproxy_control_plane_hostname_enabled 1\n"));
+        assert!(rendered.contains("outcome=\"allocate_applied\""));
         assert!(!rendered.contains("agent-dev"));
         assert!(!rendered.contains("tunnel-dev"));
         assert!(!rendered.contains("127.0.0.1"));

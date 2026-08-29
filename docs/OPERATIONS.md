@@ -216,5 +216,23 @@ managed hostname, so use the lifecycle command rather than editing its route.
 
 Allocation hostnames and TunnelIds are operator-visible identity, not metric
 labels. Do not add either to Prometheus labels or emit database paths through
-failure messages. Protect database access because these CLI commands are the
-current administrative boundary; there is no authenticated remote admin API.
+failure messages. Protect database access because the operator commands remain
+an administrative boundary. The Session 40 Agent service exposes only
+allocate/release for the exact currently authorized certificate/AgentId/
+TunnelId and a server-owned base domain; it is not a general remote admin API.
+
+When the Agent hostname listener is enabled, keep `--hostname-agent-ca`
+separate from the Edge client CA unless the deployment intentionally shares a
+trust root. Bind it only on the intended control network, set
+`--max-hostname-clients` and `--hostname-request-timeout-ms` for that network,
+and monitor the fixed-cardinality `tunnelproxy_control_plane_hostname_*`
+metrics. TLS rejection, authorization rejection, capacity rejection, and
+failed mutation counters contain no AgentId, TunnelId, hostname, certificate,
+or peer-address labels.
+
+An Agent success means both the SQLite transaction and in-process route
+publication completed. It does not prove that every disconnected Edge has
+received the catalog, nor does it provision wildcard DNS or public TLS. During
+rollback, issue `hostname-release`, record the returned catalog version, and
+confirm Edge route-source/catalog metrics have advanced before considering the
+hostname withdrawn everywhere.

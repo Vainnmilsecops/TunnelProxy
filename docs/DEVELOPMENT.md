@@ -769,6 +769,48 @@ restart. `https-route-upsert` and `https-route-remove` reject managed names so
 generic administration cannot silently steal or delete lifecycle ownership.
 Routes created before Session 39 migrate as operator-owned routes.
 
-This command does not create DNS records or certificates and is not yet
-available to an Agent. Keep wildcard DNS/TLS provisioning, base-domain policy,
-and access to the Control Plane database under operator control.
+This command does not create DNS records or certificates. Keep wildcard
+DNS/TLS provisioning, base-domain policy, and direct database access under
+operator control.
+
+## 25. Running the authenticated Agent hostname service
+
+Enable route distribution and the dedicated hostname listener together. The
+snapshot database must already contain the Agent certificate fingerprint and
+enabled AgentId/TunnelId grant:
+
+```text
+tunnelproxy-control-plane serve \
+  --database state.sqlite \
+  --listen 127.0.0.1:7200 \
+  --https-route-listen 127.0.0.1:7201 \
+  --hostname-listen 127.0.0.1:7400 \
+  --hostname-base-domain tunnelproxy.dev \
+  --hostname-agent-ca agent-ca.pem \
+  --tls-cert control-plane.pem \
+  --tls-key control-plane-key.pem \
+  --edge-client-ca edge-ca.pem
+```
+
+Allocate from the authenticated Agent identity:
+
+```text
+tunnelproxy-agent hostname-allocate \
+  --hostname-server 127.0.0.1:7400 \
+  --hostname-ca control-plane-ca.pem \
+  --hostname-server-name control.tunnelproxy.test \
+  --tls-client-cert agent.pem \
+  --tls-client-key agent-key.pem \
+  --agent-id agent-a \
+  --tunnel-id tunnel-a
+```
+
+Use the same arguments with `hostname-release` to remove it. Success prints
+`hostname`, `catalog_version`, and `changed`. A wrong certificate/AgentId/
+TunnelId binding is rejected even when TLS trust succeeds. The Agent cannot
+override `--hostname-base-domain`. The service commits the mutation and
+publishes the durable catalog to live route subscribers before responding.
+
+These commands do not start the tunnel, inspect a local port, change DNS, or
+issue public certificates; they are the authenticated lifecycle slice beneath
+the future `tunnelproxy http` UX.

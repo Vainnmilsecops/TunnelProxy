@@ -291,7 +291,7 @@
 ### DEBT-024 — Durable HTTPS routes require operator-chosen hostnames — resolved
 
 - **Introduced in:** Session 31
-- **Resolved in:** Session 39
+- **Resolved in:** Sessions 39–40
 - **Category:** product / reliability
 - **Impact:** medium for the future one-command HTTP tunnel workflow
 - **Rationale:** Sessions 31–32 established exact durable route ownership and
@@ -304,10 +304,13 @@
   ownership metadata, enabled route, and catalog version share one immediate
   transaction; retries, release, restart, migration, and generic-mutation
   conflicts are covered. The existing authenticated route stream distributes
-  the result without a protocol change.
-- **Residual boundary:** Agent-facing requests, the end-user CLI workflow,
-  wildcard DNS/TLS automation, rename/rotation, and custom domains remain
-  future product surfaces rather than implicit behavior of this allocator.
+  the result without a protocol change. Session 40 adds a dedicated bounded
+  mTLS Agent service that checks the live certificate/AgentId/TunnelId grant,
+  keeps the base domain server-owned, and publishes durable catalog state
+  before returning success.
+- **Residual boundary:** The complete end-user local-port workflow, wildcard
+  DNS/TLS automation, rename/rotation, and custom domains remain future product
+  surfaces rather than implicit behavior of this allocator.
 
 ### DEBT-002 — No CI configuration — resolved
 
