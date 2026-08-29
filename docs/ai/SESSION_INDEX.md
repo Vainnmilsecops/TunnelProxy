@@ -1324,3 +1324,35 @@ Out of scope:
 - CRL/OCSP, protected key custody, automatic CA orchestration, active TLS
   renegotiation, DNS/public-certificate automation, the complete
   `tunnelproxy http` UX, custom domains, HTTP/2, and multi-edge ownership.
+
+## Session 42 — Managed HTTP Agent Orchestration — complete
+
+Scope delivered:
+
+- Added `tunnelproxy-agent http <port>` with a fixed loopback target and strict
+  rejection of zero ports, `--local`, `--enroll-only`, incomplete Edge mTLS,
+  or incomplete hostname-service configuration.
+- Validates and constructs transport TLS/reload, enrollment, Agent runtime, and
+  optional operations listener before durable mutation. It then performs one
+  authenticated idempotent allocation using the exact AgentId/TunnelId that
+  Protocol v2 registers.
+- Reuses the existing reconnecting Agent supervisor and adds a bounded,
+  shutdown-aware readiness observer. One stable public-to-local mapping is
+  written to stdout after the transport first reaches `Connected`; structured
+  allocation/publication/readiness events remain on stderr.
+- Preserves durable hostname ownership across shutdown, reconnect, local
+  refusal, and terminal runtime error. Repeated startup reuses the same URL and
+  catalog version; only explicit `hostname-release` removes ownership.
+- Added parser and subprocess CLI-contract coverage plus real mTLS/HTTPS
+  integration across authenticated allocation, dynamic exact-host activation,
+  Agent mTLS registration, public wildcard TLS, local HTTP forwarding,
+  idempotent retry, and persistence after Agent shutdown. The workspace now
+  contains 371 explicit tests.
+- Documented startup ordering, stdout meaning, observability, offline behavior,
+  wildcard prerequisites, and non-destructive rollback semantics.
+
+Out of scope:
+
+- DNS/public-certificate automation, an external reachability probe, persisted
+  account/config profiles, the shorter `tunnelproxy http` executable, custom
+  domains, HTTP/2/upgrade/CONNECT, multi-edge ownership, and protocol changes.

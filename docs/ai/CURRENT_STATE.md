@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Atomic Agent Hostname Service TLS Rotation** (Session 41).
+**Managed HTTP Agent Orchestration** (Session 42).
 
 ## Completed
 
@@ -414,6 +414,18 @@
 - Hostname-specific cert/key paths may override the shared Control Plane
   identity without breaking the Session 40 static defaults. Reload events emit
   only generation, fixed health, and outcome values.
+- `tunnelproxy-agent http <port>` maps one non-zero port to loopback, requires
+  complete Edge and hostname-service mTLS inputs, and validates the normal
+  runtime, reload/enrollment, and optional operations configuration before
+  requesting a durable allocation.
+- Managed HTTP startup allocates or reuses the hostname with the same
+  AgentId/TunnelId used for Protocol v2, starts the existing reconnecting Agent
+  supervisor, and emits exactly one stable public-to-local stdout mapping after
+  the transport first reaches `Connected`.
+- Managed hostname ownership outlives the Agent process. Shutdown, reconnect,
+  local refusal, and terminal runtime failure do not auto-release it; repeated
+  startup reuses the URL without a catalog version change, while explicit
+  `hostname-release` remains the only removal path.
 - The Control Plane may expose an independent bounded mutual-TLS route service
   using a strict versioned full-catalog protocol and latest-value publication.
 - Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
@@ -430,7 +442,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 367 explicit workspace tests are present; all prior behavior is preserved.
+- 371 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -447,9 +459,10 @@
   Sessions 36–37 expose saturation/fairness measurements plus their live
   capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
-- Complete automatic public-port/local-service orchestration. Authenticated
-  Agent hostname allocate/release, durable route distribution, and Edge
-  activation are implemented; DNS/TLS automation is not.
+- The short `tunnelproxy http` executable and persisted account/config profile.
+  Single-process orchestration exists as `tunnelproxy-agent http <port>`, but
+  wildcard DNS/public TLS provisioning and external reachability probing do
+  not.
 - HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -464,7 +477,7 @@
 
 ## Next planned session
 
-Session 42 has not been selected. DNS/public-certificate automation, the complete
-`tunnelproxy http` UX, HTTP/2, signed access URLs, and multi-edge ownership
+Session 43 has not been selected. DNS/public-certificate automation, the short
+`tunnelproxy http` packaging/config UX, HTTP/2, signed access URLs, and multi-edge ownership
 remain separate scopes. Collect workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

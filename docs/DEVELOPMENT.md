@@ -811,9 +811,9 @@ TunnelId binding is rejected even when TLS trust succeeds. The Agent cannot
 override `--hostname-base-domain`. The service commits the mutation and
 publishes the durable catalog to live route subscribers before responding.
 
-These commands do not start the tunnel, inspect a local port, change DNS, or
-issue public certificates; they are the authenticated lifecycle slice beneath
-the future `tunnelproxy http` UX.
+These manual commands do not start the tunnel, inspect a local port, change
+DNS, or issue public certificates. Session 42 composes allocation with the
+existing Agent runtime through the separate `http <port>` command.
 
 ## 26. Rotating hostname-service TLS without restart
 
@@ -858,7 +858,50 @@ health failed. If that last-known-good server certificate expires before a
 valid replacement is published, the Control Plane supervisor exits non-zero
 and releases its listeners.
 
-The Agent commands are one-shot clients and read their CA/certificate/key files
-on every invocation, so they need no separate reload daemon. During Agent CA
-rotation, publish an overlap bundle when both old and new credentials must be
-accepted temporarily; publish the new-only bundle when the overlap ends.
+The manual Agent commands are one-shot clients and read their
+CA/certificate/key files on every invocation. The managed HTTP command also
+performs exactly one hostname request at startup; the long-running Edge
+transport retains its existing independent TLS reload supervisor. During Agent
+CA rotation, publish an overlap bundle when both old and new credentials must
+be accepted temporarily; publish the new-only bundle when the overlap ends.
+
+## 27. Running one managed HTTP Agent process
+
+Prerequisites remain operator-owned: wildcard DNS must direct the configured
+base domain to Edge, public TLS must cover that wildcard, Control Plane route
+distribution and hostname services must be live, and the Agent certificate
+must authorize the exact AgentId/TunnelId pair.
+
+```text
+tunnelproxy-agent http 3000 \
+  --edge edge.example.test:7100 \
+  --hostname-server control.example.test:7400 \
+  --hostname-ca control-plane-ca.pem \
+  --hostname-server-name control.example.test \
+  --tls-ca edge-ca.pem \
+  --tls-client-cert agent.pem \
+  --tls-client-key agent-key.pem \
+  --tls-server-name edge.example.test \
+  --agent-id agent-a \
+  --tunnel-id tunnel-a
+```
+
+`http <port>` accepts only a non-zero TCP port and always targets
+`127.0.0.1:<port>`; combining it with `--local` is rejected. Complete Edge
+mTLS and hostname-service inputs are mandatory. All runtime, TLS, enrollment,
+operations-listener, and reconnect configuration is validated before the
+hostname mutation. The command then allocates or reuses the durable hostname,
+starts the normal Agent supervisor, and prints exactly one mapping after the
+Agent reaches `Connected`:
+
+```text
+https://tp-0123456789abcdef0123456789abcdef.tunnelproxy.dev -> http://127.0.0.1:3000
+```
+
+Human or JSON operational logs remain on stderr. The stdout line means the
+Control Plane accepted and published the hostname and Edge accepted Protocol
+v2 registration; it is not a DNS, public-certificate, or external
+reachability probe. Ctrl-C, reconnect, a missing local service, and terminal
+runtime errors do not release the hostname. Repeating the command reuses the
+same hostname without advancing the catalog version. Use the explicit
+`hostname-release` command when permanent withdrawal is intended.

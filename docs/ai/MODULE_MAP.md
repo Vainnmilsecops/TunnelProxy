@@ -54,14 +54,17 @@ certificate-bound Protocol v2 registration intent, handshake/heartbeat,
 bounded multiplexed local bridging, a runnable reconnecting single-session
 process supervisor/CLI, a bounded loopback operations endpoint with connection
 status/metrics, and Agent-owned-key bootstrap/renewal that publishes atomic
-credential manifests.
+credential manifests. The `http <port>` command composes one authenticated
+managed-hostname allocation with that supervisor and announces the URL after
+the transport becomes ready without coupling hostname lifetime to process
+lifetime.
 
 **Responsibility (future)**
 
 - Initiate outbound tunnel to Edge (INV-001).
 - Register tunnel metadata with the control plane.
 - Forward public request traffic to a local service.
-- CLI surface for developers (`tunnelproxy http 3000`).
+- Short executable/config-profile ergonomics for `tunnelproxy http 3000`.
 
 **Prohibited**
 

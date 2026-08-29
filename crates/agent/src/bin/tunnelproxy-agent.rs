@@ -16,13 +16,14 @@ use tunnelproxy_agent::{
 };
 use tunnelproxy_common::{
     init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths,
-    AgentId, ProcessLogFormat, TunnelId,
+    AgentId, ProcessLogFormat, PublicHostname, ShutdownSignal, TunnelId,
 };
 use tunnelproxy_protocol::RegistrationRequest;
 
 const USAGE: &str = "\
 Usage:
   tunnelproxy-agent [OPTIONS]
+  tunnelproxy-agent http <port> [OPTIONS]
   tunnelproxy-agent hostname-allocate [OPTIONS]
   tunnelproxy-agent hostname-release [OPTIONS]
 
@@ -76,6 +77,13 @@ Hostname command options:
   --connect-timeout-ms <ms>         TCP timeout (default 5000)
   --tls-handshake-timeout-ms <ms>   TLS timeout (default 10000)
   --request-timeout-ms <ms>         request timeout (default 5000)
+Managed HTTP options:
+  --hostname-server <addr>          Control Plane hostname address (required)
+  --hostname-ca <path>              trusted hostname server CA PEM (required)
+  --hostname-server-name <name>     verified hostname service DNS name (required)
+  --hostname-request-timeout-ms <ms> allocation deadline (default 5000)
+  Uses the common Edge, Agent identity, TLS, reconnect, enrollment, and
+  operations options above. The managed hostname remains allocated on exit.
   --help                         print this help and exit
 ";
 
@@ -112,7 +120,17 @@ async fn main() -> ExitCode {
             }
         };
     }
-    let parsed = match parse_args(&args) {
+    if matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("http"), Some("--help" | "-h"))
+    ) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let (mode, parsed) = match parse_run_command(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             error!(%error, "invalid Agent CLI arguments");
@@ -202,7 +220,7 @@ async fn main() -> ExitCode {
             config.header_read_timeout = parsed.ops_header_timeout;
             config.request_timeout = parsed.ops_request_timeout;
             config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-            match AgentOperationsRuntime::bind(config, runtime_status).await {
+            match AgentOperationsRuntime::bind(config, runtime_status.clone()).await {
                 Ok(runtime) => {
                     info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
                     Some(runtime)
@@ -215,6 +233,50 @@ async fn main() -> ExitCode {
         }
         None => None,
     };
+    let managed_http = match mode {
+        RunMode::Tunnel => None,
+        RunMode::Http => {
+            info!(
+                agent_id = %parsed.agent_id,
+                tunnel_id = %parsed.tunnel_id,
+                event = "managed_http_allocation_started",
+                "Managed HTTP hostname allocation started"
+            );
+            let client = match load_http_hostname_client(&parsed).await {
+                Ok(client) => client,
+                Err(error) => {
+                    let configuration_error = error.is_configuration_error();
+                    error!(%error, "failed to configure managed HTTP hostname client");
+                    if configuration_error {
+                        print_usage_for_error(log_format);
+                        return ExitCode::from(2);
+                    }
+                    return ExitCode::from(1);
+                }
+            };
+            let allocation = match client
+                .allocate(parsed.agent_id.clone(), parsed.tunnel_id.clone())
+                .await
+            {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    error!(%error, "managed HTTP hostname allocation failed");
+                    return ExitCode::from(1);
+                }
+            };
+            info!(
+                hostname = %allocation.hostname,
+                catalog_version = allocation.catalog_version,
+                changed = allocation.changed,
+                event = "managed_http_hostname_published",
+                "Managed HTTP hostname is durable and published"
+            );
+            Some(ManagedHttpAnnouncement {
+                hostname: allocation.hostname,
+                local: parsed.local,
+            })
+        }
+    };
     info!(
         edge = %parsed.edge,
         local = %parsed.local,
@@ -225,6 +287,13 @@ async fn main() -> ExitCode {
 
     let (trigger, signal) = shutdown_channel();
     let (operations_trigger, operations_signal) = shutdown_channel();
+    let ready_task = managed_http.map(|announcement| {
+        tokio::spawn(announce_managed_http_ready(
+            announcement,
+            runtime_status,
+            signal.clone(),
+        ))
+    });
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
     let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
@@ -238,6 +307,7 @@ async fn main() -> ExitCode {
     return tokio::select! {
         result = &mut runtime_future => {
             trigger.shutdown();
+            join_ready_task(ready_task).await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
@@ -247,6 +317,7 @@ async fn main() -> ExitCode {
         reload = &mut reload_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
+            join_ready_task(ready_task).await;
             let _ = runtime_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
@@ -263,6 +334,7 @@ async fn main() -> ExitCode {
         enrollment = &mut enrollment_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
+            join_ready_task(ready_task).await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
             operations_trigger.shutdown();
@@ -279,6 +351,7 @@ async fn main() -> ExitCode {
         operations = &mut operations_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
+            join_ready_task(ready_task).await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
@@ -291,6 +364,7 @@ async fn main() -> ExitCode {
                     error!(%error, "OS shutdown listener failed");
                     runtime_control.begin_draining();
                     trigger.shutdown();
+                    join_ready_task(ready_task).await;
                     let _ = runtime_future.await;
                     let _ = reload_future.await;
                     let _ = enrollment_future.await;
@@ -301,6 +375,7 @@ async fn main() -> ExitCode {
             }
             runtime_control.begin_draining();
             trigger.shutdown();
+            join_ready_task(ready_task).await;
             let result = runtime_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
@@ -309,6 +384,59 @@ async fn main() -> ExitCode {
             combine_exit_codes(agent_exit_code(result), operations)
         }
     };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Tunnel,
+    Http,
+}
+
+#[derive(Debug)]
+struct ManagedHttpAnnouncement {
+    hostname: PublicHostname,
+    local: SocketAddr,
+}
+
+impl ManagedHttpAnnouncement {
+    fn mapping(&self) -> String {
+        format!("https://{} -> http://{}", self.hostname, self.local)
+    }
+}
+
+async fn announce_managed_http_ready(
+    announcement: ManagedHttpAnnouncement,
+    status: tunnelproxy_agent::AgentRuntimeStatusHandle,
+    signal: ShutdownSignal,
+) {
+    let mut poll = tokio::time::interval(Duration::from_millis(10));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => return,
+            _ = poll.tick() => {
+                if status.snapshot().is_ready() {
+                    println!("{}", announcement.mapping());
+                    info!(
+                        hostname = %announcement.hostname,
+                        local = %announcement.local,
+                        event = "managed_http_ready",
+                        "Managed HTTP tunnel is ready"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn join_ready_task(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task {
+        if let Err(error) = task.await {
+            error!(%error, "managed HTTP readiness task failed");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +506,48 @@ async fn run_hostname_command(args: &[String]) -> Result<(), HostnameCommandErro
         }
     }
     Ok(())
+}
+
+async fn load_http_hostname_client(
+    parsed: &ParsedArgs,
+) -> Result<AgentHostnameClient, HostnameCommandError> {
+    let (server_ca, client_cert, client_key) = tokio::try_join!(
+        tokio::fs::read(
+            parsed
+                .hostname_ca
+                .as_ref()
+                .expect("validated managed HTTP hostname CA"),
+        ),
+        tokio::fs::read(
+            parsed
+                .tls_client_cert
+                .as_ref()
+                .expect("validated managed HTTP client certificate"),
+        ),
+        tokio::fs::read(
+            parsed
+                .tls_client_key
+                .as_ref()
+                .expect("validated managed HTTP client private key"),
+        ),
+    )
+    .map_err(|_| HostnameCommandError::ReadTls)?;
+    AgentHostnameClient::new(HostnameClientConfig {
+        server_addr: parsed
+            .hostname_server
+            .expect("validated managed HTTP hostname server"),
+        server_name: parsed
+            .hostname_server_name
+            .clone()
+            .expect("validated managed HTTP hostname server name"),
+        server_ca_pem: server_ca,
+        client_cert_pem: client_cert,
+        client_key_pem: client_key,
+        connect_timeout: parsed.connect_timeout,
+        handshake_timeout: parsed.tls_handshake_timeout,
+        request_timeout: parsed.hostname_request_timeout,
+    })
+    .map_err(HostnameCommandError::Client)
 }
 
 fn parse_hostname_command(args: &[String]) -> Result<HostnameCommandArgs, ArgError> {
@@ -558,6 +728,7 @@ fn agent_exit_code(
 struct ParsedArgs {
     edge: SocketAddr,
     local: SocketAddr,
+    local_explicit: bool,
     agent_id: AgentId,
     tunnel_id: TunnelId,
     max_streams: usize,
@@ -583,6 +754,11 @@ struct ParsedArgs {
     tls_reload_interval: Duration,
     tls_expiry_warning: Duration,
     tls_reload_options_present: bool,
+    hostname_server: Option<SocketAddr>,
+    hostname_ca: Option<PathBuf>,
+    hostname_server_name: Option<String>,
+    hostname_request_timeout: Duration,
+    hostname_options_present: bool,
     enroll_only: bool,
     enrollment_server: Option<SocketAddr>,
     enrollment_ca: Option<PathBuf>,
@@ -604,6 +780,7 @@ impl Default for ParsedArgs {
         Self {
             edge: "127.0.0.1:7100".parse().unwrap(),
             local: "127.0.0.1:3000".parse().unwrap(),
+            local_explicit: false,
             agent_id: AgentId::new("agent-dev").unwrap(),
             tunnel_id: TunnelId::new("tunnel-dev").unwrap(),
             max_streams: 32,
@@ -629,6 +806,11 @@ impl Default for ParsedArgs {
             tls_reload_interval: Duration::from_secs(1),
             tls_expiry_warning: Duration::from_secs(7 * 24 * 60 * 60),
             tls_reload_options_present: false,
+            hostname_server: None,
+            hostname_ca: None,
+            hostname_server_name: None,
+            hostname_request_timeout: Duration::from_secs(5),
+            hostname_options_present: false,
             enroll_only: false,
             enrollment_server: None,
             enrollment_ca: None,
@@ -654,6 +836,13 @@ enum ArgError {
     InvalidAddress { flag: String, value: String },
     InvalidNumber { flag: String, value: String },
     InvalidIdentifier { flag: String, value: String },
+    InvalidHttpPort(String),
+    ZeroHttpPort,
+    HttpLocalConflict,
+    HttpEnrollOnlyConflict,
+    HttpRequiresMutualTls,
+    IncompleteHostnameOptions,
+    HostnameOptionsRequireHttp,
     UnknownFlag(String),
 }
 
@@ -671,9 +860,82 @@ impl std::fmt::Display for ArgError {
             Self::InvalidIdentifier { flag, value } => {
                 write!(f, "{flag}={value} is not a valid durable identifier")
             }
+            Self::InvalidHttpPort(value) => {
+                write!(f, "http port {value} is not a valid TCP port")
+            }
+            Self::ZeroHttpPort => f.write_str("http port must be greater than zero"),
+            Self::HttpLocalConflict => {
+                f.write_str("http <port> cannot be combined with --local")
+            }
+            Self::HttpEnrollOnlyConflict => {
+                f.write_str("http <port> cannot be combined with --enroll-only")
+            }
+            Self::HttpRequiresMutualTls => f.write_str(
+                "http <port> requires --tls-ca, --tls-client-cert, --tls-client-key, and --tls-server-name",
+            ),
+            Self::IncompleteHostnameOptions => f.write_str(
+                "http <port> requires --hostname-server, --hostname-ca, and --hostname-server-name",
+            ),
+            Self::HostnameOptionsRequireHttp => {
+                f.write_str("managed HTTP hostname options require the http <port> command")
+            }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
+}
+
+fn parse_run_command(args: &[String]) -> Result<(RunMode, ParsedArgs), ArgError> {
+    if args.first().map(String::as_str) != Some("http") {
+        let parsed = parse_args(args)?;
+        if parsed.hostname_options_present {
+            return Err(ArgError::HostnameOptionsRequireHttp);
+        }
+        return Ok((RunMode::Tunnel, parsed));
+    }
+
+    let raw_port = args
+        .get(1)
+        .ok_or(ArgError::MissingRequired("http <port>"))?;
+    let port = raw_port
+        .parse::<u16>()
+        .map_err(|_| ArgError::InvalidHttpPort(raw_port.clone()))?;
+    if port == 0 {
+        return Err(ArgError::ZeroHttpPort);
+    }
+    let mut parsed = parse_args(&args[2..])?;
+    if parsed.help {
+        parsed.local = SocketAddr::from(([127, 0, 0, 1], port));
+        return Ok((RunMode::Http, parsed));
+    }
+    if parsed.local_explicit {
+        return Err(ArgError::HttpLocalConflict);
+    }
+    if parsed.enroll_only {
+        return Err(ArgError::HttpEnrollOnlyConflict);
+    }
+    if !matches!(
+        (
+            &parsed.tls_ca,
+            &parsed.tls_client_cert,
+            &parsed.tls_client_key,
+            &parsed.tls_server_name,
+        ),
+        (Some(_), Some(_), Some(_), Some(_))
+    ) {
+        return Err(ArgError::HttpRequiresMutualTls);
+    }
+    if !matches!(
+        (
+            parsed.hostname_server,
+            &parsed.hostname_ca,
+            &parsed.hostname_server_name,
+        ),
+        (Some(_), Some(_), Some(_))
+    ) {
+        return Err(ArgError::IncompleteHostnameOptions);
+    }
+    parsed.local = SocketAddr::from(([127, 0, 0, 1], port));
+    Ok((RunMode::Http, parsed))
 }
 
 fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
@@ -692,6 +954,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--local" => {
                 parsed.local = parse_addr(args, index, flag)?;
+                parsed.local_explicit = true;
                 index += 2;
             }
             "--agent-id" => {
@@ -795,6 +1058,27 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             "--tls-expiry-warning-ms" => {
                 parsed.tls_expiry_warning = Duration::from_millis(parse_number(args, index, flag)?);
                 parsed.tls_reload_options_present = true;
+                index += 2;
+            }
+            "--hostname-server" => {
+                parsed.hostname_server = Some(parse_addr(args, index, flag)?);
+                parsed.hostname_options_present = true;
+                index += 2;
+            }
+            "--hostname-ca" => {
+                parsed.hostname_ca = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.hostname_options_present = true;
+                index += 2;
+            }
+            "--hostname-server-name" => {
+                parsed.hostname_server_name = Some(value(args, index, flag)?.to_owned());
+                parsed.hostname_options_present = true;
+                index += 2;
+            }
+            "--hostname-request-timeout-ms" => {
+                parsed.hostname_request_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.hostname_options_present = true;
                 index += 2;
             }
             "--enroll-only" => {
@@ -1134,6 +1418,100 @@ mod tests {
                 "127.0.0.1:17400"
             ])),
             Err(ArgError::MissingRequired("--hostname-ca"))
+        ));
+    }
+
+    #[test]
+    fn managed_http_command_composes_loopback_target_and_authenticated_services() {
+        let (mode, parsed) = parse_run_command(&args(&[
+            "http",
+            "8080",
+            "--edge",
+            "127.0.0.1:17100",
+            "--hostname-server",
+            "127.0.0.1:17400",
+            "--hostname-ca",
+            "hostname-ca.pem",
+            "--hostname-server-name",
+            "control.test",
+            "--hostname-request-timeout-ms",
+            "900",
+            "--tls-ca",
+            "edge-ca.pem",
+            "--tls-client-cert",
+            "agent.pem",
+            "--tls-client-key",
+            "agent-key.pem",
+            "--tls-server-name",
+            "edge.test",
+            "--agent-id",
+            "agent-prod",
+            "--tunnel-id",
+            "tunnel-prod",
+        ]))
+        .unwrap();
+        assert_eq!(mode, RunMode::Http);
+        assert_eq!(parsed.local, "127.0.0.1:8080".parse().unwrap());
+        assert!(!parsed.local_explicit);
+        assert_eq!(parsed.hostname_server.unwrap().port(), 17400);
+        assert_eq!(parsed.hostname_ca, Some(PathBuf::from("hostname-ca.pem")));
+        assert_eq!(parsed.hostname_server_name.as_deref(), Some("control.test"));
+        assert_eq!(parsed.hostname_request_timeout, Duration::from_millis(900));
+        assert_eq!(parsed.agent_id.as_str(), "agent-prod");
+        assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
+        assert_eq!(
+            ManagedHttpAnnouncement {
+                hostname: PublicHostname::new("tp-0123456789abcdef0123456789abcdef.test").unwrap(),
+                local: parsed.local,
+            }
+            .mapping(),
+            "https://tp-0123456789abcdef0123456789abcdef.test -> http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn managed_http_command_rejects_ambiguous_or_incomplete_configuration() {
+        assert!(matches!(
+            parse_run_command(&args(&["http", "0"])),
+            Err(ArgError::ZeroHttpPort)
+        ));
+        assert!(matches!(
+            parse_run_command(&args(&["http", "not-a-port"])),
+            Err(ArgError::InvalidHttpPort(_))
+        ));
+        assert!(matches!(
+            parse_run_command(&args(&["http", "3000", "--local", "127.0.0.1:4000"])),
+            Err(ArgError::HttpLocalConflict)
+        ));
+        assert!(matches!(
+            parse_run_command(&args(&["http", "3000"])),
+            Err(ArgError::HttpRequiresMutualTls)
+        ));
+        assert!(matches!(
+            parse_run_command(&args(&[
+                "http",
+                "3000",
+                "--tls-ca",
+                "edge-ca.pem",
+                "--tls-client-cert",
+                "agent.pem",
+                "--tls-client-key",
+                "agent-key.pem",
+                "--tls-server-name",
+                "edge.test",
+            ])),
+            Err(ArgError::IncompleteHostnameOptions)
+        ));
+        assert!(matches!(
+            parse_run_command(&args(&[
+                "--hostname-server",
+                "127.0.0.1:7400",
+                "--hostname-ca",
+                "hostname-ca.pem",
+                "--hostname-server-name",
+                "control.test",
+            ])),
+            Err(ArgError::HostnameOptionsRequireHttp)
         ));
     }
 

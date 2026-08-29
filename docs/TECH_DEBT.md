@@ -288,6 +288,28 @@
 
 ## Resolved items
 
+### DEBT-026 — Managed hostname and Agent runtime required separate commands — resolved
+
+- **Introduced in:** Session 40
+- **Resolved in:** Session 42
+- **Category:** product / reliability
+- **Impact:** medium for the managed HTTP developer workflow
+- **Rationale:** Agent-facing allocation was authenticated and durable, but an
+  operator still had to run a one-shot hostname command, capture its output,
+  and separately start the Agent runtime with matching identity. Partial or
+  reordered manual steps could advertise no URL, use inconsistent IDs, or
+  obscure whether allocation or transport startup had completed.
+- **Resolution:** `tunnelproxy-agent http <port>` validates the complete Edge,
+  hostname, TLS, runtime, and optional operations configuration before
+  mutation; performs one idempotent allocation with the same AgentId/TunnelId;
+  starts the existing supervised reconnecting runtime; and prints one stable
+  public-to-loopback mapping after Protocol v2 registration. Real mTLS/HTTPS
+  coverage proves allocation, dynamic exact-host activation, local HTTP
+  forwarding, repeated allocation, and durable ownership after shutdown.
+- **Residual boundary:** Wildcard DNS/public TLS, external reachability probes,
+  persisted account/config profiles, the shorter `tunnelproxy` executable,
+  custom domains, and multi-edge ownership remain separate product scopes.
+
 ### DEBT-025 — Agent hostname TLS required Control Plane restart — resolved
 
 - **Introduced in:** Session 40

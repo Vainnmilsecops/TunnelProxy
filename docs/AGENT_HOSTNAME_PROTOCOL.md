@@ -65,3 +65,18 @@ Allocation retry is idempotent for the same TunnelId/base domain. Releasing an
 absent allocation is a successful unchanged response. A success does not
 provision DNS or certificates and does not imply a disconnected Edge has
 already reconnected.
+
+## Agent command composition
+
+The manual `hostname-allocate` and `hostname-release` commands remain
+one-request clients. Session 42 also uses one Allocate exchange at startup of
+`tunnelproxy-agent http <port>`, then runs the existing Protocol v2 Agent
+transport independently. The public mapping is printed only after that
+transport first reaches `Connected`.
+
+The managed HTTP process does not keep a hostname-protocol connection open and
+does not repeat allocation on reconnect. Normal shutdown and transport failure
+never synthesize a Release request; durable ownership is removed only by an
+explicit release command. Hostname-service CA/identity generations therefore
+affect the next process invocation, while the long-running Agent-to-Edge TLS
+connection follows its own reload configuration.

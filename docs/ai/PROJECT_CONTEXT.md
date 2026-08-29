@@ -73,13 +73,15 @@ localhost:<port>
 
 ## What is NOT in scope right now
 
-Complete local-port-to-public-URL orchestration, DNS/TLS automation, custom
-domains, dashboard, billing, distributed/shared request-rate coordination, request
-inspection, stream replay, protected issuer custody, multi-edge ownership, and
-cloud deployment are explicitly **not implemented**. Sessions 39–41 provide
+The short `tunnelproxy http` executable/config-profile UX, DNS/TLS automation,
+custom domains, dashboard, billing, distributed/shared request-rate
+coordination, request inspection, stream replay, protected issuer custody,
+multi-edge ownership, and cloud deployment are explicitly **not implemented**.
+Sessions 39–42 provide
 durable managed-hostname allocation plus authenticated Agent-facing
 allocate/release and independent atomic hostname server identity/Agent-CA
-rotation on the existing route catalog. The implemented public surfaces are opt-in opaque raw
+rotation on the existing route catalog, followed by single-process
+`tunnelproxy-agent http <port>` orchestration. The implemented public surfaces are opt-in opaque raw
 TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
 HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
@@ -96,3 +98,10 @@ public/authenticated operations access and durable metrics storage are not
 implemented. All three runnable components can emit collector-friendly,
 secret-safe JSON Lines to stderr without changing their plain stdout command
 contracts.
+
+Managed HTTP startup validates complete Edge and hostname-service mTLS inputs,
+allocates or reuses the hostname with the same AgentId/TunnelId, starts the
+normal reconnecting Agent runtime, and prints the mapping after its first
+successful registration. The hostname remains durable across shutdown and
+reconnect. Wildcard DNS/public TLS and external reachability remain
+operator-owned prerequisites rather than claims made by that stdout line.

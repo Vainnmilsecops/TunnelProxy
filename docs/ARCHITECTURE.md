@@ -921,6 +921,29 @@ and fixed health only. Hostname cert/key paths may be separate from the
 snapshot identity; static Session 40 startup remains compatible when no
 hostname manifest is configured.
 
+### 2.40 Managed HTTP Agent orchestration (Session 42)
+
+`tunnelproxy-agent http <port>` is process composition, not a new wire
+protocol. The command maps the non-zero port to `127.0.0.1:<port>`, requires
+complete Edge and hostname-service mTLS inputs, and constructs the normal
+Agent runtime, enrollment/reload supervisors, and optional operations listener
+before requesting any durable mutation.
+
+Startup then performs one authenticated hostname allocation using the same
+AgentId, TunnelId, and client credential as Protocol v2 registration. The
+Session 40 response establishes durable commit and in-process catalog
+publication; the Agent runtime then owns connection and reconnect. A bounded,
+shutdown-aware readiness observer prints the public-to-local mapping once the
+runtime status first becomes `Connected`. It does not probe DNS, public TLS,
+Edge catalog convergence, or the local HTTP application.
+
+Allocation and transport lifetimes deliberately differ. The hostname remains
+durable when the command is cancelled, reconnecting, offline, or terminated by
+a runtime error. Edge keeps the route intent but fails closed without a live
+tunnel. Re-running allocation returns the same hostname and does not advance
+the catalog; only explicit release removes it. This preserves URL stability
+and avoids destructive rollback after an ambiguous client-side failure.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
