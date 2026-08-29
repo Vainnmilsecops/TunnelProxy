@@ -1083,3 +1083,33 @@ without partial state. The base domain still requires operator-provisioned
 wildcard DNS and TLS. Agent-facing allocation, DNS/certificate automation,
 friendly-name generation, rename/rotation, custom-domain proof, administrative
 APIs, and multi-edge ownership remain outside this decision.
+
+---
+
+## ADR-040 — Agent hostname lifecycle uses a dedicated authenticated service
+
+**Status:** Accepted (Session 40).
+
+**Context:** Session 39 made hostname ownership durable, but invoking a local
+database command from an Agent would cross the storage boundary and provide no
+live certificate/Agent/tunnel authorization. Reusing Tunnel Protocol v2 or the
+Edge route stream would mix lifecycle mutation with data-plane transport and
+would let an Agent race ahead of route publication.
+
+**Decision:** Control Plane exposes an opt-in, bounded,
+one-request-per-mTLS-connection `TPH1` service with ALPN
+`tunnelproxy-hostname/1`. The current authorization snapshot must match the
+client leaf fingerprint, AgentId, and enabled TunnelId. Control Plane, not
+Agent, owns the canonical base domain. Mutation serializes through the
+persistent route authority; SQLite commit and complete live catalog
+publication both finish before a success response. Agent supplies TLS material
+by file and exposes separate allocate/release CLI commands with bounded
+connect, handshake, and request deadlines.
+
+**Consequences:** An authenticated Agent can safely request its existing
+managed-hostname lifecycle without database access, arbitrary namespace
+selection, or Edge hot-path lookups. Retries remain idempotent and Edge route
+distribution retains its existing protocol. Static hostname-service TLS
+configuration, wildcard DNS/certificate provisioning, the complete
+`tunnelproxy http` orchestration, custom domains, and multi-edge coordination
+remain outside this decision.

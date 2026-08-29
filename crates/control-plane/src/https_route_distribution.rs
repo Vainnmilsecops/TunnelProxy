@@ -258,6 +258,53 @@ impl PersistentHttpsRouteCatalog {
             .publish(catalog)
             .map_err(|_| HttpsRouteAuthorityError::PublishInvariant)
     }
+
+    pub async fn allocate_managed_hostname(
+        &self,
+        tunnel_id: &tunnelproxy_common::TunnelId,
+        base_domain: &crate::ManagedHostnameBaseDomain,
+    ) -> Result<crate::ManagedHostnameAllocationOutcome, HttpsRouteAuthorityError> {
+        let _guard = self.refresh_gate.lock().await;
+        let repository = self.repository.clone();
+        let tunnel_id = tunnel_id.clone();
+        let base_domain = base_domain.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            repository.allocate_managed_hostname(&tunnel_id, &base_domain)
+        })
+        .await
+        .map_err(|_| HttpsRouteAuthorityError::StorageTask)?
+        .map_err(HttpsRouteAuthorityError::Repository)?;
+        self.publish_durable_current().await?;
+        Ok(outcome)
+    }
+
+    pub async fn release_managed_hostname(
+        &self,
+        tunnel_id: &tunnelproxy_common::TunnelId,
+    ) -> Result<crate::ManagedHostnameReleaseOutcome, HttpsRouteAuthorityError> {
+        let _guard = self.refresh_gate.lock().await;
+        let repository = self.repository.clone();
+        let tunnel_id = tunnel_id.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || repository.release_managed_hostname(&tunnel_id))
+                .await
+                .map_err(|_| HttpsRouteAuthorityError::StorageTask)?
+                .map_err(HttpsRouteAuthorityError::Repository)?;
+        self.publish_durable_current().await?;
+        Ok(outcome)
+    }
+
+    async fn publish_durable_current(&self) -> Result<(), HttpsRouteAuthorityError> {
+        let loader = self.repository.clone();
+        let catalog = tokio::task::spawn_blocking(move || loader.load())
+            .await
+            .map_err(|_| HttpsRouteAuthorityError::StorageTask)?
+            .map_err(HttpsRouteAuthorityError::Repository)?;
+        self.publisher
+            .publish(catalog)
+            .map(|_| ())
+            .map_err(|_| HttpsRouteAuthorityError::PublishInvariant)
+    }
 }
 
 #[derive(Debug)]

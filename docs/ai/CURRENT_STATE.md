@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Durable Managed Hostname Allocation** (Session 39).
+**Authenticated Agent Hostname Lifecycle Service** (Session 40).
 
 ## Completed
 
@@ -390,6 +390,21 @@
   immediate SQLite transaction as one catalog-version increment. Release is
   likewise atomic; legacy/manual routes remain operator-owned, and generic
   route commands cannot overwrite or remove managed names.
+- Control Plane can opt into a bounded Agent-facing hostname service using
+  mutual TLS and dedicated ALPN `tunnelproxy-hostname/1`. Each request is
+  authorized against the current certificate/AgentId/TunnelId snapshot before
+  allocation or release; the managed base domain is server-owned.
+- Hostname mutations serialize with route refresh, commit to SQLite, reload the
+  complete durable catalog, and publish it to the existing Edge route stream
+  before a success response is sent. Duplicate allocation and absent release
+  retain their idempotent version semantics.
+- Agent exposes `hostname-allocate` and `hostname-release` commands with bounded
+  TCP, TLS, and request deadlines. TLS material is read from files and never
+  accepted as command-line secret bytes.
+- Control Plane runtime supervises the hostname listener with its snapshot,
+  route, enrollment, and operations children. Fixed-cardinality hostname
+  admission, TLS, authorization, and outcome metrics contain no identities or
+  hostnames.
 - The Control Plane may expose an independent bounded mutual-TLS route service
   using a strict versioned full-catalog protocol and latest-value publication.
 - Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
@@ -406,7 +421,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 357 explicit workspace tests are present; all prior behavior is preserved.
+- 365 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -423,9 +438,9 @@
   Sessions 36–37 expose saturation/fairness measurements plus their live
   capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
-- Agent-facing automatic public port/hostname requests and CLI orchestration.
-  Durable operator-invoked managed-hostname allocation, route distribution,
-  and Edge activation are implemented; DNS/TLS automation is not.
+- Complete automatic public-port/local-service orchestration. Authenticated
+  Agent hostname allocate/release, durable route distribution, and Edge
+  activation are implemented; DNS/TLS automation is not.
 - HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -440,8 +455,7 @@
 
 ## Next planned session
 
-Session 40 has not been selected. Collect workload evidence using the Session
-37 runbook before proposing peer-negotiated transport flow control. A later
-bounded slice may expose managed allocation through an authenticated
-Agent-facing API, but DNS/TLS automation, the complete `tunnelproxy http` UX,
-HTTP/2, signed access URLs, and multi-edge ownership remain separate scopes.
+Session 41 has not been selected. DNS/TLS automation, the complete
+`tunnelproxy http` UX, HTTP/2, signed access URLs, and multi-edge ownership
+remain separate scopes. Collect workload evidence using the Session 37 runbook
+before proposing peer-negotiated transport flow control.

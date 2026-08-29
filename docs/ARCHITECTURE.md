@@ -872,8 +872,31 @@ the exact hostname, TunnelId, and enabled status for request routing. The
 Control Plane refresh loop therefore distributes allocation and release like
 any other catalog update, and Edge applies or removes the exact route without
 restart or hot-path storage access. Wildcard DNS/TLS provisioning,
-Agent-facing allocation, rename/rotation, custom domains, and multi-edge
-ownership remain separate control-plane concerns.
+rename/rotation, custom domains, and multi-edge ownership remain separate
+control-plane concerns.
+
+### 2.38 Authenticated Agent hostname lifecycle (Session 40)
+
+The opt-in Agent hostname listener is separate from Tunnel Protocol v2,
+snapshot distribution, enrollment, and route distribution. It negotiates only
+`tunnelproxy-hostname/1`, requires an Agent client certificate signed by the
+configured Agent CA, and handles exactly one bounded `TPH1` allocate or release
+request per TLS connection. TCP connect, TLS handshake, protocol I/O, message
+size, active clients, and child tasks all have explicit bounds.
+
+TLS identity is necessary but not sufficient. The leaf fingerprint plus the
+requested AgentId and TunnelId must authorize successfully against the current
+in-memory snapshot, including enabled tunnel state. The Agent never chooses the
+base domain: server configuration owns one canonical suffix, preventing a
+valid credential from requesting arbitrary namespaces.
+
+An authorized mutation enters the route authority's serialization gate,
+commits through the Session 39 immediate SQLite transaction, reloads the full
+durable catalog, and publishes it to route subscribers before success is sent
+to the Agent. Therefore a success response never precedes the corresponding
+live Edge-distribution state. Repeated allocation and absent release remain
+idempotent. The runtime supervises this listener with the other Control Plane
+children and exposes only fixed-cardinality aggregate metrics.
 
 ## 3. Control plane vs data plane
 

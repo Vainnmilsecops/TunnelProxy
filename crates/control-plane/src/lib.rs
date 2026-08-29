@@ -17,6 +17,7 @@ use tunnelproxy_common::{AgentId, TunnelId};
 mod certificate_issuer;
 mod enrollment_repository;
 mod enrollment_service;
+mod hostname_service;
 mod https_route_codec;
 mod https_route_distribution;
 mod https_route_protocol;
@@ -40,6 +41,9 @@ pub use enrollment_repository::{
 pub use enrollment_service::{
     EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, EnrollmentServerTlsConfig,
     EnrollmentTlsConfigError,
+};
+pub use hostname_service::{
+    HostnameServer, HostnameServerConfig, HostnameServerError, HostnameServerTlsConfig,
 };
 pub use https_route_codec::{
     decode_https_route_catalog, encode_https_route_catalog, HttpsRouteCodecError,

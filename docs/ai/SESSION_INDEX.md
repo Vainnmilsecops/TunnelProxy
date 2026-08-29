@@ -1263,3 +1263,35 @@ Out of scope:
 - Agent-facing allocation, the complete `tunnelproxy http` UX, DNS or
   certificate automation, friendly names, hostname rename/rotation, custom
   domains, administrative APIs, HTTP/2, and multi-edge ownership.
+
+## Session 40 — Authenticated Agent Hostname Lifecycle Service — complete
+
+Scope delivered:
+
+- Added the bounded `TPH1` request/response protocol with dedicated ALPN
+  `tunnelproxy-hostname/1`, strict canonical identifiers/hostnames, a 1 KiB
+  payload ceiling, and fixed error codes.
+- Added a separately configurable mutual-TLS Control Plane listener. Agent leaf
+  fingerprint, AgentId, and enabled TunnelId must match the current in-memory
+  authorization snapshot, while the canonical allocation base domain remains
+  server-owned.
+- Serialized allocation/release with route refresh and made the response
+  ordering durable SQLite commit → complete catalog publication → Agent
+  success. Session 39 idempotency and atomic version semantics are preserved.
+- Integrated bounded concurrency, deadlines, runtime supervision, shutdown,
+  CLI configuration, and identity-free fixed-cardinality telemetry with the
+  existing Control Plane lifecycle.
+- Added an Agent mTLS client plus `hostname-allocate` and `hostname-release`
+  commands with file-based TLS inputs and stable result output.
+- Added protocol/parser coverage and a real-TLS integration test for exact
+  authorization, unknown identity/wrong binding rejection, idempotent
+  allocation, live route publication, and release. The workspace now contains
+  365 explicit tests.
+- Documented protocol, trust boundaries, startup, mutation ordering,
+  observability, and rollback.
+
+Out of scope:
+
+- The complete `tunnelproxy http <port>` orchestration, DNS or public
+  certificate automation, hostname rename/rotation, friendly names, custom
+  domains, general administrative APIs, HTTP/2, and multi-edge ownership.

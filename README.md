@@ -68,6 +68,10 @@ correct agent, which in turn proxies them into the local service.
 - Durable managed-hostname allocation for one hostname per TunnelId using a
   bounded 128-bit OS-random DNS label, transactional release, collision retry,
   and live propagation through the existing Edge route stream.
+- An opt-in authenticated Agent hostname lifecycle service with dedicated
+  mTLS/ALPN, exact certificate/AgentId/TunnelId authorization, server-owned
+  base domains, durable-before-live publication, and Agent allocate/release
+  commands.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, and HTTPS route transports with last-known-good rollback, expiry
   enforcement, and static Agent-certificate authorization rotation.
@@ -78,7 +82,7 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
-- Agent-facing automatic hostname requests, custom-domain administration, DNS
+- Complete `tunnelproxy http` orchestration, custom-domain administration, DNS
   or certificate automation, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
@@ -149,9 +153,9 @@ https://blue-cat.tunnelproxy.dev -> http://127.0.0.1:3000
 
 This end-user command does not work yet. Session 25 provides the Edge ingress
 path, Sessions 31–32 provide durable route intent and distribution, and
-Session 39 provides operator-invoked durable managed-hostname allocation. An
-authenticated Agent-facing allocation API and local CLI orchestration remain
-future work, as do DNS and certificate automation.
+Session 40 provides authenticated Agent-facing allocate/release commands over
+a dedicated Control Plane service. The single-command local-port orchestration,
+DNS provisioning, and certificate automation remain future work.
 
 ## Repository structure
 
@@ -237,6 +241,7 @@ and Definition of Done.
 | 37 _(complete)_ | live transport capacity telemetry and operator runbook |
 | 38 _(complete)_ | bounded nonblocking process logging and sink telemetry |
 | 39 _(complete)_ | durable managed-hostname allocation and release lifecycle |
+| 40 _(complete)_ | authenticated Agent managed-hostname lifecycle service |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

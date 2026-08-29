@@ -9,7 +9,8 @@ use tunnelproxy_common::{shutdown_channel, ShutdownSignal};
 use crate::{
     operations::{ControlPlaneOperationsRuntime, ControlPlaneTelemetry, RefreshOutcome},
     ControlPlaneOperationsConfig, ControlPlaneOperationsError, ControlPlaneOperationsOutcome,
-    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, HttpsRouteAuthorityError,
+    EnrollmentServer, EnrollmentServerConfig, EnrollmentServerError, HostnameServer,
+    HostnameServerConfig, HostnameServerError, HttpsRouteAuthorityError,
     HttpsRouteDistributionServer, HttpsRoutePublishOutcome, HttpsRouteRepository,
     HttpsRouteServerConfig, HttpsRouteServerError, PersistentHttpsRouteCatalog,
     PersistentSnapshotAuthority, PersistentSnapshotAuthorityError, SnapshotDistributionServer,
@@ -56,6 +57,7 @@ pub struct ControlPlaneRuntime {
     server: SnapshotDistributionServer,
     https_route_authority: Option<PersistentHttpsRouteCatalog>,
     https_route_server: Option<HttpsRouteDistributionServer>,
+    hostname_server: Option<HostnameServer>,
     enrollment_server: Option<EnrollmentServer>,
     operations: Option<ControlPlaneOperationsRuntime>,
     telemetry: ControlPlaneTelemetry,
@@ -64,21 +66,40 @@ pub struct ControlPlaneRuntime {
 
 impl ControlPlaneRuntime {
     pub async fn bind(config: ControlPlaneRuntimeConfig) -> Result<Self, ControlPlaneRuntimeError> {
-        Self::bind_inner(config, None).await
+        Self::bind_inner(config, None, None).await
     }
 
     pub async fn bind_with_enrollment(
         config: ControlPlaneRuntimeConfig,
         enrollment: EnrollmentServerConfig,
     ) -> Result<Self, ControlPlaneRuntimeError> {
-        Self::bind_inner(config, Some(enrollment)).await
+        Self::bind_inner(config, Some(enrollment), None).await
+    }
+
+    pub async fn bind_with_hostname(
+        config: ControlPlaneRuntimeConfig,
+        hostname: HostnameServerConfig,
+    ) -> Result<Self, ControlPlaneRuntimeError> {
+        Self::bind_inner(config, None, Some(hostname)).await
+    }
+
+    pub async fn bind_with_enrollment_and_hostname(
+        config: ControlPlaneRuntimeConfig,
+        enrollment: EnrollmentServerConfig,
+        hostname: HostnameServerConfig,
+    ) -> Result<Self, ControlPlaneRuntimeError> {
+        Self::bind_inner(config, Some(enrollment), Some(hostname)).await
     }
 
     async fn bind_inner(
         config: ControlPlaneRuntimeConfig,
         enrollment: Option<EnrollmentServerConfig>,
+        hostname: Option<HostnameServerConfig>,
     ) -> Result<Self, ControlPlaneRuntimeError> {
         config.validate()?;
+        if hostname.is_some() && config.https_route_server.is_none() {
+            return Err(ControlPlaneRuntimeError::InvalidConfig);
+        }
         let operations_config = config.operations;
         let https_route_server_config = config.https_route_server;
         let database_path = config.database_path;
@@ -93,7 +114,11 @@ impl ControlPlaneRuntime {
             .await
             .map_err(ControlPlaneRuntimeError::Authority)?;
         let telemetry = ControlPlaneTelemetry::default();
-        telemetry.initialize(authority.current().version().get(), enrollment.is_some());
+        telemetry.initialize(
+            authority.current().version().get(),
+            enrollment.is_some(),
+            hostname.is_some(),
+        );
         let server = SnapshotDistributionServer::bind_with_telemetry(
             config.snapshot_server,
             authority.subscribe(),
@@ -127,6 +152,22 @@ impl ControlPlaneRuntime {
             ),
             None => None,
         };
+        let hostname_server = match hostname {
+            Some(config) => Some(
+                HostnameServer::bind_with_telemetry(
+                    config,
+                    authority.subscribe(),
+                    https_route_authority
+                        .as_ref()
+                        .expect("hostname service requires route authority")
+                        .clone(),
+                    telemetry.clone(),
+                )
+                .await
+                .map_err(ControlPlaneRuntimeError::Hostname)?,
+            ),
+            None => None,
+        };
         let operations = match operations_config {
             Some(config) => Some(
                 ControlPlaneOperationsRuntime::bind(config, telemetry.clone())
@@ -140,6 +181,7 @@ impl ControlPlaneRuntime {
             server,
             https_route_authority,
             https_route_server,
+            hostname_server,
             enrollment_server,
             operations,
             telemetry,
@@ -167,6 +209,12 @@ impl ControlPlaneRuntime {
             .map(HttpsRouteDistributionServer::local_addr)
     }
 
+    pub fn hostname_addr(&self) -> Option<std::net::SocketAddr> {
+        self.hostname_server
+            .as_ref()
+            .map(HostnameServer::local_addr)
+    }
+
     pub fn operations_addr(&self) -> Option<std::net::SocketAddr> {
         self.operations
             .as_ref()
@@ -180,6 +228,7 @@ impl ControlPlaneRuntime {
         let local_addr = self.server.local_addr();
         let enrollment_addr = self.enrollment_addr();
         let https_route_addr = self.https_route_addr();
+        let hostname_addr = self.hostname_addr();
         let operations_addr = self.operations_addr();
         let (server_trigger, server_signal) = shutdown_channel();
         let mut server_task = tokio::spawn(self.server.run_until_shutdown(server_signal));
@@ -191,6 +240,10 @@ impl ControlPlaneRuntime {
         let mut enrollment_task = self
             .enrollment_server
             .map(|server| tokio::spawn(server.run_until_shutdown(enrollment_signal)));
+        let (hostname_trigger, hostname_signal) = shutdown_channel();
+        let mut hostname_task = self
+            .hostname_server
+            .map(|server| tokio::spawn(server.run_until_shutdown(hostname_signal)));
         let (operations_trigger, operations_signal) = shutdown_channel();
         let mut operations_task = self
             .operations
@@ -211,19 +264,23 @@ impl ControlPlaneRuntime {
                     server_trigger.shutdown();
                     route_trigger.shutdown();
                     enrollment_trigger.shutdown();
+                    hostname_trigger.shutdown();
                     let server_result = await_server(server_task).await;
                     let route_result = await_route_server(&mut route_task).await;
                     let enrollment_result = await_enrollment(&mut enrollment_task).await;
+                    let hostname_result = await_hostname(&mut hostname_task).await;
                     operations_trigger.shutdown();
                     let operations_result = await_operations(&mut operations_task).await;
                     server_result?;
                     route_result?;
                     enrollment_result?;
+                    hostname_result?;
                     let operations = operations_result?;
                     return Ok(ControlPlaneRuntimeOutcome {
                         listen_addr: local_addr,
                         enrollment_addr,
                         https_route_addr,
+                        hostname_addr,
                         operations_addr,
                         applied_refreshes,
                         applied_route_refreshes,
@@ -234,8 +291,10 @@ impl ControlPlaneRuntime {
                     self.telemetry.begin_draining();
                     enrollment_trigger.shutdown();
                     route_trigger.shutdown();
+                    hostname_trigger.shutdown();
                     let _ = await_route_server(&mut route_task).await;
                     let _ = await_enrollment(&mut enrollment_task).await;
+                    let _ = await_hostname(&mut hostname_task).await;
                     operations_trigger.shutdown();
                     let _ = await_operations(&mut operations_task).await;
                     return match result {
@@ -248,8 +307,10 @@ impl ControlPlaneRuntime {
                     self.telemetry.begin_draining();
                     server_trigger.shutdown();
                     enrollment_trigger.shutdown();
+                    hostname_trigger.shutdown();
                     let _ = await_server(server_task).await;
                     let _ = await_enrollment(&mut enrollment_task).await;
+                    let _ = await_hostname(&mut hostname_task).await;
                     operations_trigger.shutdown();
                     let _ = await_operations(&mut operations_task).await;
                     return match result {
@@ -263,8 +324,10 @@ impl ControlPlaneRuntime {
                     self.telemetry.begin_draining();
                     server_trigger.shutdown();
                     route_trigger.shutdown();
+                    hostname_trigger.shutdown();
                     let _ = await_route_server(&mut route_task).await;
                     let _ = await_server(server_task).await;
+                    let _ = await_hostname(&mut hostname_task).await;
                     operations_trigger.shutdown();
                     let _ = await_operations(&mut operations_task).await;
                     return match result {
@@ -274,14 +337,33 @@ impl ControlPlaneRuntime {
                         None => Err(ControlPlaneRuntimeError::EnrollmentStopped),
                     };
                 }
+                result = next_hostname(&mut hostname_task), if hostname_task.is_some() => {
+                    self.telemetry.begin_draining();
+                    server_trigger.shutdown();
+                    route_trigger.shutdown();
+                    enrollment_trigger.shutdown();
+                    let _ = await_route_server(&mut route_task).await;
+                    let _ = await_enrollment(&mut enrollment_task).await;
+                    let _ = await_server(server_task).await;
+                    operations_trigger.shutdown();
+                    let _ = await_operations(&mut operations_task).await;
+                    return match result {
+                        Some(Ok(Ok(()))) => Err(ControlPlaneRuntimeError::HostnameStopped),
+                        Some(Ok(Err(error))) => Err(ControlPlaneRuntimeError::Hostname(error)),
+                        Some(Err(error)) => Err(ControlPlaneRuntimeError::HostnameTask(error.to_string())),
+                        None => Err(ControlPlaneRuntimeError::HostnameStopped),
+                    };
+                }
                 result = next_operations(&mut operations_task), if operations_task.is_some() => {
                     self.telemetry.begin_draining();
                     server_trigger.shutdown();
                     route_trigger.shutdown();
+                    hostname_trigger.shutdown();
                     let _ = await_route_server(&mut route_task).await;
                     enrollment_trigger.shutdown();
                     let _ = await_server(server_task).await;
                     let _ = await_enrollment(&mut enrollment_task).await;
+                    let _ = await_hostname(&mut hostname_task).await;
                     return match result {
                         Some(Ok(Ok(_))) => Err(ControlPlaneRuntimeError::OperationsStopped),
                         Some(Ok(Err(error))) => Err(ControlPlaneRuntimeError::Operations(error)),
@@ -303,8 +385,12 @@ impl ControlPlaneRuntime {
                             self.telemetry.begin_draining();
                             server_trigger.shutdown();
                             enrollment_trigger.shutdown();
+                            route_trigger.shutdown();
+                            hostname_trigger.shutdown();
                             let _ = await_server(server_task).await;
                             let _ = await_enrollment(&mut enrollment_task).await;
+                            let _ = await_route_server(&mut route_task).await;
+                            let _ = await_hostname(&mut hostname_task).await;
                             operations_trigger.shutdown();
                             let _ = await_operations(&mut operations_task).await;
                             return Err(ControlPlaneRuntimeError::Authority(error));
@@ -321,9 +407,11 @@ impl ControlPlaneRuntime {
                                 server_trigger.shutdown();
                                 route_trigger.shutdown();
                                 enrollment_trigger.shutdown();
+                                hostname_trigger.shutdown();
                                 let _ = await_server(server_task).await;
                                 let _ = await_route_server(&mut route_task).await;
                                 let _ = await_enrollment(&mut enrollment_task).await;
+                                let _ = await_hostname(&mut hostname_task).await;
                                 operations_trigger.shutdown();
                                 let _ = await_operations(&mut operations_task).await;
                                 return Err(ControlPlaneRuntimeError::HttpsRouteAuthority(error));
@@ -413,6 +501,28 @@ async fn await_enrollment(
     }
 }
 
+async fn next_hostname(
+    task: &mut Option<JoinHandle<Result<(), HostnameServerError>>>,
+) -> Option<Result<Result<(), HostnameServerError>, tokio::task::JoinError>> {
+    match task {
+        Some(task) => Some(task.await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn await_hostname(
+    task: &mut Option<JoinHandle<Result<(), HostnameServerError>>>,
+) -> Result<(), ControlPlaneRuntimeError> {
+    let Some(task) = task.take() else {
+        return Ok(());
+    };
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ControlPlaneRuntimeError::Hostname(error)),
+        Err(error) => Err(ControlPlaneRuntimeError::HostnameTask(error.to_string())),
+    }
+}
+
 async fn await_server(
     task: JoinHandle<Result<(), SnapshotServerError>>,
 ) -> Result<(), ControlPlaneRuntimeError> {
@@ -428,6 +538,7 @@ pub struct ControlPlaneRuntimeOutcome {
     pub listen_addr: std::net::SocketAddr,
     pub enrollment_addr: Option<std::net::SocketAddr>,
     pub https_route_addr: Option<std::net::SocketAddr>,
+    pub hostname_addr: Option<std::net::SocketAddr>,
     pub operations_addr: Option<std::net::SocketAddr>,
     pub applied_refreshes: u64,
     pub applied_route_refreshes: u64,
@@ -444,6 +555,7 @@ pub enum ControlPlaneRuntimeError {
     HttpsRouteServer(HttpsRouteServerError),
     Server(SnapshotServerError),
     Enrollment(EnrollmentServerError),
+    Hostname(HostnameServerError),
     Operations(ControlPlaneOperationsError),
     StorageTask,
     ServerTask(String),
@@ -452,6 +564,8 @@ pub enum ControlPlaneRuntimeError {
     HttpsRouteServerStopped,
     EnrollmentTask(String),
     EnrollmentStopped,
+    HostnameTask(String),
+    HostnameStopped,
     OperationsTask(String),
     OperationsStopped,
 }
@@ -467,6 +581,7 @@ impl std::fmt::Display for ControlPlaneRuntimeError {
             Self::HttpsRouteServer(error) => error.fmt(f),
             Self::Server(error) => error.fmt(f),
             Self::Enrollment(error) => error.fmt(f),
+            Self::Hostname(error) => error.fmt(f),
             Self::Operations(error) => error.fmt(f),
             Self::StorageTask => f.write_str("snapshot storage worker stopped unexpectedly"),
             Self::ServerTask(_) => f.write_str("snapshot server task stopped unexpectedly"),
@@ -477,6 +592,8 @@ impl std::fmt::Display for ControlPlaneRuntimeError {
             Self::HttpsRouteServerStopped => f.write_str("HTTPS route server stopped unexpectedly"),
             Self::EnrollmentTask(_) => f.write_str("enrollment server task stopped unexpectedly"),
             Self::EnrollmentStopped => f.write_str("enrollment server stopped unexpectedly"),
+            Self::HostnameTask(_) => f.write_str("hostname server task stopped unexpectedly"),
+            Self::HostnameStopped => f.write_str("hostname server stopped unexpectedly"),
             Self::OperationsTask(_) => f.write_str("operations server task stopped unexpectedly"),
             Self::OperationsStopped => f.write_str("operations server stopped unexpectedly"),
         }

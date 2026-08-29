@@ -28,6 +28,7 @@
 
 mod agent_transport;
 mod enrollment;
+mod hostname;
 mod multiplex;
 mod operations;
 mod runtime;
@@ -41,6 +42,10 @@ pub use enrollment::{
     bootstrap_agent_credentials, read_token as read_enrollment_token,
     write_token as write_enrollment_token, AgentEnrollmentClient, AgentEnrollmentConfig,
     AgentEnrollmentError, AgentEnrollmentRuntime, EnrollmentClientConfig, IssuedEnrollment,
+};
+pub use hostname::{
+    AgentHostnameClient, AgentHostnameError, HostnameAllocation, HostnameClientConfig,
+    HostnameRelease,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,

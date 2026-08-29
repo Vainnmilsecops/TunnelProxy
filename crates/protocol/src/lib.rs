@@ -26,6 +26,7 @@ mod enrollment;
 mod error;
 mod frame;
 mod handshake;
+mod hostname;
 mod stream;
 mod wire;
 
@@ -41,6 +42,11 @@ pub use handshake::{
     HandshakeErrorCode, HeartbeatErrorCode, HeartbeatSequence, HelloRole, RegistrationPayloadError,
     RegistrationRequest, TransportSessionId, REGISTER_MAX_PAYLOAD_SIZE, REGISTER_PREFIX_SIZE,
     ROLE_AGENT,
+};
+pub use hostname::{
+    read_hostname_message, write_hostname_message, HostnameErrorCode, HostnameMessage,
+    HostnameProtocolError, HOSTNAME_PROTOCOL_ALPN, HOSTNAME_PROTOCOL_MAGIC,
+    HOSTNAME_PROTOCOL_VERSION, MAX_HOSTNAME_MESSAGE_BYTES,
 };
 pub use stream::StreamResetCode;
 pub use wire::{

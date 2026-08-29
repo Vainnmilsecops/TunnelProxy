@@ -8,10 +8,11 @@ use std::time::Duration;
 use tracing::{error, info};
 use tunnelproxy_agent::{
     bootstrap_agent_credentials, AgentEnrollmentConfig, AgentEnrollmentError,
-    AgentEnrollmentRuntime, AgentOperationsConfig, AgentOperationsError, AgentOperationsOutcome,
-    AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig,
-    AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, EnrollmentClientConfig, RuntimeShutdownConfig,
+    AgentEnrollmentRuntime, AgentHostnameClient, AgentHostnameError, AgentOperationsConfig,
+    AgentOperationsError, AgentOperationsOutcome, AgentOperationsRuntime, AgentRuntime,
+    AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
+    AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
+    AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{
     init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths,
@@ -20,7 +21,10 @@ use tunnelproxy_common::{
 use tunnelproxy_protocol::RegistrationRequest;
 
 const USAGE: &str = "\
-Usage: tunnelproxy-agent [OPTIONS]
+Usage:
+  tunnelproxy-agent [OPTIONS]
+  tunnelproxy-agent hostname-allocate [OPTIONS]
+  tunnelproxy-agent hostname-release [OPTIONS]
 
 Options:
   --edge <addr>                  Edge address  (default 127.0.0.1:7100)
@@ -61,6 +65,17 @@ Options:
   --enrollment-handshake-timeout-ms <ms> TLS timeout (default 10000)
   --enrollment-request-timeout-ms <ms> request timeout (default 30000)
   --enrollment-activation-timeout-ms <ms> reload wait (default 30000)
+Hostname command options:
+  --hostname-server <addr>          Control Plane hostname address (required)
+  --hostname-ca <path>              trusted hostname server CA PEM (required)
+  --hostname-server-name <name>     verified hostname service DNS name (required)
+  --tls-client-cert <path>          Agent certificate PEM (required)
+  --tls-client-key <path>           Agent private key PEM (required)
+  --agent-id <id>                   authorized Agent ID (required)
+  --tunnel-id <id>                  authorized Tunnel ID (required)
+  --connect-timeout-ms <ms>         TCP timeout (default 5000)
+  --tls-handshake-timeout-ms <ms>   TLS timeout (default 10000)
+  --request-timeout-ms <ms>         request timeout (default 5000)
   --help                         print this help and exit
 ";
 
@@ -75,6 +90,28 @@ async fn main() -> ExitCode {
     };
     let log_format = logging.format();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("hostname-allocate" | "hostname-release")
+    ) {
+        if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        return match run_hostname_command(&args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let configuration_error = error.is_configuration_error();
+                error!(%error, "Agent hostname command failed");
+                if configuration_error {
+                    print_usage_for_error(log_format);
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+        };
+    }
     let parsed = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -274,6 +311,161 @@ async fn main() -> ExitCode {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostnameAction {
+    Allocate,
+    Release,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HostnameCommandArgs {
+    action: HostnameAction,
+    server_addr: SocketAddr,
+    server_ca: PathBuf,
+    server_name: String,
+    client_cert: PathBuf,
+    client_key: PathBuf,
+    agent_id: AgentId,
+    tunnel_id: TunnelId,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    request_timeout: Duration,
+}
+
+async fn run_hostname_command(args: &[String]) -> Result<(), HostnameCommandError> {
+    let args = parse_hostname_command(args).map_err(HostnameCommandError::Arguments)?;
+    let (server_ca_pem, client_cert_pem, client_key_pem) = tokio::try_join!(
+        tokio::fs::read(&args.server_ca),
+        tokio::fs::read(&args.client_cert),
+        tokio::fs::read(&args.client_key),
+    )
+    .map_err(|_| HostnameCommandError::ReadTls)?;
+    let client = AgentHostnameClient::new(HostnameClientConfig {
+        server_addr: args.server_addr,
+        server_name: args.server_name,
+        server_ca_pem,
+        client_cert_pem,
+        client_key_pem,
+        connect_timeout: args.connect_timeout,
+        handshake_timeout: args.handshake_timeout,
+        request_timeout: args.request_timeout,
+    })
+    .map_err(HostnameCommandError::Client)?;
+    match args.action {
+        HostnameAction::Allocate => {
+            let outcome = client
+                .allocate(args.agent_id, args.tunnel_id)
+                .await
+                .map_err(HostnameCommandError::Client)?;
+            println!(
+                "hostname={} catalog_version={} changed={}",
+                outcome.hostname, outcome.catalog_version, outcome.changed
+            );
+        }
+        HostnameAction::Release => {
+            let outcome = client
+                .release(args.agent_id, args.tunnel_id)
+                .await
+                .map_err(HostnameCommandError::Client)?;
+            println!(
+                "hostname={} catalog_version={} changed={}",
+                outcome
+                    .hostname
+                    .map_or_else(|| "-".to_owned(), |hostname| hostname.to_string()),
+                outcome.catalog_version,
+                outcome.changed
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_hostname_command(args: &[String]) -> Result<HostnameCommandArgs, ArgError> {
+    let action = match args.first().map(String::as_str) {
+        Some("hostname-allocate") => HostnameAction::Allocate,
+        Some("hostname-release") => HostnameAction::Release,
+        Some(command) => return Err(ArgError::UnknownFlag(command.to_owned())),
+        None => return Err(ArgError::MissingRequired("hostname command")),
+    };
+    let mut server_addr = None;
+    let mut server_ca = None;
+    let mut server_name = None;
+    let mut client_cert = None;
+    let mut client_key = None;
+    let mut agent_id = None;
+    let mut tunnel_id = None;
+    let mut connect_timeout = Duration::from_secs(5);
+    let mut handshake_timeout = Duration::from_secs(10);
+    let mut request_timeout = Duration::from_secs(5);
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--hostname-server" => server_addr = Some(parse_addr(args, index, flag)?),
+            "--hostname-ca" => server_ca = Some(PathBuf::from(value(args, index, flag)?)),
+            "--hostname-server-name" => server_name = Some(value(args, index, flag)?.to_owned()),
+            "--tls-client-cert" => client_cert = Some(PathBuf::from(value(args, index, flag)?)),
+            "--tls-client-key" => client_key = Some(PathBuf::from(value(args, index, flag)?)),
+            "--agent-id" => agent_id = Some(parse_agent_id(args, index, flag)?),
+            "--tunnel-id" => tunnel_id = Some(parse_tunnel_id(args, index, flag)?),
+            "--connect-timeout-ms" => {
+                connect_timeout = Duration::from_millis(parse_number(args, index, flag)?)
+            }
+            "--tls-handshake-timeout-ms" => {
+                handshake_timeout = Duration::from_millis(parse_number(args, index, flag)?)
+            }
+            "--request-timeout-ms" => {
+                request_timeout = Duration::from_millis(parse_number(args, index, flag)?)
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(HostnameCommandArgs {
+        action,
+        server_addr: server_addr.ok_or(ArgError::MissingRequired("--hostname-server"))?,
+        server_ca: server_ca.ok_or(ArgError::MissingRequired("--hostname-ca"))?,
+        server_name: server_name.ok_or(ArgError::MissingRequired("--hostname-server-name"))?,
+        client_cert: client_cert.ok_or(ArgError::MissingRequired("--tls-client-cert"))?,
+        client_key: client_key.ok_or(ArgError::MissingRequired("--tls-client-key"))?,
+        agent_id: agent_id.ok_or(ArgError::MissingRequired("--agent-id"))?,
+        tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
+        connect_timeout,
+        handshake_timeout,
+        request_timeout,
+    })
+}
+
+#[derive(Debug)]
+enum HostnameCommandError {
+    Arguments(ArgError),
+    ReadTls,
+    Client(AgentHostnameError),
+}
+
+impl HostnameCommandError {
+    fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Arguments(_)
+                | Self::ReadTls
+                | Self::Client(
+                    AgentHostnameError::InvalidConfig | AgentHostnameError::TlsConfig(_)
+                )
+        )
+    }
+}
+
+impl std::fmt::Display for HostnameCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arguments(error) => error.fmt(formatter),
+            Self::ReadTls => formatter.write_str("failed to read hostname TLS PEM files"),
+            Self::Client(error) => error.fmt(formatter),
+        }
+    }
+}
+
 fn print_usage_for_error(log_format: ProcessLogFormat) {
     if log_format == ProcessLogFormat::Text {
         eprintln!("{USAGE}");
@@ -457,6 +649,7 @@ impl Default for ParsedArgs {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ArgError {
+    MissingRequired(&'static str),
     MissingValue(String),
     InvalidAddress { flag: String, value: String },
     InvalidNumber { flag: String, value: String },
@@ -467,6 +660,7 @@ enum ArgError {
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingRequired(flag) => write!(f, "missing required option: {flag}"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
             Self::InvalidAddress { flag, value } => {
                 write!(f, "{flag}={value} is not a valid socket address")
@@ -906,6 +1100,41 @@ mod tests {
     #[test]
     fn defaults_are_stable() {
         assert_eq!(parse_args(&[]).unwrap(), ParsedArgs::default());
+    }
+
+    #[test]
+    fn hostname_commands_require_complete_authenticated_inputs() {
+        let parsed = parse_hostname_command(&args(&[
+            "hostname-allocate",
+            "--hostname-server",
+            "127.0.0.1:17400",
+            "--hostname-ca",
+            "control-ca.pem",
+            "--hostname-server-name",
+            "control.test",
+            "--tls-client-cert",
+            "agent.pem",
+            "--tls-client-key",
+            "agent-key.pem",
+            "--agent-id",
+            "agent-prod",
+            "--tunnel-id",
+            "tunnel-prod",
+            "--request-timeout-ms",
+            "900",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.action, HostnameAction::Allocate);
+        assert_eq!(parsed.server_addr.port(), 17400);
+        assert_eq!(parsed.request_timeout, Duration::from_millis(900));
+        assert!(matches!(
+            parse_hostname_command(&args(&[
+                "hostname-release",
+                "--hostname-server",
+                "127.0.0.1:17400"
+            ])),
+            Err(ArgError::MissingRequired("--hostname-ca"))
+        ));
     }
 
     #[test]
