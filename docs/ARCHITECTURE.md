@@ -944,6 +944,29 @@ tunnel. Re-running allocation returns the same hostname and does not advance
 the catalog; only explicit release removes it. This preserves URL stability
 and avoids destructive rollback after an ambiguous client-side failure.
 
+### 2.41 Canonical Agent CLI and local config (Session 43)
+
+The production Agent CLI driver now lives in the Agent library. Two minimal
+Tokio wrappers call it with their executable name: `tunnelproxy-agent` retains
+the historical contract, while `tunnelproxy` is the canonical developer
+surface. Argument parsing, structured-log target, stdout, exit classes,
+supervision, and managed HTTP behavior therefore share one implementation.
+
+Local config v1 is a strict bounded startup input, not Control Plane state. It
+contains Edge and hostname-service addresses/trust names plus durable IDs and
+credential file paths. It contains no inline PEM, key, or token bytes. Reads
+stop after 64 KiB; unknown/duplicate fields, unsupported versions, invalid
+addresses/IDs, and empty paths fail before socket creation or allocation.
+Relative credential paths resolve from the config directory. Explicit CLI
+values override config, and config overrides process defaults.
+
+Config selection is deterministic: explicit flag, environment path, then one
+platform default. `config validate` loads both TLS client configurations and a
+default Agent runtime without opening a network connection. The local host and
+filesystem remain a trust boundary because changing the file can select other
+trust roots and credential paths. Account provisioning, key custody, DNS, and
+public-certificate automation remain outside this local representation.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

@@ -22,8 +22,9 @@ correct agent, which in turn proxies them into the local service.
 - Lifecycle-managed raw-ingress routes with bounded global and per-source-IP
   connection admission, tracked stream completion, graceful drain, and
   Agent-disconnect cleanup.
-- Runnable `tunnelproxy-edge` and `tunnelproxy-agent` binaries for one local
-  tunnel, with Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
+- Runnable `tunnelproxy-edge`, backwards-compatible `tunnelproxy-agent`, and
+  canonical `tunnelproxy` binaries for one local tunnel, with
+  Ctrl-C/SIGTERM-driven ordered shutdown and startup rollback.
 - Cancellable bounded exponential Agent reconnect and automatic Edge raw-route
   recovery on the same address after a replacement session arrives.
 - Optional mutual TLS on the Agent transport with Edge server-name validation,
@@ -76,6 +77,10 @@ correct agent, which in turn proxies them into the local service.
   TLS configuration before allocation, idempotently creates or reuses the
   durable hostname, starts the reconnecting Agent runtime, and prints the
   public URL once Protocol v2 registration succeeds.
+- A strict bounded local Agent config v1 with CLI/environment/platform path
+  resolution, relative credential paths, CLI override precedence, offline TLS
+  validation, and no inline secret values. It enables `tunnelproxy http 3000`
+  while retaining the long-form Session 42 command.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, HTTPS route, and Agent hostname transports with last-known-good
   rollback, expiry enforcement, and static Agent-certificate authorization
@@ -87,8 +92,8 @@ correct agent, which in turn proxies them into the local service.
 The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
-- The final short `tunnelproxy http` executable/config-profile UX,
-  custom-domain administration, DNS or certificate automation, and HTTP/2.
+- Automatic config/account provisioning, custom-domain administration, DNS or
+  certificate automation, and HTTP/2.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA
@@ -149,22 +154,14 @@ capacity interpretation.
 
 ## Managed HTTP orchestration
 
-With operator-provisioned wildcard DNS/public TLS and the authenticated
-services already running, one Agent process can allocate or reuse its hostname
-and expose a loopback HTTP port:
+With operator-provisioned wildcard DNS/public TLS, the authenticated services
+already running, and local config v1 installed, one Agent process can allocate
+or reuse its hostname and expose a loopback HTTP port:
 
 ```text
-tunnelproxy-agent http 3000 \
-  --edge edge.example.test:7100 \
-  --hostname-server control.example.test:7400 \
-  --hostname-ca control-plane-ca.pem \
-  --hostname-server-name control.example.test \
-  --tls-ca edge-ca.pem \
-  --tls-client-cert agent.pem \
-  --tls-client-key agent-key.pem \
-  --tls-server-name edge.example.test \
-  --agent-id agent-a \
-  --tunnel-id tunnel-a
+tunnelproxy config validate
+configuration valid
+tunnelproxy http 3000
 https://tp-0123456789abcdef0123456789abcdef.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
@@ -172,8 +169,8 @@ The URL is printed once the allocation response has durably published the
 catalog and the Agent transport is connected. Shutdown and reconnect never
 release or rename the hostname; use `hostname-release` explicitly. This is not
 an external reachability probe and does not create DNS records or public
-certificates. A persisted account/config profile and the shorter
-`tunnelproxy http 3000` packaging remain future ergonomics.
+certificates. See [`docs/AGENT_CONFIG.md`](docs/AGENT_CONFIG.md) for the strict
+schema, platform paths, precedence, trust boundary, and long-form fallback.
 
 ## Repository structure
 
@@ -262,6 +259,7 @@ and Definition of Done.
 | 40 _(complete)_ | authenticated Agent managed-hostname lifecycle service |
 | 41 _(complete)_ | atomic TLS and Agent-CA rotation for the hostname service |
 | 42 _(complete)_ | single-process managed HTTP hostname and Agent orchestration |
+| 43 _(complete)_ | canonical `tunnelproxy` CLI and strict local Agent config v1 |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

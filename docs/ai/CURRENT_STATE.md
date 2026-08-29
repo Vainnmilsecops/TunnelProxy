@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Managed HTTP Agent Orchestration** (Session 42).
+**Canonical Agent CLI and Strict Local Config** (Session 43).
 
 ## Completed
 
@@ -426,6 +426,17 @@
   local refusal, and terminal runtime failure do not auto-release it; repeated
   startup reuses the URL without a catalog version change, while explicit
   `hostname-release` remains the only removal path.
+- `tunnelproxy` is the canonical installed Agent executable. The historical
+  `tunnelproxy-agent` binary remains a thin compatibility wrapper over the same
+  library driver, preserving parsing, logging, exit, stdout, and lifecycle
+  behavior.
+- Strict local config v1 supplies managed HTTP Edge/hostname endpoints,
+  identities, trust names, and credential paths. Reads are capped at 64 KiB;
+  unknown/duplicate fields and unsupported versions fail closed. Relative
+  paths resolve from the config directory, and layering is CLI over config over
+  defaults with deterministic explicit/environment/platform path selection.
+- `tunnelproxy config validate` performs bounded offline schema, runtime, path,
+  and dual-TLS validation without network access or durable mutation.
 - The Control Plane may expose an independent bounded mutual-TLS route service
   using a strict versioned full-catalog protocol and latest-value publication.
 - Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
@@ -442,7 +453,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 371 explicit workspace tests are present; all prior behavior is preserved.
+- 376 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -459,10 +470,10 @@
   Sessions 36–37 expose saturation/fairness measurements plus their live
   capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
-- The short `tunnelproxy http` executable and persisted account/config profile.
-  Single-process orchestration exists as `tunnelproxy-agent http <port>`, but
-  wildcard DNS/public TLS provisioning and external reachability probing do
-  not.
+- Automatic account/profile creation, inline secret custody, named profiles,
+  wildcard DNS/public TLS provisioning, and external reachability probing.
+  The canonical `tunnelproxy http <port>` executable and strict path-based
+  local config are implemented.
 - HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
   administration, and signed access URLs.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
@@ -477,7 +488,7 @@
 
 ## Next planned session
 
-Session 43 has not been selected. DNS/public-certificate automation, the short
-`tunnelproxy http` packaging/config UX, HTTP/2, signed access URLs, and multi-edge ownership
-remain separate scopes. Collect workload evidence using the Session 37 runbook
+Session 44 has not been selected. DNS/public-certificate automation, HTTP/2,
+signed access URLs, and multi-edge ownership remain separate scopes. Collect
+workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

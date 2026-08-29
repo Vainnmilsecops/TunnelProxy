@@ -57,14 +57,18 @@ status/metrics, and Agent-owned-key bootstrap/renewal that publishes atomic
 credential manifests. The `http <port>` command composes one authenticated
 managed-hostname allocation with that supervisor and announces the URL after
 the transport becomes ready without coupling hostname lifetime to process
-lifetime.
+lifetime. A shared library driver powers the canonical `tunnelproxy`
+executable and compatibility `tunnelproxy-agent` wrapper. Strict bounded local
+config v1 supplies the repeated managed HTTP endpoints, identities, and
+credential paths, with offline validation and deterministic layering.
 
 **Responsibility (future)**
 
 - Initiate outbound tunnel to Edge (INV-001).
 - Register tunnel metadata with the control plane.
 - Forward public request traffic to a local service.
-- Short executable/config-profile ergonomics for `tunnelproxy http 3000`.
+- Extend canonical CLI ergonomics without weakening config strictness or
+  duplicating the shared driver.
 
 **Prohibited**
 

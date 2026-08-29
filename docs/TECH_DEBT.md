@@ -306,9 +306,10 @@
   public-to-loopback mapping after Protocol v2 registration. Real mTLS/HTTPS
   coverage proves allocation, dynamic exact-host activation, local HTTP
   forwarding, repeated allocation, and durable ownership after shutdown.
-- **Residual boundary:** Wildcard DNS/public TLS, external reachability probes,
-  persisted account/config profiles, the shorter `tunnelproxy` executable,
-  custom domains, and multi-edge ownership remain separate product scopes.
+- **Residual boundary:** Session 43 resolves the canonical executable and
+  strict local path-based config. Automatic account/profile provisioning,
+  wildcard DNS/public TLS, external reachability probes, custom domains, and
+  multi-edge ownership remain separate product scopes.
 
 ### DEBT-025 — Agent hostname TLS required Control Plane restart — resolved
 
@@ -411,6 +412,21 @@
 - **Residual boundary:** SHA-256 detects corruption but is not a signature.
   The local Edge host/filesystem remains trusted; adversarial local rollback is
   outside this debt item.
+
+### DEBT-027 — Managed HTTP startup repeats identity and mTLS flags — resolved
+
+- **Introduced in:** Session 42
+- **Resolved in:** Session 43
+- **Category:** developer ergonomics / security
+- **Impact:** medium for routine local startup
+- **Resolution:** Added the canonical `tunnelproxy` wrapper and strict,
+  versioned, 64 KiB-bounded local config. CLI values override config, config
+  overrides defaults, relative credential paths use the config directory, and
+  `config validate` performs offline schema/runtime/TLS validation. The legacy
+  executable and long-form CLI remain compatible through the shared driver.
+- **Residual boundary:** The local filesystem is trusted. Account creation,
+  inline secret custody, DNS, and public-certificate automation remain out of
+  scope.
 
 ### DEBT-016 — Runnable tunnel stops after its sole Agent disconnects
 

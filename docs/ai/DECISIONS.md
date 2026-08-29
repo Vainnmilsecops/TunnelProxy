@@ -1172,3 +1172,32 @@ certificate, Edge-catalog acknowledgement, local-application, or external
 reachability probe. Explicit release, operator-provisioned wildcard DNS/TLS,
 the short `tunnelproxy` executable/config profile, custom domains, and
 multi-edge ownership remain separate concerns.
+
+---
+
+## ADR-043 — Canonical Agent CLI uses a strict local config layer
+
+**Status:** Accepted (Session 43).
+
+**Context:** Session 42 delivered the complete managed HTTP lifecycle, but its
+installed command repeated Edge, hostname-service, identity, and credential
+paths on every invocation. A second implementation for a shorter executable
+would risk divergent parsing, logging, exit, and lifecycle behavior. An
+unbounded or permissive profile could silently accept typos or inline secrets.
+
+**Decision:** Move the production driver into the Agent library and install two
+thin wrappers. `tunnelproxy` is canonical; `tunnelproxy-agent` remains
+compatible. Local config v1 is strict JSON, capped at 64 KiB, rejects unknown
+and duplicate fields, stores only addresses, identifiers, trust names, and
+credential paths, and resolves relative paths from its own directory. Selection
+is explicit `--config`, then `TUNNELPROXY_CONFIG`, then the platform default.
+Layering is CLI over config over defaults. `config validate` loads schema,
+runtime values, and both TLS clients without network access or mutation.
+
+**Consequences:** `tunnelproxy http <port>` provides the intended concise
+startup while the legacy command remains behaviorally aligned by construction.
+Typos, oversized files, unsupported versions, missing credentials, and invalid
+TLS material fail before allocation or socket creation. The local filesystem
+remains a trust boundary: a writer can redirect endpoints or credential paths.
+Account provisioning, inline key custody, named profiles, DNS/public TLS
+automation, and reachability probing remain separate concerns.

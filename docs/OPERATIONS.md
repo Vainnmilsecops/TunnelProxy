@@ -275,3 +275,25 @@ permission to ignore the failure because expiry of that active server leaf is
 terminal and initiates ordered Control Plane shutdown. Roll back by restoring
 the last valid three-file set and publishing it as a new, higher generation;
 never lower or reuse a generation number.
+
+### Canonical Agent config rollout
+
+Use `tunnelproxy config validate --config <path>` as the preflight step before
+starting or restarting a managed HTTP Agent. Validation is offline: it reads a
+maximum of 64 KiB, rejects unknown or duplicate JSON fields and unsupported
+versions, resolves relative credential paths from the config directory, and
+parses both TLS client identities without connecting to Edge or Control Plane.
+
+Treat the config directory as part of the credential trust boundary. An actor
+who can replace the file can redirect the Agent or select different trust
+roots and key paths. Apply restrictive file permissions, deploy referenced PEM
+files before atomically replacing the config, and never place inline private
+keys or tokens in the JSON. Validation errors and structured logs intentionally
+omit file contents and secret values.
+
+For migration, keep the existing `tunnelproxy-agent` invocation available as
+a rollback path because it executes the same shared driver. Prefer an explicit
+`--config` in service definitions; use `TUNNELPROXY_CONFIG` only when the
+service manager owns the environment. Do not assume the platform-default file
+exists. A successful validation proves local configuration integrity, not DNS,
+public TLS, Edge catalog freshness, or external reachability.

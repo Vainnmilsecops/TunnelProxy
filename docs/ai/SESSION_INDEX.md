@@ -1356,3 +1356,33 @@ Out of scope:
 - DNS/public-certificate automation, an external reachability probe, persisted
   account/config profiles, the shorter `tunnelproxy http` executable, custom
   domains, HTTP/2/upgrade/CONNECT, multi-edge ownership, and protocol changes.
+
+## Session 43 — Canonical Agent CLI and Strict Local Config — complete
+
+Scope delivered:
+
+- Added the canonical `tunnelproxy` executable while retaining
+  `tunnelproxy-agent` as a compatibility wrapper. Both delegate to one library
+  driver, so parsing, structured logging, stdout, exit codes, and managed HTTP
+  supervision cannot drift.
+- Added strict versioned JSON config for the repeated Edge,
+  hostname-service, identity, trust-name, and credential-path inputs. Reads are
+  bounded to 64 KiB; unknown/duplicate fields, unsupported versions, invalid
+  addresses/IDs, empty paths, and invalid TLS material fail closed.
+- Added deterministic config resolution (`--config`, `TUNNELPROXY_CONFIG`,
+  then platform default), config-relative credential paths, and CLI-over-config-
+  over-default layering while preserving the Session 42 long-form command.
+- Added `tunnelproxy config validate`, which validates schema, runtime values,
+  and both TLS clients without network access or durable mutation.
+- Added parser/unit coverage for layering, strict schema, path precedence, and
+  the size bound plus subprocess coverage for the canonical help/validation,
+  no-network guarantee, and secret-safe failure. The workspace now contains
+  376 explicit tests.
+- Documented the schema, platform paths, migration, trust boundary, offline
+  validation, compatibility surface, and operational rollout.
+
+Out of scope:
+
+- Automatic account/profile creation, inline secrets, named profiles,
+  DNS/public-certificate automation, external reachability probing, custom
+  domains, HTTP/2/upgrade/CONNECT, multi-edge ownership, and protocol changes.

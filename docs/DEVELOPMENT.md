@@ -905,3 +905,37 @@ reachability probe. Ctrl-C, reconnect, a missing local service, and terminal
 runtime errors do not release the hostname. Repeating the command reuses the
 same hostname without advancing the catalog version. Use the explicit
 `hostname-release` command when permanent withdrawal is intended.
+
+## 28. Using the canonical Agent CLI and local config
+
+Session 43 installs `tunnelproxy` as the canonical executable while retaining
+`tunnelproxy-agent` as a compatibility wrapper over the same driver. Existing
+long-form commands therefore keep their parsing, exit codes, stderr logging,
+and stdout contracts.
+
+Create a strict config v1 as described in `docs/AGENT_CONFIG.md`, then validate
+its schema, paths, identifiers, addresses, and both TLS client configurations
+without opening a network connection:
+
+```text
+tunnelproxy config validate --config ./config.json
+```
+
+After validation, expose the loopback service with the shorter command:
+
+```text
+tunnelproxy http 3000 --config ./config.json
+```
+
+Explicit CLI values override fields from the selected file. Relative CA,
+certificate, and key paths resolve from the directory containing that file,
+not from the current working directory. `--config` overrides
+`TUNNELPROXY_CONFIG`, which overrides the platform default. A missing explicit
+or environment-selected file is always an error; a missing platform-default
+file is ignored only when the complete managed HTTP identity and mTLS input is
+provided explicitly on the CLI.
+
+The file stores credential paths, never inline PEM or token bytes. Keep it and
+the referenced private key readable only by the intended local account. This
+feature does not provision accounts, DNS, wildcard certificates, or external
+reachability.

@@ -24,11 +24,12 @@
 //! Agent/tunnel registration to the authenticated certificate. Session 29 adds
 //! a bounded loopback operations endpoint and connection-lifecycle metrics.
 //! Session 42 composes managed-hostname allocation with the runnable Agent in
-//! `tunnelproxy-agent http <port>`. Short executable/config-profile ergonomics
-//! remain out of scope. See
+//! `tunnelproxy-agent http <port>`. Session 43 adds the canonical `tunnelproxy`
+//! wrapper and a shared CLI driver with strict bounded local config v1. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
+pub mod cli;
 mod enrollment;
 mod hostname;
 mod multiplex;
