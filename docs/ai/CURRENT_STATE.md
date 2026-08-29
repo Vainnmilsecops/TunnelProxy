@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Authenticated Agent Hostname Lifecycle Service** (Session 40).
+**Atomic Agent Hostname Service TLS Rotation** (Session 41).
 
 ## Completed
 
@@ -405,6 +405,15 @@
   route, enrollment, and operations children. Fixed-cardinality hostname
   admission, TLS, authorization, and outcome metrics contain no identities or
   hostnames.
+- Hostname server TLS can independently bootstrap and reload a strict
+  digest-bound generation containing its server certificate, private key, and
+  Agent client CA while preserving `tunnelproxy-hostname/1`. New handshakes
+  atomically use increasing complete generations; invalid/stale/partial
+  candidates retain last-known-good and active server-certificate expiry stops
+  Control Plane supervision.
+- Hostname-specific cert/key paths may override the shared Control Plane
+  identity without breaking the Session 40 static defaults. Reload events emit
+  only generation, fixed health, and outcome values.
 - The Control Plane may expose an independent bounded mutual-TLS route service
   using a strict versioned full-catalog protocol and latest-value publication.
 - Dynamic HTTPS Edge mode bootstraps online before binding, atomically replaces
@@ -421,7 +430,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 365 explicit workspace tests are present; all prior behavior is preserved.
+- 367 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -455,7 +464,7 @@
 
 ## Next planned session
 
-Session 41 has not been selected. DNS/TLS automation, the complete
+Session 42 has not been selected. DNS/public-certificate automation, the complete
 `tunnelproxy http` UX, HTTP/2, signed access URLs, and multi-edge ownership
 remain separate scopes. Collect workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

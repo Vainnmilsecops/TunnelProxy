@@ -70,11 +70,12 @@ correct agent, which in turn proxies them into the local service.
   and live propagation through the existing Edge route stream.
 - An opt-in authenticated Agent hostname lifecycle service with dedicated
   mTLS/ALPN, exact certificate/AgentId/TunnelId authorization, server-owned
-  base domains, durable-before-live publication, and Agent allocate/release
-  commands.
+  base domains, durable-before-live publication, atomic server TLS/Agent-CA
+  rotation, and Agent allocate/release commands.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
-  HTTPS, and HTTPS route transports with last-known-good rollback, expiry
-  enforcement, and static Agent-certificate authorization rotation.
+  HTTPS, HTTPS route, and Agent hostname transports with last-known-good
+  rollback, expiry enforcement, and static Agent-certificate authorization
+  rotation.
 - Real TCP/mTLS integration tests for framing, forwarding, lifecycle, liveness,
   public admission, revocation, and the reverse data path.
 - Product, architecture, development, and AI context documentation.
@@ -242,6 +243,7 @@ and Definition of Done.
 | 38 _(complete)_ | bounded nonblocking process logging and sink telemetry |
 | 39 _(complete)_ | durable managed-hostname allocation and release lifecycle |
 | 40 _(complete)_ | authenticated Agent managed-hostname lifecycle service |
+| 41 _(complete)_ | atomic TLS and Agent-CA rotation for the hostname service |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

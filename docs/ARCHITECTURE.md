@@ -898,6 +898,29 @@ live Edge-distribution state. Repeated allocation and absent release remain
 idempotent. The runtime supervises this listener with the other Control Plane
 children and exposes only fixed-cardinality aggregate metrics.
 
+### 2.39 Agent hostname service TLS generations (Session 41)
+
+The hostname listener reuses the shared protocol-server reload engine but owns
+an independent manifest and fixed hostname ALPN. One generation binds exactly
+three files by SHA-256 digest: server certificate, server private key, and
+Agent client CA. The entire file set is loaded and parsed before a candidate
+rustls server configuration is published through the shared reloadable pointer.
+
+Generation numbers are non-zero and strictly increasing. Missing, unknown,
+partial, stale, same-generation-conflicting, digest-mismatched, malformed, or
+cryptographically incompatible candidates mark reload health failed without
+replacing the active configuration. Every accepted TCP connection snapshots
+the current immutable configuration before TLS negotiation, so new handshakes
+observe an applied generation while an in-flight one-request connection keeps
+the generation it negotiated.
+
+The hostname reloader is supervised alongside snapshot and route reloaders.
+Expiry of the last-known-good server leaf is terminal: Control Plane begins its
+ordered shutdown and releases all listeners. Reload events contain generation
+and fixed health only. Hostname cert/key paths may be separate from the
+snapshot identity; static Session 40 startup remains compatible when no
+hostname manifest is configured.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

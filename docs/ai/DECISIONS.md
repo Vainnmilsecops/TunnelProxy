@@ -1110,6 +1110,34 @@ connect, handshake, and request deadlines.
 managed-hostname lifecycle without database access, arbitrary namespace
 selection, or Edge hot-path lookups. Retries remain idempotent and Edge route
 distribution retains its existing protocol. Static hostname-service TLS
-configuration, wildcard DNS/certificate provisioning, the complete
+configuration (resolved by Session 41), wildcard DNS/certificate provisioning, the complete
 `tunnelproxy http` orchestration, custom domains, and multi-edge coordination
 remain outside this decision.
+
+---
+
+## ADR-041 — Hostname TLS rotates as an independent atomic generation
+
+**Status:** Accepted (Session 41).
+
+**Context:** The Session 40 hostname listener was long-lived but loaded its
+server identity and Agent trust roots only at process start. Restart-based
+rotation would interrupt unrelated Control Plane services, and reusing a
+snapshot or route TLS candidate would negotiate the wrong ALPN and couple
+independent trust policies.
+
+**Decision:** The hostname service owns a strict digest manifest and reuses the
+generic protocol-server reload engine with fixed ALPN
+`tunnelproxy-hostname/1`. Each generation contains exactly the server
+certificate, server private key, and Agent client CA. A complete valid higher
+generation is atomically published for new handshakes. Rejected candidates
+retain last-known-good. Expiry of the active server leaf without replacement
+is terminal to the shared Control Plane supervisor. Hostname cert/key paths may
+override, but default to, the existing Control Plane paths.
+
+**Consequences:** Operators can rotate the hostname endpoint identity and
+Agent trust policy without restarting or weakening ALPN separation. Old Agent
+credentials stop authenticating on new connections once their CA is removed.
+Manifest/file publication ordering and CA overlap remain operator policy;
+CRL/OCSP, protected key custody, DNS/public-certificate automation, and active
+TLS renegotiation remain outside this decision.

@@ -1,6 +1,7 @@
 //! Authenticated Agent-facing managed-hostname lifecycle service.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,18 +10,19 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{info, warn};
-use tunnelproxy_common::ShutdownSignal;
+use tunnelproxy_common::{ShutdownSignal, TlsConfigStatus, TlsReloadRuntimeError};
 use tunnelproxy_protocol::{
     read_hostname_message, write_hostname_message, HostnameErrorCode, HostnameMessage,
     HOSTNAME_PROTOCOL_ALPN,
 };
 
+use crate::snapshot_service::ProtocolServerTlsReloadRuntime;
 use crate::{
     operations::{ControlPlaneTelemetry, HostnameRequestOutcome},
     AuthorizationSnapshotSubscription, CertificateFingerprint, HttpsRouteAuthorityError,
     HttpsRouteRepositoryError, ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain,
     ManagedHostnameReleaseOutcome, PersistentHttpsRouteCatalog, SnapshotServerTlsConfig,
-    SnapshotTlsConfigError,
+    SnapshotServerTlsReloadConfig, SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError,
 };
 
 #[derive(Clone)]
@@ -42,6 +44,10 @@ impl HostnameServerTlsConfig {
         )
         .map(Self)
     }
+
+    pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
+        self.0.reload_status(expiry_warning)
+    }
 }
 
 impl std::fmt::Debug for HostnameServerTlsConfig {
@@ -49,6 +55,55 @@ impl std::fmt::Debug for HostnameServerTlsConfig {
         formatter
             .debug_struct("HostnameServerTlsConfig")
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HostnameServerTlsReloadConfig {
+    pub manifest_path: PathBuf,
+    pub server_certificate_path: PathBuf,
+    pub server_private_key_path: PathBuf,
+    pub agent_client_ca_path: PathBuf,
+    pub poll_interval: Duration,
+    pub expiry_warning: Duration,
+}
+
+impl From<HostnameServerTlsReloadConfig> for SnapshotServerTlsReloadConfig {
+    fn from(value: HostnameServerTlsReloadConfig) -> Self {
+        Self {
+            manifest_path: value.manifest_path,
+            server_certificate_path: value.server_certificate_path,
+            server_private_key_path: value.server_private_key_path,
+            client_ca_path: value.agent_client_ca_path,
+            poll_interval: value.poll_interval,
+            expiry_warning: value.expiry_warning,
+        }
+    }
+}
+
+pub struct HostnameServerTlsReloadRuntime {
+    inner: ProtocolServerTlsReloadRuntime,
+}
+
+impl HostnameServerTlsReloadRuntime {
+    pub async fn bootstrap(
+        reload: HostnameServerTlsReloadConfig,
+        handshake_timeout: Duration,
+    ) -> Result<(HostnameServerTlsConfig, Self), SnapshotTlsReloadBootstrapError> {
+        let (tls, inner) = ProtocolServerTlsReloadRuntime::bootstrap(
+            reload.into(),
+            handshake_timeout,
+            HOSTNAME_PROTOCOL_ALPN,
+        )
+        .await?;
+        Ok((HostnameServerTlsConfig(tls), Self { inner }))
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        signal: ShutdownSignal,
+    ) -> Result<(), TlsReloadRuntimeError> {
+        self.inner.run_until_shutdown(signal).await
     }
 }
 

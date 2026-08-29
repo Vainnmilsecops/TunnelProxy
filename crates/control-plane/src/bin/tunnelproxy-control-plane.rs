@@ -15,13 +15,14 @@ use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
     ControlPlaneOperationsConfig, ControlPlaneRuntime, ControlPlaneRuntimeConfig,
     EnrollmentRepository, EnrollmentServerConfig, EnrollmentServerTlsConfig, HostnameServerConfig,
-    HostnameServerTlsConfig, HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository,
-    HttpsRouteServerConfig, HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig,
-    HttpsRouteServerTlsReloadRuntime, HttpsRouteStatus, ManagedHostnameAllocationOutcome,
-    ManagedHostnameBaseDomain, ManagedHostnameReleaseOutcome, SnapshotCommitOutcome,
-    SnapshotRepository, SnapshotServerConfig, SnapshotServerTlsConfig,
-    SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime, SnapshotTlsConfigError,
-    SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository, MAX_SNAPSHOT_BYTES,
+    HostnameServerTlsConfig, HostnameServerTlsReloadConfig, HostnameServerTlsReloadRuntime,
+    HttpsRouteMutationOutcome, HttpsRouteRecord, HttpsRouteRepository, HttpsRouteServerConfig,
+    HttpsRouteServerTlsConfig, HttpsRouteServerTlsReloadConfig, HttpsRouteServerTlsReloadRuntime,
+    HttpsRouteStatus, ManagedHostnameAllocationOutcome, ManagedHostnameBaseDomain,
+    ManagedHostnameReleaseOutcome, SnapshotCommitOutcome, SnapshotRepository, SnapshotServerConfig,
+    SnapshotServerTlsConfig, SnapshotServerTlsReloadConfig, SnapshotServerTlsReloadRuntime,
+    SnapshotTlsConfigError, SnapshotTlsReloadBootstrapError, SqliteSnapshotRepository,
+    MAX_SNAPSHOT_BYTES,
 };
 
 const USAGE: &str = "\
@@ -51,6 +52,9 @@ Serve options:
   --hostname-listen <addr>           opt-in authenticated Agent hostname listener
   --hostname-base-domain <name>      server-owned managed hostname suffix
   --hostname-agent-ca <path>         trusted Agent client CA PEM
+  --hostname-tls-cert <path>         hostname certificate PEM (defaults to --tls-cert)
+  --hostname-tls-key <path>          hostname private key PEM (defaults to --tls-key)
+  --hostname-tls-reload-manifest <path> hostname TLS generation manifest
   --max-hostname-clients <usize>     hostname client limit (default 32)
   --hostname-request-timeout-ms <ms> hostname request deadline (default 5000)
   --ops-listen <addr>                opt-in loopback operations listener
@@ -272,7 +276,7 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (tls, reloader) = load_server_tls(&args).await?;
     let (https_route_server, https_route_reloader) = load_https_route_server_config(&args).await?;
     let enrollment = load_enrollment_server_config(&args).await?;
-    let hostname = load_hostname_server_config(&args).await?;
+    let (hostname, hostname_reloader) = load_hostname_server_config(&args).await?;
     let runtime_config = ControlPlaneRuntimeConfig {
         database_path: args.database.clone(),
         refresh_interval: args.refresh_interval,
@@ -329,7 +333,8 @@ async fn run_server(args: ServeArgs) -> Result<(), ServeError> {
     let (trigger, signal) = shutdown_channel();
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
-    let reload_future = run_tls_reloaders(reloader, https_route_reloader, signal);
+    let reload_future =
+        run_tls_reloaders(reloader, https_route_reloader, hostname_reloader, signal);
     tokio::pin!(reload_future);
     let os_signal = wait_for_process_shutdown();
     tokio::pin!(os_signal);
@@ -457,13 +462,52 @@ async fn load_enrollment_server_config(
 
 async fn load_hostname_server_config(
     args: &ServeArgs,
-) -> Result<Option<HostnameServerConfig>, ServeError> {
+) -> Result<
+    (
+        Option<HostnameServerConfig>,
+        Option<HostnameServerTlsReloadRuntime>,
+    ),
+    ServeError,
+> {
     let Some(hostname) = &args.hostname else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    let server_certificate_path = hostname.tls_cert.as_ref().unwrap_or(&args.tls_cert);
+    let server_private_key_path = hostname.tls_key.as_ref().unwrap_or(&args.tls_key);
+    if let Some(manifest_path) = &hostname.tls_reload_manifest {
+        let (tls, runtime) = HostnameServerTlsReloadRuntime::bootstrap(
+            HostnameServerTlsReloadConfig {
+                manifest_path: manifest_path.clone(),
+                server_certificate_path: server_certificate_path.clone(),
+                server_private_key_path: server_private_key_path.clone(),
+                agent_client_ca_path: hostname.agent_ca.clone(),
+                poll_interval: args.tls_reload_interval,
+                expiry_warning: args.tls_expiry_warning,
+            },
+            args.tls_handshake_timeout,
+        )
+        .await
+        .map_err(ServeError::ReloadBootstrap)?;
+        return Ok((
+            Some(HostnameServerConfig {
+                listen_addr: hostname.listen,
+                max_clients: hostname.max_clients,
+                request_timeout: hostname.request_timeout,
+                base_domain: hostname.base_domain.clone(),
+                tls,
+            }),
+            Some(runtime),
+        ));
+    }
     let (server_certificate, server_private_key, agent_ca) = tokio::try_join!(
-        read_pem(args.tls_cert.clone(), "hostname server certificate"),
-        read_pem(args.tls_key.clone(), "hostname server private key"),
+        read_pem(
+            server_certificate_path.clone(),
+            "hostname server certificate"
+        ),
+        read_pem(
+            server_private_key_path.clone(),
+            "hostname server private key"
+        ),
         read_pem(hostname.agent_ca.clone(), "hostname Agent client CA"),
     )?;
     let tls = HostnameServerTlsConfig::from_pem(
@@ -473,13 +517,16 @@ async fn load_hostname_server_config(
         args.tls_handshake_timeout,
     )
     .map_err(ServeError::Tls)?;
-    Ok(Some(HostnameServerConfig {
-        listen_addr: hostname.listen,
-        max_clients: hostname.max_clients,
-        request_timeout: hostname.request_timeout,
-        base_domain: hostname.base_domain.clone(),
-        tls,
-    }))
+    Ok((
+        Some(HostnameServerConfig {
+            listen_addr: hostname.listen,
+            max_clients: hostname.max_clients,
+            request_timeout: hostname.request_timeout,
+            base_domain: hostname.base_domain.clone(),
+            tls,
+        }),
+        None,
+    ))
 }
 
 async fn run_create_token(args: CreateTokenArgs) -> Result<(), CreateTokenError> {
@@ -540,6 +587,7 @@ async fn load_server_tls(
 async fn run_tls_reloaders(
     snapshot: Option<SnapshotServerTlsReloadRuntime>,
     routes: Option<HttpsRouteServerTlsReloadRuntime>,
+    hostname: Option<HostnameServerTlsReloadRuntime>,
     signal: tunnelproxy_common::ShutdownSignal,
 ) -> Result<(), tunnelproxy_common::TlsReloadRuntimeError> {
     let mut tasks = tokio::task::JoinSet::new();
@@ -548,6 +596,10 @@ async fn run_tls_reloaders(
         tasks.spawn(runtime.run_until_shutdown(child_signal));
     }
     if let Some(runtime) = routes {
+        let child_signal = signal.clone();
+        tasks.spawn(runtime.run_until_shutdown(child_signal));
+    }
+    if let Some(runtime) = hostname {
         let child_signal = signal.clone();
         tasks.spawn(runtime.run_until_shutdown(child_signal));
     }
@@ -616,6 +668,9 @@ struct HostnameArgs {
     listen: SocketAddr,
     base_domain: ManagedHostnameBaseDomain,
     agent_ca: PathBuf,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_reload_manifest: Option<PathBuf>,
     max_clients: usize,
     request_timeout: Duration,
 }
@@ -897,6 +952,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     let mut hostname_listen = None;
     let mut hostname_base_domain = None;
     let mut hostname_agent_ca = None;
+    let mut hostname_tls_cert = None;
+    let mut hostname_tls_key = None;
+    let mut hostname_tls_reload_manifest = None;
     let mut max_hostname_clients = 32;
     let mut hostname_request_timeout = Duration::from_secs(5);
     let mut hostname_options_present = false;
@@ -927,6 +985,18 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             }
             "--hostname-agent-ca" => {
                 hostname_agent_ca = Some(parse_path(args, index, flag)?);
+                hostname_options_present = true;
+            }
+            "--hostname-tls-cert" => {
+                hostname_tls_cert = Some(parse_path(args, index, flag)?);
+                hostname_options_present = true;
+            }
+            "--hostname-tls-key" => {
+                hostname_tls_key = Some(parse_path(args, index, flag)?);
+                hostname_options_present = true;
+            }
+            "--hostname-tls-reload-manifest" => {
+                hostname_tls_reload_manifest = Some(parse_path(args, index, flag)?);
                 hostname_options_present = true;
             }
             "--max-hostname-clients" => {
@@ -1019,6 +1089,7 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     if reload_tuning_present
         && tls_reload_manifest.is_none()
         && https_route_tls_reload_manifest.is_none()
+        && hostname_tls_reload_manifest.is_none()
     {
         return Err(ArgError::MissingRequired("--tls-reload-manifest"));
     }
@@ -1027,6 +1098,11 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
     }
     if hostname_options_present && https_route_listen.is_none() {
         return Err(ArgError::MissingRequired("--https-route-listen"));
+    }
+    match (&hostname_tls_cert, &hostname_tls_key) {
+        (Some(_), None) => return Err(ArgError::MissingRequired("--hostname-tls-key")),
+        (None, Some(_)) => return Err(ArgError::MissingRequired("--hostname-tls-cert")),
+        _ => {}
     }
     let enrollment = if enrollment_options_present {
         Some(EnrollmentArgs {
@@ -1060,6 +1136,9 @@ fn parse_serve(args: &[String]) -> Result<ServeArgs, ArgError> {
             base_domain: hostname_base_domain
                 .ok_or(ArgError::MissingRequired("--hostname-base-domain"))?,
             agent_ca: hostname_agent_ca.ok_or(ArgError::MissingRequired("--hostname-agent-ca"))?,
+            tls_cert: hostname_tls_cert,
+            tls_key: hostname_tls_key,
+            tls_reload_manifest: hostname_tls_reload_manifest,
             max_clients: max_hostname_clients,
             request_timeout: hostname_request_timeout,
         })
@@ -1607,6 +1686,12 @@ mod tests {
             "Agents.Example.Test.",
             "--hostname-agent-ca",
             "agent-ca.pem",
+            "--hostname-tls-cert",
+            "hostname.pem",
+            "--hostname-tls-key",
+            "hostname-key.pem",
+            "--hostname-tls-reload-manifest",
+            "hostname-tls.json",
             "--max-hostname-clients",
             "7",
             "--hostname-request-timeout-ms",
@@ -1618,6 +1703,12 @@ mod tests {
         let hostname = serve.hostname.unwrap();
         assert_eq!(hostname.listen.port(), 17400);
         assert_eq!(hostname.base_domain.as_str(), "agents.example.test");
+        assert_eq!(hostname.tls_cert, Some(PathBuf::from("hostname.pem")));
+        assert_eq!(hostname.tls_key, Some(PathBuf::from("hostname-key.pem")));
+        assert_eq!(
+            hostname.tls_reload_manifest,
+            Some(PathBuf::from("hostname-tls.json"))
+        );
         assert_eq!(hostname.max_clients, 7);
         assert_eq!(hostname.request_timeout, Duration::from_millis(800));
 
@@ -1640,6 +1731,48 @@ mod tests {
                 "agent-ca.pem",
             ])),
             Err(ArgError::MissingRequired("--https-route-listen"))
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server-key.pem",
+                "--edge-client-ca",
+                "edge-ca.pem",
+                "--https-route-listen",
+                "127.0.0.1:17201",
+                "--hostname-listen",
+                "127.0.0.1:17400",
+                "--hostname-base-domain",
+                "agents.example.test",
+                "--hostname-agent-ca",
+                "agent-ca.pem",
+                "--hostname-tls-cert",
+                "hostname.pem",
+            ])),
+            Err(ArgError::MissingRequired("--hostname-tls-key"))
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "serve",
+                "--database",
+                "state.db",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server-key.pem",
+                "--edge-client-ca",
+                "edge-ca.pem",
+                "--https-route-listen",
+                "127.0.0.1:17201",
+                "--hostname-tls-reload-manifest",
+                "hostname-tls.json",
+            ])),
+            Err(ArgError::MissingRequired("--hostname-listen"))
         ));
     }
 

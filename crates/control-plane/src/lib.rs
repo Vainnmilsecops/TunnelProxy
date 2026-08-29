@@ -44,6 +44,7 @@ pub use enrollment_service::{
 };
 pub use hostname_service::{
     HostnameServer, HostnameServerConfig, HostnameServerError, HostnameServerTlsConfig,
+    HostnameServerTlsReloadConfig, HostnameServerTlsReloadRuntime,
 };
 pub use https_route_codec::{
     decode_https_route_catalog, encode_https_route_catalog, HttpsRouteCodecError,

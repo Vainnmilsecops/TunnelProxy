@@ -16,6 +16,11 @@ and carries no application traffic.
   fingerprint, AgentId, and enabled TunnelId against its current snapshot.
 - One connection carries one request and one response. All phases have
   configurable non-zero deadlines and server admission is semaphore-bounded.
+- Control Plane can opt into digest-manifest TLS generations containing the
+  server certificate, server private key, and Agent client CA. Complete newer
+  generations apply only to new handshakes; invalid candidates retain the
+  last-known-good configuration and active server-certificate expiry is
+  terminal.
 
 ## Frame
 

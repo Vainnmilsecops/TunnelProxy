@@ -288,6 +288,27 @@
 
 ## Resolved items
 
+### DEBT-025 — Agent hostname TLS required Control Plane restart — resolved
+
+- **Introduced in:** Session 40
+- **Resolved in:** Session 41
+- **Category:** ops / security
+- **Impact:** medium during hostname server identity or Agent CA rotation
+- **Rationale:** The first authenticated hostname lifecycle slice used a static
+  rustls server configuration. Rotation required restarting the complete
+  Control Plane even though snapshot and route transports already supported
+  atomic generations.
+- **Resolution:** Session 41 wraps the shared protocol-server reload engine with
+  hostname-specific configuration and fixed ALPN. Strict digest manifests
+  atomically publish server certificate, key, and Agent CA generations for new
+  handshakes, retain last-known-good after invalid candidates, and terminate
+  supervision after active server-leaf expiry. Real mTLS tests cover identity
+  and CA rotation, old-client rejection, invalid-generation rollback, and
+  expiry.
+- **Residual boundary:** Multi-CA overlap is expressed by an operator-supplied
+  CA bundle. Protected key custody, CA lifecycle, CRL/OCSP, and active TLS
+  renegotiation remain outside this item.
+
 ### DEBT-024 — Durable HTTPS routes require operator-chosen hostnames — resolved
 
 - **Introduced in:** Session 31
