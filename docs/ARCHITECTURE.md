@@ -967,6 +967,36 @@ filesystem remain a trust boundary because changing the file can select other
 trust roots and credential paths. Account provisioning, key custody, DNS, and
 public-certificate automation remain outside this local representation.
 
+### 2.42 Bounded HTTP/2 public ingress (Session 44)
+
+HTTP/2 is an explicit public HTTPS policy, not a replacement transport. The
+default TLS generation still advertises only `http/1.1`; enabling HTTP/2 makes
+every initial and reloaded generation advertise `h2` first with HTTP/1.1
+fallback. A missing ALPN retains the compatible HTTP/1.1 path, while any other
+negotiated protocol fails before request parsing.
+
+After TLS, Edge selects a Hyper HTTP/1.1 or HTTP/2 connection driver around one
+shared request service. HTTP/2 `:authority`, an optional Host field, and TLS SNI
+must canonicalize to the same exact hostname. Header count/list size, request
+body, request deadline, global/per-IP rate admission, cached route lookup, and
+Tunnel Protocol stream admission are repeated independently for every stream.
+CONNECT and upgrade semantics remain rejected.
+
+HTTP/2 connection state is explicitly bounded: concurrent and pending/local
+reset streams have the same hard cap, send buffers and initial flow-control
+windows are capped, PING keepalive has finite interval/timeout, and connection
+admission remains global plus per source IP. Accepted requests are rewritten to
+origin-form HTTP/1.1 with canonical forwarding headers before entering the
+existing Edge-to-Agent byte stream, so Tunnel Protocol v2 and local services do
+not change.
+
+One rejected, oversized, or timed-out stream returns its own response without
+closing healthy siblings. Shutdown stops listener admission, initiates Hyper's
+HTTP/2 graceful shutdown/GOAWAY, and lets active response bodies finish within
+the existing HTTPS drain deadline before task abort. Status and operations
+metrics expose only protocol counters and active/peak stream cardinality.
+Hostnames, peer addresses, durable IDs, and payload data are not labels.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

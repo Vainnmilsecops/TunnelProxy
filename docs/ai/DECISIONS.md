@@ -1201,3 +1201,33 @@ TLS material fail before allocation or socket creation. The local filesystem
 remains a trust boundary: a writer can redirect endpoints or credential paths.
 Account provisioning, inline key custody, named profiles, DNS/public TLS
 automation, and reachability probing remain separate concerns.
+
+---
+
+## ADR-044 — HTTP/2 is opt-in, bounded, and translated at Edge
+
+**Status:** Accepted (Session 44).
+
+**Context:** Public HTTPS already enforced exact Host/SNI routing, bounded
+HTTP/1.1 reuse, request/body deadlines, rate admission, and graceful drain.
+Enabling HTTP/2 without explicit stream, reset, buffer, and liveness bounds
+would multiply per-connection resource ownership and could bypass the security
+checks established for HTTP/1.1. Extending Tunnel Protocol or requiring local
+applications to speak HTTP/2 was unnecessary.
+
+**Decision:** Keep HTTP/1.1-only as the default and add one explicit HTTP/2
+policy. Enabled public TLS generations advertise `h2` then `http/1.1`; reloads
+capture the startup policy. ALPN selects a protocol-specific Hyper connection
+driver around one shared request service. HTTP/2 authority, optional Host, and
+SNI must match. Concurrent and reset streams, header lists, send/flow windows,
+PING keepalive, body size, request time, and request-rate state are bounded.
+Accepted streams are normalized to origin-form HTTP/1.1 and use the unchanged
+cached route and Tunnel Protocol v2 path.
+
+**Consequences:** Multiple public requests can safely share one TLS connection
+without coupling sibling failure or changing Agents/local services. HTTP/1.1
+fallback and all previous defaults remain compatible. Shutdown uses graceful
+HTTP/2 GOAWAY within the existing drain deadline, and operations telemetry adds
+only fixed-cardinality protocol/stream values. h2c, HTTP/2 upstream forwarding,
+WebSocket, CONNECT, HTTP/3, distributed rate limiting, and multi-edge ownership
+remain separate concerns.

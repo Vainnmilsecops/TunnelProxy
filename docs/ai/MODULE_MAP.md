@@ -81,8 +81,8 @@ credential paths, with offline validation and deterministic layering.
 
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed raw TCP routes, and bounded
-HTTPS/HTTP/1.1 ingress with opt-in capped keep-alive, per-request deadlines,
-and graceful connection drain. The runnable
+HTTPS ingress with default HTTP/1.1 and opt-in bounded HTTP/2, per-request
+deadlines, protocol-specific keepalive, and graceful connection drain. The runnable
 single-tunnel process keeps its durable TunnelId listener bound across
 replacement Agent sessions. Loopback is the default; explicit public raw mode
 requires Agent mTLS, dynamic snapshot authority, global admission, and a
@@ -97,7 +97,7 @@ In dynamic HTTPS mode, Edge bootstraps an independent authenticated route
 stream, atomically reads immutable in-memory catalogs on the request path, and
 serves the last authenticated catalog only until its configured stale deadline.
 Public raw ingress remains opaque TCP. The alternative HTTPS mode terminates a
-separate reloadable public TLS identity, requires exact SNI/Host routing,
+separate reloadable public TLS identity, requires exact SNI/Host-or-authority routing,
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane

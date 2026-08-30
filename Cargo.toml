@@ -55,7 +55,7 @@ x509-parser = "0.16"
 bytes = "1"
 # Session 25 pins the HTTP stack to releases whose declared MSRV remains below
 # the workspace Rust 1.75 floor. CI verifies this independently.
-hyper = { version = "=1.6.0", default-features = false, features = ["client", "server", "http1"] }
+hyper = { version = "=1.6.0", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "=0.1.10", default-features = false, features = ["tokio"] }
 http-body-util = "=0.1.2"
 

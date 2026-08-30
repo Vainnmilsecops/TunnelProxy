@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Canonical Agent CLI and Strict Local Config** (Session 43).
+**Bounded HTTP/2 Public HTTPS Ingress** (Session 44).
 
 ## Completed
 
@@ -293,18 +293,19 @@
 - The MSRV path retains the workspace-level `forbid(unsafe_code)` policy while
   avoiding redundant crate-level lint overrides, and locks transitive
   dependencies to Cargo-1.75-readable releases.
-- Edge can replace its raw listener with bounded HTTPS/HTTP/1.1 ingress for one
+- Edge can replace its raw listener with bounded HTTPS ingress for one
   exact configured DNS hostname and TunnelId. HTTP routing uses only cached
   hostname and live-session state; Agent-offline requests fail closed.
 - Public HTTPS has explicit global/per-source-IP connection admission, public
   opt-in, Agent-facing mTLS, and external dynamic snapshot requirements.
   Loopback remains the safe default.
 - Public TLS is a separate server-only rustls configuration with bounded
-  handshake time, HTTP/1.1 ALPN, secret-safe diagnostics, expiry status, and
-  optional atomic digest-manifest generation reload.
-- Host, SNI, and absolute-form authority are normalized and compared exactly.
-  CONNECT, upgrades, unknown hosts, duplicate/missing Host, and host-fronting
-  attempts are rejected before a tunnel stream opens.
+  handshake time, default HTTP/1.1 ALPN, optional `h2` ALPN, secret-safe
+  diagnostics, expiry status, and optional atomic digest-manifest generation
+  reload that preserves the selected protocol policy.
+- Host, SNI, and request authority are normalized and compared exactly.
+  CONNECT, upgrades, unknown hosts, duplicate Host, missing authority, and
+  host-fronting attempts are rejected before a tunnel stream opens.
 - Edge strips hop-by-hop fields plus untrusted `Forwarded` and
   `X-Forwarded-*`, then supplies canonical `X-Forwarded-For`,
   `X-Forwarded-Proto`, `X-Forwarded-Host`, and Host values to the local service.
@@ -315,6 +316,14 @@
   of 1024 sequential requests per TLS connection. Every request revalidates
   routing/security/admission state; errors close, deadlines cover response
   bodies, and shutdown gracefully closes idle reused connections.
+- Public HTTP/2 is separately opt-in. Each TLS connection has a hard concurrent
+  stream cap, bounded header/reset/send/flow-control state, PING keepalive, and
+  per-stream body/deadline/rate-limit enforcement. HTTP/2 authority, optional
+  Host, and TLS SNI must agree exactly; accepted requests are normalized to
+  HTTP/1.1 for the existing Agent/local path without a Tunnel Protocol change.
+- HTTP/2 stream failure, oversized bodies, and request timeout remain isolated
+  from sibling streams. Shutdown sends graceful GOAWAY and drains within the
+  existing HTTPS deadline. HTTP/1.1 fallback remains available when enabled.
 - `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
   the HTTP client connection can reuse the existing multiplexed Tunnel
   Protocol v2 path without a wire-format change.
@@ -453,7 +462,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 376 explicit workspace tests are present; all prior behavior is preserved.
+- 378 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -474,8 +483,9 @@
   wildcard DNS/public TLS provisioning, and external reachability probing.
   The canonical `tunnelproxy http <port>` executable and strict path-based
   local config are implemented.
-- HTTP/2, WebSocket/upgrade, CONNECT, custom-domain
-  administration, and signed access URLs.
+- WebSocket/upgrade, CONNECT, HTTP/3, custom-domain administration, and signed
+  access URLs. HTTP/2 public ingress is implemented; local forwarding remains
+  HTTP/1.1.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -488,7 +498,7 @@
 
 ## Next planned session
 
-Session 44 has not been selected. DNS/public-certificate automation, HTTP/2,
-signed access URLs, and multi-edge ownership remain separate scopes. Collect
+Session 45 has not been selected. DNS/public-certificate automation, signed
+access URLs, WebSocket/CONNECT, and multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

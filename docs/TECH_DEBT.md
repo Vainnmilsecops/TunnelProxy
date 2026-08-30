@@ -75,26 +75,30 @@
   and explicit behavior during coordination outages.
 - **Tracking:** open.
 
-### DEBT-020 — Public HTTP ingress lacks HTTP/2 and upgrade support
+### DEBT-020 — Public HTTP ingress lacks upgrade support
 
 - **Introduced in:** Session 25
 - **Category:** product / performance
 - **Impact:** medium for production HTTP workloads, low for the bounded slice
-- **Rationale:** The first public HTTPS surface disables keep-alive and supports
-  exactly one HTTP/1.1 request per TLS connection. It rejects HTTP upgrade,
-  WebSocket, CONNECT, and does not negotiate HTTP/2. This keeps request
+- **Rationale:** The first public HTTPS surface disabled keep-alive and
+  supported exactly one HTTP/1.1 request per TLS connection. It rejected HTTP
+  upgrade, WebSocket, CONNECT, and did not negotiate HTTP/2. This kept request
   ownership, timeout, body bounds, drain, and tunnel-stream completion explicit
   while hostname and forwarding-header security are established.
-- **Exit plan:** Add measured connection reuse and HTTP/2 only with explicit
+- **Exit plan:** Add upgrades only as separate policy surfaces with explicit
   per-connection/per-stream admission, fair tunnel scheduling, independent body
   deadlines, graceful drain tests, and equivalent host-fronting/header
   sanitization coverage. Treat upgrades/CONNECT as separate policy surfaces.
 - **Progress:** Session 34 added opt-in sequential HTTP/1.1 keep-alive with a
   hard request cap, per-request header/body deadlines, repeated admission and
   routing checks, error-close semantics, graceful drain, and fixed-cardinality
-  reuse/timeout metrics. The default remains one request for compatibility.
-- **Tracking:** HTTP/1.1 connection reuse resolved in Session 34; HTTP/2,
-  WebSocket/upgrade, CONNECT, and measured multiplexed fairness remain open.
+  reuse/timeout metrics. Session 44 added opt-in ALPN HTTP/2 with bounded
+  concurrent streams, headers, reset state, send/flow-control windows,
+  keepalive, per-stream isolation, exact authority/SNI validation, HTTP/1.1
+  local translation, fixed-cardinality metrics, and graceful GOAWAY drain.
+  HTTP/1.1-only remains the default for compatibility.
+- **Tracking:** HTTP/1.1 reuse resolved in Session 34 and HTTP/2 resolved in
+  Session 44. WebSocket/upgrade and CONNECT remain open.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

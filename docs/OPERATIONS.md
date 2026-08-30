@@ -297,3 +297,24 @@ a rollback path because it executes the same shared driver. Prefer an explicit
 service manager owns the environment. Do not assume the platform-default file
 exists. A successful validation proves local configuration integrity, not DNS,
 public TLS, Edge catalog freshness, or external reachability.
+
+### HTTP/2 rollout and rollback
+
+Roll out `--enable-http2` on a canary Edge first. Confirm negotiated-protocol
+counts, active/peak stream occupancy, request timeouts, rate-limit rejections,
+Tunnel DATA saturation, and drain outcomes before increasing the default
+32-stream cap. The hard supported cap is 128 streams per TLS connection;
+global and per-IP connection admission still apply outside that bound.
+
+Keep HTTP/2 keepalive enabled with non-zero interval and acknowledgement
+timeout. A silent client is closed when the PING acknowledgement deadline is
+missed. During shutdown, Edge sends graceful GOAWAY and waits for active
+streams only until the configured ingress drain deadline. Forced shutdown is
+observable through the existing runtime outcome.
+
+TLS generation rotation must not change protocol policy: certificate and key
+files are published before the manifest as usual, while the running Edge
+rebuilds each generation with the startup ALPN list. Roll back HTTP/2 by
+removing the opt-in and restarting Edge; clients then negotiate HTTP/1.1 only.
+No route catalog, Agent credential, hostname allocation, or Tunnel Protocol
+rollback is required.

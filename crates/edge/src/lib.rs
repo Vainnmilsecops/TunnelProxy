@@ -53,7 +53,9 @@
 //! Session 12 composes it into a runnable single-Agent process, Session 14
 //! adds mutual TLS to that Agent transport, and Session 23 adds explicit
 //! public raw TCP exposure backed by dynamic authorization and per-IP
-//! admission. Public HTTP/TLS routing is not implemented.
+//! admission. Sessions 25 and 34 add bounded HTTP/1.1 routing; Session 44 adds
+//! opt-in bounded HTTP/2 with the same exact cached routing and local HTTP/1.1
+//! forwarding path.
 //! See `docs/ai/DECISIONS.md` (ADR-002, ADR-005, ADR-006, ADR-007) and
 //! `docs/TECH_DEBT.md` for the deliberate limitations.
 
@@ -1183,10 +1185,11 @@ mod snapshot_runtime;
 mod tls;
 
 pub use http_ingress::{
-    HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError, HttpIngressConfig,
-    HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy, HttpIngressOutcome,
-    HttpIngressRuntime, HttpIngressStatus, HttpIngressStatusHandle, MAX_HTTP_HEADER_BYTES,
-    MAX_HTTP_HOST_ROUTES, MAX_HTTP_REQUESTS_PER_CONNECTION, MIN_HTTP_HEADER_BYTES,
+    Http2IngressConfig, HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError,
+    HttpIngressConfig, HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy,
+    HttpIngressOutcome, HttpIngressRuntime, HttpIngressStatus, HttpIngressStatusHandle,
+    MAX_HTTP2_CONCURRENT_STREAMS, MAX_HTTP_HEADER_BYTES, MAX_HTTP_HOST_ROUTES,
+    MAX_HTTP_REQUESTS_PER_CONNECTION, MIN_HTTP_HEADER_BYTES,
 };
 pub use http_rate_limit::{
     HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError, MAX_HTTP_RATE_LIMIT_IDLE,
@@ -1194,8 +1197,8 @@ pub use http_rate_limit::{
     MIN_HTTP_RATE_LIMIT_IDLE,
 };
 pub use http_tls::{
-    PublicTlsConfig, PublicTlsConfigError, PublicTlsReloadBootstrapError, PublicTlsReloadConfig,
-    PublicTlsReloadRuntime, PUBLIC_HTTP1_ALPN,
+    PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsConfigError, PublicTlsReloadBootstrapError,
+    PublicTlsReloadConfig, PublicTlsReloadRuntime, PUBLIC_HTTP1_ALPN, PUBLIC_HTTP2_ALPN,
 };
 pub use multiplex::{
     AuthorizationSourceStatus, EdgeAuthorizationStatus, EdgeSessionRouter, MultiplexedEdgeConfig,

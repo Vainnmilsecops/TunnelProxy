@@ -19,8 +19,8 @@ use hyper::header::{
     PROXY_AUTHORIZATION, RETRY_AFTER, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::http::uri::Authority;
-use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -40,13 +40,33 @@ use crate::http_rate_limit::{
     HttpRateLimitRejection, HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError,
     HttpRequestRateLimiter,
 };
-use crate::http_tls::{PublicTlsConfig, PUBLIC_HTTP1_ALPN};
+use crate::http_tls::{
+    PublicHttpProtocolPolicy, PublicTlsConfig, PUBLIC_HTTP1_ALPN, PUBLIC_HTTP2_ALPN,
+};
 use crate::multiplex::{EdgeSessionRouter, RouteError};
 
 pub const MIN_HTTP_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_HTTP_HEADER_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_HOST_ROUTES: usize = 64;
 pub const MAX_HTTP_REQUESTS_PER_CONNECTION: usize = 1024;
+pub const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2IngressConfig {
+    pub max_concurrent_streams: u32,
+    pub keep_alive_interval: Duration,
+    pub keep_alive_timeout: Duration,
+}
+
+impl Default for Http2IngressConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: 32,
+            keep_alive_interval: Duration::from_secs(30),
+            keep_alive_timeout: Duration::from_secs(10),
+        }
+    }
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -226,6 +246,7 @@ pub struct HttpIngressConfig {
     pub max_headers: usize,
     pub max_request_body_bytes: usize,
     pub max_requests_per_connection: usize,
+    pub http2: Option<Http2IngressConfig>,
     pub request_rate_limit: HttpRequestRateLimitConfig,
     pub header_read_timeout: Duration,
     pub request_timeout: Duration,
@@ -269,6 +290,23 @@ impl HttpIngressConfig {
         if !(1..=MAX_HTTP_REQUESTS_PER_CONNECTION).contains(&self.max_requests_per_connection) {
             return Err(HttpIngressConfigError::InvalidRequestsPerConnection);
         }
+        match (self.http2, self.tls.protocols()) {
+            (None, PublicHttpProtocolPolicy::Http1Only) => {}
+            (Some(http2), PublicHttpProtocolPolicy::Http1AndHttp2) => {
+                if http2.max_concurrent_streams == 0
+                    || http2.max_concurrent_streams > MAX_HTTP2_CONCURRENT_STREAMS
+                {
+                    return Err(HttpIngressConfigError::InvalidHttp2ConcurrentStreams);
+                }
+                if http2.keep_alive_interval.is_zero() {
+                    return Err(HttpIngressConfigError::ZeroHttp2KeepAliveInterval);
+                }
+                if http2.keep_alive_timeout.is_zero() {
+                    return Err(HttpIngressConfigError::ZeroHttp2KeepAliveTimeout);
+                }
+            }
+            _ => return Err(HttpIngressConfigError::Http2TlsPolicyMismatch),
+        }
         self.request_rate_limit
             .validate()
             .map_err(HttpIngressConfigError::InvalidRequestRateLimit)?;
@@ -298,6 +336,10 @@ pub enum HttpIngressConfigError {
     InvalidHeaderCount,
     ZeroRequestBodyBytes,
     InvalidRequestsPerConnection,
+    InvalidHttp2ConcurrentStreams,
+    ZeroHttp2KeepAliveInterval,
+    ZeroHttp2KeepAliveTimeout,
+    Http2TlsPolicyMismatch,
     InvalidRequestRateLimit(HttpRequestRateLimitConfigError),
     InvalidDuplexCapacity,
     ZeroHeaderTimeout,
@@ -335,6 +377,19 @@ impl std::fmt::Display for HttpIngressConfigError {
                 f,
                 "max HTTP requests per connection must be between 1 and {MAX_HTTP_REQUESTS_PER_CONNECTION}"
             ),
+            Self::InvalidHttp2ConcurrentStreams => write!(
+                f,
+                "max HTTP/2 concurrent streams must be between 1 and {MAX_HTTP2_CONCURRENT_STREAMS}"
+            ),
+            Self::ZeroHttp2KeepAliveInterval => {
+                f.write_str("HTTP/2 keep-alive interval must be greater than zero")
+            }
+            Self::ZeroHttp2KeepAliveTimeout => {
+                f.write_str("HTTP/2 keep-alive timeout must be greater than zero")
+            }
+            Self::Http2TlsPolicyMismatch => {
+                f.write_str("HTTP/2 ingress and public TLS protocol policies must match")
+            }
             Self::InvalidRequestRateLimit(error) => {
                 write!(f, "invalid HTTP request rate limit: {error}")
             }
@@ -364,6 +419,9 @@ pub struct HttpIngressOutcome {
     pub global_capacity_rejections: u64,
     pub per_ip_capacity_rejections: u64,
     pub tls_rejections: u64,
+    pub http1_connections: u64,
+    pub http2_connections: u64,
+    pub peak_active_http2_streams: usize,
     pub reused_requests: u64,
     pub request_timeouts: u64,
     pub global_rate_limit_rejections: u64,
@@ -409,6 +467,10 @@ struct HttpIngressCounters {
     global_capacity_rejections: AtomicU64,
     per_ip_capacity_rejections: AtomicU64,
     tls_rejections: AtomicU64,
+    http1_connections: AtomicU64,
+    http2_connections: AtomicU64,
+    active_http2_streams: AtomicUsize,
+    peak_active_http2_streams: AtomicUsize,
     reused_requests: AtomicU64,
     request_timeouts: AtomicU64,
     global_rate_limit_rejections: AtomicU64,
@@ -416,7 +478,7 @@ struct HttpIngressCounters {
     rate_limit_peer_capacity_rejections: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HttpIngressStatus {
     pub active_connections: usize,
     pub accepted_connections: u64,
@@ -426,6 +488,10 @@ pub struct HttpIngressStatus {
     pub global_capacity_rejections: u64,
     pub per_ip_capacity_rejections: u64,
     pub tls_rejections: u64,
+    pub http1_connections: u64,
+    pub http2_connections: u64,
+    pub active_http2_streams: usize,
+    pub peak_active_http2_streams: usize,
     pub reused_requests: u64,
     pub request_timeouts: u64,
     pub global_rate_limit_rejections: u64,
@@ -459,6 +525,13 @@ impl HttpIngressStatusHandle {
                 .per_ip_capacity_rejections
                 .load(Ordering::Relaxed),
             tls_rejections: self.counters.tls_rejections.load(Ordering::Relaxed),
+            http1_connections: self.counters.http1_connections.load(Ordering::Relaxed),
+            http2_connections: self.counters.http2_connections.load(Ordering::Relaxed),
+            active_http2_streams: self.counters.active_http2_streams.load(Ordering::Relaxed),
+            peak_active_http2_streams: self
+                .counters
+                .peak_active_http2_streams
+                .load(Ordering::Relaxed),
             reused_requests: self.counters.reused_requests.load(Ordering::Relaxed),
             request_timeouts: self.counters.request_timeouts.load(Ordering::Relaxed),
             global_rate_limit_rejections: self
@@ -619,6 +692,9 @@ impl HttpIngressRuntime {
             global_capacity_rejections: counters.global_capacity_rejections.load(Ordering::Relaxed),
             per_ip_capacity_rejections: counters.per_ip_capacity_rejections.load(Ordering::Relaxed),
             tls_rejections: counters.tls_rejections.load(Ordering::Relaxed),
+            http1_connections: counters.http1_connections.load(Ordering::Relaxed),
+            http2_connections: counters.http2_connections.load(Ordering::Relaxed),
+            peak_active_http2_streams: counters.peak_active_http2_streams.load(Ordering::Relaxed),
             reused_requests: counters.reused_requests.load(Ordering::Relaxed),
             request_timeouts: counters.request_timeouts.load(Ordering::Relaxed),
             global_rate_limit_rejections: status.global_rate_limit_rejections,
@@ -673,74 +749,140 @@ async fn run_connection(
                 return;
             }
         };
-    if !matches!(
-        tls.get_ref().1.alpn_protocol(),
-        None | Some(PUBLIC_HTTP1_ALPN)
-    ) {
-        counters.tls_rejections.fetch_add(1, Ordering::Relaxed);
-        warn!(%peer, event = "https_alpn_rejected");
-        return;
+    let protocol = match tls.get_ref().1.alpn_protocol() {
+        None | Some(PUBLIC_HTTP1_ALPN) => NegotiatedHttpProtocol::Http1,
+        Some(PUBLIC_HTTP2_ALPN) if config.http2.is_some() => NegotiatedHttpProtocol::Http2,
+        Some(_) => {
+            counters.tls_rejections.fetch_add(1, Ordering::Relaxed);
+            warn!(%peer, event = "https_alpn_rejected");
+            return;
+        }
+    };
+    match protocol {
+        NegotiatedHttpProtocol::Http1 => {
+            counters.http1_connections.fetch_add(1, Ordering::Relaxed);
+        }
+        NegotiatedHttpProtocol::Http2 => {
+            counters.http2_connections.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let server_name = tls
         .get_ref()
         .1
         .server_name()
         .and_then(|name| HttpHostname::new(name).ok());
-    let service_config = config.clone();
-    let service_counters = Arc::clone(&counters);
     let request_count = Arc::new(AtomicUsize::new(0));
+    let service_config = config.clone();
     let service = hyper::service::service_fn(move |request| {
-        let request_number = request_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let config = service_config.clone();
-        let counters = Arc::clone(&service_counters);
-        let server_name = server_name.clone();
-        let router = router.clone();
-        let rate_limiter = rate_limiter.clone();
-        async move {
-            if request_number > config.max_requests_per_connection {
-                counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
-                return Ok::<_, Infallible>(error_response(StatusCode::SERVICE_UNAVAILABLE));
-            }
-            if request_number > 1 {
-                counters.reused_requests.fetch_add(1, Ordering::Relaxed);
-            }
-            let close_after = request_number == config.max_requests_per_connection;
-            let deadline = tokio::time::Instant::now() + config.request_timeout;
-            let response = tokio::time::timeout_at(
-                deadline,
-                proxy_request(
-                    request,
-                    HttpRequestContext {
-                        peer,
-                        server_name,
-                        config,
-                        router,
-                        counters: Arc::clone(&counters),
-                        rate_limiter,
-                    },
-                    deadline,
-                ),
-            )
-            .await;
-            match response {
-                Ok(Ok(mut response)) => {
-                    if close_after {
-                        response
-                            .headers_mut()
-                            .insert(CONNECTION, HeaderValue::from_static("close"));
-                    }
-                    Ok(response)
-                }
-                Ok(Err(infallible)) => match infallible {},
-                Err(_) => {
-                    counters.request_timeouts.fetch_add(1, Ordering::Relaxed);
-                    counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
-                    warn!(%peer, event = "https_request_timeout");
-                    Ok(error_response(StatusCode::GATEWAY_TIMEOUT))
-                }
-            }
-        }
+        handle_ingress_request(
+            request,
+            peer,
+            server_name.clone(),
+            service_config.clone(),
+            router.clone(),
+            Arc::clone(&counters),
+            rate_limiter.clone(),
+            Arc::clone(&request_count),
+            protocol,
+        )
     });
+    match protocol {
+        NegotiatedHttpProtocol::Http1 => serve_http1(tls, service, peer, &config, signal).await,
+        NegotiatedHttpProtocol::Http2 => serve_http2(tls, service, peer, &config, signal).await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegotiatedHttpProtocol {
+    Http1,
+    Http2,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ingress_request(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    server_name: Option<HttpHostname>,
+    config: HttpIngressConfig,
+    router: EdgeSessionRouter,
+    counters: Arc<HttpIngressCounters>,
+    rate_limiter: HttpRequestRateLimiter,
+    request_count: Arc<AtomicUsize>,
+    protocol: NegotiatedHttpProtocol,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let request_number = if protocol == NegotiatedHttpProtocol::Http1 {
+        request_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    } else {
+        0
+    };
+    let stream_guard = (protocol == NegotiatedHttpProtocol::Http2)
+        .then(|| ActiveHttp2StreamGuard::new(Arc::clone(&counters)));
+    if protocol == NegotiatedHttpProtocol::Http1
+        && request_number > config.max_requests_per_connection
+    {
+        counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        return Ok(finish_protocol_response(
+            error_response(StatusCode::SERVICE_UNAVAILABLE),
+            protocol,
+            stream_guard,
+        ));
+    }
+    if protocol == NegotiatedHttpProtocol::Http1 && request_number > 1 {
+        counters.reused_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    let close_after = protocol == NegotiatedHttpProtocol::Http1
+        && request_number == config.max_requests_per_connection;
+    let deadline = tokio::time::Instant::now() + config.request_timeout;
+    let response = tokio::time::timeout_at(
+        deadline,
+        proxy_request(
+            request,
+            HttpRequestContext {
+                peer,
+                server_name,
+                config,
+                router,
+                counters: Arc::clone(&counters),
+                rate_limiter,
+            },
+            deadline,
+        ),
+    )
+    .await;
+    let mut response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(infallible)) => match infallible {},
+        Err(_) => {
+            counters.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            warn!(%peer, event = "https_request_timeout");
+            error_response(StatusCode::GATEWAY_TIMEOUT)
+        }
+    };
+    if close_after {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    Ok(finish_protocol_response(response, protocol, stream_guard))
+}
+
+async fn serve_http1<S>(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    service: S,
+    peer: SocketAddr,
+    config: &HttpIngressConfig,
+    signal: ShutdownSignal,
+) where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<ProxyBody>,
+            Error = Infallible,
+        > + 'static,
+    S::Future: 'static,
+{
     let mut http = hyper::server::conn::http1::Builder::new();
     http.keep_alive(config.max_requests_per_connection > 1)
         .half_close(false)
@@ -761,6 +903,122 @@ async fn run_connection(
                 Err(error) => warn!(%peer, %error, event = "https_connection_drain_failed"),
             }
         }
+    }
+}
+
+async fn serve_http2<S>(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    service: S,
+    peer: SocketAddr,
+    config: &HttpIngressConfig,
+    signal: ShutdownSignal,
+) where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<ProxyBody>,
+            Error = Infallible,
+        > + 'static,
+    S::Future: Send + 'static,
+{
+    let http2 = config
+        .http2
+        .expect("HTTP/2 is validated before protocol negotiation");
+    let reset_limit = http2.max_concurrent_streams as usize;
+    let stream_window = (config.duplex_capacity.min(64 * 1024)) as u32;
+    let connection_window = stream_window.saturating_mul(http2.max_concurrent_streams);
+    let mut http = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    http.max_concurrent_streams(http2.max_concurrent_streams)
+        .max_pending_accept_reset_streams(reset_limit)
+        .max_local_error_reset_streams(reset_limit)
+        .max_header_list_size(config.max_header_bytes as u32)
+        .max_send_buf_size(stream_window as usize)
+        .initial_stream_window_size(stream_window)
+        .initial_connection_window_size(connection_window)
+        .keep_alive_interval(http2.keep_alive_interval)
+        .keep_alive_timeout(http2.keep_alive_timeout)
+        .timer(TokioTimer::new());
+    let mut served = Box::pin(http.serve_connection(TokioIo::new(tls), service));
+    tokio::select! {
+        result = &mut served => match result {
+            Ok(()) => info!(%peer, protocol = "http2", event = "https_connection_completed"),
+            Err(error) => warn!(%peer, %error, protocol = "http2", event = "https_connection_failed"),
+        },
+        () = signal.cancelled() => {
+            served.as_mut().graceful_shutdown();
+            match served.await {
+                Ok(()) => info!(%peer, protocol = "http2", event = "https_connection_drained"),
+                Err(error) => warn!(%peer, %error, protocol = "http2", event = "https_connection_drain_failed"),
+            }
+        }
+    }
+}
+
+struct ActiveHttp2StreamGuard {
+    counters: Arc<HttpIngressCounters>,
+}
+
+impl ActiveHttp2StreamGuard {
+    fn new(counters: Arc<HttpIngressCounters>) -> Self {
+        let active = counters
+            .active_http2_streams
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        counters
+            .peak_active_http2_streams
+            .fetch_max(active, Ordering::Relaxed);
+        Self { counters }
+    }
+}
+
+impl Drop for ActiveHttp2StreamGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_http2_streams
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct Http2TrackedBody {
+    inner: Pin<Box<ProxyBody>>,
+    _stream: ActiveHttp2StreamGuard,
+}
+
+impl Body for Http2TrackedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        self.get_mut().inner.as_mut().poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn finish_protocol_response(
+    mut response: Response<ProxyBody>,
+    protocol: NegotiatedHttpProtocol,
+    stream: Option<ActiveHttp2StreamGuard>,
+) -> Response<ProxyBody> {
+    if protocol == NegotiatedHttpProtocol::Http2 {
+        response.headers_mut().remove(CONNECTION);
+        let (parts, body) = response.into_parts();
+        let body = Http2TrackedBody {
+            inner: Box::pin(body),
+            _stream: stream.expect("HTTP/2 responses own a stream guard"),
+        }
+        .boxed_unsync();
+        Response::from_parts(parts, body)
+    } else {
+        response
     }
 }
 
@@ -883,26 +1141,78 @@ fn prepare_request(
             reason: "unsupported_method_or_upgrade",
         });
     }
+    if request.headers().len() > config.max_headers {
+        return Err(RequestRejection {
+            status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            reason: "too_many_headers",
+        });
+    }
+    let header_bytes = request
+        .headers()
+        .iter()
+        .fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+    if header_bytes > config.max_header_bytes {
+        return Err(RequestRejection {
+            status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            reason: "headers_too_large",
+        });
+    }
     let host_values = request.headers().get_all(HOST);
     let mut hosts = host_values.iter();
-    let host = hosts.next().ok_or(RequestRejection {
-        status: StatusCode::BAD_REQUEST,
-        reason: "missing_host",
-    })?;
+    let host = hosts.next();
     if hosts.next().is_some() {
         return Err(RequestRejection {
             status: StatusCode::BAD_REQUEST,
             reason: "duplicate_host",
         });
     }
-    let hostname = host
-        .to_str()
-        .ok()
-        .and_then(|value| normalize_authority(value).ok())
-        .ok_or(RequestRejection {
+    let host_hostname = host
+        .map(|host| {
+            host.to_str()
+                .ok()
+                .and_then(|value| normalize_authority(value).ok())
+                .ok_or(RequestRejection {
+                    status: StatusCode::BAD_REQUEST,
+                    reason: "invalid_host",
+                })
+        })
+        .transpose()?;
+    let uri_hostname = request
+        .uri()
+        .authority()
+        .map(|authority| {
+            normalize_authority(authority.as_str()).map_err(|_| RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "invalid_uri_authority",
+            })
+        })
+        .transpose()?;
+    if request.version() != Version::HTTP_2 && host_hostname.is_none() {
+        return Err(RequestRejection {
             status: StatusCode::BAD_REQUEST,
-            reason: "invalid_host",
-        })?;
+            reason: "missing_host",
+        });
+    }
+    let hostname = match (host_hostname, uri_hostname) {
+        (Some(host), Some(authority)) if host != authority => {
+            return Err(RequestRejection {
+                status: StatusCode::MISDIRECTED_REQUEST,
+                reason: "host_authority_mismatch",
+            })
+        }
+        (Some(host), _) => host,
+        (None, Some(authority)) => authority,
+        (None, None) => {
+            return Err(RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "missing_authority",
+            })
+        }
+    };
     let server_name = server_name.ok_or(RequestRejection {
         status: StatusCode::MISDIRECTED_REQUEST,
         reason: "missing_sni",
@@ -912,19 +1222,6 @@ fn prepare_request(
             status: StatusCode::MISDIRECTED_REQUEST,
             reason: "sni_host_mismatch",
         });
-    }
-    if let Some(authority) = request.uri().authority() {
-        let absolute_hostname =
-            normalize_authority(authority.as_str()).map_err(|_| RequestRejection {
-                status: StatusCode::BAD_REQUEST,
-                reason: "invalid_absolute_uri",
-            })?;
-        if absolute_hostname != hostname {
-            return Err(RequestRejection {
-                status: StatusCode::MISDIRECTED_REQUEST,
-                reason: "uri_host_mismatch",
-            });
-        }
     }
     let tunnel_id = config.routes.resolve(&hostname).ok_or(RequestRejection {
         status: StatusCode::NOT_FOUND,
@@ -944,6 +1241,7 @@ fn prepare_request(
                 status: StatusCode::BAD_REQUEST,
                 reason: "invalid_request_target",
             })?;
+    *request.version_mut() = Version::HTTP_11;
     Ok((hostname, tunnel_id))
 }
 
@@ -1266,20 +1564,29 @@ mod tests {
         counters.admitted_requests.store(2, Ordering::Relaxed);
         counters.reused_requests.store(1, Ordering::Relaxed);
         counters.request_timeouts.store(4, Ordering::Relaxed);
+        counters.http1_connections.store(5, Ordering::Relaxed);
+        counters.http2_connections.store(6, Ordering::Relaxed);
         rate_limiter
             .try_admit(IpAddr::from([127, 0, 0, 1]))
             .unwrap();
         let active = ActiveConnectionGuard::new(Arc::clone(&counters));
+        let active_http2 = ActiveHttp2StreamGuard::new(Arc::clone(&counters));
         let snapshot = status.snapshot();
         assert_eq!(snapshot.active_connections, 1);
         assert_eq!(snapshot.accepted_connections, 3);
         assert_eq!(snapshot.admitted_requests, 2);
         assert_eq!(snapshot.reused_requests, 1);
         assert_eq!(snapshot.request_timeouts, 4);
+        assert_eq!(snapshot.http1_connections, 5);
+        assert_eq!(snapshot.http2_connections, 6);
+        assert_eq!(snapshot.active_http2_streams, 1);
+        assert_eq!(snapshot.peak_active_http2_streams, 1);
         assert_eq!(snapshot.tracked_rate_limit_peers, 1);
         assert_eq!(snapshot.peak_tracked_rate_limit_peers, 1);
         drop(active);
+        drop(active_http2);
         assert_eq!(status.snapshot().active_connections, 0);
+        assert_eq!(status.snapshot().active_http2_streams, 0);
     }
 
     #[test]
@@ -1291,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_per_connection_are_strictly_bounded() {
+    fn http_protocol_limits_are_strictly_bounded() {
         let routes = HttpHostRoutes::single(
             HttpHostname::new("demo.example.test").unwrap(),
             TunnelId::new("tunnel-dev").unwrap(),
@@ -1312,6 +1619,7 @@ mod tests {
             max_headers: 8,
             max_request_body_bytes: 1,
             max_requests_per_connection: 1,
+            http2: None,
             request_rate_limit: HttpRequestRateLimitConfig::default(),
             header_read_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
@@ -1328,6 +1636,39 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(HttpIngressConfigError::InvalidRequestsPerConnection)
+        );
+        config.max_requests_per_connection = 1;
+        config.http2 = Some(Http2IngressConfig::default());
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::Http2TlsPolicyMismatch)
+        );
+        config.tls = PublicTlsConfig::from_pem_with_protocols(
+            pki.cert.pem().as_bytes(),
+            pki.key_pair.serialize_pem().as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        config.http2.as_mut().unwrap().max_concurrent_streams = 0;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::InvalidHttp2ConcurrentStreams)
+        );
+        let http2 = config.http2.as_mut().unwrap();
+        http2.max_concurrent_streams = 1;
+        http2.keep_alive_interval = Duration::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::ZeroHttp2KeepAliveInterval)
+        );
+        let http2 = config.http2.as_mut().unwrap();
+        http2.keep_alive_interval = Duration::from_secs(1);
+        http2.keep_alive_timeout = Duration::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::ZeroHttp2KeepAliveTimeout)
         );
     }
 

@@ -83,10 +83,12 @@ allocate/release and independent atomic hostname server identity/Agent-CA
 rotation on the existing route catalog, followed by single-process
 `tunnelproxy-agent http <port>` orchestration. Session 43 adds the canonical
 `tunnelproxy http <port>` wrapper and strict local config v1 with offline
-validation. The implemented public surfaces are opt-in opaque raw
-TCP and a bounded operator-configured HTTPS/HTTP/1.1 route. Both use
+validation. Session 44 adds opt-in bounded HTTP/2 termination at Edge with
+HTTP/1.1 fallback and local translation. The implemented public surfaces are opt-in opaque raw
+TCP and a bounded operator-configured HTTPS route with default HTTP/1.1 and
+opt-in HTTP/2. Both use
 per-IP concurrency admission and authenticated dynamic Agent authority; the
-HTTPS slice also terminates reloadable public TLS, enforces exact Host/SNI
+HTTPS slice also terminates reloadable public TLS, enforces exact Host-or-authority/SNI
 routing from static or authenticated dynamically distributed state, supports
 opt-in capped sequential keep-alive with per-request deadlines, and applies
 process-local global/per-IP request token buckets, but it

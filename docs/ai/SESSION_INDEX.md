@@ -40,6 +40,14 @@
 | 34      | Bounded HTTP/1.1 Keep-Alive & Per-Request Deadlines | complete |
 | 35      | Bounded Fair DATA Scheduling                  | complete |
 | 36      | Multiplexed Transport Fairness Telemetry       | complete |
+| 37      | Live Transport Capacity Telemetry & Operator Runbook | complete |
+| 38      | Bounded Nonblocking Process Logging & Sink Telemetry | complete |
+| 39      | Durable Managed-Hostname Allocation & Release | complete |
+| 40      | Authenticated Agent Managed-Hostname Lifecycle | complete |
+| 41      | Atomic TLS & Agent-CA Rotation for Hostname Service | complete |
+| 42      | Managed HTTP Agent Orchestration              | complete |
+| 43      | Canonical Agent CLI & Strict Local Config v1  | complete |
+| 44      | Bounded HTTP/2 Public HTTPS Ingress           | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1386,3 +1394,34 @@ Out of scope:
 - Automatic account/profile creation, inline secrets, named profiles,
   DNS/public-certificate automation, external reachability probing, custom
   domains, HTTP/2/upgrade/CONNECT, multi-edge ownership, and protocol changes.
+
+## Session 44 — Bounded HTTP/2 Public HTTPS Ingress — complete
+
+Scope delivered:
+
+- Added opt-in `h2` ALPN with HTTP/1.1 fallback while preserving the
+  HTTP/1.1-only default. Public TLS bootstrap and every atomic reload generation
+  use the same immutable protocol policy.
+- Added explicit concurrent-stream, pending/local reset, header-list,
+  send-buffer, flow-control-window, and PING keepalive bounds. Existing global
+  and per-IP connection admission remains outside those per-connection bounds.
+- Unified HTTP/1.1 Host and HTTP/2 authority handling with exact SNI matching,
+  duplicate/conflicting authority rejection, shared header/body/rate/deadline
+  enforcement, and unchanged CONNECT/upgrade rejection.
+- Normalized accepted HTTP/2 requests to canonical origin-form HTTP/1.1 before
+  using the existing cached TunnelId route and Tunnel Protocol v2 stream. No
+  Agent, local-service, route protocol, or wire-format change was required.
+- Added graceful HTTP/2 GOAWAY/drain and fixed-cardinality HTTP/1/HTTP/2
+  connection plus active/peak stream telemetry.
+- Added strict CLI configuration and real TLS coverage for ALPN, two concurrent
+  streams, HTTP/1.1 fallback, host fronting, oversized-body and timeout
+  isolation, local HTTP/1.1 translation, telemetry, and idle graceful shutdown.
+  The workspace now contains 378 explicit tests.
+- Documented policy, resource bounds, translation, rollout/rollback,
+  observability, trust checks, and remaining protocol exclusions.
+
+Out of scope:
+
+- h2c, HTTP/2 to local applications, WebSocket/upgrade, CONNECT, HTTP/3,
+  DNS/public-certificate automation, signed access URLs, distributed rate
+  limiting, multi-edge ownership, and Tunnel Protocol changes.
