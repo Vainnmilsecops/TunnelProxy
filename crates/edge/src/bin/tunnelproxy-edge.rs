@@ -24,7 +24,7 @@ use tunnelproxy_edge::{
     HttpRequestRateLimitConfig, PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsConfigError,
     PublicTlsReloadBootstrapError, PublicTlsReloadConfig, PublicTlsReloadRuntime,
     RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
-    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
+    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome, WebSocketIngressConfig,
 };
 
 const USAGE: &str = "\
@@ -59,6 +59,9 @@ Options:
   --max-http2-concurrent-streams <u32> HTTP/2 stream limit (default 32)
   --http2-keepalive-interval-ms <ms> HTTP/2 ping interval (default 30000)
   --http2-keepalive-timeout-ms <ms> HTTP/2 ping timeout (default 10000)
+  --enable-websocket-upgrade       opt in to bounded HTTP/1.1 WebSocket upgrades
+  --max-websocket-sessions <usize> WebSocket session limit (default 32)
+  --websocket-idle-timeout-ms <ms> WebSocket idle deadline (default 60000)
   --http-requests-per-second <u64> global request rate (default 100)
   --http-request-burst <u64>       global burst capacity (default 200)
   --http-requests-per-ip-per-second <u64> per-IP rate (default 20)
@@ -340,6 +343,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         https_host = ?parsed.https_host,
         https_route_server = ?parsed.https_route_server,
         http2_enabled = parsed.enable_http2,
+        websocket_enabled = parsed.enable_websocket_upgrade,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
         public_raw_ingress = parsed.allow_public_raw_ingress,
@@ -429,6 +433,10 @@ struct ParsedArgs {
     http2_keep_alive_interval: Duration,
     http2_keep_alive_timeout: Duration,
     http2_options_present: bool,
+    enable_websocket_upgrade: bool,
+    max_websocket_sessions: usize,
+    websocket_idle_timeout: Duration,
+    websocket_options_present: bool,
     http_requests_per_second: u64,
     http_request_burst: u64,
     http_requests_per_ip_per_second: u64,
@@ -503,6 +511,10 @@ impl Default for ParsedArgs {
             http2_keep_alive_interval: Duration::from_secs(30),
             http2_keep_alive_timeout: Duration::from_secs(10),
             http2_options_present: false,
+            enable_websocket_upgrade: false,
+            max_websocket_sessions: 32,
+            websocket_idle_timeout: Duration::from_secs(60),
+            websocket_options_present: false,
             http_requests_per_second: 100,
             http_request_burst: 200,
             http_requests_per_ip_per_second: 20,
@@ -560,6 +572,7 @@ enum ArgError {
     HttpsRouteStaleWithoutServer,
     HttpsRouteReloadWithoutServer,
     Http2OptionsWithoutOptIn,
+    WebSocketOptionsWithoutOptIn,
     IngressModeConflict,
     PublicHttpsOptInRequired,
     PublicHttpsPerIpLimitRequired,
@@ -606,6 +619,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::Http2OptionsWithoutOptIn => {
                 f.write_str("HTTP/2 tuning options require --enable-http2")
+            }
+            Self::WebSocketOptionsWithoutOptIn => {
+                f.write_str("WebSocket tuning options require --enable-websocket-upgrade")
             }
             Self::IngressModeConflict => {
                 f.write_str("raw-ingress options cannot be combined with --https-listen")
@@ -784,6 +800,24 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.http2_keep_alive_timeout =
                     Duration::from_millis(parse_number(args, index, flag)?);
                 parsed.http2_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--enable-websocket-upgrade" => {
+                parsed.enable_websocket_upgrade = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--max-websocket-sessions" => {
+                parsed.max_websocket_sessions = parse_number(args, index, flag)?;
+                parsed.websocket_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--websocket-idle-timeout-ms" => {
+                parsed.websocket_idle_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.websocket_options_present = true;
                 parsed.https_options_present = true;
                 index += 2;
             }
@@ -980,6 +1014,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     }
     if parsed.http2_options_present && !parsed.enable_http2 {
         return Err(ArgError::Http2OptionsWithoutOptIn);
+    }
+    if parsed.websocket_options_present && !parsed.enable_websocket_upgrade {
+        return Err(ArgError::WebSocketOptionsWithoutOptIn);
     }
     Ok(parsed)
 }
@@ -1545,6 +1582,12 @@ async fn load_https_configuration(
             keep_alive_interval: parsed.http2_keep_alive_interval,
             keep_alive_timeout: parsed.http2_keep_alive_timeout,
         }),
+        websocket: parsed
+            .enable_websocket_upgrade
+            .then_some(WebSocketIngressConfig {
+                max_concurrent_sessions: parsed.max_websocket_sessions,
+                idle_timeout: parsed.websocket_idle_timeout,
+            }),
         request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
@@ -1907,6 +1950,11 @@ mod tests {
             "4000",
             "--http2-keepalive-timeout-ms",
             "1000",
+            "--enable-websocket-upgrade",
+            "--max-websocket-sessions",
+            "8",
+            "--websocket-idle-timeout-ms",
+            "2500",
             "--http-requests-per-second",
             "50",
             "--http-request-burst",
@@ -1940,6 +1988,9 @@ mod tests {
         assert_eq!(parsed.max_http2_concurrent_streams, 12);
         assert_eq!(parsed.http2_keep_alive_interval, Duration::from_secs(4));
         assert_eq!(parsed.http2_keep_alive_timeout, Duration::from_secs(1));
+        assert!(parsed.enable_websocket_upgrade);
+        assert_eq!(parsed.max_websocket_sessions, 8);
+        assert_eq!(parsed.websocket_idle_timeout, Duration::from_millis(2500));
         assert_eq!(parsed.http_requests_per_second, 50);
         assert_eq!(parsed.http_request_burst, 100);
         assert_eq!(parsed.http_requests_per_ip_per_second, 10);
@@ -1976,6 +2027,10 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["--max-http2-concurrent-streams", "2"])),
             Err(ArgError::Http2OptionsWithoutOptIn)
+        );
+        assert_eq!(
+            parse_args(&args(&["--max-websocket-sessions", "2"])),
+            Err(ArgError::WebSocketOptionsWithoutOptIn)
         );
     }
 

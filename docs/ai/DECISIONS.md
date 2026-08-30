@@ -1231,3 +1231,32 @@ HTTP/2 GOAWAY within the existing drain deadline, and operations telemetry adds
 only fixed-cardinality protocol/stream values. h2c, HTTP/2 upstream forwarding,
 WebSocket, CONNECT, HTTP/3, distributed rate limiting, and multi-edge ownership
 remain separate concerns.
+
+---
+
+## ADR-045 — HTTP/1.1 WebSocket upgrade is explicit, validated, and task-owned
+
+**Status:** Accepted (Session 45).
+
+**Context:** Session 44 completed bounded HTTP/2 request ingress, while all
+upgrade semantics still failed closed. A WebSocket becomes an indefinite
+bidirectional byte stream after `101`; treating it like a response body could
+release connection capacity early, detach Hyper drivers from shutdown, bypass
+Host/header controls, or accept a forged local upgrade. General CONNECT and
+HTTP/2 extended CONNECT have different authorization semantics.
+
+**Decision:** Add one default-off HTTP/1.1 WebSocket policy. Validate GET,
+version 13, a canonical 16-byte key, zero body, exact Upgrade tokens, no
+extensions, exact Host/SNI/route agreement, and existing request-rate admission.
+Reconstruct a sanitized local HTTP/1.1 handshake and require a matching local
+`101`, RFC accept digest, Upgrade tokens, and offered subprotocol. After both
+Hyper upgrades resolve, relay opaque bytes with fixed buffers, a global session
+semaphore, and an activity-based idle deadline. The original connection task
+owns the driver, upgrades, route completion, permit, and relay through drain.
+
+**Consequences:** WebSocket frames cross the existing Tunnel Protocol v2 path
+without parsing, logging, replay, or wire changes. Capacity and idle failures
+are isolated, shutdown may drain until its established deadline, and telemetry
+remains fixed-cardinality. CONNECT, RFC 8441/WebSocket over HTTP/2, extension
+negotiation, HTTP/3, distributed admission, and multi-edge ownership remain
+separate concerns.

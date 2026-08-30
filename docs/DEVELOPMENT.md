@@ -970,4 +970,43 @@ rate-limit, connection/per-IP, duplex, and drain settings continue to apply.
 HTTP/2 is terminated at Edge. Requests are canonicalized, stripped of
 hop-by-hop and untrusted forwarding fields, then sent through the existing
 tunnel as HTTP/1.1 to the local application. This session does not enable h2c,
-HTTP/2 to localhost, WebSocket, CONNECT, or HTTP/3.
+HTTP/2 to localhost, HTTP/2 WebSocket/extended CONNECT, CONNECT, or HTTP/3.
+
+## 30. Enabling bounded HTTP/1.1 WebSocket upgrades at Edge
+
+WebSocket remains disabled unless it is explicitly enabled on an HTTPS
+listener. The session cap must be no larger than the existing HTTPS connection
+cap, and both the cap and idle deadline require the opt-in flag:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-route-server control.example.test:7201 \
+  --public-tls-cert wildcard.pem \
+  --public-tls-key wildcard-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --enable-websocket-upgrade \
+  --max-websocket-sessions 16 \
+  --websocket-idle-timeout-ms 60000 \
+  <snapshot, route, and Agent mTLS options>
+```
+
+The public request must use HTTP/1.1 GET, WebSocket version 13, one canonical
+16-byte Base64 key, no body, and no extension offer. Host, TLS SNI, and route
+selection follow the normal exact-match policy. Existing request-rate admission
+runs before the WebSocket session permit is acquired. Edge removes spoofed
+forwarding and hop-by-hop fields, then reconstructs the validated upgrade for
+the local HTTP/1.1 service.
+
+The local service must return `101 Switching Protocols`, matching
+Connection/Upgrade tokens and `Sec-WebSocket-Accept`, no extension response,
+and at most one subprotocol that the client offered. Any malformed local `101`
+becomes `502`; a non-`101` response remains an ordinary bounded HTTP response.
+After upgrade, Edge relays bytes without parsing WebSocket frames. Activity in
+either direction resets the idle deadline. Shutdown lets the session close only
+within the configured Edge drain timeout before force cleanup.
+
+This option does not enable CONNECT, RFC 8441 extended CONNECT, WebSocket over
+HTTP/2, compression/extensions, h2c, or HTTP/3.

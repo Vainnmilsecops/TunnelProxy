@@ -43,6 +43,9 @@ correct agent, which in turn proxies them into the local service.
   HTTP/1.1 remains the default with opt-in capped sequential keep-alive.
   HTTP/2 is separately opt-in with bounded concurrent streams, header/reset
   state, keepalive, per-stream deadlines, and graceful GOAWAY drain.
+  HTTP/1.1 WebSocket upgrade is separately opt-in with strict handshake and
+  local-response validation, a global session cap, idle deadline, opaque
+  frame relay, fixed-cardinality metrics, and bounded drain.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -94,7 +97,8 @@ The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
 - Automatic config/account provisioning, custom-domain administration, DNS or
-  certificate automation, WebSocket/upgrade, CONNECT, and HTTP/3.
+  certificate automation, CONNECT, HTTP/2 extended CONNECT, WebSocket
+  extensions, and HTTP/3.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA

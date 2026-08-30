@@ -48,6 +48,7 @@
 | 42      | Managed HTTP Agent Orchestration              | complete |
 | 43      | Canonical Agent CLI & Strict Local Config v1  | complete |
 | 44      | Bounded HTTP/2 Public HTTPS Ingress           | complete |
+| 45      | Bounded WebSocket Upgrade Ingress             | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1425,3 +1426,34 @@ Out of scope:
 - h2c, HTTP/2 to local applications, WebSocket/upgrade, CONNECT, HTTP/3,
   DNS/public-certificate automation, signed access URLs, distributed rate
   limiting, multi-edge ownership, and Tunnel Protocol changes.
+
+## Session 45 — Bounded WebSocket Upgrade Ingress — complete
+
+Scope delivered:
+
+- Added an explicit default-off HTTP/1.1 WebSocket policy with CLI session and
+  idle-time limits. WebSocket capacity cannot exceed the existing HTTPS
+  connection cap; tuning flags without opt-in fail before listener bind.
+- Validated GET/version-13 client handshakes, canonical Base64 keys, Upgrade
+  tokens, zero request bodies, exact Host/SNI/route agreement, request-rate
+  admission, and bounded subprotocol offers. Extension negotiation is rejected.
+- Rebuilt the local HTTP/1.1 handshake after hop-by-hop and untrusted forwarding
+  sanitization. Edge accepts local upgrade only after an exact `101`, matching
+  RFC accept digest, Upgrade tokens, no extensions, and an offered subprotocol.
+- Relayed upgraded bytes opaquely through the existing cached TunnelId and
+  Tunnel Protocol v2 stream. One connection task owns the Hyper driver, both
+  upgrade futures, route completion, session permit, idle timer, and drain.
+- Added fixed-cardinality accepted/rejected/current/peak/idle-timeout metrics,
+  cancellation-safe driver cleanup, graceful session completion, and forced
+  cleanup at the existing HTTPS drain deadline.
+- Added one relay unit test and two real TLS Edge-to-Agent-to-local E2E tests
+  covering text/binary/ping bytes, spoofed forwarding cleanup, host fronting,
+  malformed client and local handshakes, capacity rejection/release, idle
+  timeout, sibling isolation, and forced shutdown. The workspace now contains
+  381 explicit tests.
+
+Out of scope:
+
+- CONNECT, HTTP/2 extended CONNECT/WebSocket, WebSocket extension negotiation,
+  h2c, HTTP/3, public-client authentication, distributed admission, multi-edge
+  ownership, and Tunnel Protocol changes.

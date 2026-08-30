@@ -304,8 +304,9 @@
   diagnostics, expiry status, and optional atomic digest-manifest generation
   reload that preserves the selected protocol policy.
 - Host, SNI, and request authority are normalized and compared exactly.
-  CONNECT, upgrades, unknown hosts, duplicate Host, missing authority, and
-  host-fronting attempts are rejected before a tunnel stream opens.
+  CONNECT, HTTP/2 upgrade/extended-CONNECT attempts, unknown hosts, duplicate
+  Host, missing authority, and host-fronting attempts are rejected before a
+  tunnel stream opens.
 - Edge strips hop-by-hop fields plus untrusted `Forwarded` and
   `X-Forwarded-*`, then supplies canonical `X-Forwarded-For`,
   `X-Forwarded-Proto`, `X-Forwarded-Host`, and Host values to the local service.
@@ -324,6 +325,16 @@
 - HTTP/2 stream failure, oversized bodies, and request timeout remain isolated
   from sibling streams. Shutdown sends graceful GOAWAY and drains within the
   existing HTTPS deadline. HTTP/1.1 fallback remains available when enabled.
+- HTTP/1.1 WebSocket upgrade is separately opt-in and default-off. Edge accepts
+  only GET/version-13 handshakes with one canonical 16-byte key, no request
+  body or extensions, exact Host/SNI routing, and the existing request-rate
+  admission. The local service must return a matching `101`, accept digest,
+  Upgrade tokens, and an offered subprotocol before opaque relay begins.
+- WebSocket sessions have an independent global cap no larger than HTTPS
+  connection capacity, a finite activity-based read/write idle deadline, RAII
+  current/peak accounting, and fixed-cardinality accept/reject/timeout metrics.
+  Their relay future remains owned by the HTTP/1.1 connection task, so graceful
+  close may drain and the existing HTTPS deadline force-aborts stalled peers.
 - `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
   the HTTP client connection can reuse the existing multiplexed Tunnel
   Protocol v2 path without a wire-format change.
@@ -462,7 +473,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 378 explicit workspace tests are present; all prior behavior is preserved.
+- 381 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -483,9 +494,10 @@
   wildcard DNS/public TLS provisioning, and external reachability probing.
   The canonical `tunnelproxy http <port>` executable and strict path-based
   local config are implemented.
-- WebSocket/upgrade, CONNECT, HTTP/3, custom-domain administration, and signed
-  access URLs. HTTP/2 public ingress is implemented; local forwarding remains
-  HTTP/1.1.
+- CONNECT, HTTP/2 extended CONNECT/WebSocket, WebSocket extension negotiation,
+  HTTP/3, custom-domain administration, and signed access URLs. Bounded
+  HTTP/1.1 WebSocket ingress is implemented; ordinary request forwarding and
+  the WebSocket handshake to the local application remain HTTP/1.1.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -498,7 +510,7 @@
 
 ## Next planned session
 
-Session 45 has not been selected. DNS/public-certificate automation, signed
-access URLs, WebSocket/CONNECT, and multi-edge ownership remain separate scopes. Collect
+Session 46 has not been selected. DNS/public-certificate automation, signed
+access URLs, CONNECT, and multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

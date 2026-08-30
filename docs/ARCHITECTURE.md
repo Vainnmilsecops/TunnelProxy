@@ -997,6 +997,40 @@ the existing HTTPS drain deadline before task abort. Status and operations
 metrics expose only protocol counters and active/peak stream cardinality.
 Hostnames, peer addresses, durable IDs, and payload data are not labels.
 
+### 2.43 Bounded HTTP/1.1 WebSocket upgrade ingress (Session 45)
+
+WebSocket is an explicit public HTTPS policy and remains disabled by default.
+It applies only to HTTP/1.1 GET requests; HTTP/2 extended CONNECT and general
+CONNECT remain rejected. Before opening a tunnel stream, Edge requires
+`Connection: Upgrade`, exact `Upgrade: websocket`, version 13, one canonical
+Base64 key representing 16 bytes, no request body, and no extension offer. The
+normal exact Host/SNI/route checks and global/per-IP request-rate admission run
+unchanged. Subprotocol offers are bounded by the existing header limits and
+must be unique HTTP tokens.
+
+Edge strips hop-by-hop and client-supplied forwarding fields, writes canonical
+trusted forwarding metadata, and reconstructs only the validated WebSocket
+handshake for the local HTTP/1.1 service. A local `101` is accepted only when
+its Connection/Upgrade tokens and RFC accept digest match and any selected
+subprotocol was offered by the client. Local extension negotiation is rejected.
+Non-`101` local responses remain ordinary bounded HTTP responses; malformed
+`101` responses become `502` and never expose an upgraded public stream.
+
+After both Hyper upgrade futures resolve, Edge relays bytes opaquely through
+the existing cached TunnelId and Tunnel Protocol v2 logical stream. It does not
+parse or log WebSocket frames. A dedicated global session semaphore cannot
+exceed HTTPS connection capacity, and one fixed-size buffer per direction plus
+an activity-based idle deadline bounds relay resources. One HTTP/1.1 connection
+task owns both Hyper drivers, upgrade futures, route completion, semaphore
+permit, idle timer, and relay, preventing detached work after timeout.
+
+Shutdown stops new HTTPS admission and lets an upgraded session close within
+the normal HTTPS drain window. The outer connection task is force-aborted when
+that deadline expires, which drops the relay, local stream, route, and permit
+together. Fixed-cardinality metrics expose accepted/rejected upgrades,
+active/peak sessions, and idle timeouts without host, peer, ID, or payload
+labels.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |
