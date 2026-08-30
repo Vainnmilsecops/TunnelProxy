@@ -75,7 +75,7 @@
   and explicit behavior during coordination outages.
 - **Tracking:** open.
 
-### DEBT-020 — Public HTTP ingress lacks upgrade support
+### DEBT-020 — Public HTTP ingress lacks CONNECT support
 
 - **Introduced in:** Session 25
 - **Category:** product / performance
@@ -96,9 +96,15 @@
   concurrent streams, headers, reset state, send/flow-control windows,
   keepalive, per-stream isolation, exact authority/SNI validation, HTTP/1.1
   local translation, fixed-cardinality metrics, and graceful GOAWAY drain.
-  HTTP/1.1-only remains the default for compatibility.
+  HTTP/1.1-only remains the default for compatibility. Session 45 added an
+  independently opt-in HTTP/1.1 WebSocket surface with strict client and local
+  `101` validation, exact Host/SNI checks, global session admission, an
+  activity-based idle deadline, task-owned opaque relay, fixed-cardinality
+  telemetry, and bounded graceful/forced drain.
 - **Tracking:** HTTP/1.1 reuse resolved in Session 34 and HTTP/2 resolved in
-  Session 44. WebSocket/upgrade and CONNECT remain open.
+  Session 44. HTTP/1.1 WebSocket upgrade resolved in Session 45. General
+  CONNECT, HTTP/2 extended CONNECT/WebSocket, and extension negotiation remain
+  open as separate policy surfaces.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

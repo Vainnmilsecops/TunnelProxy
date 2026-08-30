@@ -82,7 +82,9 @@ credential paths, with offline validation and deterministic layering.
 **Current implementation:** TCP baselines, bounded forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed raw TCP routes, and bounded
 HTTPS ingress with default HTTP/1.1 and opt-in bounded HTTP/2, per-request
-deadlines, protocol-specific keepalive, and graceful connection drain. The runnable
+deadlines, protocol-specific keepalive, graceful connection drain, and an
+independently opt-in HTTP/1.1 WebSocket upgrade surface with strict handshake,
+session-cap, idle-timeout, and task-ownership bounds. The runnable
 single-tunnel process keeps its durable TunnelId listener bound across
 replacement Agent sessions. Loopback is the default; explicit public raw mode
 requires Agent mTLS, dynamic snapshot authority, global admission, and a
@@ -101,7 +103,9 @@ separate reloadable public TLS identity, requires exact SNI/Host-or-authority ro
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane
-access. Its rate-limit peer state and live counters are explicitly bounded.
+access. Validated WebSocket upgrades reuse that route and Tunnel Protocol v2
+stream as opaque bytes without frame inspection. Its rate-limit peer state and
+live counters are explicitly bounded.
 An optional loopback-only operations listener reads these in-memory snapshots
 for health/readiness and fixed-cardinality Prometheus output, remains available
 during ingress drain, and performs no Control Plane or storage lookup.

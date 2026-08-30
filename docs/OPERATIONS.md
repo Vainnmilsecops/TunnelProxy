@@ -318,3 +318,29 @@ rebuilds each generation with the startup ALPN list. Roll back HTTP/2 by
 removing the opt-in and restarting Edge; clients then negotiate HTTP/1.1 only.
 No route catalog, Agent credential, hostname allocation, or Tunnel Protocol
 rollback is required.
+
+### WebSocket rollout and rollback
+
+Canary `--enable-websocket-upgrade` independently from HTTP/2. Start with a
+WebSocket session cap below the HTTPS connection cap and a finite idle timeout
+appropriate for application heartbeat traffic. Monitor
+`tunnelproxy_edge_https_websocket_upgrades_total`,
+`tunnelproxy_edge_https_websocket_rejections_total`,
+`tunnelproxy_edge_https_active_websocket_sessions`, its peak gauge, idle
+timeouts, HTTPS connection occupancy, Tunnel DATA saturation, and forced drain
+outcomes. None of these metrics carries hostname, peer, ID, subprotocol, or
+payload labels.
+
+An increase in `502` responses indicates the local service returned a malformed
+upgrade response, a mismatched accept digest, an unoffered subprotocol, or an
+extension. Capacity rejection returns `503`; increase the session cap only
+after confirming HTTPS connection and Tunnel stream headroom. Idle timeout
+closes the upgraded byte stream without closing the Agent transport or sibling
+connections.
+
+During shutdown, active WebSockets may finish until the normal Edge drain
+deadline. Stalled sessions are then force-aborted and release their route and
+session permits together. Roll back by removing `--enable-websocket-upgrade`
+and restarting Edge. Ordinary HTTP/1.1 and opt-in HTTP/2 remain available; no
+TLS generation, route catalog, Agent credential, or Tunnel Protocol rollback is
+required.

@@ -31,5 +31,8 @@ limits, then streams to the selected Agent without a storage or Control Plane
 lookup. HTTP/1.1 is the compatible default. Session 44 adds explicit bounded
 HTTP/2 ALPN with concurrent-stream/reset/header/keepalive limits, per-stream
 failure isolation, HTTP/1.1 local translation, fixed-cardinality telemetry, and
-graceful GOAWAY drain. WebSocket, CONNECT, HTTP/3, distributed rate limiting,
-and multi-edge ownership remain outside the current implementation.
+graceful GOAWAY drain. Session 45 adds explicit HTTP/1.1 WebSocket upgrades
+with strict client/local handshakes, bounded active sessions and idle time,
+opaque bidirectional relay, and bounded drain. CONNECT, HTTP/2 extended
+CONNECT, WebSocket extensions, HTTP/3, distributed rate limiting, and
+multi-edge ownership remain outside the current implementation.
