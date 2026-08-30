@@ -85,6 +85,8 @@ HTTPS ingress with default HTTP/1.1 and opt-in bounded HTTP/2, per-request
 deadlines, protocol-specific keepalive, graceful connection drain, and an
 independently opt-in HTTP/1.1 WebSocket upgrade surface with strict handshake,
 session-cap, idle-timeout, and task-ownership bounds. The runnable
+route-bound HTTP/1.1 CONNECT policy has independent authority-port validation,
+session/idle bounds, opaque relay ownership, and fixed-cardinality telemetry. The runnable
 single-tunnel process keeps its durable TunnelId listener bound across
 replacement Agent sessions. Loopback is the default; explicit public raw mode
 requires Agent mTLS, dynamic snapshot authority, global admission, and a
@@ -104,7 +106,9 @@ sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane
 access. Validated WebSocket upgrades reuse that route and Tunnel Protocol v2
-stream as opaque bytes without frame inspection. Its rate-limit peer state and
+stream as opaque bytes without frame inspection. Validated CONNECT sessions
+reuse the route's fixed local target directly and never dial client-selected
+destinations. Its rate-limit peer state and
 live counters are explicitly bounded.
 An optional loopback-only operations listener reads these in-memory snapshots
 for health/readiness and fixed-cardinality Prometheus output, remains available

@@ -49,6 +49,7 @@
 | 43      | Canonical Agent CLI & Strict Local Config v1  | complete |
 | 44      | Bounded HTTP/2 Public HTTPS Ingress           | complete |
 | 45      | Bounded WebSocket Upgrade Ingress             | complete |
+| 46      | Bounded Route-Bound HTTP/1.1 CONNECT Ingress  | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1456,4 +1457,37 @@ Out of scope:
 
 - CONNECT, HTTP/2 extended CONNECT/WebSocket, WebSocket extension negotiation,
   h2c, HTTP/3, public-client authentication, distributed admission, multi-edge
+  ownership, and Tunnel Protocol changes.
+
+## Session 46 — Bounded Route-Bound HTTP/1.1 CONNECT Ingress — complete
+
+Scope delivered:
+
+- Added an explicit default-off HTTP/1.1 CONNECT policy with CLI session cap,
+  activity idle deadline, and operator-configured authority port. Tuning flags
+  without opt-in fail before listener bind, and the session cap cannot exceed
+  HTTPS connection capacity.
+- Required authority-form URI and exact configured port, matching Host and TLS
+  SNI, a cached enabled hostname route, zero request body, no transfer encoding,
+  no upgrade headers, and existing request-rate admission. HTTP/2 CONNECT and
+  malformed/fronted requests fail closed before tunnel creation.
+- Kept CONNECT route-bound rather than acting as a forward proxy: Edge opens
+  only the selected TunnelId's fixed Agent local target, returns `200`, and
+  relays opaque bytes directly through unchanged Tunnel Protocol v2 without
+  forwarding an HTTP CONNECT request to the local application.
+- Added independent RAII session admission, fixed directional buffers, an
+  activity-based read/write/half-close idle deadline, and connection-task
+  ownership through graceful or forced HTTPS drain.
+- Added fixed-cardinality accepted/rejected/current/peak/idle-timeout metrics,
+  strict config/parser coverage, shared opaque-relay tests, and two real TLS
+  Edge-to-Agent-to-local E2Es covering byte-exact relay, wrong host/port/body,
+  capacity release, idle timeout, and forced shutdown. The workspace now
+  contains 383 explicit tests.
+- Documented trust boundaries, rollout/rollback, observability, failure status,
+  compatibility defaults, and the non-forward-proxy contract.
+
+Out of scope:
+
+- Arbitrary forward-proxy destinations, HTTP/2 extended CONNECT/WebSocket,
+  h2c, HTTP/3, public-client authorization, distributed admission, multi-edge
   ownership, and Tunnel Protocol changes.

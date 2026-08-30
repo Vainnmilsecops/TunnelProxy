@@ -75,7 +75,7 @@
   and explicit behavior during coordination outages.
 - **Tracking:** open.
 
-### DEBT-020 — Public HTTP ingress lacks CONNECT support
+### DEBT-020 — Public HTTP ingress lacks remaining CONNECT variants
 
 - **Introduced in:** Session 25
 - **Category:** product / performance
@@ -101,10 +101,15 @@
   `101` validation, exact Host/SNI checks, global session admission, an
   activity-based idle deadline, task-owned opaque relay, fixed-cardinality
   telemetry, and bounded graceful/forced drain.
+  Session 46 added independently opt-in route-bound HTTP/1.1 CONNECT. Exact
+  configured authority port, Host, SNI, cached route, rate, session, and idle
+  checks precede a direct opaque Tunnel Protocol relay; arbitrary destination
+  dialing is deliberately not implemented.
 - **Tracking:** HTTP/1.1 reuse resolved in Session 34 and HTTP/2 resolved in
   Session 44. HTTP/1.1 WebSocket upgrade resolved in Session 45. General
-  CONNECT, HTTP/2 extended CONNECT/WebSocket, and extension negotiation remain
-  open as separate policy surfaces.
+  route-bound HTTP/1.1 CONNECT is resolved in Session 46. Arbitrary forward
+  proxying, HTTP/2 extended CONNECT/WebSocket, and extension negotiation remain
+  outside the implemented policy as separate surfaces.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

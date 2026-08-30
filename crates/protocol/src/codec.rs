@@ -124,14 +124,29 @@ impl FrameEncoder {
 /// - `Err(ProtocolError::TruncatedPayload { .. })` — partial payload then EOF.
 #[derive(Debug)]
 pub struct FrameDecoder {
-    _priv: (),
+    header: [u8; HEADER_SIZE as usize],
+    header_offset: usize,
+    pending: Option<PendingFrame>,
+}
+
+#[derive(Debug)]
+struct PendingFrame {
+    frame_type: FrameType,
+    flags: u16,
+    stream_id: StreamId,
+    payload: Vec<u8>,
+    payload_offset: usize,
 }
 
 impl FrameDecoder {
     /// Creates a new decoder.
     #[inline]
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self {
+            header: [0; HEADER_SIZE as usize],
+            header_offset: 0,
+            pending: None,
+        }
     }
 
     /// Reads and validates a single frame from `reader`.
@@ -145,79 +160,130 @@ impl FrameDecoder {
         &mut self,
         reader: &mut R,
     ) -> Result<Option<Frame>, ProtocolError> {
-        // --- Read 16-byte header ---
-        let mut header = [0u8; HEADER_SIZE as usize];
-        let mut header_offset = 0;
-
-        while header_offset < HEADER_SIZE as usize {
-            let n = reader.read(&mut header[header_offset..]).await?;
-            if n == 0 {
-                // EOF.
-                if header_offset == 0 {
-                    // No header bytes received — clean EOF.
-                    return Ok(None);
-                } else {
-                    // Some header bytes received but not all 16.
-                    return Err(ProtocolError::TruncatedHeader { got: header_offset });
+        // Header and payload progress live on the decoder rather than this
+        // future so callers can safely use `decode` inside `tokio::select!`.
+        // A losing branch may cancel the future after a partial socket read;
+        // the next call must resume at that byte offset instead of treating
+        // the rest of the frame as a new header.
+        if self.pending.is_none() {
+            while self.header_offset < HEADER_SIZE as usize {
+                let n = match reader.read(&mut self.header[self.header_offset..]).await {
+                    Ok(n) => n,
+                    Err(error) => {
+                        self.reset();
+                        return Err(error.into());
+                    }
+                };
+                if n == 0 {
+                    if self.header_offset == 0 {
+                        return Ok(None);
+                    }
+                    let got = self.header_offset;
+                    self.reset();
+                    return Err(ProtocolError::TruncatedHeader { got });
                 }
+                self.header_offset += n;
             }
-            header_offset += n;
+
+            let magic = [
+                self.header[0],
+                self.header[1],
+                self.header[2],
+                self.header[3],
+            ];
+            if magic != MAGIC {
+                self.reset();
+                return Err(ProtocolError::InvalidMagic(magic));
+            }
+
+            let version = self.header[4];
+            if version != VERSION {
+                self.reset();
+                return Err(ProtocolError::UnsupportedVersion(version));
+            }
+
+            let frame_type = match FrameType::from_raw(self.header[5]) {
+                Some(frame_type) => frame_type,
+                None => {
+                    let raw = self.header[5];
+                    self.reset();
+                    return Err(ProtocolError::UnknownFrameType(raw));
+                }
+            };
+
+            let flags = u16::from_be_bytes([self.header[6], self.header[7]]);
+            if flags != 0 {
+                self.reset();
+                return Err(ProtocolError::UnsupportedFlags(flags));
+            }
+
+            let stream_id = StreamId(u32::from_be_bytes([
+                self.header[8],
+                self.header[9],
+                self.header[10],
+                self.header[11],
+            ]));
+            let payload_len = u32::from_be_bytes([
+                self.header[12],
+                self.header[13],
+                self.header[14],
+                self.header[15],
+            ]);
+            if payload_len > MAX_FRAME_PAYLOAD {
+                self.reset();
+                return Err(ProtocolError::FrameTooLarge(payload_len));
+            }
+
+            self.header_offset = 0;
+            self.pending = Some(PendingFrame {
+                frame_type,
+                flags,
+                stream_id,
+                payload: vec![0; payload_len as usize],
+                payload_offset: 0,
+            });
         }
 
-        // --- Parse header fields ---
-
-        // Magic (offset 0).
-        let magic = [header[0], header[1], header[2], header[3]];
-        if magic != MAGIC {
-            return Err(ProtocolError::InvalidMagic(magic));
-        }
-
-        // Version (offset 4).
-        let version = header[4];
-        if version != VERSION {
-            return Err(ProtocolError::UnsupportedVersion(version));
-        }
-
-        // Frame type (offset 5).
-        let frame_type =
-            FrameType::from_raw(header[5]).ok_or(ProtocolError::UnknownFrameType(header[5]))?;
-
-        // Flags (offset 6-7, big-endian).
-        let flags = u16::from_be_bytes([header[6], header[7]]);
-        if flags != 0 {
-            return Err(ProtocolError::UnsupportedFlags(flags));
-        }
-
-        // Stream ID (offset 8-11, big-endian).
-        let stream_id = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-        let stream_id = StreamId(stream_id);
-
-        // Payload length (offset 12-15, big-endian).
-        let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]);
-
-        // --- Validate payload length BEFORE allocating ---
-        if payload_len > MAX_FRAME_PAYLOAD {
-            return Err(ProtocolError::FrameTooLarge(payload_len));
-        }
-
-        // --- Read payload ---
-        let mut payload = vec![0u8; payload_len as usize];
-        let mut payload_offset = 0;
-
-        while payload_offset < payload_len as usize {
-            let n = reader.read(&mut payload[payload_offset..]).await?;
+        let pending = self
+            .pending
+            .as_mut()
+            .expect("a validated header creates a pending frame");
+        while pending.payload_offset < pending.payload.len() {
+            let n = match reader
+                .read(&mut pending.payload[pending.payload_offset..])
+                .await
+            {
+                Ok(n) => n,
+                Err(error) => {
+                    self.reset();
+                    return Err(error.into());
+                }
+            };
             if n == 0 {
-                // EOF before full payload.
-                return Err(ProtocolError::TruncatedPayload {
-                    got: payload_offset,
-                    expected: payload_len as usize,
-                });
+                let got = pending.payload_offset;
+                let expected = pending.payload.len();
+                self.reset();
+                return Err(ProtocolError::TruncatedPayload { got, expected });
             }
-            payload_offset += n;
+            pending.payload_offset += n;
         }
 
-        // --- Reconstruct frame (which re-validates) ---
-        Frame::new(frame_type, flags, stream_id, payload).map(Some)
+        let pending = self
+            .pending
+            .take()
+            .expect("payload completion retains its pending frame");
+        Frame::new(
+            pending.frame_type,
+            pending.flags,
+            pending.stream_id,
+            pending.payload,
+        )
+        .map(Some)
+    }
+
+    fn reset(&mut self) {
+        self.header_offset = 0;
+        self.pending = None;
     }
 }
 
@@ -267,6 +333,40 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(decode_bytes_async(bytes))
+    }
+
+    #[tokio::test]
+    async fn decode_resumes_after_header_and_payload_cancellation() {
+        let frame = Frame::stream(
+            StreamId::new(7).unwrap(),
+            FrameType::Data,
+            b"cancellation-safe payload".to_vec(),
+        )
+        .unwrap();
+        let wire = encode_frame_async(&frame).await;
+        let (mut reader, mut writer) = duplex(4096);
+        let mut decoder = FrameDecoder::new();
+
+        writer.write_all(&wire[..7]).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            decoder.decode(&mut reader),
+        )
+        .await
+        .is_err());
+
+        let payload_prefix = HEADER_SIZE as usize + 3;
+        writer.write_all(&wire[7..payload_prefix]).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            decoder.decode(&mut reader),
+        )
+        .await
+        .is_err());
+
+        writer.write_all(&wire[payload_prefix..]).await.unwrap();
+        let decoded = decoder.decode(&mut reader).await.unwrap().unwrap();
+        assert_eq!(decoded, frame);
     }
 
     // TEST 1 — Round trip: control frame.

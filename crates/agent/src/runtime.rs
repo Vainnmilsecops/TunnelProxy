@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use tunnelproxy_common::{
     MultiplexTelemetry, MultiplexTelemetrySnapshot, RuntimeShutdownConfig, ShutdownSignal,
 };
-use tunnelproxy_protocol::{RegistrationRequest, TransportSessionId};
+use tunnelproxy_protocol::{ProtocolError, RegistrationRequest, TransportSessionId};
 
 use crate::{
     connect_registered_with_security, development_registration, AgentError,
@@ -656,6 +656,11 @@ fn is_retryable(error: &AgentError) -> bool {
             | AgentError::TlsTransport(_)
             | AgentError::HandshakeTimeout
             | AgentError::SessionIo(_)
+            | AgentError::ProtocolDecode(
+                ProtocolError::Io(_)
+                    | ProtocolError::TruncatedHeader { .. }
+                    | ProtocolError::TruncatedPayload { .. }
+            )
             | AgentError::ConnectionClosed
             | AgentError::RegistrationRejected {
                 code: Some(tunnelproxy_protocol::HandshakeErrorCode::TunnelAlreadyConnected),
@@ -819,6 +824,15 @@ mod tests {
     fn retry_classification_is_conservative() {
         assert!(is_retryable(&AgentError::ConnectTimeout));
         assert!(is_retryable(&AgentError::ConnectionClosed));
+        assert!(is_retryable(&AgentError::ProtocolDecode(
+            ProtocolError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        )));
+        assert!(is_retryable(&AgentError::ProtocolDecode(
+            ProtocolError::TruncatedHeader { got: 3 }
+        )));
+        assert!(!is_retryable(&AgentError::ProtocolDecode(
+            ProtocolError::InvalidMagic(*b"NOPE")
+        )));
         assert!(!is_retryable(&AgentError::ProtocolViolation {
             reason: "test"
         }));

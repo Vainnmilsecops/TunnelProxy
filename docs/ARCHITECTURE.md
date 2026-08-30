@@ -1000,8 +1000,9 @@ Hostnames, peer addresses, durable IDs, and payload data are not labels.
 ### 2.43 Bounded HTTP/1.1 WebSocket upgrade ingress (Session 45)
 
 WebSocket is an explicit public HTTPS policy and remains disabled by default.
-It applies only to HTTP/1.1 GET requests; HTTP/2 extended CONNECT and general
-CONNECT remain rejected. Before opening a tunnel stream, Edge requires
+It applies only to HTTP/1.1 GET requests; HTTP/2 extended CONNECT remains
+rejected and route-bound HTTP/1.1 CONNECT requires the separate Session 46
+policy. Before opening a tunnel stream, Edge requires
 `Connection: Upgrade`, exact `Upgrade: websocket`, version 13, one canonical
 Base64 key representing 16 bytes, no request body, and no extension offer. The
 normal exact Host/SNI/route checks and global/per-IP request-rate admission run
@@ -1030,6 +1031,31 @@ that deadline expires, which drops the relay, local stream, route, and permit
 together. Fixed-cardinality metrics expose accepted/rejected upgrades,
 active/peak sessions, and idle timeouts without host, peer, ID, or payload
 labels.
+
+### 2.44 Bounded route-bound HTTP/1.1 CONNECT ingress (Session 46)
+
+CONNECT is a separate default-off HTTP/1.1 policy. It is not a general forward
+proxy: the authority hostname must resolve through the existing exact route
+cache, its port must equal the operator-configured CONNECT authority port, and
+the Host authority and TLS SNI must name the same hostname and port. HTTP/2
+CONNECT, schemes, paths, request bodies, transfer encoding, and upgrade headers
+fail closed before a tunnel stream opens. Existing header bounds and
+process-local global/per-IP request-rate admission still apply.
+
+After route and admission checks, Edge opens the existing Tunnel Protocol v2
+logical stream to the route's fixed Agent local target and returns `200 OK`.
+It does not forward the CONNECT request to the local service and does not use
+the client authority to select any arbitrary destination. The upgraded public
+TLS stream and the route byte stream are then relayed opaquely with one fixed
+buffer per direction. Tunnel Protocol v2 and Agent configuration are unchanged.
+
+An independent session semaphore cannot exceed HTTPS connection capacity. An
+activity-based idle deadline covers reads, writes, and half-close propagation.
+The HTTP/1.1 connection task owns the upgrade future, relay, route completion,
+permit, and timer; graceful shutdown may drain it only within the existing
+HTTPS deadline, after which one task abort releases all resources. Metrics
+expose accepted/rejected, active/peak, and idle-timeout totals without
+authority, hostname, peer, durable ID, or payload labels.
 
 ## 3. Control plane vs data plane
 

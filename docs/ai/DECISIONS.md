@@ -1260,3 +1260,31 @@ are isolated, shutdown may drain until its established deadline, and telemetry
 remains fixed-cardinality. CONNECT, RFC 8441/WebSocket over HTTP/2, extension
 negotiation, HTTP/3, distributed admission, and multi-edge ownership remain
 separate concerns.
+
+---
+
+## ADR-046 — HTTP/1.1 CONNECT is route-bound, explicit, and task-owned
+
+**Status:** Accepted (Session 46).
+
+**Context:** CONNECT changes an HTTP connection into an indefinite opaque byte
+stream, but TunnelProxy routes public hostnames to fixed Agent local targets;
+it is not an arbitrary outbound proxy. Using the client authority as a dial
+target would broaden the trust boundary, while treating CONNECT as an ordinary
+request could release capacity or detach upgraded work from shutdown.
+
+**Decision:** Add one default-off HTTP/1.1 CONNECT policy with an
+operator-configured authority port. Require authority-form URI, the exact
+cached route hostname and port in URI and Host, matching TLS SNI, no scheme,
+path, body, transfer encoding, or upgrade headers, and the existing request
+rate admission. Open only the selected TunnelId's existing fixed local target,
+return `200`, and relay the upgraded public stream directly through Tunnel
+Protocol v2. A separate global semaphore, fixed directional buffers, activity
+idle deadline, and the HTTP/1.1 connection task own the complete lifecycle.
+
+**Consequences:** CONNECT cannot reach an arbitrary host or port and requires
+no Agent, route-protocol, or Tunnel Protocol change. Capacity, timeout,
+fronting, and tunnel failures remain isolated and observable with
+fixed-cardinality counters. HTTP/2 extended CONNECT/WebSocket, arbitrary
+forward proxying, HTTP/3, public-client authorization, distributed admission,
+and multi-edge ownership remain separate concerns.
