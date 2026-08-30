@@ -36,12 +36,13 @@ correct agent, which in turn proxies them into the local service.
 - Explicit public raw TCP exposure that requires Agent-facing mTLS, dynamic
   snapshot authorization, operator opt-in, and a bounded per-IP concurrency
   limit; loopback remains the default.
-- Bounded public HTTPS/HTTP/1.1 ingress for one operator-configured exact
+- Bounded public HTTPS ingress for one operator-configured exact
   hostname, including public TLS termination/reload, Host/SNI validation,
   forwarding-header sanitization, cached TunnelId routing, and bounded global
   plus per-source-IP request-rate admission with explicit `429` responses.
-  Opt-in keep-alive permits a bounded number of sequential requests per TLS
-  connection with per-request deadlines and graceful drain.
+  HTTP/1.1 remains the default with opt-in capped sequential keep-alive.
+  HTTP/2 is separately opt-in with bounded concurrent streams, header/reset
+  state, keepalive, per-stream deadlines, and graceful GOAWAY drain.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -93,7 +94,7 @@ The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
 - Automatic config/account provisioning, custom-domain administration, DNS or
-  certificate automation, and HTTP/2.
+  certificate automation, WebSocket/upgrade, CONNECT, and HTTP/3.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
 - General administrative/account API and protected issuer-key custody/CA
@@ -143,9 +144,9 @@ Today the control-plane crate provides versioned certificate/Agent/tunnel
 authorization snapshots, SQLite persistence, full-snapshot import, a runnable
 authenticated distribution service, and a separate durable exact-hostname
 route catalog with authenticated distribution to an in-memory Edge cache. The data plane has tested
-opt-in public raw-TCP ingress plus a bounded HTTPS/HTTP/1.1 reverse-proxy
-slice with exact static or dynamically distributed hostname routing, bounded
-HTTP/1.1 keep-alive, public TLS reload, and local global/per-IP request-rate
+opt-in public raw-TCP ingress plus a bounded HTTPS reverse-proxy slice with
+exact static or dynamically distributed hostname routing, bounded HTTP/1.1
+keep-alive, opt-in bounded HTTP/2, public TLS reload, and local global/per-IP request-rate
 enforcement. Edge and Agent can optionally export
 bounded loopback health/readiness and fixed-cardinality Prometheus metrics. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown and
@@ -260,6 +261,7 @@ and Definition of Done.
 | 41 _(complete)_ | atomic TLS and Agent-CA rotation for the hostname service |
 | 42 _(complete)_ | single-process managed HTTP hostname and Agent orchestration |
 | 43 _(complete)_ | canonical `tunnelproxy` CLI and strict local Agent config v1 |
+| 44 _(complete)_ | opt-in bounded HTTP/2 public HTTPS ingress |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

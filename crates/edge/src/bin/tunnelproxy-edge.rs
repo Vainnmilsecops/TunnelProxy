@@ -20,8 +20,8 @@ use tunnelproxy_edge::{
     EdgeOperationsConfig, EdgeRegistrationPolicy, EdgeRegistrationPolicyError, EdgeRuntime,
     EdgeRuntimeConfig, EdgeRuntimeError, EdgeRuntimeOutcome, EdgeTlsConfig, EdgeTlsConfigError,
     EdgeTlsReloadBootstrapError, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
-    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
-    HttpRequestRateLimitConfig, PublicTlsConfig, PublicTlsConfigError,
+    Http2IngressConfig, HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
+    HttpRequestRateLimitConfig, PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsConfigError,
     PublicTlsReloadBootstrapError, PublicTlsReloadConfig, PublicTlsReloadRuntime,
     RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
     SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
@@ -55,6 +55,10 @@ Options:
   --max-http-headers <usize>       header count (default 64)
   --max-http-request-body-bytes <usize> body limit (default 10485760)
   --max-http-requests-per-connection <usize> keep-alive request cap (default 1)
+  --enable-http2                  opt in to bounded HTTP/2 plus HTTP/1.1 fallback
+  --max-http2-concurrent-streams <u32> HTTP/2 stream limit (default 32)
+  --http2-keepalive-interval-ms <ms> HTTP/2 ping interval (default 30000)
+  --http2-keepalive-timeout-ms <ms> HTTP/2 ping timeout (default 10000)
   --http-requests-per-second <u64> global request rate (default 100)
   --http-request-burst <u64>       global burst capacity (default 200)
   --http-requests-per-ip-per-second <u64> per-IP rate (default 20)
@@ -335,6 +339,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         operations_addr = ?parsed.ops_listen,
         https_host = ?parsed.https_host,
         https_route_server = ?parsed.https_route_server,
+        http2_enabled = parsed.enable_http2,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
         public_raw_ingress = parsed.allow_public_raw_ingress,
@@ -419,6 +424,11 @@ struct ParsedArgs {
     max_http_headers: usize,
     max_http_request_body_bytes: usize,
     max_http_requests_per_connection: usize,
+    enable_http2: bool,
+    max_http2_concurrent_streams: u32,
+    http2_keep_alive_interval: Duration,
+    http2_keep_alive_timeout: Duration,
+    http2_options_present: bool,
     http_requests_per_second: u64,
     http_request_burst: u64,
     http_requests_per_ip_per_second: u64,
@@ -488,6 +498,11 @@ impl Default for ParsedArgs {
             max_http_headers: 64,
             max_http_request_body_bytes: 10 * 1024 * 1024,
             max_http_requests_per_connection: 1,
+            enable_http2: false,
+            max_http2_concurrent_streams: 32,
+            http2_keep_alive_interval: Duration::from_secs(30),
+            http2_keep_alive_timeout: Duration::from_secs(10),
+            http2_options_present: false,
             http_requests_per_second: 100,
             http_request_burst: 200,
             http_requests_per_ip_per_second: 20,
@@ -544,6 +559,7 @@ enum ArgError {
     HttpsRouteHostConflict,
     HttpsRouteStaleWithoutServer,
     HttpsRouteReloadWithoutServer,
+    Http2OptionsWithoutOptIn,
     IngressModeConflict,
     PublicHttpsOptInRequired,
     PublicHttpsPerIpLimitRequired,
@@ -587,6 +603,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::HttpsRouteReloadWithoutServer => {
                 f.write_str("--https-route-tls-reload-manifest requires --https-route-server")
+            }
+            Self::Http2OptionsWithoutOptIn => {
+                f.write_str("HTTP/2 tuning options require --enable-http2")
             }
             Self::IngressModeConflict => {
                 f.write_str("raw-ingress options cannot be combined with --https-listen")
@@ -740,6 +759,31 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--max-http-requests-per-connection" => {
                 parsed.max_http_requests_per_connection = parse_number(args, index, flag)?;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--enable-http2" => {
+                parsed.enable_http2 = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--max-http2-concurrent-streams" => {
+                parsed.max_http2_concurrent_streams = parse_number(args, index, flag)?;
+                parsed.http2_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http2-keepalive-interval-ms" => {
+                parsed.http2_keep_alive_interval =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.http2_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--http2-keepalive-timeout-ms" => {
+                parsed.http2_keep_alive_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.http2_options_present = true;
                 parsed.https_options_present = true;
                 index += 2;
             }
@@ -933,6 +977,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     }
     if parsed.https_route_tls_reload_manifest.is_some() && parsed.https_route_server.is_none() {
         return Err(ArgError::HttpsRouteReloadWithoutServer);
+    }
+    if parsed.http2_options_present && !parsed.enable_http2 {
+        return Err(ArgError::Http2OptionsWithoutOptIn);
     }
     Ok(parsed)
 }
@@ -1445,9 +1492,14 @@ async fn load_https_configuration(
             tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(error),
         )
     })?;
+    let protocols = if parsed.enable_http2 {
+        PublicHttpProtocolPolicy::Http1AndHttp2
+    } else {
+        PublicHttpProtocolPolicy::Http1Only
+    };
     let (tls, reloader) = match &parsed.public_tls_reload_manifest {
         Some(manifest_path) => {
-            let (tls, runtime) = PublicTlsReloadRuntime::bootstrap(
+            let (tls, runtime) = PublicTlsReloadRuntime::bootstrap_with_protocols(
                 PublicTlsReloadConfig {
                     manifest_path: manifest_path.clone(),
                     server_certificate_path: certificate_path,
@@ -1456,6 +1508,7 @@ async fn load_https_configuration(
                     expiry_warning: parsed.tls_expiry_warning,
                 },
                 parsed.tls_handshake_timeout,
+                protocols,
             )
             .await
             .map_err(TlsLoadError::PublicReload)?;
@@ -1464,9 +1517,13 @@ async fn load_https_configuration(
         None => {
             let certificate = read_tls_file(&certificate_path, "public server certificate").await?;
             let private_key = read_tls_file(&private_key_path, "public server private key").await?;
-            let tls =
-                PublicTlsConfig::from_pem(&certificate, &private_key, parsed.tls_handshake_timeout)
-                    .map_err(TlsLoadError::InvalidPublicTls)?;
+            let tls = PublicTlsConfig::from_pem_with_protocols(
+                &certificate,
+                &private_key,
+                parsed.tls_handshake_timeout,
+                protocols,
+            )
+            .map_err(TlsLoadError::InvalidPublicTls)?;
             (tls, None)
         }
     };
@@ -1483,6 +1540,11 @@ async fn load_https_configuration(
         max_headers: parsed.max_http_headers,
         max_request_body_bytes: parsed.max_http_request_body_bytes,
         max_requests_per_connection: parsed.max_http_requests_per_connection,
+        http2: parsed.enable_http2.then_some(Http2IngressConfig {
+            max_concurrent_streams: parsed.max_http2_concurrent_streams,
+            keep_alive_interval: parsed.http2_keep_alive_interval,
+            keep_alive_timeout: parsed.http2_keep_alive_timeout,
+        }),
         request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
@@ -1838,6 +1900,13 @@ mod tests {
             "2048",
             "--max-http-requests-per-connection",
             "3",
+            "--enable-http2",
+            "--max-http2-concurrent-streams",
+            "12",
+            "--http2-keepalive-interval-ms",
+            "4000",
+            "--http2-keepalive-timeout-ms",
+            "1000",
             "--http-requests-per-second",
             "50",
             "--http-request-burst",
@@ -1867,6 +1936,10 @@ mod tests {
         assert_eq!(parsed.max_http_headers, 40);
         assert_eq!(parsed.max_http_request_body_bytes, 2048);
         assert_eq!(parsed.max_http_requests_per_connection, 3);
+        assert!(parsed.enable_http2);
+        assert_eq!(parsed.max_http2_concurrent_streams, 12);
+        assert_eq!(parsed.http2_keep_alive_interval, Duration::from_secs(4));
+        assert_eq!(parsed.http2_keep_alive_timeout, Duration::from_secs(1));
         assert_eq!(parsed.http_requests_per_second, 50);
         assert_eq!(parsed.http_request_burst, 100);
         assert_eq!(parsed.http_requests_per_ip_per_second, 10);
@@ -1900,6 +1973,10 @@ mod tests {
             parse_args(&args(&["--https-host", "bad_host"])),
             Err(ArgError::InvalidHostname(_))
         ));
+        assert_eq!(
+            parse_args(&args(&["--max-http2-concurrent-streams", "2"])),
+            Err(ArgError::Http2OptionsWithoutOptIn)
+        );
     }
 
     #[test]

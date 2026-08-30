@@ -13,11 +13,35 @@ use tunnelproxy_common::{
 };
 
 pub const PUBLIC_HTTP1_ALPN: &[u8] = b"http/1.1";
+pub const PUBLIC_HTTP2_ALPN: &[u8] = b"h2";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PublicHttpProtocolPolicy {
+    #[default]
+    Http1Only,
+    Http1AndHttp2,
+}
+
+impl PublicHttpProtocolPolicy {
+    pub const fn supports_http2(self) -> bool {
+        matches!(self, Self::Http1AndHttp2)
+    }
+
+    fn alpn_protocols(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Http1Only => vec![PUBLIC_HTTP1_ALPN.to_vec()],
+            Self::Http1AndHttp2 => {
+                vec![PUBLIC_HTTP2_ALPN.to_vec(), PUBLIC_HTTP1_ALPN.to_vec()]
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PublicTlsConfig {
     pub(crate) server_config: ReloadableConfig<ServerConfig>,
     pub(crate) handshake_timeout: Duration,
+    protocols: PublicHttpProtocolPolicy,
 }
 
 impl PublicTlsConfig {
@@ -26,19 +50,38 @@ impl PublicTlsConfig {
         server_key_pem: &[u8],
         handshake_timeout: Duration,
     ) -> Result<Self, PublicTlsConfigError> {
+        Self::from_pem_with_protocols(
+            server_cert_pem,
+            server_key_pem,
+            handshake_timeout,
+            PublicHttpProtocolPolicy::Http1Only,
+        )
+    }
+
+    pub fn from_pem_with_protocols(
+        server_cert_pem: &[u8],
+        server_key_pem: &[u8],
+        handshake_timeout: Duration,
+        protocols: PublicHttpProtocolPolicy,
+    ) -> Result<Self, PublicTlsConfigError> {
         if handshake_timeout.is_zero() {
             return Err(PublicTlsConfigError::ZeroHandshakeTimeout);
         }
-        let candidate = build_server_config(server_cert_pem, server_key_pem)?;
+        let candidate = build_server_config(server_cert_pem, server_key_pem, protocols)?;
         Ok(Self {
             server_config: ReloadableConfig::new(1, [0; 32], candidate.config, candidate.validity)
                 .map_err(|_| PublicTlsConfigError::InvalidCertificateValidity)?,
             handshake_timeout,
+            protocols,
         })
     }
 
     pub const fn handshake_timeout(&self) -> Duration {
         self.handshake_timeout
+    }
+
+    pub const fn protocols(&self) -> PublicHttpProtocolPolicy {
+        self.protocols
     }
 
     pub fn reload_status(&self, expiry_warning: Duration) -> TlsConfigStatus {
@@ -51,6 +94,7 @@ impl fmt::Debug for PublicTlsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PublicTlsConfig")
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("protocols", &self.protocols)
             .field("generation", &self.server_config.generation())
             .finish_non_exhaustive()
     }
@@ -107,6 +151,7 @@ fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, PublicTlsConf
 fn build_server_config(
     server_cert_pem: &[u8],
     server_key_pem: &[u8],
+    protocols: PublicHttpProtocolPolicy,
 ) -> Result<TlsReloadCandidate<ServerConfig>, PublicTlsConfigError> {
     let certificates = parse_certificates(server_cert_pem)?;
     let validity = certificate_validity(certificates[0].as_ref())
@@ -116,7 +161,7 @@ fn build_server_config(
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|_| PublicTlsConfigError::InvalidServerIdentity)?;
-    config.alpn_protocols = vec![PUBLIC_HTTP1_ALPN.to_vec()];
+    config.alpn_protocols = protocols.alpn_protocols();
     Ok(TlsReloadCandidate { config, validity })
 }
 
@@ -164,6 +209,19 @@ impl PublicTlsReloadRuntime {
         reload: PublicTlsReloadConfig,
         handshake_timeout: Duration,
     ) -> Result<(PublicTlsConfig, Self), PublicTlsReloadBootstrapError> {
+        Self::bootstrap_with_protocols(
+            reload,
+            handshake_timeout,
+            PublicHttpProtocolPolicy::Http1Only,
+        )
+        .await
+    }
+
+    pub async fn bootstrap_with_protocols(
+        reload: PublicTlsReloadConfig,
+        handshake_timeout: Duration,
+        protocols: PublicHttpProtocolPolicy,
+    ) -> Result<(PublicTlsConfig, Self), PublicTlsReloadBootstrapError> {
         if handshake_timeout.is_zero() {
             return Err(PublicTlsReloadBootstrapError::Tls(
                 PublicTlsConfigError::ZeroHandshakeTimeout,
@@ -179,7 +237,7 @@ impl PublicTlsReloadRuntime {
         )
         .await
         .map_err(PublicTlsReloadBootstrapError::Load)?;
-        let candidate = build_reload_generation(&generation)
+        let candidate = build_reload_generation(&generation, protocols)
             .map_err(|()| PublicTlsReloadBootstrapError::Candidate)?;
         let server_config = ReloadableConfig::new(
             generation.generation(),
@@ -191,11 +249,14 @@ impl PublicTlsReloadRuntime {
         let tls = PublicTlsConfig {
             server_config: server_config.clone(),
             handshake_timeout,
+            protocols,
         };
+        let build =
+            move |generation: &TlsReloadGeneration| build_reload_generation(generation, protocols);
         let inner = TlsReloadRuntime::new(
             runtime_config,
             server_config,
-            Box::new(build_reload_generation) as PublicTlsBuild,
+            Box::new(build) as PublicTlsBuild,
         )
         .map_err(PublicTlsReloadBootstrapError::Runtime)?;
         Ok((tls, Self { inner }))
@@ -211,10 +272,12 @@ impl PublicTlsReloadRuntime {
 
 fn build_reload_generation(
     generation: &TlsReloadGeneration,
+    protocols: PublicHttpProtocolPolicy,
 ) -> Result<TlsReloadCandidate<ServerConfig>, ()> {
     build_server_config(
         generation.file(RELOAD_PUBLIC_CERTIFICATE).map_err(|_| ())?,
         generation.file(RELOAD_PUBLIC_PRIVATE_KEY).map_err(|_| ())?,
+        protocols,
     )
     .map_err(|_| ())
 }
@@ -258,5 +321,31 @@ mod tests {
             PublicTlsConfig::from_pem(b"certificate", b"secret-key", Duration::ZERO).unwrap_err();
         let debug = format!("{error:?}");
         assert!(!debug.contains("secret-key"));
+    }
+
+    #[test]
+    fn http2_is_explicit_and_alpn_order_is_stable() {
+        let pki = rcgen::generate_simple_self_signed(vec!["demo.example.test".to_owned()]).unwrap();
+        let default = PublicTlsConfig::from_pem(
+            pki.cert.pem().as_bytes(),
+            pki.key_pair.serialize_pem().as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            default.server_config.current().alpn_protocols,
+            vec![PUBLIC_HTTP1_ALPN.to_vec()]
+        );
+        let enabled = PublicTlsConfig::from_pem_with_protocols(
+            pki.cert.pem().as_bytes(),
+            pki.key_pair.serialize_pem().as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap();
+        assert_eq!(
+            enabled.server_config.current().alpn_protocols,
+            vec![PUBLIC_HTTP2_ALPN.to_vec(), PUBLIC_HTTP1_ALPN.to_vec()]
+        );
     }
 }

@@ -856,6 +856,26 @@ fn render_https_metrics(
             status.accepted_connections,
         ),
         (
+            "tunnelproxy_edge_https_http1_connections_total",
+            "counter",
+            status.http1_connections,
+        ),
+        (
+            "tunnelproxy_edge_https_http2_connections_total",
+            "counter",
+            status.http2_connections,
+        ),
+        (
+            "tunnelproxy_edge_https_active_http2_streams",
+            "gauge",
+            status.active_http2_streams as u64,
+        ),
+        (
+            "tunnelproxy_edge_https_peak_active_http2_streams",
+            "gauge",
+            status.peak_active_http2_streams as u64,
+        ),
+        (
             "tunnelproxy_edge_https_completed_requests_total",
             "counter",
             status.completed_requests,
@@ -1012,6 +1032,26 @@ mod tests {
         assert!(rendered.contains("tunnelproxy_edge_transport_data_pipeline_capacity_frames 256"));
         assert!(!rendered.contains("TunnelId"));
         assert!(!rendered.contains("127.0.0.1"));
+
+        let mut https = String::new();
+        render_https_metrics(
+            &mut https,
+            HttpIngressStatus {
+                http1_connections: 3,
+                http2_connections: 2,
+                active_http2_streams: 4,
+                peak_active_http2_streams: 7,
+                ..HttpIngressStatus::default()
+            },
+            None,
+            0,
+            1,
+        );
+        assert!(https.contains("tunnelproxy_edge_https_http1_connections_total 3\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_connections_total 2\n"));
+        assert!(https.contains("tunnelproxy_edge_https_active_http2_streams 4\n"));
+        assert!(https.contains("tunnelproxy_edge_https_peak_active_http2_streams 7\n"));
+        assert!(!https.contains("hostname"));
     }
 
     #[test]

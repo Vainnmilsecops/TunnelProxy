@@ -939,3 +939,35 @@ The file stores credential paths, never inline PEM or token bytes. Keep it and
 the referenced private key readable only by the intended local account. This
 feature does not provision accounts, DNS, wildcard certificates, or external
 reachability.
+
+## 29. Enabling bounded HTTP/2 at Edge
+
+HTTP/1.1 remains the default. Enable HTTP/2 only on an HTTPS listener and keep
+the existing public-listener authorization/admission requirements:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-route-server control.example.test:7201 \
+  --public-tls-cert wildcard.pem \
+  --public-tls-key wildcard-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --enable-http2 \
+  --max-http2-concurrent-streams 32 \
+  --http2-keepalive-interval-ms 30000 \
+  --http2-keepalive-timeout-ms 10000 \
+  <snapshot, route, and Agent mTLS options>
+```
+
+When enabled, public TLS advertises `h2` followed by `http/1.1`; the same order
+is retained by atomic TLS reload. HTTP/1.1 clients continue to work. HTTP/2
+stream concurrency is capped at 128 and the configured stream cap also bounds
+pending/local reset state. The existing header, body, request deadline,
+rate-limit, connection/per-IP, duplex, and drain settings continue to apply.
+
+HTTP/2 is terminated at Edge. Requests are canonicalized, stripped of
+hop-by-hop and untrusted forwarding fields, then sent through the existing
+tunnel as HTTP/1.1 to the local application. This session does not enable h2c,
+HTTP/2 to localhost, WebSocket, CONNECT, or HTTP/3.

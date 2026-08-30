@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::header::{CONNECTION, HOST};
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -44,10 +44,11 @@ use tunnelproxy_control_plane::{
 use tunnelproxy_edge::{
     shutdown_channel, AuthorizationSourceStatus, EdgeOperationsConfig, EdgeRegistrationPolicy,
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig,
-    EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity, HttpHostRoutes, HttpHostname,
-    HttpIngressConfig, HttpIngressExposurePolicy, HttpRequestRateLimitConfig, PublicTlsConfig,
-    PublicTlsReloadConfig, PublicTlsReloadRuntime, RawIngressExposurePolicy,
-    RuntimeShutdownOutcome, SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
+    EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity, Http2IngressConfig,
+    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
+    HttpRequestRateLimitConfig, PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsReloadConfig,
+    PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownOutcome,
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError,
 };
 use tunnelproxy_protocol::{
     EnrollmentRequestId, Frame, FrameEncoder, FrameType, HandshakeErrorCode, ProtocolError,
@@ -263,6 +264,19 @@ fn raw_tls_client_config(
     if advertise_alpn {
         config.alpn_protocols = vec![b"tunnelproxy/2".to_vec()];
     }
+    Arc::new(config)
+}
+
+fn public_tls_client_config(authority_pem: &str, alpn: &[u8]) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    let mut reader = BufReader::new(Cursor::new(authority_pem.as_bytes()));
+    for certificate in rustls_pemfile::certs(&mut reader) {
+        roots.add(certificate.unwrap()).unwrap();
+    }
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
     Arc::new(config)
 }
 
@@ -849,6 +863,7 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
         max_headers: 32,
         max_request_body_bytes: 1024 * 1024,
         max_requests_per_connection: 1,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
@@ -922,6 +937,251 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
 }
 
 #[tokio::test]
+async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let (captured_tx, mut captured_rx) = tokio::sync::mpsc::channel(5);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let local_task = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..5 {
+            let (mut socket, _) = local_listener.accept().await.unwrap();
+            let captured_tx = captured_tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                captured_tx
+                    .send(String::from_utf8(request.clone()).unwrap())
+                    .await
+                    .unwrap();
+                if index < 2 {
+                    barrier.wait().await;
+                }
+                if request.windows(9).any(|window| window == b"GET /slow") {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem_with_protocols(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 2,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        max_requests_per_connection: 1,
+        http2: Some(Http2IngressConfig {
+            max_concurrent_streams: 2,
+            keep_alive_interval: Duration::from_secs(1),
+            keep_alive_timeout: Duration::from_secs(1),
+        }),
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_millis(200),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let agent = agent_runtime(edge_addr, local_addr);
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    wait_for_tunnel(&router, "tunnel-dev").await;
+
+    let connector = TlsConnector::from(public_tls_client_config(&public_pki.authority_pem, b"h2"));
+    let tcp = connect_eventually(https_addr).await;
+    let tls = connector
+        .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let request = |path: &'static str, host: Option<&'static str>| {
+        let builder = Request::builder().uri(format!("https://demo.example.test{path}"));
+        let builder = match host {
+            Some(host) => builder.header(HOST, host),
+            None => builder,
+        };
+        builder.body(Full::new(Bytes::new())).unwrap()
+    };
+    let mut second_sender = sender.clone();
+    let (first, second) = tokio::join!(
+        sender.send_request(request("/one", None)),
+        second_sender.send_request(request("/two", Some("demo.example.test"))),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(first.into_body().collect().await.unwrap().to_bytes(), "ok");
+    assert_eq!(second.into_body().collect().await.unwrap().to_bytes(), "ok");
+
+    let oversized = sender
+        .send_request(
+            Request::builder()
+                .uri("https://demo.example.test/oversized")
+                .header(HOST, "demo.example.test")
+                .body(Full::new(Bytes::from(vec![0_u8; 1025])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let _ = oversized.into_body().collect().await.unwrap();
+
+    let mut fast_sender = sender.clone();
+    let (slow, fast) = tokio::join!(
+        sender.send_request(request("/slow", Some("demo.example.test"))),
+        fast_sender.send_request(request("/fast", Some("demo.example.test"))),
+    );
+    let slow = slow.unwrap();
+    let fast = fast.unwrap();
+    assert_eq!(slow.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(fast.status(), StatusCode::OK);
+    let _ = slow.into_body().collect().await.unwrap();
+    assert_eq!(fast.into_body().collect().await.unwrap().to_bytes(), "ok");
+
+    let fronted = sender
+        .send_request(request("/fronted", Some("other.example.test")))
+        .await
+        .unwrap();
+    assert_eq!(fronted.status(), StatusCode::MISDIRECTED_REQUEST);
+    let _ = fronted.into_body().collect().await.unwrap();
+    drop(sender);
+    drop(second_sender);
+    drop(fast_sender);
+    connection_task.await.unwrap().unwrap();
+
+    let connector = TlsConnector::from(public_tls_client_config(
+        &public_pki.authority_pem,
+        b"http/1.1",
+    ));
+    let tls = connector
+        .connect(
+            ServerName::try_from("demo.example.test").unwrap(),
+            connect_eventually(https_addr).await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(b"http/1.1".as_slice())
+    );
+    let (mut fallback, fallback_connection) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let fallback_task = tokio::spawn(fallback_connection);
+    let response = fallback
+        .send_request(
+            Request::builder()
+                .uri("/fallback")
+                .header(HOST, "demo.example.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "ok"
+    );
+    fallback_task.await.unwrap().unwrap();
+
+    let connector = TlsConnector::from(public_tls_client_config(&public_pki.authority_pem, b"h2"));
+    let idle_tls = connector
+        .connect(
+            ServerName::try_from("demo.example.test").unwrap(),
+            connect_eventually(https_addr).await,
+        )
+        .await
+        .unwrap();
+    let (idle_sender, idle_connection): (hyper::client::conn::http2::SendRequest<Empty<Bytes>>, _) =
+        hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(idle_tls))
+            .await
+            .unwrap();
+    let idle_connection_task = tokio::spawn(idle_connection);
+
+    let mut captured = Vec::new();
+    for _ in 0..5 {
+        captured.push(captured_rx.recv().await.unwrap().to_ascii_lowercase());
+    }
+    captured.sort();
+    assert!(captured[0].starts_with("get /fallback http/1.1\r\n"));
+    assert!(captured[1].starts_with("get /fast http/1.1\r\n"));
+    assert!(captured[2].starts_with("get /one http/1.1\r\n"));
+    assert!(captured[3].starts_with("get /slow http/1.1\r\n"));
+    assert!(captured[4].starts_with("get /two http/1.1\r\n"));
+    assert!(captured
+        .iter()
+        .all(|request| request.contains("host: demo.example.test\r\n")));
+
+    local_task.await.unwrap();
+    agent_trigger.shutdown();
+    let _ = agent_task.await.unwrap().unwrap();
+    edge_trigger.shutdown();
+    timeout(Duration::from_millis(500), idle_connection_task)
+        .await
+        .expect("idle HTTP/2 connection did not receive graceful shutdown")
+        .unwrap()
+        .unwrap();
+    drop(idle_sender);
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.http1_connections, 1);
+    assert_eq!(https.http2_connections, 2);
+    assert!(https.peak_active_http2_streams >= 2);
+    assert_eq!(https.completed_requests, 4);
+    assert_eq!(https.rejected_requests, 3);
+    assert_eq!(https.request_timeouts, 1);
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
 async fn managed_hostname_allocation_activates_end_to_end_https_without_auto_release() {
     let agent_pki = test_pki("edge.test");
     let public_pki = test_pki("*.agents.example.test");
@@ -975,6 +1235,7 @@ async fn managed_hostname_allocation_activates_end_to_end_https_without_auto_rel
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 1,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
@@ -1154,6 +1415,7 @@ async fn https_keep_alive_reuses_one_tls_connection_until_the_request_cap() {
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 2,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
@@ -1265,6 +1527,7 @@ async fn https_request_deadline_returns_504_and_closes_the_reused_connection() {
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 4,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_millis(100),
@@ -1362,6 +1625,7 @@ async fn https_shutdown_gracefully_closes_an_idle_keep_alive_connection() {
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 4,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(2),
@@ -1461,6 +1725,7 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 4,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
@@ -1583,6 +1848,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 4,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig {
             global_requests_per_second: 2,
             global_burst: 2,
@@ -1755,6 +2021,7 @@ async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 1,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
@@ -1836,6 +2103,7 @@ async fn public_https_per_ip_admission_releases_after_connection_close() {
         max_headers: 32,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 1,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(3),
@@ -2387,6 +2655,7 @@ fn public_https_config_requires_agent_mtls_and_dynamic_authorization() {
         max_headers: 64,
         max_request_body_bytes: 1024,
         max_requests_per_connection: 1,
+        http2: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
@@ -3145,7 +3414,7 @@ async fn public_tls_generation_reload_is_atomic() {
             ("public_server_private_key", &private_key),
         ],
     );
-    let (tls, runtime) = PublicTlsReloadRuntime::bootstrap(
+    let (tls, runtime) = PublicTlsReloadRuntime::bootstrap_with_protocols(
         PublicTlsReloadConfig {
             manifest_path: manifest.clone(),
             server_certificate_path: certificate.clone(),
@@ -3154,10 +3423,12 @@ async fn public_tls_generation_reload_is_atomic() {
             expiry_warning: Duration::from_secs(60),
         },
         Duration::from_secs(1),
+        PublicHttpProtocolPolicy::Http1AndHttp2,
     )
     .await
     .unwrap();
     assert_eq!(tls.reload_status(Duration::from_secs(60)).generation, 1);
+    assert_eq!(tls.protocols(), PublicHttpProtocolPolicy::Http1AndHttp2);
     let status = tls.clone();
     let (trigger, signal) = shutdown_channel();
     let task = tokio::spawn(runtime.run_until_shutdown(signal));
@@ -3179,6 +3450,7 @@ async fn public_tls_generation_reload_is_atomic() {
     })
     .await
     .expect("public TLS generation did not reload");
+    assert_eq!(status.protocols(), PublicHttpProtocolPolicy::Http1AndHttp2);
 
     trigger.shutdown();
     task.await.unwrap().unwrap();
