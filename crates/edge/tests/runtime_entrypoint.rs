@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use tunnelproxy_agent::{
     connect_registered_with_security, AgentError, AgentHostnameClient, AgentOperationsConfig,
@@ -341,6 +341,27 @@ async fn connect_eventually(addr: SocketAddr) -> TcpStream {
     })
     .await
     .expect("raw route was not bound")
+}
+
+async fn connect_tls_eventually(
+    connector: &TlsConnector,
+    addr: SocketAddr,
+    server_name: &'static str,
+) -> TlsStream<TcpStream> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let socket = connect_eventually(addr).await;
+            match connector
+                .connect(ServerName::try_from(server_name).unwrap(), socket)
+                .await
+            {
+                Ok(tls) => break tls,
+                Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+            }
+        }
+    })
+    .await
+    .expect("HTTPS listener did not admit a TLS connection")
 }
 
 async fn read_http_head<S>(stream: &mut S) -> Vec<u8>
@@ -1319,15 +1340,8 @@ async fn websocket_upgrade_relays_frames_and_releases_bounded_capacity() {
         &public_pki.authority_pem,
         b"http/1.1",
     ));
-    let connect = || async {
-        connector
-            .connect(
-                ServerName::try_from("demo.example.test").unwrap(),
-                connect_eventually(https_addr).await,
-            )
-            .await
-            .unwrap()
-    };
+    let connect =
+        || async { connect_tls_eventually(&connector, https_addr, "demo.example.test").await };
 
     let mut first = connect().await;
     first.write_all(REQUEST).await.unwrap();
@@ -1476,15 +1490,8 @@ async fn connect_ingress_is_route_bound_bounded_and_byte_exact() {
         &public_pki.authority_pem,
         b"http/1.1",
     ));
-    let connect = || async {
-        connector
-            .connect(
-                ServerName::try_from("demo.example.test").unwrap(),
-                connect_eventually(https_addr).await,
-            )
-            .await
-            .unwrap()
-    };
+    let connect =
+        || async { connect_tls_eventually(&connector, https_addr, "demo.example.test").await };
 
     let mut first = connect().await;
     first.write_all(REQUEST).await.unwrap();
@@ -1607,15 +1614,8 @@ async fn websocket_idle_timeout_and_forced_shutdown_are_bounded() {
         &public_pki.authority_pem,
         b"http/1.1",
     ));
-    let connect = || async {
-        connector
-            .connect(
-                ServerName::try_from("demo.example.test").unwrap(),
-                connect_eventually(https_addr).await,
-            )
-            .await
-            .unwrap()
-    };
+    let connect =
+        || async { connect_tls_eventually(&connector, https_addr, "demo.example.test").await };
     let mut idle = connect().await;
     idle.write_all(REQUEST).await.unwrap();
     let response = String::from_utf8(read_http_head(&mut idle).await).unwrap();
@@ -1728,15 +1728,8 @@ async fn connect_idle_timeout_and_forced_shutdown_are_bounded() {
         &public_pki.authority_pem,
         b"http/1.1",
     ));
-    let connect = || async {
-        connector
-            .connect(
-                ServerName::try_from("demo.example.test").unwrap(),
-                connect_eventually(https_addr).await,
-            )
-            .await
-            .unwrap()
-    };
+    let connect =
+        || async { connect_tls_eventually(&connector, https_addr, "demo.example.test").await };
 
     let mut idle = connect().await;
     idle.write_all(REQUEST).await.unwrap();
