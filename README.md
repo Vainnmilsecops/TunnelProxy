@@ -46,6 +46,9 @@ correct agent, which in turn proxies them into the local service.
   HTTP/1.1 WebSocket upgrade is separately opt-in with strict handshake and
   local-response validation, a global session cap, idle deadline, opaque
   frame relay, fixed-cardinality metrics, and bounded drain.
+  HTTP/1.1 CONNECT is separately opt-in and route-bound: exact authority
+  hostname/port, Host, and SNI must agree before a capped, idle-bounded opaque
+  tunnel begins. It never acts as an arbitrary forward proxy.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -97,7 +100,7 @@ The following are **not yet implemented**:
 
 - Peer-negotiated credit/window flow control and weighted byte scheduling.
 - Automatic config/account provisioning, custom-domain administration, DNS or
-  certificate automation, CONNECT, HTTP/2 extended CONNECT, WebSocket
+  certificate automation, HTTP/2 extended CONNECT, WebSocket
   extensions, and HTTP/3.
 - Public-client access authorization, signed URLs, distributed request-rate
   coordination, and DDoS mitigation.
@@ -150,8 +153,8 @@ authenticated distribution service, and a separate durable exact-hostname
 route catalog with authenticated distribution to an in-memory Edge cache. The data plane has tested
 opt-in public raw-TCP ingress plus a bounded HTTPS reverse-proxy slice with
 exact static or dynamically distributed hostname routing, bounded HTTP/1.1
-keep-alive, opt-in bounded HTTP/2, public TLS reload, and local global/per-IP request-rate
-enforcement. Edge and Agent can optionally export
+keep-alive, opt-in bounded HTTP/2, WebSocket and route-bound CONNECT, public
+TLS reload, and local global/per-IP request-rate enforcement. Edge and Agent can optionally export
 bounded loopback health/readiness and fixed-cardinality Prometheus metrics. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown and
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for collection, alert baselines, and
@@ -266,6 +269,8 @@ and Definition of Done.
 | 42 _(complete)_ | single-process managed HTTP hostname and Agent orchestration |
 | 43 _(complete)_ | canonical `tunnelproxy` CLI and strict local Agent config v1 |
 | 44 _(complete)_ | opt-in bounded HTTP/2 public HTTPS ingress |
+| 45 _(complete)_ | bounded HTTP/1.1 WebSocket upgrade ingress |
+| 46 _(complete)_ | bounded route-bound HTTP/1.1 CONNECT ingress |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

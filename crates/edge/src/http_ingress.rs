@@ -55,7 +55,8 @@ pub const MAX_HTTP_HOST_ROUTES: usize = 64;
 pub const MAX_HTTP_REQUESTS_PER_CONNECTION: usize = 1024;
 pub const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 128;
 pub const MAX_WEBSOCKET_SESSIONS: usize = 1024;
-const WEBSOCKET_BUFFER_BYTES: usize = 16 * 1024;
+pub const MAX_CONNECT_SESSIONS: usize = 1024;
+const UPGRADED_BUFFER_BYTES: usize = 16 * 1024;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +91,26 @@ impl Default for WebSocketIngressConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectIngressConfig {
+    pub max_concurrent_sessions: usize,
+    pub idle_timeout: Duration,
+    pub authority_port: u16,
+}
+
+impl Default for ConnectIngressConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_sessions: 32,
+            idle_timeout: Duration::from_secs(60),
+            authority_port: 443,
+        }
+    }
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
-type WebSocketRelay = Pin<Box<dyn Future<Output = ()> + Send>>;
+type OpaqueRelay = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 fn normalize_authority(value: &str) -> Result<HttpHostname, HttpHostnameError> {
     let authority: Authority = value.parse().map_err(|_| HttpHostnameError::InvalidLabel)?;
@@ -271,6 +289,7 @@ pub struct HttpIngressConfig {
     pub max_requests_per_connection: usize,
     pub http2: Option<Http2IngressConfig>,
     pub websocket: Option<WebSocketIngressConfig>,
+    pub connect: Option<ConnectIngressConfig>,
     pub request_rate_limit: HttpRequestRateLimitConfig,
     pub header_read_timeout: Duration,
     pub request_timeout: Duration,
@@ -344,6 +363,22 @@ impl HttpIngressConfig {
                 return Err(HttpIngressConfigError::ZeroWebSocketIdleTimeout);
             }
         }
+        if let Some(connect) = self.connect {
+            if connect.max_concurrent_sessions == 0
+                || connect.max_concurrent_sessions > MAX_CONNECT_SESSIONS
+            {
+                return Err(HttpIngressConfigError::InvalidConnectSessionLimit);
+            }
+            if connect.max_concurrent_sessions > self.max_concurrent_connections {
+                return Err(HttpIngressConfigError::ConnectSessionsExceedConnections);
+            }
+            if connect.idle_timeout.is_zero() {
+                return Err(HttpIngressConfigError::ZeroConnectIdleTimeout);
+            }
+            if connect.authority_port == 0 {
+                return Err(HttpIngressConfigError::ZeroConnectAuthorityPort);
+            }
+        }
         self.request_rate_limit
             .validate()
             .map_err(HttpIngressConfigError::InvalidRequestRateLimit)?;
@@ -380,6 +415,10 @@ pub enum HttpIngressConfigError {
     InvalidWebSocketSessionLimit,
     WebSocketSessionsExceedConnections,
     ZeroWebSocketIdleTimeout,
+    InvalidConnectSessionLimit,
+    ConnectSessionsExceedConnections,
+    ZeroConnectIdleTimeout,
+    ZeroConnectAuthorityPort,
     InvalidRequestRateLimit(HttpRequestRateLimitConfigError),
     InvalidDuplexCapacity,
     ZeroHeaderTimeout,
@@ -440,6 +479,19 @@ impl std::fmt::Display for HttpIngressConfigError {
             Self::ZeroWebSocketIdleTimeout => {
                 f.write_str("WebSocket idle timeout must be greater than zero")
             }
+            Self::InvalidConnectSessionLimit => write!(
+                f,
+                "max CONNECT sessions must be between 1 and {MAX_CONNECT_SESSIONS}"
+            ),
+            Self::ConnectSessionsExceedConnections => {
+                f.write_str("max CONNECT sessions cannot exceed max HTTP connections")
+            }
+            Self::ZeroConnectIdleTimeout => {
+                f.write_str("CONNECT idle timeout must be greater than zero")
+            }
+            Self::ZeroConnectAuthorityPort => {
+                f.write_str("CONNECT authority port must be greater than zero")
+            }
             Self::InvalidRequestRateLimit(error) => {
                 write!(f, "invalid HTTP request rate limit: {error}")
             }
@@ -478,6 +530,10 @@ pub struct HttpIngressOutcome {
     pub rejected_websocket_upgrades: u64,
     pub peak_active_websocket_sessions: usize,
     pub websocket_idle_timeouts: u64,
+    pub accepted_connect_sessions: u64,
+    pub rejected_connect_sessions: u64,
+    pub peak_active_connect_sessions: usize,
+    pub connect_idle_timeouts: u64,
     pub global_rate_limit_rejections: u64,
     pub per_ip_rate_limit_rejections: u64,
     pub rate_limit_peer_capacity_rejections: u64,
@@ -532,6 +588,11 @@ struct HttpIngressCounters {
     active_websocket_sessions: AtomicUsize,
     peak_active_websocket_sessions: AtomicUsize,
     websocket_idle_timeouts: AtomicU64,
+    accepted_connect_sessions: AtomicU64,
+    rejected_connect_sessions: AtomicU64,
+    active_connect_sessions: AtomicUsize,
+    peak_active_connect_sessions: AtomicUsize,
+    connect_idle_timeouts: AtomicU64,
     global_rate_limit_rejections: AtomicU64,
     per_ip_rate_limit_rejections: AtomicU64,
     rate_limit_peer_capacity_rejections: AtomicU64,
@@ -558,6 +619,11 @@ pub struct HttpIngressStatus {
     pub active_websocket_sessions: usize,
     pub peak_active_websocket_sessions: usize,
     pub websocket_idle_timeouts: u64,
+    pub accepted_connect_sessions: u64,
+    pub rejected_connect_sessions: u64,
+    pub active_connect_sessions: usize,
+    pub peak_active_connect_sessions: usize,
+    pub connect_idle_timeouts: u64,
     pub global_rate_limit_rejections: u64,
     pub per_ip_rate_limit_rejections: u64,
     pub rate_limit_peer_capacity_rejections: u64,
@@ -618,6 +684,23 @@ impl HttpIngressStatusHandle {
                 .counters
                 .websocket_idle_timeouts
                 .load(Ordering::Relaxed),
+            accepted_connect_sessions: self
+                .counters
+                .accepted_connect_sessions
+                .load(Ordering::Relaxed),
+            rejected_connect_sessions: self
+                .counters
+                .rejected_connect_sessions
+                .load(Ordering::Relaxed),
+            active_connect_sessions: self
+                .counters
+                .active_connect_sessions
+                .load(Ordering::Relaxed),
+            peak_active_connect_sessions: self
+                .counters
+                .peak_active_connect_sessions
+                .load(Ordering::Relaxed),
+            connect_idle_timeouts: self.counters.connect_idle_timeouts.load(Ordering::Relaxed),
             global_rate_limit_rejections: self
                 .counters
                 .global_rate_limit_rejections
@@ -684,6 +767,10 @@ impl HttpIngressRuntime {
             .config
             .websocket
             .map(|websocket| Arc::new(Semaphore::new(websocket.max_concurrent_sessions)));
+        let connect_permits = self
+            .config
+            .connect
+            .map(|connect| Arc::new(Semaphore::new(connect.max_concurrent_sessions)));
         let peer_admission = match self.config.exposure {
             HttpIngressExposurePolicy::LoopbackOnly => None,
             HttpIngressExposurePolicy::Public {
@@ -739,6 +826,7 @@ impl HttpIngressRuntime {
                         Arc::clone(&counters),
                         rate_limiter.clone(),
                         websocket_permits.clone(),
+                        connect_permits.clone(),
                         global_permit,
                         peer_permit,
                         active_connection,
@@ -790,6 +878,10 @@ impl HttpIngressRuntime {
             rejected_websocket_upgrades: status.rejected_websocket_upgrades,
             peak_active_websocket_sessions: status.peak_active_websocket_sessions,
             websocket_idle_timeouts: status.websocket_idle_timeouts,
+            accepted_connect_sessions: status.accepted_connect_sessions,
+            rejected_connect_sessions: status.rejected_connect_sessions,
+            peak_active_connect_sessions: status.peak_active_connect_sessions,
+            connect_idle_timeouts: status.connect_idle_timeouts,
             global_rate_limit_rejections: status.global_rate_limit_rejections,
             per_ip_rate_limit_rejections: status.per_ip_rate_limit_rejections,
             rate_limit_peer_capacity_rejections: status.rate_limit_peer_capacity_rejections,
@@ -828,6 +920,7 @@ async fn run_connection(
     counters: Arc<HttpIngressCounters>,
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
+    connect_permits: Option<Arc<Semaphore>>,
     _global_permit: OwnedSemaphorePermit,
     _peer_permit: Option<PeerAdmissionPermit>,
     _active_connection: ActiveConnectionGuard,
@@ -866,7 +959,7 @@ async fn run_connection(
         .server_name()
         .and_then(|name| HttpHostname::new(name).ok());
     let request_count = Arc::new(AtomicUsize::new(0));
-    let (websocket_relay_tx, websocket_relay_rx) = mpsc::channel(1);
+    let (opaque_relay_tx, opaque_relay_rx) = mpsc::channel(1);
     let service_config = config.clone();
     let service = hyper::service::service_fn(move |request| {
         handle_ingress_request(
@@ -878,14 +971,15 @@ async fn run_connection(
             Arc::clone(&counters),
             rate_limiter.clone(),
             websocket_permits.clone(),
-            (protocol == NegotiatedHttpProtocol::Http1).then(|| websocket_relay_tx.clone()),
+            connect_permits.clone(),
+            (protocol == NegotiatedHttpProtocol::Http1).then(|| opaque_relay_tx.clone()),
             Arc::clone(&request_count),
             protocol,
         )
     });
     match protocol {
         NegotiatedHttpProtocol::Http1 => {
-            serve_http1(tls, service, websocket_relay_rx, peer, &config, signal).await
+            serve_http1(tls, service, opaque_relay_rx, peer, &config, signal).await
         }
         NegotiatedHttpProtocol::Http2 => serve_http2(tls, service, peer, &config, signal).await,
     }
@@ -907,7 +1001,8 @@ async fn handle_ingress_request(
     counters: Arc<HttpIngressCounters>,
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
-    websocket_relay_tx: Option<mpsc::Sender<WebSocketRelay>>,
+    connect_permits: Option<Arc<Semaphore>>,
+    opaque_relay_tx: Option<mpsc::Sender<OpaqueRelay>>,
     request_count: Arc<AtomicUsize>,
     protocol: NegotiatedHttpProtocol,
 ) -> Result<Response<ProxyBody>, Infallible> {
@@ -948,7 +1043,8 @@ async fn handle_ingress_request(
                 counters: Arc::clone(&counters),
                 rate_limiter,
                 websocket_permits,
-                websocket_relay_tx,
+                connect_permits,
+                opaque_relay_tx,
             },
             deadline,
         ),
@@ -964,7 +1060,10 @@ async fn handle_ingress_request(
             error_response(StatusCode::GATEWAY_TIMEOUT)
         }
     };
-    if close_after && response.status() != StatusCode::SWITCHING_PROTOCOLS {
+    if close_after
+        && response.status() != StatusCode::SWITCHING_PROTOCOLS
+        && response.extensions().get::<ConnectResponse>().is_none()
+    {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -975,7 +1074,7 @@ async fn handle_ingress_request(
 async fn serve_http1<S>(
     tls: tokio_rustls::server::TlsStream<TcpStream>,
     service: S,
-    mut websocket_relay_rx: mpsc::Receiver<WebSocketRelay>,
+    mut opaque_relay_rx: mpsc::Receiver<OpaqueRelay>,
     peer: SocketAddr,
     config: &HttpIngressConfig,
     signal: ShutdownSignal,
@@ -988,7 +1087,7 @@ async fn serve_http1<S>(
     S::Future: 'static,
 {
     let mut http = hyper::server::conn::http1::Builder::new();
-    http.keep_alive(config.max_requests_per_connection > 1)
+    http.keep_alive(config.max_requests_per_connection > 1 || config.connect.is_some())
         .half_close(false)
         .max_buf_size(config.max_header_bytes)
         .max_headers(config.max_headers)
@@ -1000,9 +1099,9 @@ async fn serve_http1<S>(
     );
     tokio::select! {
         result = &mut served => {
-            if let Ok(relay) = websocket_relay_rx.try_recv() {
+            if let Ok(relay) = opaque_relay_rx.try_recv() {
                 relay.await;
-                info!(%peer, event = "https_websocket_completed");
+                info!(%peer, event = "https_opaque_session_completed");
             } else {
                 match result {
                     Ok(()) => info!(%peer, event = "https_connection_completed"),
@@ -1014,9 +1113,9 @@ async fn serve_http1<S>(
             served.as_mut().graceful_shutdown();
             tokio::select! {
                 result = &mut served => {
-                    if let Ok(relay) = websocket_relay_rx.try_recv() {
+                    if let Ok(relay) = opaque_relay_rx.try_recv() {
                         relay.await;
-                        info!(%peer, event = "https_websocket_drained");
+                        info!(%peer, event = "https_opaque_session_drained");
                     } else {
                         match result {
                             Ok(()) => info!(%peer, event = "https_connection_drained"),
@@ -1024,23 +1123,23 @@ async fn serve_http1<S>(
                         }
                     }
                 },
-                relay = websocket_relay_rx.recv() => {
+                relay = opaque_relay_rx.recv() => {
                     if let Some(relay) = relay {
                         let (result, ()) = tokio::join!(&mut served, relay);
                         match result {
-                            Ok(()) => info!(%peer, event = "https_websocket_drained"),
-                            Err(error) => warn!(%peer, %error, event = "https_websocket_drain_failed"),
+                            Ok(()) => info!(%peer, event = "https_opaque_session_drained"),
+                            Err(error) => warn!(%peer, %error, event = "https_opaque_session_drain_failed"),
                         }
                     }
                 }
             }
         },
-        relay = websocket_relay_rx.recv() => {
+        relay = opaque_relay_rx.recv() => {
             if let Some(relay) = relay {
                 let (result, ()) = tokio::join!(&mut served, relay);
                 match result {
-                    Ok(()) => info!(%peer, event = "https_websocket_completed"),
-                    Err(error) => warn!(%peer, %error, event = "https_websocket_connection_failed"),
+                    Ok(()) => info!(%peer, event = "https_opaque_session_completed"),
+                    Err(error) => warn!(%peer, %error, event = "https_opaque_session_connection_failed"),
                 }
             }
         }
@@ -1171,8 +1270,12 @@ struct HttpRequestContext {
     counters: Arc<HttpIngressCounters>,
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
-    websocket_relay_tx: Option<mpsc::Sender<WebSocketRelay>>,
+    connect_permits: Option<Arc<Semaphore>>,
+    opaque_relay_tx: Option<mpsc::Sender<OpaqueRelay>>,
 }
+
+#[derive(Debug, Clone)]
+struct ConnectResponse;
 
 async fn proxy_request(
     mut request: Request<Incoming>,
@@ -1187,9 +1290,11 @@ async fn proxy_request(
         counters,
         rate_limiter,
         websocket_permits,
-        websocket_relay_tx,
+        connect_permits,
+        opaque_relay_tx,
     } = context;
     let websocket_intent = has_websocket_intent(request.headers());
+    let connect_intent = request.method() == Method::CONNECT;
     let outcome = prepare_request(&mut request, peer, server_name.as_ref(), &config);
     let PreparedRequest {
         hostname,
@@ -1204,6 +1309,11 @@ async fn proxy_request(
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if connect_intent {
+                counters
+                    .rejected_connect_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             warn!(reason = rejection.reason, event = "https_request_rejected");
             return Ok(error_response(rejection.status));
         }
@@ -1214,6 +1324,11 @@ async fn proxy_request(
         if matches!(&kind, PreparedRequestKind::WebSocket(_)) {
             counters
                 .rejected_websocket_upgrades
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(&kind, PreparedRequestKind::Connect) {
+            counters
+                .rejected_connect_sessions
                 .fetch_add(1, Ordering::Relaxed);
         }
         match rejection {
@@ -1258,8 +1373,29 @@ async fn proxy_request(
         None
     };
 
-    let client_upgrade = matches!(&kind, PreparedRequestKind::WebSocket(_))
-        .then(|| hyper::upgrade::on(&mut request));
+    let connect_guard = if matches!(&kind, PreparedRequestKind::Connect) {
+        let permits = connect_permits
+            .expect("CONNECT permits exist when validated CONNECT ingress is enabled");
+        match permits.try_acquire_owned() {
+            Ok(permit) => Some(ConnectSessionGuard::new(Arc::clone(&counters), permit)),
+            Err(_) => {
+                counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .rejected_connect_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, %hostname, event = "https_connect_capacity_rejected");
+                return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE));
+            }
+        }
+    } else {
+        None
+    };
+
+    let client_upgrade = matches!(
+        &kind,
+        PreparedRequestKind::WebSocket(_) | PreparedRequestKind::Connect
+    )
+    .then(|| hyper::upgrade::on(&mut request));
 
     let (parts, body) = request.into_parts();
     if body
@@ -1277,10 +1413,67 @@ async fn proxy_request(
         Ok(stream) => stream,
         Err(error) => {
             counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            if matches!(&kind, PreparedRequestKind::WebSocket(_)) {
+                counters
+                    .rejected_websocket_upgrades
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(&kind, PreparedRequestKind::Connect) {
+                counters
+                    .rejected_connect_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             warn!(%hostname, %error, event = "https_tunnel_unavailable");
             return Ok(error_response(route_error_status(&error)));
         }
     };
+    if matches!(&kind, PreparedRequestKind::Connect) {
+        let relay_tx = opaque_relay_tx.expect("HTTP/1.1 CONNECT requests have a relay owner");
+        let connect = config.connect.expect("validated CONNECT config exists");
+        let counters_for_relay = Arc::clone(&counters);
+        let relay: OpaqueRelay = Box::pin(async move {
+            let _session = connect_guard.expect("CONNECT admission owns a guard");
+            match tokio::time::timeout(
+                config.request_timeout,
+                client_upgrade.expect("CONNECT request captured public upgrade"),
+            )
+            .await
+            {
+                Ok(Ok(client)) => {
+                    if relay_upgraded_io(TokioIo::new(client), edge_io, connect.idle_timeout).await
+                        == OpaqueRelayOutcome::IdleTimeout
+                    {
+                        counters_for_relay
+                            .connect_idle_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(Err(_)) | Err(_) => warn!(event = "https_connect_upgrade_failed"),
+            }
+            let _ = routed.wait_closed().await;
+            counters_for_relay
+                .completed_requests
+                .fetch_add(1, Ordering::Relaxed);
+        });
+        if relay_tx.try_send(relay).is_err() {
+            counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            counters
+                .rejected_connect_sessions
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        counters
+            .accepted_connect_sessions
+            .fetch_add(1, Ordering::Relaxed);
+        info!(%peer, %hostname, event = "https_connect_established");
+        let body = Full::new(Bytes::new())
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed_unsync();
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::OK;
+        response.extensions_mut().insert(ConnectResponse);
+        return Ok(response);
+    }
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(edge_io))
         .await
@@ -1342,15 +1535,14 @@ async fn proxy_request(
                     return Ok(error_response(StatusCode::BAD_GATEWAY));
                 }
             };
-            let relay_tx =
-                websocket_relay_tx.expect("HTTP/1.1 WebSocket requests have a relay owner");
+            let relay_tx = opaque_relay_tx.expect("HTTP/1.1 WebSocket requests have a relay owner");
             let idle_timeout = config
                 .websocket
                 .expect("validated WebSocket config exists")
                 .idle_timeout;
             let upgrade_timeout = config.request_timeout;
             let counters_for_relay = Arc::clone(&counters);
-            let relay: WebSocketRelay = Box::pin(async move {
+            let relay: OpaqueRelay = Box::pin(async move {
                 let _session = websocket_guard.expect("WebSocket admission owns a guard");
                 let upgraded = tokio::time::timeout(upgrade_timeout, async {
                     let (client, local) = tokio::join!(
@@ -1366,9 +1558,9 @@ async fn proxy_request(
                 .ok()
                 .flatten();
                 if let Some((client, local)) = upgraded {
-                    if relay_websocket_io(TokioIo::new(client), TokioIo::new(local), idle_timeout)
+                    if relay_upgraded_io(TokioIo::new(client), TokioIo::new(local), idle_timeout)
                         .await
-                        == WebSocketRelayOutcome::IdleTimeout
+                        == OpaqueRelayOutcome::IdleTimeout
                     {
                         counters_for_relay
                             .websocket_idle_timeouts
@@ -1395,6 +1587,9 @@ async fn proxy_request(
                 .fetch_add(1, Ordering::Relaxed);
             info!(%peer, %hostname, event = "https_websocket_upgraded");
             Ok(response)
+        }
+        PreparedRequestKind::Connect => {
+            unreachable!("CONNECT returns before the local HTTP handshake")
         }
     }
 }
@@ -1424,6 +1619,35 @@ impl Drop for WebSocketSessionGuard {
     fn drop(&mut self) {
         self.counters
             .active_websocket_sessions
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ConnectSessionGuard {
+    counters: Arc<HttpIngressCounters>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectSessionGuard {
+    fn new(counters: Arc<HttpIngressCounters>, permit: OwnedSemaphorePermit) -> Self {
+        let active = counters
+            .active_connect_sessions
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        counters
+            .peak_active_connect_sessions
+            .fetch_max(active, Ordering::Relaxed);
+        Self {
+            counters,
+            _permit: permit,
+        }
+    }
+}
+
+impl Drop for ConnectSessionGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_connect_sessions
             .fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -1538,17 +1762,13 @@ fn exact_header(headers: &hyper::HeaderMap, name: HeaderName) -> Option<&HeaderV
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebSocketRelayOutcome {
+enum OpaqueRelayOutcome {
     Completed,
     IdleTimeout,
     IoError,
 }
 
-async fn relay_websocket_io<C, L>(
-    client: C,
-    local: L,
-    idle_timeout: Duration,
-) -> WebSocketRelayOutcome
+async fn relay_upgraded_io<C, L>(client: C, local: L, idle_timeout: Duration) -> OpaqueRelayOutcome
 where
     C: AsyncRead + AsyncWrite + Unpin,
     L: AsyncRead + AsyncWrite + Unpin,
@@ -1557,8 +1777,8 @@ where
     let (mut local_read, mut local_write) = tokio::io::split(local);
     let mut client_open = true;
     let mut local_open = true;
-    let mut client_buffer = [0u8; WEBSOCKET_BUFFER_BYTES];
-    let mut local_buffer = [0u8; WEBSOCKET_BUFFER_BYTES];
+    let mut client_buffer = [0u8; UPGRADED_BUFFER_BYTES];
+    let mut local_buffer = [0u8; UPGRADED_BUFFER_BYTES];
     let idle = tokio::time::sleep(idle_timeout);
     tokio::pin!(idle);
     while client_open || local_open {
@@ -1568,7 +1788,7 @@ where
                     Ok(0) => {
                         client_open = false;
                         if tokio::time::timeout(idle_timeout, local_write.shutdown()).await.is_err() {
-                            return WebSocketRelayOutcome::IdleTimeout;
+                            return OpaqueRelayOutcome::IdleTimeout;
                         }
                     }
                     Ok(read) => {
@@ -1577,11 +1797,11 @@ where
                             local_write.write_all(&client_buffer[..read]),
                         ).await {
                             Ok(Ok(())) => idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout),
-                            Ok(Err(_)) => return WebSocketRelayOutcome::IoError,
-                            Err(_) => return WebSocketRelayOutcome::IdleTimeout,
+                            Ok(Err(_)) => return OpaqueRelayOutcome::IoError,
+                            Err(_) => return OpaqueRelayOutcome::IdleTimeout,
                         }
                     }
-                    Err(_) => return WebSocketRelayOutcome::IoError,
+                    Err(_) => return OpaqueRelayOutcome::IoError,
                 }
             }
             read = local_read.read(&mut local_buffer), if local_open => {
@@ -1589,7 +1809,7 @@ where
                     Ok(0) => {
                         local_open = false;
                         if tokio::time::timeout(idle_timeout, client_write.shutdown()).await.is_err() {
-                            return WebSocketRelayOutcome::IdleTimeout;
+                            return OpaqueRelayOutcome::IdleTimeout;
                         }
                     }
                     Ok(read) => {
@@ -1598,17 +1818,17 @@ where
                             client_write.write_all(&local_buffer[..read]),
                         ).await {
                             Ok(Ok(())) => idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout),
-                            Ok(Err(_)) => return WebSocketRelayOutcome::IoError,
-                            Err(_) => return WebSocketRelayOutcome::IdleTimeout,
+                            Ok(Err(_)) => return OpaqueRelayOutcome::IoError,
+                            Err(_) => return OpaqueRelayOutcome::IdleTimeout,
                         }
                     }
-                    Err(_) => return WebSocketRelayOutcome::IoError,
+                    Err(_) => return OpaqueRelayOutcome::IoError,
                 }
             }
-            () = &mut idle => return WebSocketRelayOutcome::IdleTimeout,
+            () = &mut idle => return OpaqueRelayOutcome::IdleTimeout,
         }
     }
-    WebSocketRelayOutcome::Completed
+    OpaqueRelayOutcome::Completed
 }
 
 struct RequestRejection {
@@ -1619,6 +1839,7 @@ struct RequestRejection {
 enum PreparedRequestKind {
     Regular,
     WebSocket(WebSocketHandshake),
+    Connect,
 }
 
 struct WebSocketHandshake {
@@ -1659,13 +1880,10 @@ fn prepare_request(
             reason: "headers_too_large",
         });
     }
-    if request.method() == Method::CONNECT {
-        return Err(RequestRejection {
-            status: StatusCode::NOT_IMPLEMENTED,
-            reason: "unsupported_connect",
-        });
-    }
-    let kind = if has_websocket_intent(request.headers()) {
+    let kind = if request.method() == Method::CONNECT {
+        validate_connect_request(request, config)?;
+        PreparedRequestKind::Connect
+    } else if has_websocket_intent(request.headers()) {
         PreparedRequestKind::WebSocket(validate_websocket_handshake(request, config)?)
     } else {
         PreparedRequestKind::Regular
@@ -1700,6 +1918,35 @@ fn prepare_request(
             })
         })
         .transpose()?;
+    if matches!(&kind, PreparedRequestKind::Connect) {
+        let connect = config.connect.expect("CONNECT was validated as enabled");
+        let uri_authority = request.uri().authority().ok_or(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "missing_connect_authority",
+        })?;
+        if request.uri().scheme().is_some()
+            || request.uri().path_and_query().is_some()
+            || uri_authority.port_u16() != Some(connect.authority_port)
+        {
+            return Err(RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "invalid_connect_authority",
+            });
+        }
+        let host_authority = host
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<Authority>().ok())
+            .ok_or(RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "invalid_connect_host",
+            })?;
+        if host_authority.port_u16() != Some(connect.authority_port) {
+            return Err(RequestRejection {
+                status: StatusCode::MISDIRECTED_REQUEST,
+                reason: "connect_host_port_mismatch",
+            });
+        }
+    }
     if request.version() != Version::HTTP_2 && host_hostname.is_none() {
         return Err(RequestRejection {
             status: StatusCode::BAD_REQUEST,
@@ -1737,25 +1984,62 @@ fn prepare_request(
         reason: "unknown_host",
     })?;
     sanitize_request_headers(request, peer.ip(), &hostname, &kind)?;
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    *request.uri_mut() =
-        Uri::builder()
-            .path_and_query(path)
-            .build()
-            .map_err(|_| RequestRejection {
-                status: StatusCode::BAD_REQUEST,
-                reason: "invalid_request_target",
-            })?;
-    *request.version_mut() = Version::HTTP_11;
+    if !matches!(&kind, PreparedRequestKind::Connect) {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        *request.uri_mut() =
+            Uri::builder()
+                .path_and_query(path)
+                .build()
+                .map_err(|_| RequestRejection {
+                    status: StatusCode::BAD_REQUEST,
+                    reason: "invalid_request_target",
+                })?;
+        *request.version_mut() = Version::HTTP_11;
+    }
     Ok(PreparedRequest {
         hostname,
         tunnel_id,
         kind,
     })
+}
+
+fn validate_connect_request(
+    request: &Request<Incoming>,
+    config: &HttpIngressConfig,
+) -> Result<(), RequestRejection> {
+    if config.connect.is_none() || request.version() != Version::HTTP_11 {
+        return Err(RequestRejection {
+            status: StatusCode::NOT_IMPLEMENTED,
+            reason: "connect_not_enabled_for_protocol",
+        });
+    }
+    if has_websocket_intent(request.headers()) {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "connect_upgrade_headers_not_allowed",
+        });
+    }
+    let mut content_lengths = request.headers().get_all(CONTENT_LENGTH).iter();
+    let content_length = content_lengths.next();
+    if content_lengths.next().is_some()
+        || request.headers().contains_key(TRANSFER_ENCODING)
+        || content_length.is_some_and(|value| value.as_bytes() != b"0")
+        || request
+            .body()
+            .size_hint()
+            .upper()
+            .is_some_and(|size| size != 0)
+    {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "connect_request_body_not_allowed",
+        });
+    }
+    Ok(())
 }
 
 fn has_websocket_intent(headers: &hyper::HeaderMap) -> bool {
@@ -2026,6 +2310,7 @@ fn sanitize_request_headers(
                     .insert(HeaderName::from_static("sec-websocket-protocol"), protocols);
             }
         }
+        PreparedRequestKind::Connect => {}
     }
     Ok(())
 }
@@ -2318,6 +2603,13 @@ mod tests {
             .rejected_websocket_upgrades
             .store(8, Ordering::Relaxed);
         counters.websocket_idle_timeouts.store(9, Ordering::Relaxed);
+        counters
+            .accepted_connect_sessions
+            .store(10, Ordering::Relaxed);
+        counters
+            .rejected_connect_sessions
+            .store(11, Ordering::Relaxed);
+        counters.connect_idle_timeouts.store(12, Ordering::Relaxed);
         rate_limiter
             .try_admit(IpAddr::from([127, 0, 0, 1]))
             .unwrap();
@@ -2325,6 +2617,8 @@ mod tests {
         let active_http2 = ActiveHttp2StreamGuard::new(Arc::clone(&counters));
         let websocket_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let active_websocket = WebSocketSessionGuard::new(Arc::clone(&counters), websocket_permit);
+        let connect_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let active_connect = ConnectSessionGuard::new(Arc::clone(&counters), connect_permit);
         let snapshot = status.snapshot();
         assert_eq!(snapshot.active_connections, 1);
         assert_eq!(snapshot.accepted_connections, 3);
@@ -2340,14 +2634,21 @@ mod tests {
         assert_eq!(snapshot.active_websocket_sessions, 1);
         assert_eq!(snapshot.peak_active_websocket_sessions, 1);
         assert_eq!(snapshot.websocket_idle_timeouts, 9);
+        assert_eq!(snapshot.accepted_connect_sessions, 10);
+        assert_eq!(snapshot.rejected_connect_sessions, 11);
+        assert_eq!(snapshot.active_connect_sessions, 1);
+        assert_eq!(snapshot.peak_active_connect_sessions, 1);
+        assert_eq!(snapshot.connect_idle_timeouts, 12);
         assert_eq!(snapshot.tracked_rate_limit_peers, 1);
         assert_eq!(snapshot.peak_tracked_rate_limit_peers, 1);
         drop(active);
         drop(active_http2);
         drop(active_websocket);
+        drop(active_connect);
         assert_eq!(status.snapshot().active_connections, 0);
         assert_eq!(status.snapshot().active_http2_streams, 0);
         assert_eq!(status.snapshot().active_websocket_sessions, 0);
+        assert_eq!(status.snapshot().active_connect_sessions, 0);
     }
 
     #[test]
@@ -2382,6 +2683,7 @@ mod tests {
             max_requests_per_connection: 1,
             http2: None,
             websocket: None,
+            connect: None,
             request_rate_limit: HttpRequestRateLimitConfig::default(),
             header_read_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
@@ -2453,13 +2755,42 @@ mod tests {
             config.validate(),
             Err(HttpIngressConfigError::ZeroWebSocketIdleTimeout)
         );
+        config.websocket.as_mut().unwrap().idle_timeout = Duration::from_secs(1);
+        config.connect = Some(ConnectIngressConfig {
+            max_concurrent_sessions: 2,
+            idle_timeout: Duration::from_secs(1),
+            authority_port: 443,
+        });
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::ConnectSessionsExceedConnections)
+        );
+        config.connect.as_mut().unwrap().max_concurrent_sessions = 0;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::InvalidConnectSessionLimit)
+        );
+        let connect = config.connect.as_mut().unwrap();
+        connect.max_concurrent_sessions = 1;
+        connect.idle_timeout = Duration::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::ZeroConnectIdleTimeout)
+        );
+        let connect = config.connect.as_mut().unwrap();
+        connect.idle_timeout = Duration::from_secs(1);
+        connect.authority_port = 0;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::ZeroConnectAuthorityPort)
+        );
     }
 
     #[tokio::test]
-    async fn websocket_relay_is_bidirectional_and_idle_bounded() {
+    async fn opaque_relay_is_bidirectional_and_idle_bounded() {
         let (proxy_client, mut public_client) = tokio::io::duplex(64);
         let (proxy_local, mut local_service) = tokio::io::duplex(64);
-        let relay = tokio::spawn(relay_websocket_io(
+        let relay = tokio::spawn(relay_upgraded_io(
             proxy_client,
             proxy_local,
             Duration::from_secs(1),
@@ -2474,13 +2805,13 @@ mod tests {
         assert_eq!(&from_local, b"from-local");
         public_client.shutdown().await.unwrap();
         local_service.shutdown().await.unwrap();
-        assert_eq!(relay.await.unwrap(), WebSocketRelayOutcome::Completed);
+        assert_eq!(relay.await.unwrap(), OpaqueRelayOutcome::Completed);
 
         let (proxy_client, _public_client) = tokio::io::duplex(1);
         let (proxy_local, _local_service) = tokio::io::duplex(1);
         assert_eq!(
-            relay_websocket_io(proxy_client, proxy_local, Duration::from_millis(10)).await,
-            WebSocketRelayOutcome::IdleTimeout
+            relay_upgraded_io(proxy_client, proxy_local, Duration::from_millis(10)).await,
+            OpaqueRelayOutcome::IdleTimeout
         );
     }
 

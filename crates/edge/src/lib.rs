@@ -1185,12 +1185,12 @@ mod snapshot_runtime;
 mod tls;
 
 pub use http_ingress::{
-    Http2IngressConfig, HttpHostRoutes, HttpHostRoutesError, HttpHostname, HttpHostnameError,
-    HttpIngressConfig, HttpIngressConfigError, HttpIngressError, HttpIngressExposurePolicy,
-    HttpIngressOutcome, HttpIngressRuntime, HttpIngressStatus, HttpIngressStatusHandle,
-    WebSocketIngressConfig, MAX_HTTP2_CONCURRENT_STREAMS, MAX_HTTP_HEADER_BYTES,
-    MAX_HTTP_HOST_ROUTES, MAX_HTTP_REQUESTS_PER_CONNECTION, MAX_WEBSOCKET_SESSIONS,
-    MIN_HTTP_HEADER_BYTES,
+    ConnectIngressConfig, Http2IngressConfig, HttpHostRoutes, HttpHostRoutesError, HttpHostname,
+    HttpHostnameError, HttpIngressConfig, HttpIngressConfigError, HttpIngressError,
+    HttpIngressExposurePolicy, HttpIngressOutcome, HttpIngressRuntime, HttpIngressStatus,
+    HttpIngressStatusHandle, WebSocketIngressConfig, MAX_CONNECT_SESSIONS,
+    MAX_HTTP2_CONCURRENT_STREAMS, MAX_HTTP_HEADER_BYTES, MAX_HTTP_HOST_ROUTES,
+    MAX_HTTP_REQUESTS_PER_CONNECTION, MAX_WEBSOCKET_SESSIONS, MIN_HTTP_HEADER_BYTES,
 };
 pub use http_rate_limit::{
     HttpRequestRateLimitConfig, HttpRequestRateLimitConfigError, MAX_HTTP_RATE_LIMIT_IDLE,

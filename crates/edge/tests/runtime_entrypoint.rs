@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::header::{CONNECTION, HOST};
-use hyper::{Request, StatusCode};
+use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -42,10 +42,10 @@ use tunnelproxy_control_plane::{
     VersionedAuthorizationSnapshot,
 };
 use tunnelproxy_edge::{
-    shutdown_channel, AuthorizationSourceStatus, EdgeOperationsConfig, EdgeRegistrationPolicy,
-    EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter, EdgeTlsConfig,
-    EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity, Http2IngressConfig,
-    HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
+    shutdown_channel, AuthorizationSourceStatus, ConnectIngressConfig, EdgeOperationsConfig,
+    EdgeRegistrationPolicy, EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeError, EdgeSessionRouter,
+    EdgeTlsConfig, EdgeTlsReloadConfig, EdgeTlsReloadRuntime, EdgeTransportSecurity,
+    Http2IngressConfig, HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
     HttpRequestRateLimitConfig, PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsReloadConfig,
     PublicTlsReloadRuntime, RawIngressExposurePolicy, RuntimeShutdownOutcome,
     SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, WebSocketIngressConfig,
@@ -882,6 +882,7 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
         max_requests_per_connection: 1,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
@@ -942,6 +943,18 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
     assert!(!captured.contains("spoofed"));
     assert!(!captured.contains("x-remove"));
 
+    let tcp = connect_eventually(https_addr).await;
+    let mut disabled_connect = connector
+        .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+        .await
+        .unwrap();
+    disabled_connect
+        .write_all(b"CONNECT demo.example.test:443 HTTP/1.1\r\nHost: demo.example.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let response = String::from_utf8(read_http_head(&mut disabled_connect).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+
     agent_trigger.shutdown();
     let _ = agent_task.await.unwrap().unwrap();
     edge_trigger.shutdown();
@@ -949,7 +962,8 @@ async fn https_ingress_routes_exact_host_and_replaces_spoofed_forwarding_headers
     assert_eq!(outcome.raw_addr, None);
     let https = outcome.https_ingress.unwrap();
     assert_eq!(https.completed_requests, 1);
-    assert_eq!(https.rejected_requests, 0);
+    assert_eq!(https.rejected_requests, 1);
+    assert_eq!(https.rejected_connect_sessions, 1);
     local_task.await.unwrap();
     wait_until_bindable(https_addr).await;
 }
@@ -1028,6 +1042,11 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
             keep_alive_timeout: Duration::from_secs(1),
         }),
         websocket: None,
+        connect: Some(ConnectIngressConfig {
+            max_concurrent_sessions: 1,
+            idle_timeout: Duration::from_secs(1),
+            authority_port: 443,
+        }),
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_millis(200),
@@ -1108,6 +1127,18 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
         .unwrap();
     assert_eq!(fronted.status(), StatusCode::MISDIRECTED_REQUEST);
     let _ = fronted.into_body().collect().await.unwrap();
+    let connect = sender
+        .send_request(
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("demo.example.test:443")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(connect.status(), StatusCode::NOT_IMPLEMENTED);
+    let _ = connect.into_body().collect().await.unwrap();
     drop(sender);
     drop(second_sender);
     drop(fast_sender);
@@ -1195,7 +1226,8 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     assert_eq!(https.http2_connections, 2);
     assert!(https.peak_active_http2_streams >= 2);
     assert_eq!(https.completed_requests, 4);
-    assert_eq!(https.rejected_requests, 3);
+    assert_eq!(https.rejected_requests, 4);
+    assert_eq!(https.rejected_connect_sessions, 1);
     assert_eq!(https.request_timeouts, 1);
     wait_until_bindable(https_addr).await;
 }
@@ -1265,6 +1297,7 @@ async fn websocket_upgrade_relays_frames_and_releases_bounded_capacity() {
             max_concurrent_sessions: 1,
             idle_timeout: Duration::from_secs(2),
         }),
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(1),
@@ -1367,6 +1400,147 @@ async fn websocket_upgrade_relays_frames_and_releases_bounded_capacity() {
 }
 
 #[tokio::test]
+async fn connect_ingress_is_route_bound_bounded_and_byte_exact() {
+    const REQUEST: &[u8] =
+        b"CONNECT demo.example.test:443 HTTP/1.1\r\nHost: demo.example.test:443\r\n\r\n";
+    const WRONG_PORT: &[u8] =
+        b"CONNECT demo.example.test:8443 HTTP/1.1\r\nHost: demo.example.test:8443\r\n\r\n";
+    const FRONTED: &[u8] =
+        b"CONNECT other.example.test:443 HTTP/1.1\r\nHost: other.example.test:443\r\n\r\n";
+    const WITH_BODY: &[u8] = b"CONNECT demo.example.test:443 HTTP/1.1\r\nHost: demo.example.test:443\r\nContent-Length: 1\r\n\r\nx";
+
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let local_task = tokio::spawn(async move {
+        for (request, response) in [
+            (b"first".as_slice(), b"from-local-one".as_slice()),
+            (b"second".as_slice(), b"from-local-two".as_slice()),
+        ] {
+            let (mut socket, _) = local_listener.accept().await.unwrap();
+            let mut received = vec![0_u8; request.len()];
+            socket.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, request);
+            socket.write_all(response).await.unwrap();
+            let mut trailing = Vec::new();
+            let _ = socket.read_to_end(&mut trailing).await;
+            assert!(trailing.is_empty());
+        }
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 2,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        max_requests_per_connection: 1,
+        http2: None,
+        websocket: None,
+        connect: Some(ConnectIngressConfig {
+            max_concurrent_sessions: 1,
+            idle_timeout: Duration::from_secs(2),
+            authority_port: 443,
+        }),
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let agent = agent_runtime(edge_addr, local_addr);
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    wait_for_tunnel(&router, "tunnel-dev").await;
+
+    let connector = TlsConnector::from(public_tls_client_config(
+        &public_pki.authority_pem,
+        b"http/1.1",
+    ));
+    let connect = || async {
+        connector
+            .connect(
+                ServerName::try_from("demo.example.test").unwrap(),
+                connect_eventually(https_addr).await,
+            )
+            .await
+            .unwrap()
+    };
+
+    let mut first = connect().await;
+    first.write_all(REQUEST).await.unwrap();
+    let response = String::from_utf8(read_http_head(&mut first).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!response.to_ascii_lowercase().contains("connection: close"));
+    first.write_all(b"first").await.unwrap();
+    let mut reply = [0_u8; 14];
+    first.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"from-local-one");
+
+    let mut capacity = connect().await;
+    capacity.write_all(REQUEST).await.unwrap();
+    let response = String::from_utf8(read_http_head(&mut capacity).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    drop(capacity);
+
+    for (request, expected) in [
+        (WRONG_PORT, "HTTP/1.1 400 Bad Request\r\n"),
+        (FRONTED, "HTTP/1.1 421 Misdirected Request\r\n"),
+        (WITH_BODY, "HTTP/1.1 400 Bad Request\r\n"),
+    ] {
+        let mut rejected = connect().await;
+        rejected.write_all(request).await.unwrap();
+        let response = String::from_utf8(read_http_head(&mut rejected).await).unwrap();
+        assert!(response.starts_with(expected));
+    }
+
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut replacement = connect().await;
+    replacement.write_all(REQUEST).await.unwrap();
+    let response = String::from_utf8(read_http_head(&mut replacement).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    replacement.write_all(b"second").await.unwrap();
+    let mut reply = [0_u8; 14];
+    replacement.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"from-local-two");
+    drop(replacement);
+
+    local_task.await.unwrap();
+    agent_trigger.shutdown();
+    let _ = agent_task.await.unwrap().unwrap();
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.accepted_connect_sessions, 2);
+    assert_eq!(https.rejected_connect_sessions, 4);
+    assert_eq!(https.peak_active_connect_sessions, 1);
+    assert_eq!(https.connect_idle_timeouts, 0);
+    assert_eq!(https.completed_requests, 2);
+    assert_eq!(https.rejected_requests, 4);
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
 async fn websocket_idle_timeout_and_forced_shutdown_are_bounded() {
     const REQUEST: &[u8] = b"GET /socket HTTP/1.1\r\nHost: demo.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
     const SWITCHING: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
@@ -1411,6 +1585,7 @@ async fn websocket_idle_timeout_and_forced_shutdown_are_bounded() {
             max_concurrent_sessions: 1,
             idle_timeout: Duration::from_millis(500),
         }),
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(1),
@@ -1488,6 +1663,128 @@ async fn websocket_idle_timeout_and_forced_shutdown_are_bounded() {
 }
 
 #[tokio::test]
+async fn connect_idle_timeout_and_forced_shutdown_are_bounded() {
+    const REQUEST: &[u8] =
+        b"CONNECT demo.example.test:443 HTTP/1.1\r\nHost: demo.example.test:443\r\n\r\n";
+
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let local_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = local_listener.accept().await.unwrap();
+            let mut trailing = Vec::new();
+            let _ = socket.read_to_end(&mut trailing).await;
+            assert!(trailing.is_empty());
+        }
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.shutdown = RuntimeShutdownConfig::new(Duration::from_millis(30));
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 1,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        max_requests_per_connection: 1,
+        http2: None,
+        websocket: None,
+        connect: Some(ConnectIngressConfig {
+            max_concurrent_sessions: 1,
+            idle_timeout: Duration::from_millis(500),
+            authority_port: 443,
+        }),
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_millis(30)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let agent = agent_runtime(edge_addr, local_addr);
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    wait_for_tunnel(&router, "tunnel-dev").await;
+
+    let connector = TlsConnector::from(public_tls_client_config(
+        &public_pki.authority_pem,
+        b"http/1.1",
+    ));
+    let connect = || async {
+        connector
+            .connect(
+                ServerName::try_from("demo.example.test").unwrap(),
+                connect_eventually(https_addr).await,
+            )
+            .await
+            .unwrap()
+    };
+
+    let mut idle = connect().await;
+    idle.write_all(REQUEST).await.unwrap();
+    let response = String::from_utf8(read_http_head(&mut idle).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let mut byte = [0_u8; 1];
+    let idle_closed = timeout(Duration::from_secs(1), idle.read(&mut byte))
+        .await
+        .expect("idle CONNECT was not closed");
+    assert!(matches!(idle_closed, Ok(0) | Err(_)));
+    drop(idle);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let mut active = connect().await;
+    active.write_all(REQUEST).await.unwrap();
+    let response = String::from_utf8(read_http_head(&mut active).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    edge_trigger.shutdown();
+    let outcome = timeout(Duration::from_secs(1), edge_task)
+        .await
+        .expect("Edge CONNECT drain exceeded its bound")
+        .unwrap()
+        .unwrap();
+    let forced_closed = timeout(Duration::from_millis(500), active.read(&mut byte))
+        .await
+        .expect("forced CONNECT was not closed");
+    assert!(matches!(forced_closed, Ok(0) | Err(_)));
+    drop(active);
+
+    agent_trigger.shutdown();
+    let _ = agent_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.accepted_connect_sessions, 2);
+    assert_eq!(https.rejected_connect_sessions, 0);
+    assert_eq!(https.peak_active_connect_sessions, 1);
+    assert_eq!(https.connect_idle_timeouts, 1);
+    assert!(matches!(
+        https.shutdown,
+        RuntimeShutdownOutcome::Forced {
+            aborted_tasks: 1,
+            ..
+        }
+    ));
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
 async fn managed_hostname_allocation_activates_end_to_end_https_without_auto_release() {
     let agent_pki = test_pki("edge.test");
     let public_pki = test_pki("*.agents.example.test");
@@ -1543,6 +1840,7 @@ async fn managed_hostname_allocation_activates_end_to_end_https_without_auto_rel
         max_requests_per_connection: 1,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
@@ -1724,6 +2022,7 @@ async fn https_keep_alive_reuses_one_tls_connection_until_the_request_cap() {
         max_requests_per_connection: 2,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
@@ -1837,6 +2136,7 @@ async fn https_request_deadline_returns_504_and_closes_the_reused_connection() {
         max_requests_per_connection: 4,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_millis(100),
@@ -1936,6 +2236,7 @@ async fn https_shutdown_gracefully_closes_an_idle_keep_alive_connection() {
         max_requests_per_connection: 4,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(2),
@@ -2037,6 +2338,7 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
         max_requests_per_connection: 4,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
@@ -2161,6 +2463,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
         max_requests_per_connection: 4,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig {
             global_requests_per_second: 2,
             global_burst: 2,
@@ -2335,6 +2638,7 @@ async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
         max_requests_per_connection: 1,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
@@ -2418,6 +2722,7 @@ async fn public_https_per_ip_admission_releases_after_connection_close() {
         max_requests_per_connection: 1,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(3),
@@ -2971,6 +3276,7 @@ fn public_https_config_requires_agent_mtls_and_dynamic_authorization() {
         max_requests_per_connection: 1,
         http2: None,
         websocket: None,
+        connect: None,
         request_rate_limit: HttpRequestRateLimitConfig::default(),
         header_read_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),

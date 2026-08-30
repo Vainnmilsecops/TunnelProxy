@@ -344,3 +344,22 @@ session permits together. Roll back by removing `--enable-websocket-upgrade`
 and restarting Edge. Ordinary HTTP/1.1 and opt-in HTTP/2 remain available; no
 TLS generation, route catalog, Agent credential, or Tunnel Protocol rollback is
 required.
+
+### CONNECT rollout and rollback
+
+Canary `--enable-connect` independently from WebSocket and HTTP/2. Keep the
+session cap below HTTPS connection capacity, choose one authority port that
+matches the intended client contract, and set a finite idle timeout. Monitor
+`tunnelproxy_edge_https_connect_sessions_total`,
+`tunnelproxy_edge_https_connect_rejections_total`,
+`tunnelproxy_edge_https_active_connect_sessions`, its peak gauge,
+`tunnelproxy_edge_https_connect_idle_timeouts_total`, HTTPS connection
+occupancy, Tunnel DATA saturation, and forced drain outcomes.
+
+`400` indicates malformed authority/body/upgrade semantics, `421` indicates
+Host/SNI fronting, `404` indicates no cached route, and `503` indicates session
+or tunnel capacity/unavailability. CONNECT never uses the requested authority
+as a dial target; it always reaches the fixed local target already owned by the
+selected TunnelId. Roll back by removing `--enable-connect` and restarting
+Edge. Existing HTTP/1.1, WebSocket, HTTP/2, route, TLS, and Tunnel Protocol
+state require no migration or rollback.

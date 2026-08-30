@@ -1010,3 +1010,38 @@ within the configured Edge drain timeout before force cleanup.
 
 This option does not enable CONNECT, RFC 8441 extended CONNECT, WebSocket over
 HTTP/2, compression/extensions, h2c, or HTTP/3.
+
+## 31. Enabling bounded route-bound HTTP/1.1 CONNECT at Edge
+
+CONNECT remains disabled unless explicitly enabled. Its session cap cannot
+exceed the HTTPS connection cap. The authority port is an Edge policy value,
+not a destination chosen by the client:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-route-server control.example.test:7201 \
+  --public-tls-cert wildcard.pem \
+  --public-tls-key wildcard-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --enable-connect \
+  --max-connect-sessions 16 \
+  --connect-idle-timeout-ms 60000 \
+  --connect-authority-port 443 \
+  <snapshot, route, and Agent mTLS options>
+```
+
+A request must be HTTP/1.1 authority-form CONNECT with matching
+`Host: <route-host>:<configured-port>` and TLS SNI. Schemes, paths, a missing or
+different port, bodies, transfer encoding, and WebSocket/Upgrade headers are
+rejected before tunnel creation. The exact cached hostname route and normal
+request-rate admission run unchanged.
+
+Edge returns `200 OK`, then relays opaque bytes to the route's already
+configured Agent local target. It never dials the requested authority and does
+not forward CONNECT as HTTP to the local application. Activity in either
+direction resets the idle deadline; graceful shutdown is bounded by the normal
+Edge drain timeout. This option does not enable an arbitrary forward proxy,
+HTTP/2 extended CONNECT, RFC 8441 WebSocket, h2c, or HTTP/3.
