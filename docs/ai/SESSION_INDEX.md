@@ -51,6 +51,7 @@
 | 45      | Bounded WebSocket Upgrade Ingress             | complete |
 | 46      | Bounded Route-Bound HTTP/1.1 CONNECT Ingress  | complete |
 | 47      | Bounded Route-Bound Classic HTTP/2 CONNECT Ingress | complete |
+| 48      | Bounded Route-Bound RFC 8441 WebSocket Ingress | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1530,3 +1531,36 @@ Out of scope:
   arbitrary forward-proxy destinations, public-client authorization, h2c,
   HTTP/3, distributed admission, multi-edge ownership, and Tunnel Protocol
   changes.
+
+## Session 48 — Bounded Route-Bound RFC 8441 WebSocket Ingress — complete
+
+Scope delivered:
+
+- Added separate `--enable-http2-websocket` policy requiring bounded HTTP/2.
+  Only that policy advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`; HTTP/1.1
+  WebSocket and classic HTTP/2 CONNECT flags remain independent.
+- Required extended CONNECT with `:protocol = websocket`, HTTPS scheme/path,
+  exact authority/optional-Host/SNI route agreement, version 13, no public
+  key/accept, body framing, connection-specific fields, or extension offer.
+- Generated a fresh internal WebSocket key, translated to sanitized local
+  HTTP/1.1 GET Upgrade, validated the local `101` accept/subprotocol, returned
+  HTTP/2 `200`, and relayed frames opaquely through unchanged Tunnel Protocol
+  v2 without requiring local HTTP/2.
+- Shared the existing WebSocket session semaphore and idle deadline across
+  HTTP/1.1 and HTTP/2. Reused the bounded per-h2-connection relay supervisor for
+  reset isolation, half-close, graceful GOAWAY, and forced drain ownership.
+- Added fixed-cardinality HTTP/2 WebSocket accepted/rejected/current/peak/idle
+  metrics and strict CLI/config compatibility validation.
+- Added two real TLS HTTP/2 Edge-to-Agent-to-local E2Es covering concurrent
+  RFC 8441 streams, generated-key local handshake translation, subprotocol and
+  byte-exact frame relay, extension/fronting rejection, shared cross-protocol
+  capacity, idle release, GOAWAY ownership, and forced shutdown. The workspace
+  now contains 388 explicit tests.
+- Documented protocol semantics, rollout/rollback, observability, compatibility,
+  and remaining exclusions.
+
+Out of scope:
+
+- WebSocket extension negotiation, non-WebSocket extended CONNECT, arbitrary
+  forward-proxy destinations, public-client authorization, h2c, HTTP/3,
+  distributed admission, multi-edge ownership, and Tunnel Protocol changes.

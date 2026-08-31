@@ -1091,6 +1091,35 @@ the connection task. RAII retains both aggregate and HTTP/2-specific
 current/peak session gauges; fixed-cardinality counters expose accepted,
 rejected, and idle-timeout outcomes without identity or payload labels.
 
+### 2.46 Bounded route-bound RFC 8441 WebSocket ingress (Session 48)
+
+RFC 8441 WebSocket is independently default-off and requires bounded HTTP/2.
+Only that policy causes Hyper to advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`;
+HTTP/1.1 WebSocket and classic HTTP/2 CONNECT retain their independent flags.
+HTTP/1.1 and HTTP/2 WebSockets share one session semaphore and activity idle
+deadline, so enabling both cannot double the configured WebSocket ceiling.
+
+Edge accepts only HTTP/2 extended CONNECT with `:protocol = websocket`, HTTPS
+scheme, an origin-form path, exact authority/optional-Host/TLS-SNI agreement,
+WebSocket version 13, no body framing, no connection-specific fields, and no
+extension offer. Cached route and request-rate admission still run before
+tunnel creation. Other extended protocols fail closed and the authority never
+becomes a dial target.
+
+RFC 8441 omits the HTTP/1.1 key/accept exchange. Edge therefore generates a
+fresh 16-byte key, constructs a sanitized local HTTP/1.1 GET Upgrade request,
+and requires the local service to return a valid `101`, matching accept digest,
+no extension, and at most one offered subprotocol. Edge then returns HTTP/2
+`200` with only the selected subprotocol and relays the two upgraded byte
+streams without parsing WebSocket frames.
+
+The Session 47 per-connection relay supervisor also owns RFC 8441 streams.
+END_STREAM, reset isolation, activity idle expiry, graceful GOAWAY, and the
+existing forced drain deadline remain bounded. Aggregate WebSocket telemetry is
+retained and HTTP/2-specific accepted/rejected/current/peak/idle metrics add no
+hostname, peer, subprotocol, or payload labels. Agent behavior and Tunnel
+Protocol v2 are unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

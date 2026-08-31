@@ -88,7 +88,10 @@ session-cap, idle-timeout, and task-ownership bounds. The runnable
 route-bound HTTP/1.1 CONNECT policy has independent authority-port validation,
 session/idle bounds, opaque relay ownership, and fixed-cardinality telemetry.
 Classic HTTP/2 CONNECT is independently opt-in, shares that policy/capacity,
-and adds bounded per-h2-connection relay supervision. The runnable
+and adds bounded per-h2-connection relay supervision. RFC 8441 WebSocket is
+independently opt-in, shares WebSocket capacity/idle policy, translates a
+strict extended CONNECT into a validated local HTTP/1.1 upgrade, and reuses the
+same h2 relay supervisor. The runnable
 single-tunnel process keeps its durable TunnelId listener bound across
 replacement Agent sessions. Loopback is the default; explicit public raw mode
 requires Agent mTLS, dynamic snapshot authority, global admission, and a
@@ -107,8 +110,8 @@ separate reloadable public TLS identity, requires exact SNI/Host-or-authority ro
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane
-access. Validated WebSocket upgrades reuse that route and Tunnel Protocol v2
-stream as opaque bytes without frame inspection. Validated HTTP/1.1 and
+access. Validated HTTP/1.1 and RFC 8441 WebSocket upgrades reuse that route and
+Tunnel Protocol v2 stream as opaque bytes without frame inspection. Validated HTTP/1.1 and
 classic HTTP/2 CONNECT sessions
 reuse the route's fixed local target directly and never dial client-selected
 destinations. Its rate-limit peer state and

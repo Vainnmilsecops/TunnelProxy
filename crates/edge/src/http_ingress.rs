@@ -78,6 +78,8 @@ impl Default for Http2IngressConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebSocketIngressConfig {
+    pub enable_http1: bool,
+    pub enable_http2: bool,
     pub max_concurrent_sessions: usize,
     pub idle_timeout: Duration,
 }
@@ -85,6 +87,8 @@ pub struct WebSocketIngressConfig {
 impl Default for WebSocketIngressConfig {
     fn default() -> Self {
         Self {
+            enable_http1: true,
+            enable_http2: false,
             max_concurrent_sessions: 32,
             idle_timeout: Duration::from_secs(60),
         }
@@ -355,6 +359,12 @@ impl HttpIngressConfig {
             _ => return Err(HttpIngressConfigError::Http2TlsPolicyMismatch),
         }
         if let Some(websocket) = self.websocket {
+            if !websocket.enable_http1 && !websocket.enable_http2 {
+                return Err(HttpIngressConfigError::WebSocketProtocolsDisabled);
+            }
+            if websocket.enable_http2 && self.http2.is_none() {
+                return Err(HttpIngressConfigError::Http2WebSocketWithoutHttp2);
+            }
             if websocket.max_concurrent_sessions == 0
                 || websocket.max_concurrent_sessions > MAX_WEBSOCKET_SESSIONS
             {
@@ -422,6 +432,8 @@ pub enum HttpIngressConfigError {
     ZeroHttp2KeepAliveInterval,
     ZeroHttp2KeepAliveTimeout,
     Http2TlsPolicyMismatch,
+    WebSocketProtocolsDisabled,
+    Http2WebSocketWithoutHttp2,
     InvalidWebSocketSessionLimit,
     WebSocketSessionsExceedConnections,
     ZeroWebSocketIdleTimeout,
@@ -480,6 +492,12 @@ impl std::fmt::Display for HttpIngressConfigError {
             }
             Self::Http2TlsPolicyMismatch => {
                 f.write_str("HTTP/2 ingress and public TLS protocol policies must match")
+            }
+            Self::WebSocketProtocolsDisabled => {
+                f.write_str("WebSocket ingress must enable HTTP/1.1 or HTTP/2")
+            }
+            Self::Http2WebSocketWithoutHttp2 => {
+                f.write_str("HTTP/2 WebSocket requires HTTP/2 ingress")
             }
             Self::InvalidWebSocketSessionLimit => write!(
                 f,
@@ -548,6 +566,10 @@ pub struct HttpIngressOutcome {
     pub rejected_websocket_upgrades: u64,
     pub peak_active_websocket_sessions: usize,
     pub websocket_idle_timeouts: u64,
+    pub accepted_http2_websocket_sessions: u64,
+    pub rejected_http2_websocket_sessions: u64,
+    pub peak_active_http2_websocket_sessions: usize,
+    pub http2_websocket_idle_timeouts: u64,
     pub accepted_connect_sessions: u64,
     pub rejected_connect_sessions: u64,
     pub peak_active_connect_sessions: usize,
@@ -610,6 +632,11 @@ struct HttpIngressCounters {
     active_websocket_sessions: AtomicUsize,
     peak_active_websocket_sessions: AtomicUsize,
     websocket_idle_timeouts: AtomicU64,
+    accepted_http2_websocket_sessions: AtomicU64,
+    rejected_http2_websocket_sessions: AtomicU64,
+    active_http2_websocket_sessions: AtomicUsize,
+    peak_active_http2_websocket_sessions: AtomicUsize,
+    http2_websocket_idle_timeouts: AtomicU64,
     accepted_connect_sessions: AtomicU64,
     rejected_connect_sessions: AtomicU64,
     active_connect_sessions: AtomicUsize,
@@ -646,6 +673,11 @@ pub struct HttpIngressStatus {
     pub active_websocket_sessions: usize,
     pub peak_active_websocket_sessions: usize,
     pub websocket_idle_timeouts: u64,
+    pub accepted_http2_websocket_sessions: u64,
+    pub rejected_http2_websocket_sessions: u64,
+    pub active_http2_websocket_sessions: usize,
+    pub peak_active_http2_websocket_sessions: usize,
+    pub http2_websocket_idle_timeouts: u64,
     pub accepted_connect_sessions: u64,
     pub rejected_connect_sessions: u64,
     pub active_connect_sessions: usize,
@@ -715,6 +747,26 @@ impl HttpIngressStatusHandle {
             websocket_idle_timeouts: self
                 .counters
                 .websocket_idle_timeouts
+                .load(Ordering::Relaxed),
+            accepted_http2_websocket_sessions: self
+                .counters
+                .accepted_http2_websocket_sessions
+                .load(Ordering::Relaxed),
+            rejected_http2_websocket_sessions: self
+                .counters
+                .rejected_http2_websocket_sessions
+                .load(Ordering::Relaxed),
+            active_http2_websocket_sessions: self
+                .counters
+                .active_http2_websocket_sessions
+                .load(Ordering::Relaxed),
+            peak_active_http2_websocket_sessions: self
+                .counters
+                .peak_active_http2_websocket_sessions
+                .load(Ordering::Relaxed),
+            http2_websocket_idle_timeouts: self
+                .counters
+                .http2_websocket_idle_timeouts
                 .load(Ordering::Relaxed),
             accepted_connect_sessions: self
                 .counters
@@ -930,6 +982,10 @@ impl HttpIngressRuntime {
             rejected_websocket_upgrades: status.rejected_websocket_upgrades,
             peak_active_websocket_sessions: status.peak_active_websocket_sessions,
             websocket_idle_timeouts: status.websocket_idle_timeouts,
+            accepted_http2_websocket_sessions: status.accepted_http2_websocket_sessions,
+            rejected_http2_websocket_sessions: status.rejected_http2_websocket_sessions,
+            peak_active_http2_websocket_sessions: status.peak_active_http2_websocket_sessions,
+            http2_websocket_idle_timeouts: status.http2_websocket_idle_timeouts,
             accepted_connect_sessions: status.accepted_connect_sessions,
             rejected_connect_sessions: status.rejected_connect_sessions,
             peak_active_connect_sessions: status.peak_active_connect_sessions,
@@ -1018,8 +1074,8 @@ async fn run_connection(
     let opaque_relay_capacity = match protocol {
         NegotiatedHttpProtocol::Http1 => 1,
         NegotiatedHttpProtocol::Http2 => config
-            .connect
-            .map_or(1, |connect| connect.max_concurrent_sessions),
+            .http2
+            .map_or(1, |http2| http2.max_concurrent_streams as usize),
     };
     let (opaque_relay_tx, opaque_relay_rx) = mpsc::channel(opaque_relay_capacity);
     let service_config = config.clone();
@@ -1235,6 +1291,12 @@ async fn serve_http2<S>(
     let stream_window = (config.duplex_capacity.min(64 * 1024)) as u32;
     let connection_window = stream_window.saturating_mul(http2.max_concurrent_streams);
     let mut http = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    if config
+        .websocket
+        .is_some_and(|websocket| websocket.enable_http2)
+    {
+        http.enable_connect_protocol();
+    }
     http.max_concurrent_streams(http2.max_concurrent_streams)
         .max_pending_accept_reset_streams(reset_limit)
         .max_local_error_reset_streams(reset_limit)
@@ -1376,8 +1438,14 @@ async fn proxy_request(
         connect_permits,
         opaque_relay_tx,
     } = context;
-    let websocket_intent = has_websocket_intent(request.headers());
-    let connect_intent = request.method() == Method::CONNECT;
+    let http2_websocket_intent = request.version() == Version::HTTP_2
+        && request
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|protocol| protocol.as_str().eq_ignore_ascii_case("websocket"));
+    let websocket_intent = has_websocket_intent(request.headers()) || http2_websocket_intent;
+    let connect_intent = request.method() == Method::CONNECT
+        && request.extensions().get::<hyper::ext::Protocol>().is_none();
     let http2_connect_intent = connect_intent && request.version() == Version::HTTP_2;
     let outcome = prepare_request(&mut request, peer, server_name.as_ref(), &config);
     let PreparedRequest {
@@ -1392,6 +1460,11 @@ async fn proxy_request(
                 counters
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
+                if http2_websocket_intent {
+                    counters
+                        .rejected_http2_websocket_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             if connect_intent {
                 counters
@@ -1414,6 +1487,11 @@ async fn proxy_request(
             counters
                 .rejected_websocket_upgrades
                 .fetch_add(1, Ordering::Relaxed);
+            if is_http2_websocket(&kind) {
+                counters
+                    .rejected_http2_websocket_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         if matches!(&kind, PreparedRequestKind::Connect(_)) {
             counters
@@ -1456,12 +1534,21 @@ async fn proxy_request(
         let permits = websocket_permits
             .expect("WebSocket permits exist when validated WebSocket ingress is enabled");
         match permits.try_acquire_owned() {
-            Ok(permit) => Some(WebSocketSessionGuard::new(Arc::clone(&counters), permit)),
+            Ok(permit) => Some(WebSocketSessionGuard::new(
+                Arc::clone(&counters),
+                permit,
+                websocket_protocol(&kind),
+            )),
             Err(_) => {
                 counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 counters
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
+                if is_http2_websocket(&kind) {
+                    counters
+                        .rejected_http2_websocket_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 warn!(%peer, %hostname, event = "https_websocket_capacity_rejected");
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE));
             }
@@ -1521,6 +1608,11 @@ async fn proxy_request(
                 counters
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
+                if is_http2_websocket(&kind) {
+                    counters
+                        .rejected_http2_websocket_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             if matches!(&kind, PreparedRequestKind::Connect(_)) {
                 counters
@@ -1650,7 +1742,13 @@ async fn proxy_request(
         response.extensions_mut().insert(ConnectResponse);
         return Ok(response);
     }
-    let body = Limited::new(incoming_body, config.max_request_body_bytes).boxed_unsync();
+    let body = if is_http2_websocket(&kind) {
+        Full::new(Bytes::new())
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed_unsync()
+    } else {
+        Limited::new(incoming_body, config.max_request_body_bytes).boxed_unsync()
+    };
     let request = Request::from_parts(parts, body);
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(edge_io))
@@ -1678,6 +1776,7 @@ async fn proxy_request(
             Ok(sanitize_response(response, deadline, counters))
         }
         PreparedRequestKind::WebSocket(handshake) => {
+            let http2_websocket = handshake.protocol == NegotiatedHttpProtocol::Http2;
             let driver = AbortOnDropTask::new(tokio::spawn(async move {
                 let _ = connection.with_upgrades().await;
             }));
@@ -1688,6 +1787,11 @@ async fn proxy_request(
                     counters
                         .rejected_websocket_upgrades
                         .fetch_add(1, Ordering::Relaxed);
+                    if http2_websocket {
+                        counters
+                            .rejected_http2_websocket_sessions
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     return Ok(error_response(StatusCode::BAD_GATEWAY));
                 }
             };
@@ -1695,6 +1799,11 @@ async fn proxy_request(
                 counters
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
+                if http2_websocket {
+                    counters
+                        .rejected_http2_websocket_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 tokio::spawn(async move {
                     driver.join().await;
                     let _ = routed.wait_closed().await;
@@ -1709,6 +1818,11 @@ async fn proxy_request(
                     counters
                         .rejected_websocket_upgrades
                         .fetch_add(1, Ordering::Relaxed);
+                    if http2_websocket {
+                        counters
+                            .rejected_http2_websocket_sessions
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!(%peer, reason, event = "https_websocket_response_rejected");
                     return Ok(error_response(StatusCode::BAD_GATEWAY));
                 }
@@ -1743,6 +1857,11 @@ async fn proxy_request(
                         counters_for_relay
                             .websocket_idle_timeouts
                             .fetch_add(1, Ordering::Relaxed);
+                        if http2_websocket {
+                            counters_for_relay
+                                .http2_websocket_idle_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     warn!(event = "https_websocket_upgrade_failed");
@@ -1758,12 +1877,22 @@ async fn proxy_request(
                 counters
                     .rejected_websocket_upgrades
                     .fetch_add(1, Ordering::Relaxed);
+                if http2_websocket {
+                    counters
+                        .rejected_http2_websocket_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE));
             }
             counters
                 .accepted_websocket_upgrades
                 .fetch_add(1, Ordering::Relaxed);
-            info!(%peer, %hostname, event = "https_websocket_upgraded");
+            if http2_websocket {
+                counters
+                    .accepted_http2_websocket_sessions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            info!(%peer, %hostname, protocol = if http2_websocket { "http2" } else { "http1" }, event = "https_websocket_upgraded");
             Ok(response)
         }
         PreparedRequestKind::Connect(_) => {
@@ -1775,10 +1904,15 @@ async fn proxy_request(
 struct WebSocketSessionGuard {
     counters: Arc<HttpIngressCounters>,
     _permit: OwnedSemaphorePermit,
+    protocol: NegotiatedHttpProtocol,
 }
 
 impl WebSocketSessionGuard {
-    fn new(counters: Arc<HttpIngressCounters>, permit: OwnedSemaphorePermit) -> Self {
+    fn new(
+        counters: Arc<HttpIngressCounters>,
+        permit: OwnedSemaphorePermit,
+        protocol: NegotiatedHttpProtocol,
+    ) -> Self {
         let active = counters
             .active_websocket_sessions
             .fetch_add(1, Ordering::Relaxed)
@@ -1786,9 +1920,19 @@ impl WebSocketSessionGuard {
         counters
             .peak_active_websocket_sessions
             .fetch_max(active, Ordering::Relaxed);
+        if protocol == NegotiatedHttpProtocol::Http2 {
+            let active = counters
+                .active_http2_websocket_sessions
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            counters
+                .peak_active_http2_websocket_sessions
+                .fetch_max(active, Ordering::Relaxed);
+        }
         Self {
             counters,
             _permit: permit,
+            protocol,
         }
     }
 }
@@ -1798,6 +1942,11 @@ impl Drop for WebSocketSessionGuard {
         self.counters
             .active_websocket_sessions
             .fetch_sub(1, Ordering::Relaxed);
+        if self.protocol == NegotiatedHttpProtocol::Http2 {
+            self.counters
+                .active_http2_websocket_sessions
+                .fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1931,15 +2080,25 @@ fn sanitize_websocket_response(
         parts.headers.remove(name);
     }
     parts.headers.remove(CONTENT_LENGTH);
-    parts
-        .headers
-        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-    parts
-        .headers
-        .insert(UPGRADE, HeaderValue::from_static("websocket"));
-    parts
-        .headers
-        .insert(accept_name, handshake.expected_accept.clone());
+    match handshake.protocol {
+        NegotiatedHttpProtocol::Http1 => {
+            parts.status = StatusCode::SWITCHING_PROTOCOLS;
+            parts.version = Version::HTTP_11;
+            parts
+                .headers
+                .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+            parts
+                .headers
+                .insert(UPGRADE, HeaderValue::from_static("websocket"));
+            parts
+                .headers
+                .insert(accept_name, handshake.expected_accept.clone());
+        }
+        NegotiatedHttpProtocol::Http2 => {
+            parts.status = StatusCode::OK;
+            parts.version = Version::HTTP_2;
+        }
+    }
     if let Some(protocol) = selected_protocol {
         parts.headers.insert(protocol_name, protocol);
     }
@@ -2040,7 +2199,25 @@ enum PreparedRequestKind {
     Connect(NegotiatedHttpProtocol),
 }
 
+fn websocket_protocol(kind: &PreparedRequestKind) -> NegotiatedHttpProtocol {
+    match kind {
+        PreparedRequestKind::WebSocket(handshake) => handshake.protocol,
+        _ => unreachable!("only WebSocket requests have a WebSocket protocol"),
+    }
+}
+
+fn is_http2_websocket(kind: &PreparedRequestKind) -> bool {
+    matches!(
+        kind,
+        PreparedRequestKind::WebSocket(WebSocketHandshake {
+            protocol: NegotiatedHttpProtocol::Http2,
+            ..
+        })
+    )
+}
+
 struct WebSocketHandshake {
+    protocol: NegotiatedHttpProtocol,
     key: HeaderValue,
     expected_accept: HeaderValue,
     offered_protocols: Vec<String>,
@@ -2078,7 +2255,12 @@ fn prepare_request(
             reason: "headers_too_large",
         });
     }
-    let kind = if request.method() == Method::CONNECT {
+    let kind = if request.method() == Method::CONNECT
+        && request.version() == Version::HTTP_2
+        && request.extensions().get::<hyper::ext::Protocol>().is_some()
+    {
+        PreparedRequestKind::WebSocket(validate_http2_websocket_handshake(request, config)?)
+    } else if request.method() == Method::CONNECT {
         PreparedRequestKind::Connect(validate_connect_request(request, config)?)
     } else if has_websocket_intent(request.headers()) {
         PreparedRequestKind::WebSocket(validate_websocket_handshake(request, config)?)
@@ -2292,7 +2474,11 @@ fn validate_websocket_handshake(
     request: &Request<Incoming>,
     config: &HttpIngressConfig,
 ) -> Result<WebSocketHandshake, RequestRejection> {
-    if config.websocket.is_none() || request.version() != Version::HTTP_11 {
+    if !config
+        .websocket
+        .is_some_and(|websocket| websocket.enable_http1)
+        || request.version() != Version::HTTP_11
+    {
         return Err(RequestRejection {
             status: StatusCode::NOT_IMPLEMENTED,
             reason: "websocket_not_enabled_for_protocol",
@@ -2371,6 +2557,89 @@ fn validate_websocket_handshake(
     let expected_accept = HeaderValue::from_str(&BASE64_STANDARD.encode(digest.finalize()))
         .expect("WebSocket accept is ASCII");
     Ok(WebSocketHandshake {
+        protocol: NegotiatedHttpProtocol::Http1,
+        key,
+        expected_accept,
+        offered_protocols,
+    })
+}
+
+fn validate_http2_websocket_handshake(
+    request: &Request<Incoming>,
+    config: &HttpIngressConfig,
+) -> Result<WebSocketHandshake, RequestRejection> {
+    if !config
+        .websocket
+        .is_some_and(|websocket| websocket.enable_http2)
+    {
+        return Err(RequestRejection {
+            status: StatusCode::NOT_IMPLEMENTED,
+            reason: "websocket_not_enabled_for_protocol",
+        });
+    }
+    let protocol = request
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .ok_or(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "missing_extended_connect_protocol",
+        })?;
+    if !protocol.as_str().eq_ignore_ascii_case("websocket") {
+        return Err(RequestRejection {
+            status: StatusCode::NOT_IMPLEMENTED,
+            reason: "extended_connect_protocol_not_supported",
+        });
+    }
+    if request.uri().scheme_str() != Some("https")
+        || request.uri().authority().is_none()
+        || request.uri().path_and_query().is_none()
+        || !request.uri().path().starts_with('/')
+    {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_http2_websocket_target",
+        });
+    }
+    if request.headers().contains_key(CONNECTION)
+        || request.headers().contains_key(UPGRADE)
+        || request.headers().contains_key("sec-websocket-key")
+        || request.headers().contains_key("sec-websocket-accept")
+        || request.headers().contains_key("sec-websocket-extensions")
+        || request.headers().contains_key(CONTENT_LENGTH)
+        || request.headers().contains_key(TE)
+        || request.headers().contains_key(TRAILER)
+        || request.headers().contains_key(TRANSFER_ENCODING)
+    {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_http2_websocket_headers",
+        });
+    }
+    if single_header_str(
+        request.headers(),
+        HeaderName::from_static("sec-websocket-version"),
+    )? != Some("13")
+    {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_websocket_version",
+        });
+    }
+    let offered_protocols = parse_websocket_protocols(request.headers())?;
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| RequestRejection {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        reason: "websocket_entropy_unavailable",
+    })?;
+    let key_text = BASE64_STANDARD.encode(nonce);
+    let key = HeaderValue::from_str(&key_text).expect("base64 WebSocket key is ASCII");
+    let mut digest = Sha1::new();
+    digest.update(key_text.as_bytes());
+    digest.update(WEBSOCKET_GUID);
+    let expected_accept = HeaderValue::from_str(&BASE64_STANDARD.encode(digest.finalize()))
+        .expect("WebSocket accept is ASCII");
+    Ok(WebSocketHandshake {
+        protocol: NegotiatedHttpProtocol::Http2,
         key,
         expected_accept,
         offered_protocols,
@@ -2518,6 +2787,7 @@ fn sanitize_request_headers(
                 .insert(CONNECTION, HeaderValue::from_static("close"));
         }
         PreparedRequestKind::WebSocket(handshake) => {
+            *request.method_mut() = Method::GET;
             request
                 .headers_mut()
                 .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
@@ -2837,6 +3107,15 @@ mod tests {
             .store(8, Ordering::Relaxed);
         counters.websocket_idle_timeouts.store(9, Ordering::Relaxed);
         counters
+            .accepted_http2_websocket_sessions
+            .store(16, Ordering::Relaxed);
+        counters
+            .rejected_http2_websocket_sessions
+            .store(17, Ordering::Relaxed);
+        counters
+            .http2_websocket_idle_timeouts
+            .store(18, Ordering::Relaxed);
+        counters
             .accepted_connect_sessions
             .store(10, Ordering::Relaxed);
         counters
@@ -2858,7 +3137,11 @@ mod tests {
         let active = ActiveConnectionGuard::new(Arc::clone(&counters));
         let active_http2 = ActiveHttp2StreamGuard::new(Arc::clone(&counters));
         let websocket_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let active_websocket = WebSocketSessionGuard::new(Arc::clone(&counters), websocket_permit);
+        let active_websocket = WebSocketSessionGuard::new(
+            Arc::clone(&counters),
+            websocket_permit,
+            NegotiatedHttpProtocol::Http2,
+        );
         let connect_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let active_connect = ConnectSessionGuard::new(
             Arc::clone(&counters),
@@ -2880,6 +3163,11 @@ mod tests {
         assert_eq!(snapshot.active_websocket_sessions, 1);
         assert_eq!(snapshot.peak_active_websocket_sessions, 1);
         assert_eq!(snapshot.websocket_idle_timeouts, 9);
+        assert_eq!(snapshot.accepted_http2_websocket_sessions, 16);
+        assert_eq!(snapshot.rejected_http2_websocket_sessions, 17);
+        assert_eq!(snapshot.active_http2_websocket_sessions, 1);
+        assert_eq!(snapshot.peak_active_http2_websocket_sessions, 1);
+        assert_eq!(snapshot.http2_websocket_idle_timeouts, 18);
         assert_eq!(snapshot.accepted_connect_sessions, 10);
         assert_eq!(snapshot.rejected_connect_sessions, 11);
         assert_eq!(snapshot.active_connect_sessions, 1);
@@ -2899,6 +3187,7 @@ mod tests {
         assert_eq!(status.snapshot().active_connections, 0);
         assert_eq!(status.snapshot().active_http2_streams, 0);
         assert_eq!(status.snapshot().active_websocket_sessions, 0);
+        assert_eq!(status.snapshot().active_http2_websocket_sessions, 0);
         assert_eq!(status.snapshot().active_connect_sessions, 0);
         assert_eq!(status.snapshot().active_http2_connect_sessions, 0);
     }
@@ -2988,6 +3277,8 @@ mod tests {
         );
         config.http2.as_mut().unwrap().keep_alive_timeout = Duration::from_secs(1);
         config.websocket = Some(WebSocketIngressConfig {
+            enable_http1: true,
+            enable_http2: false,
             max_concurrent_sessions: 2,
             idle_timeout: Duration::from_secs(1),
         });
@@ -3008,6 +3299,33 @@ mod tests {
             Err(HttpIngressConfigError::ZeroWebSocketIdleTimeout)
         );
         config.websocket.as_mut().unwrap().idle_timeout = Duration::from_secs(1);
+        config.websocket.as_mut().unwrap().enable_http1 = false;
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::WebSocketProtocolsDisabled)
+        );
+        config.websocket.as_mut().unwrap().enable_http2 = true;
+        config.http2 = None;
+        config.tls = PublicTlsConfig::from_pem(
+            pki.cert.pem().as_bytes(),
+            pki.key_pair.serialize_pem().as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::Http2WebSocketWithoutHttp2)
+        );
+        config.http2 = Some(Http2IngressConfig::default());
+        config.tls = PublicTlsConfig::from_pem_with_protocols(
+            pki.cert.pem().as_bytes(),
+            pki.key_pair.serialize_pem().as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap();
+        config.websocket.as_mut().unwrap().enable_http1 = true;
+        config.websocket.as_mut().unwrap().enable_http2 = false;
         config.connect = Some(ConnectIngressConfig {
             enable_http1: true,
             enable_http2: false,

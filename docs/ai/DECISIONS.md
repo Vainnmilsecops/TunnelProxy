@@ -1315,3 +1315,31 @@ protocols cannot double the configured session ceiling. No Agent or Tunnel
 Protocol change is needed. RFC 8441 WebSocket, extension negotiation,
 arbitrary forward proxying, public-client authorization, HTTP/3, distributed
 admission, and multi-edge ownership remain separate concerns.
+
+---
+
+## ADR-048 — RFC 8441 WebSocket is translated, shared-capacity, and h2-owned
+
+**Status:** Accepted (Session 48).
+
+**Context:** Session 45 validates HTTP/1.1 WebSocket upgrades and Session 47
+owns upgraded HTTP/2 streams, but RFC 8441 replaces the GET/101/key exchange
+with extended CONNECT and a `200` response. Advertising the setting globally or
+reusing either older opt-in would silently broaden policy. Local applications
+still speak HTTP/1.1 WebSocket and must not be required to implement HTTP/2.
+
+**Decision:** Add a separate default-off HTTP/2 WebSocket flag that requires
+bounded HTTP/2 and alone enables `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Accept only
+`:protocol = websocket`, HTTPS scheme/path, exact authority/optional-Host/SNI,
+version 13, no body framing, connection fields, key/accept, or extensions.
+Generate a fresh internal key, reconstruct a sanitized local HTTP/1.1 GET
+Upgrade, validate the local `101` accept and subprotocol, then return HTTP/2
+`200`. HTTP/1.1 and HTTP/2 WebSockets share admission and idle policy; the h2
+relay supervisor owns upgraded streams through reset, GOAWAY, and drain.
+
+**Consequences:** Multiple WebSockets can share one HTTP/2 connection without
+cross-talk or doubling the configured WebSocket ceiling, while local services,
+Agents, routes, and Tunnel Protocol v2 remain unchanged. Metrics add only
+fixed-cardinality HTTP/2 WebSocket outcomes. Extension negotiation,
+non-WebSocket extended CONNECT, arbitrary destination dialing, h2c, HTTP/3,
+distributed admission, and multi-edge ownership remain separate concerns.

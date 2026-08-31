@@ -38,6 +38,9 @@ route-bound HTTP/1.1 CONNECT with exact authority-port/Host/SNI validation,
 independent session and idle bounds, direct opaque tunnel relay, and bounded
 drain. Session 47 adds independently opt-in classic HTTP/2 CONNECT with shared
 CONNECT capacity, stream-scoped upgraded relay, and GOAWAY-aware bounded
-ownership. Arbitrary forward-proxy CONNECT, RFC 8441 extended CONNECT, WebSocket
-extensions, HTTP/3, distributed rate limiting, and
+ownership. Session 48 adds independently opt-in RFC 8441 WebSocket over HTTP/2,
+shared WebSocket admission, strict extended-CONNECT validation, local HTTP/1.1
+handshake translation, and the same bounded h2 relay ownership. Arbitrary
+forward-proxy CONNECT, non-WebSocket extended CONNECT, WebSocket extensions,
+HTTP/3, distributed rate limiting, and
 multi-edge ownership remain outside the current implementation.

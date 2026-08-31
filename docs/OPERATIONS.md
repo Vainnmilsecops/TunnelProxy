@@ -321,15 +321,16 @@ rollback is required.
 
 ### WebSocket rollout and rollback
 
-Canary `--enable-websocket-upgrade` independently from HTTP/2. Start with a
-WebSocket session cap below the HTTPS connection cap and a finite idle timeout
-appropriate for application heartbeat traffic. Monitor
+Canary `--enable-websocket-upgrade` for HTTP/1.1 independently. Canary RFC 8441
+with both `--enable-http2` and `--enable-http2-websocket`; neither WebSocket
+flag enables the other protocol. Both surfaces share one session cap and finite
+idle timeout, so size them for combined workload. Monitor
 `tunnelproxy_edge_https_websocket_upgrades_total`,
 `tunnelproxy_edge_https_websocket_rejections_total`,
 `tunnelproxy_edge_https_active_websocket_sessions`, its peak gauge, idle
-timeouts, HTTPS connection occupancy, Tunnel DATA saturation, and forced drain
-outcomes. None of these metrics carries hostname, peer, ID, subprotocol, or
-payload labels.
+timeouts, the corresponding `http2_websocket` accepted/rejected/active/peak/idle
+metrics, HTTPS connection occupancy, Tunnel DATA saturation, and forced drain
+outcomes. None carries hostname, peer, ID, subprotocol, or payload labels.
 
 An increase in `502` responses indicates the local service returned a malformed
 upgrade response, a mismatched accept digest, an unoffered subprotocol, or an
@@ -339,11 +340,12 @@ closes the upgraded byte stream without closing the Agent transport or sibling
 connections.
 
 During shutdown, active WebSockets may finish until the normal Edge drain
-deadline. Stalled sessions are then force-aborted and release their route and
-session permits together. Roll back by removing `--enable-websocket-upgrade`
-and restarting Edge. Ordinary HTTP/1.1 and opt-in HTTP/2 remain available; no
-TLS generation, route catalog, Agent credential, or Tunnel Protocol rollback is
-required.
+deadline. HTTP/2 GOAWAY stops new streams while accepted RFC 8441 relays drain.
+Stalled sessions are then force-aborted and release their route and session
+permits together. Roll back one surface by removing
+`--enable-websocket-upgrade` or `--enable-http2-websocket` and restarting Edge.
+No TLS generation, route catalog, Agent credential, or Tunnel Protocol rollback
+is required.
 
 ### CONNECT rollout and rollback
 
@@ -361,8 +363,9 @@ occupancy, Tunnel DATA saturation, and forced drain outcomes.
 For the h2 slice, additionally monitor
 `tunnelproxy_edge_https_http2_connect_sessions_total`, its rejection counter,
 active/peak gauges, and idle-timeout counter. A successful stream is classic
-CONNECT carried by HTTP/2 DATA; Edge does not advertise RFC 8441 extended
-CONNECT, and clients attempting `:protocol=websocket` fail before route use.
+CONNECT carried by HTTP/2 DATA. This flag alone does not advertise RFC 8441;
+when the separate HTTP/2 WebSocket flag is enabled, `:protocol=websocket` is
+handled only by that policy and never becomes a classic CONNECT destination.
 GOAWAY stops new streams while the bounded relay supervisor drains accepted
 ones under the normal HTTPS deadline.
 

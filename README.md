@@ -46,6 +46,9 @@ correct agent, which in turn proxies them into the local service.
   HTTP/1.1 WebSocket upgrade is separately opt-in with strict handshake and
   local-response validation, a global session cap, idle deadline, opaque
   frame relay, fixed-cardinality metrics, and bounded drain.
+  RFC 8441 WebSocket over HTTP/2 has its own opt-in, shares that WebSocket
+  capacity, translates the opening handshake to local HTTP/1.1, and isolates
+  upgraded streams through graceful GOAWAY/drain.
   HTTP/1.1 CONNECT is separately opt-in and route-bound: exact authority
   hostname/port, Host, and SNI must agree before a capped, idle-bounded opaque
   tunnel begins. It never acts as an arbitrary forward proxy.
@@ -275,6 +278,7 @@ and Definition of Done.
 | 45 _(complete)_ | bounded HTTP/1.1 WebSocket upgrade ingress |
 | 46 _(complete)_ | bounded route-bound HTTP/1.1 CONNECT ingress |
 | 47 _(complete)_ | bounded route-bound classic HTTP/2 CONNECT ingress |
+| 48 _(complete)_ | bounded route-bound RFC 8441 WebSocket ingress |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
