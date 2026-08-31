@@ -109,12 +109,16 @@
   upgraded h2 stream, the same route-bound authority policy and shared CONNECT
   admission, plus per-connection bounded relay ownership, idle enforcement,
   fixed telemetry, stream isolation, and GOAWAY/drain coverage.
+  Session 48 added independently opt-in RFC 8441 WebSocket with conditional
+  extended-CONNECT advertisement, strict request validation, generated local
+  HTTP/1.1 key/accept translation, shared WebSocket admission, and bounded h2
+  relay/idle/drain ownership.
 - **Tracking:** HTTP/1.1 reuse resolved in Session 34 and HTTP/2 resolved in
   Session 44. HTTP/1.1 WebSocket upgrade resolved in Session 45. General
   route-bound HTTP/1.1 CONNECT is resolved in Session 46 and classic route-bound
-  HTTP/2 CONNECT in Session 47. Arbitrary forward proxying, RFC 8441 extended
-  CONNECT/WebSocket, and extension negotiation remain outside the implemented
-  policy as separate surfaces.
+  HTTP/2 CONNECT in Session 47 and RFC 8441 WebSocket in Session 48. Arbitrary
+  forward proxying, non-WebSocket extended CONNECT, and WebSocket extension
+  negotiation remain outside the implemented policy as separate surfaces.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

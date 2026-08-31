@@ -476,7 +476,7 @@ struct OperationsCounterSnapshot {
 enum IngressMetricSnapshot {
     Raw(Option<RawIngressRouteStatus>),
     Https {
-        status: HttpIngressStatus,
+        status: Box<HttpIngressStatus>,
         route_health: Option<HttpsRouteSourceHealth>,
         route_version: u64,
         route_count: usize,
@@ -510,7 +510,7 @@ async fn collect_metrics(
             IngressMetricSnapshot::Raw(manager.get_route(*route_id).await.ok())
         }
         EdgeIngressMetricsSource::Https { status, routes } => IngressMetricSnapshot::Https {
-            status: status.snapshot(),
+            status: Box::new(status.snapshot()),
             route_health: routes.dynamic_source_health(),
             route_version: routes.dynamic_catalog_version().unwrap_or(0),
             route_count: routes.len(),
@@ -643,7 +643,7 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
             route_count,
         } => render_https_metrics(
             &mut output,
-            status,
+            *status,
             route_health,
             route_version,
             route_count,
@@ -901,6 +901,31 @@ fn render_https_metrics(
             status.websocket_idle_timeouts,
         ),
         (
+            "tunnelproxy_edge_https_http2_websocket_sessions_total",
+            "counter",
+            status.accepted_http2_websocket_sessions,
+        ),
+        (
+            "tunnelproxy_edge_https_http2_websocket_rejections_total",
+            "counter",
+            status.rejected_http2_websocket_sessions,
+        ),
+        (
+            "tunnelproxy_edge_https_active_http2_websocket_sessions",
+            "gauge",
+            status.active_http2_websocket_sessions as u64,
+        ),
+        (
+            "tunnelproxy_edge_https_peak_active_http2_websocket_sessions",
+            "gauge",
+            status.peak_active_http2_websocket_sessions as u64,
+        ),
+        (
+            "tunnelproxy_edge_https_http2_websocket_idle_timeouts_total",
+            "counter",
+            status.http2_websocket_idle_timeouts,
+        ),
+        (
             "tunnelproxy_edge_https_connect_sessions_total",
             "counter",
             status.accepted_connect_sessions,
@@ -1121,6 +1146,11 @@ mod tests {
                 active_websocket_sessions: 2,
                 peak_active_websocket_sessions: 4,
                 websocket_idle_timeouts: 1,
+                accepted_http2_websocket_sessions: 12,
+                rejected_http2_websocket_sessions: 13,
+                active_http2_websocket_sessions: 1,
+                peak_active_http2_websocket_sessions: 3,
+                http2_websocket_idle_timeouts: 4,
                 accepted_connect_sessions: 8,
                 rejected_connect_sessions: 9,
                 active_connect_sessions: 3,
@@ -1146,6 +1176,11 @@ mod tests {
         assert!(https.contains("tunnelproxy_edge_https_active_websocket_sessions 2\n"));
         assert!(https.contains("tunnelproxy_edge_https_peak_active_websocket_sessions 4\n"));
         assert!(https.contains("tunnelproxy_edge_https_websocket_idle_timeouts_total 1\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_websocket_sessions_total 12\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_websocket_rejections_total 13\n"));
+        assert!(https.contains("tunnelproxy_edge_https_active_http2_websocket_sessions 1\n"));
+        assert!(https.contains("tunnelproxy_edge_https_peak_active_http2_websocket_sessions 3\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_websocket_idle_timeouts_total 4\n"));
         assert!(https.contains("tunnelproxy_edge_https_connect_sessions_total 8\n"));
         assert!(https.contains("tunnelproxy_edge_https_connect_rejections_total 9\n"));
         assert!(https.contains("tunnelproxy_edge_https_active_connect_sessions 3\n"));

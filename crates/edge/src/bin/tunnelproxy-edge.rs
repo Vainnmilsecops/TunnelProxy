@@ -61,6 +61,7 @@ Options:
   --http2-keepalive-interval-ms <ms> HTTP/2 ping interval (default 30000)
   --http2-keepalive-timeout-ms <ms> HTTP/2 ping timeout (default 10000)
   --enable-websocket-upgrade       opt in to bounded HTTP/1.1 WebSocket upgrades
+  --enable-http2-websocket         opt in to bounded RFC 8441 WebSocket over HTTP/2
   --max-websocket-sessions <usize> WebSocket session limit (default 32)
   --websocket-idle-timeout-ms <ms> WebSocket idle deadline (default 60000)
   --enable-connect                 opt in to route-bound HTTP/1.1 CONNECT
@@ -350,6 +351,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         https_route_server = ?parsed.https_route_server,
         http2_enabled = parsed.enable_http2,
         websocket_enabled = parsed.enable_websocket_upgrade,
+        http2_websocket_enabled = parsed.enable_http2_websocket,
         connect_enabled = parsed.enable_connect,
         http2_connect_enabled = parsed.enable_http2_connect,
         agent_id = %parsed.agent_id,
@@ -442,6 +444,7 @@ struct ParsedArgs {
     http2_keep_alive_timeout: Duration,
     http2_options_present: bool,
     enable_websocket_upgrade: bool,
+    enable_http2_websocket: bool,
     max_websocket_sessions: usize,
     websocket_idle_timeout: Duration,
     websocket_options_present: bool,
@@ -526,6 +529,7 @@ impl Default for ParsedArgs {
             http2_keep_alive_timeout: Duration::from_secs(10),
             http2_options_present: false,
             enable_websocket_upgrade: false,
+            enable_http2_websocket: false,
             max_websocket_sessions: 32,
             websocket_idle_timeout: Duration::from_secs(60),
             websocket_options_present: false,
@@ -593,6 +597,7 @@ enum ArgError {
     HttpsRouteReloadWithoutServer,
     Http2OptionsWithoutOptIn,
     Http2ConnectWithoutHttp2,
+    Http2WebSocketWithoutHttp2,
     WebSocketOptionsWithoutOptIn,
     ConnectOptionsWithoutOptIn,
     IngressModeConflict,
@@ -644,6 +649,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::Http2ConnectWithoutHttp2 => {
                 f.write_str("--enable-http2-connect requires --enable-http2")
+            }
+            Self::Http2WebSocketWithoutHttp2 => {
+                f.write_str("--enable-http2-websocket requires --enable-http2")
             }
             Self::WebSocketOptionsWithoutOptIn => {
                 f.write_str("WebSocket tuning options require --enable-websocket-upgrade")
@@ -833,6 +841,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--enable-websocket-upgrade" => {
                 parsed.enable_websocket_upgrade = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--enable-http2-websocket" => {
+                parsed.enable_http2_websocket = true;
                 parsed.https_options_present = true;
                 index += 1;
             }
@@ -1075,7 +1088,13 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.enable_http2_connect && !parsed.enable_http2 {
         return Err(ArgError::Http2ConnectWithoutHttp2);
     }
-    if parsed.websocket_options_present && !parsed.enable_websocket_upgrade {
+    if parsed.enable_http2_websocket && !parsed.enable_http2 {
+        return Err(ArgError::Http2WebSocketWithoutHttp2);
+    }
+    if parsed.websocket_options_present
+        && !parsed.enable_websocket_upgrade
+        && !parsed.enable_http2_websocket
+    {
         return Err(ArgError::WebSocketOptionsWithoutOptIn);
     }
     if parsed.connect_options_present && !parsed.enable_connect && !parsed.enable_http2_connect {
@@ -1645,12 +1664,14 @@ async fn load_https_configuration(
             keep_alive_interval: parsed.http2_keep_alive_interval,
             keep_alive_timeout: parsed.http2_keep_alive_timeout,
         }),
-        websocket: parsed
-            .enable_websocket_upgrade
-            .then_some(WebSocketIngressConfig {
+        websocket: (parsed.enable_websocket_upgrade || parsed.enable_http2_websocket).then_some(
+            WebSocketIngressConfig {
+                enable_http1: parsed.enable_websocket_upgrade,
+                enable_http2: parsed.enable_http2_websocket,
                 max_concurrent_sessions: parsed.max_websocket_sessions,
                 idle_timeout: parsed.websocket_idle_timeout,
-            }),
+            },
+        ),
         connect: (parsed.enable_connect || parsed.enable_http2_connect).then_some(
             ConnectIngressConfig {
                 enable_http1: parsed.enable_connect,
@@ -2023,6 +2044,7 @@ mod tests {
             "--http2-keepalive-timeout-ms",
             "1000",
             "--enable-websocket-upgrade",
+            "--enable-http2-websocket",
             "--max-websocket-sessions",
             "8",
             "--websocket-idle-timeout-ms",
@@ -2069,6 +2091,7 @@ mod tests {
         assert_eq!(parsed.http2_keep_alive_interval, Duration::from_secs(4));
         assert_eq!(parsed.http2_keep_alive_timeout, Duration::from_secs(1));
         assert!(parsed.enable_websocket_upgrade);
+        assert!(parsed.enable_http2_websocket);
         assert_eq!(parsed.max_websocket_sessions, 8);
         assert_eq!(parsed.websocket_idle_timeout, Duration::from_millis(2500));
         assert!(parsed.enable_connect);
@@ -2125,6 +2148,20 @@ mod tests {
             parse_args(&args(&["--enable-http2-connect"])),
             Err(ArgError::Http2ConnectWithoutHttp2)
         );
+        assert_eq!(
+            parse_args(&args(&["--enable-http2-websocket"])),
+            Err(ArgError::Http2WebSocketWithoutHttp2)
+        );
+        let http2_websocket = parse_args(&args(&[
+            "--enable-http2",
+            "--enable-http2-websocket",
+            "--max-websocket-sessions",
+            "2",
+        ]))
+        .unwrap();
+        assert!(http2_websocket.enable_http2_websocket);
+        assert!(!http2_websocket.enable_websocket_upgrade);
+        assert_eq!(http2_websocket.max_websocket_sessions, 2);
         let http2_connect = parse_args(&args(&[
             "--enable-http2",
             "--enable-http2-connect",

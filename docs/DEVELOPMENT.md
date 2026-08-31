@@ -1076,8 +1076,43 @@ Client DATA becomes opaque tunnel bytes only after cached-route, rate, and
 shared CONNECT admission succeeds. Half-close and reset stay scoped to that h2
 stream; multiple accepted CONNECT streams may share one connection.
 
-The Edge does not advertise RFC 8441 extended CONNECT and rejects a
-`:protocol` request. It also does not enable WebSocket over HTTP/2, arbitrary
-forward-proxy dialing, h2c, or HTTP/3. Removing `--enable-http2-connect`
+The classic CONNECT flag does not advertise RFC 8441 extended CONNECT; that
+requires the separate HTTP/2 WebSocket policy below. It also does not enable
+arbitrary forward-proxy dialing, h2c, or HTTP/3. Removing `--enable-http2-connect`
 restores the previous HTTP/2 behavior without changing route, Agent, or Tunnel
 Protocol state.
+
+## 33. Enabling bounded RFC 8441 WebSocket at Edge
+
+RFC 8441 is a separate policy layered on bounded HTTP/2. It shares WebSocket
+capacity and idle tuning with the HTTP/1.1 upgrade surface:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-route-server control.example.test:7201 \
+  --public-tls-cert wildcard.pem \
+  --public-tls-key wildcard-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --enable-http2 \
+  --max-http2-concurrent-streams 32 \
+  --enable-http2-websocket \
+  --max-websocket-sessions 16 \
+  --websocket-idle-timeout-ms 60000 \
+  <snapshot, route, and Agent mTLS options>
+```
+
+The public request must use extended CONNECT with `:protocol = websocket`,
+`:scheme = https`, a path, exact authority/SNI agreement, version 13, and no
+key/accept, connection-specific, body-framing, or extension fields. Edge
+generates the HTTP/1.1 WebSocket key used only for the sanitized local GET
+Upgrade handshake, validates the local `101`, then returns HTTP/2 `200` and
+relays frames opaquely.
+
+HTTP/1.1 and HTTP/2 WebSockets may be enabled independently or together. When
+both are enabled they share one session cap; HTTP/2 streams also remain bounded
+by the connection's normal concurrent-stream limit and GOAWAY/drain ownership.
+This does not enable extension negotiation, non-WebSocket extended CONNECT,
+h2c, HTTP/3, destination dialing, or any Agent/Tunnel Protocol change.
