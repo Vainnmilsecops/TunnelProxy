@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Route-Bound RFC 8441 WebSocket Ingress** (Session 48).
+**Bounded Expiring Signed Access URLs for Public HTTPS** (Session 49).
 
 ## Completed
 
@@ -527,11 +527,12 @@
   The canonical `tunnelproxy http <port>` executable and strict path-based
   local config are implemented.
 - Arbitrary forward-proxy CONNECT, non-WebSocket extended CONNECT, WebSocket
-  extension negotiation, HTTP/3, custom-domain administration, and signed
-  access URLs. Bounded route-bound HTTP/1.1/classic HTTP/2 CONNECT plus
-  HTTP/1.1/RFC 8441 WebSocket ingress are implemented; ordinary request
-  forwarding and the WebSocket handshake to the local application remain
-  HTTP/1.1.
+  extension negotiation, HTTP/3, and custom-domain administration. Bounded
+  route-bound HTTP/1.1/classic HTTP/2 CONNECT plus HTTP/1.1/RFC 8441 WebSocket
+  ingress are implemented. Ed25519 signed access URLs now protect ordinary
+  HTTP/1.1/HTTP/2 plus both WebSocket forms; classic CONNECT is intentionally
+  incompatible because it has no query component. Ordinary request forwarding
+  and the WebSocket handshake to the local application remain HTTP/1.1.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -544,7 +545,7 @@
 
 ## Next planned session
 
-Session 49 has not been selected. DNS/public-certificate automation, signed
-access URLs, and multi-edge ownership remain separate scopes. Collect
+Session 50 has not been selected. DNS/public-certificate automation and
+multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

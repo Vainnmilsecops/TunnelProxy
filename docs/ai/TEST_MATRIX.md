@@ -12,6 +12,7 @@
 
 | Capability                                | Unit | Integration | E2E | Notes                                                                                                                       |
 | ----------------------------------------- | ---- | ----------- | --- | --------------------------------------------------------------------------------------------------------------------------- |
+| Expiring signed access URLs               | ✅   | ✅          | —   | Strict codec/key-ring tests cover tampering, host/key binding, lifetime/skew and size/cardinality bounds; offline CLI integration generates and signs; real TLS proves fail-closed `401`, no-store, valid admission, and `tp_access` stripping before local forwarding. |
 | Canonical Agent CLI and local config      | unit | integration | —   | Unit tests cover strict schema, duplicate/unknown/version rejection, 64 KiB bounds, platform path precedence, relative paths, and CLI layering; subprocess tests cover canonical help, offline TLS validation, no network connection, stable stdout, exit 2, and secret-safe errors. |
 | Workspace compiles and lints              | ✅   | —           | —   | Foundation checks; Session 04 keeps networking deps and lint-clean code.                                                    |
 | Reproducible cross-platform CI             | ✅   | ✅          | —   | GitHub Actions enforces locked format/check/Clippy on Ubuntu, test/build on Ubuntu and Windows MSVC, plus a Rust 1.75 MSRV check. |

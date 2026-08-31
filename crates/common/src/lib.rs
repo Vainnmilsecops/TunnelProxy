@@ -17,6 +17,7 @@ mod credential_bundle;
 mod multiplex_telemetry;
 mod process_logging;
 mod public_hostname;
+mod signed_access;
 mod tls_reload;
 
 pub use credential_bundle::{
@@ -43,6 +44,13 @@ pub use process_logging::{
 
 pub use public_hostname::{
     PublicHostname, PublicHostnameError, MAX_DNS_LABEL_BYTES, MAX_PUBLIC_HOSTNAME_BYTES,
+};
+
+pub use signed_access::{
+    generate_signed_access_keypair, load_signed_access_key_ring, load_signed_access_signer,
+    SignedAccessClaims, SignedAccessError, SignedAccessKeyRing, SignedAccessSigner,
+    MAX_SIGNED_ACCESS_KEYS, MAX_SIGNED_ACCESS_KEY_FILE_BYTES, MAX_SIGNED_ACCESS_TOKEN_BYTES,
+    SIGNED_ACCESS_QUERY_PARAMETER,
 };
 
 pub use tls_reload::{

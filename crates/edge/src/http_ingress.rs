@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -30,7 +30,10 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
-use tunnelproxy_common::{RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId};
+use tunnelproxy_common::{
+    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, SignedAccessError,
+    SignedAccessKeyRing, TunnelId, SIGNED_ACCESS_QUERY_PARAMETER,
+};
 use tunnelproxy_control_plane::{
     HttpsRouteCatalogSubscription, HttpsRouteSourceHealth, HttpsRouteStatus,
 };
@@ -56,6 +59,8 @@ pub const MAX_HTTP_REQUESTS_PER_CONNECTION: usize = 1024;
 pub const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 128;
 pub const MAX_WEBSOCKET_SESSIONS: usize = 1024;
 pub const MAX_CONNECT_SESSIONS: usize = 1024;
+pub const MAX_SIGNED_ACCESS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const MAX_SIGNED_ACCESS_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 const UPGRADED_BUFFER_BYTES: usize = 16 * 1024;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -102,6 +107,13 @@ pub struct ConnectIngressConfig {
     pub max_concurrent_sessions: usize,
     pub idle_timeout: Duration,
     pub authority_port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignedAccessIngressConfig {
+    pub key_ring: SignedAccessKeyRing,
+    pub maximum_ttl: Duration,
+    pub clock_skew: Duration,
 }
 
 impl Default for ConnectIngressConfig {
@@ -298,6 +310,7 @@ pub struct HttpIngressConfig {
     pub http2: Option<Http2IngressConfig>,
     pub websocket: Option<WebSocketIngressConfig>,
     pub connect: Option<ConnectIngressConfig>,
+    pub signed_access: Option<SignedAccessIngressConfig>,
     pub request_rate_limit: HttpRequestRateLimitConfig,
     pub header_read_timeout: Duration,
     pub request_timeout: Duration,
@@ -399,6 +412,28 @@ impl HttpIngressConfig {
                 return Err(HttpIngressConfigError::ZeroConnectAuthorityPort);
             }
         }
+        if let Some(signed_access) = &self.signed_access {
+            if signed_access.key_ring.is_empty() {
+                return Err(HttpIngressConfigError::EmptySignedAccessKeyRing);
+            }
+            if signed_access.maximum_ttl.is_zero() {
+                return Err(HttpIngressConfigError::ZeroSignedAccessMaximumTtl);
+            }
+            if signed_access.maximum_ttl > MAX_SIGNED_ACCESS_TTL {
+                return Err(HttpIngressConfigError::SignedAccessMaximumTtlTooLarge);
+            }
+            if signed_access.clock_skew > MAX_SIGNED_ACCESS_CLOCK_SKEW {
+                return Err(HttpIngressConfigError::SignedAccessClockSkewTooLarge);
+            }
+            if signed_access.maximum_ttl.subsec_nanos() != 0
+                || signed_access.clock_skew.subsec_nanos() != 0
+            {
+                return Err(HttpIngressConfigError::SubsecondSignedAccessPolicy);
+            }
+            if self.connect.is_some() {
+                return Err(HttpIngressConfigError::SignedAccessWithConnect);
+            }
+        }
         self.request_rate_limit
             .validate()
             .map_err(HttpIngressConfigError::InvalidRequestRateLimit)?;
@@ -443,6 +478,12 @@ pub enum HttpIngressConfigError {
     ConnectSessionsExceedConnections,
     ZeroConnectIdleTimeout,
     ZeroConnectAuthorityPort,
+    EmptySignedAccessKeyRing,
+    ZeroSignedAccessMaximumTtl,
+    SignedAccessMaximumTtlTooLarge,
+    SignedAccessClockSkewTooLarge,
+    SubsecondSignedAccessPolicy,
+    SignedAccessWithConnect,
     InvalidRequestRateLimit(HttpRequestRateLimitConfigError),
     InvalidDuplexCapacity,
     ZeroHeaderTimeout,
@@ -528,6 +569,24 @@ impl std::fmt::Display for HttpIngressConfigError {
             Self::ZeroConnectAuthorityPort => {
                 f.write_str("CONNECT authority port must be greater than zero")
             }
+            Self::EmptySignedAccessKeyRing => {
+                f.write_str("signed-access public-key ring must not be empty")
+            }
+            Self::ZeroSignedAccessMaximumTtl => {
+                f.write_str("signed-access maximum TTL must be greater than zero")
+            }
+            Self::SignedAccessMaximumTtlTooLarge => {
+                f.write_str("signed-access maximum TTL cannot exceed seven days")
+            }
+            Self::SignedAccessClockSkewTooLarge => {
+                f.write_str("signed-access clock skew cannot exceed five minutes")
+            }
+            Self::SubsecondSignedAccessPolicy => {
+                f.write_str("signed-access TTL and clock skew must use whole seconds")
+            }
+            Self::SignedAccessWithConnect => {
+                f.write_str("signed-access URLs cannot be combined with CONNECT ingress")
+            }
             Self::InvalidRequestRateLimit(error) => {
                 write!(f, "invalid HTTP request rate limit: {error}")
             }
@@ -581,6 +640,10 @@ pub struct HttpIngressOutcome {
     pub global_rate_limit_rejections: u64,
     pub per_ip_rate_limit_rejections: u64,
     pub rate_limit_peer_capacity_rejections: u64,
+    pub accepted_signed_access_requests: u64,
+    pub missing_signed_access_rejections: u64,
+    pub invalid_signed_access_rejections: u64,
+    pub expired_signed_access_rejections: u64,
     pub tracked_rate_limit_peers: usize,
     pub peak_tracked_rate_limit_peers: usize,
     pub shutdown: RuntimeShutdownOutcome,
@@ -650,6 +713,10 @@ struct HttpIngressCounters {
     global_rate_limit_rejections: AtomicU64,
     per_ip_rate_limit_rejections: AtomicU64,
     rate_limit_peer_capacity_rejections: AtomicU64,
+    accepted_signed_access_requests: AtomicU64,
+    missing_signed_access_rejections: AtomicU64,
+    invalid_signed_access_rejections: AtomicU64,
+    expired_signed_access_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -691,6 +758,10 @@ pub struct HttpIngressStatus {
     pub global_rate_limit_rejections: u64,
     pub per_ip_rate_limit_rejections: u64,
     pub rate_limit_peer_capacity_rejections: u64,
+    pub accepted_signed_access_requests: u64,
+    pub missing_signed_access_rejections: u64,
+    pub invalid_signed_access_rejections: u64,
+    pub expired_signed_access_rejections: u64,
     pub tracked_rate_limit_peers: usize,
     pub peak_tracked_rate_limit_peers: usize,
 }
@@ -816,6 +887,22 @@ impl HttpIngressStatusHandle {
             rate_limit_peer_capacity_rejections: self
                 .counters
                 .rate_limit_peer_capacity_rejections
+                .load(Ordering::Relaxed),
+            accepted_signed_access_requests: self
+                .counters
+                .accepted_signed_access_requests
+                .load(Ordering::Relaxed),
+            missing_signed_access_rejections: self
+                .counters
+                .missing_signed_access_rejections
+                .load(Ordering::Relaxed),
+            invalid_signed_access_rejections: self
+                .counters
+                .invalid_signed_access_rejections
+                .load(Ordering::Relaxed),
+            expired_signed_access_rejections: self
+                .counters
+                .expired_signed_access_rejections
                 .load(Ordering::Relaxed),
             tracked_rate_limit_peers: rate.tracked_peer_ips,
             peak_tracked_rate_limit_peers: rate.peak_tracked_peer_ips,
@@ -997,6 +1084,10 @@ impl HttpIngressRuntime {
             global_rate_limit_rejections: status.global_rate_limit_rejections,
             per_ip_rate_limit_rejections: status.per_ip_rate_limit_rejections,
             rate_limit_peer_capacity_rejections: status.rate_limit_peer_capacity_rejections,
+            accepted_signed_access_requests: status.accepted_signed_access_requests,
+            missing_signed_access_rejections: status.missing_signed_access_rejections,
+            invalid_signed_access_rejections: status.invalid_signed_access_rejections,
+            expired_signed_access_rejections: status.expired_signed_access_rejections,
             tracked_rate_limit_peers: status.tracked_rate_limit_peers,
             peak_tracked_rate_limit_peers: status.peak_tracked_rate_limit_peers,
             shutdown,
@@ -1447,7 +1538,7 @@ async fn proxy_request(
     let connect_intent = request.method() == Method::CONNECT
         && request.extensions().get::<hyper::ext::Protocol>().is_none();
     let http2_connect_intent = connect_intent && request.version() == Version::HTTP_2;
-    let outcome = prepare_request(&mut request, peer, server_name.as_ref(), &config);
+    let outcome = prepare_request(&mut request, server_name.as_ref(), &config);
     let PreparedRequest {
         hostname,
         tunnel_id,
@@ -1527,6 +1618,29 @@ async fn proxy_request(
             }
         }
         return Ok(rate_limited_response(rejection.retry_after()));
+    }
+    if let Some(signed_access) = &config.signed_access {
+        if let Err(rejection) = authorize_signed_access(&mut request, &hostname, signed_access) {
+            counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            match rejection.reason {
+                "signed_access_missing" => &counters.missing_signed_access_rejections,
+                "signed_access_expired" => &counters.expired_signed_access_rejections,
+                _ => &counters.invalid_signed_access_rejections,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+            record_protocol_rejection(&counters, &kind);
+            warn!(%peer, %hostname, reason = rejection.reason, event = "https_signed_access_rejected");
+            return Ok(unauthorized_response());
+        }
+        counters
+            .accepted_signed_access_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if let Err(rejection) = finalize_request(&mut request, peer, &hostname, &kind) {
+        counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        record_protocol_rejection(&counters, &kind);
+        warn!(%peer, %hostname, reason = rejection.reason, event = "https_request_rejected");
+        return Ok(error_response(rejection.status));
     }
     counters.admitted_requests.fetch_add(1, Ordering::Relaxed);
 
@@ -2188,6 +2302,7 @@ where
     OpaqueRelayOutcome::Completed
 }
 
+#[derive(Debug)]
 struct RequestRejection {
     status: StatusCode,
     reason: &'static str,
@@ -2231,7 +2346,6 @@ struct PreparedRequest {
 
 fn prepare_request(
     request: &mut Request<Incoming>,
-    peer: SocketAddr,
     server_name: Option<&HttpHostname>,
     config: &HttpIngressConfig,
 ) -> Result<PreparedRequest, RequestRejection> {
@@ -2365,28 +2479,133 @@ fn prepare_request(
         status: StatusCode::NOT_FOUND,
         reason: "unknown_host",
     })?;
-    if !matches!(&kind, PreparedRequestKind::Connect(_)) {
-        sanitize_request_headers(request, peer.ip(), &hostname, &kind)?;
-        let path = request
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-        *request.uri_mut() =
-            Uri::builder()
-                .path_and_query(path)
-                .build()
-                .map_err(|_| RequestRejection {
-                    status: StatusCode::BAD_REQUEST,
-                    reason: "invalid_request_target",
-                })?;
-        *request.version_mut() = Version::HTTP_11;
-    }
     Ok(PreparedRequest {
         hostname,
         tunnel_id,
         kind,
     })
+}
+
+fn authorize_signed_access<B>(
+    request: &mut Request<B>,
+    hostname: &HttpHostname,
+    config: &SignedAccessIngressConfig,
+) -> Result<(), RequestRejection> {
+    let query = request.uri().query().ok_or(RequestRejection {
+        status: StatusCode::UNAUTHORIZED,
+        reason: "signed_access_missing",
+    })?;
+    let mut token = None;
+    let mut retained = Vec::new();
+    for parameter in query.split('&') {
+        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        if name == SIGNED_ACCESS_QUERY_PARAMETER {
+            if value.is_empty() || token.replace(value).is_some() {
+                return Err(RequestRejection {
+                    status: StatusCode::UNAUTHORIZED,
+                    reason: "signed_access_malformed",
+                });
+            }
+        } else {
+            retained.push(parameter);
+        }
+    }
+    let token = token.ok_or(RequestRejection {
+        status: StatusCode::UNAUTHORIZED,
+        reason: "signed_access_missing",
+    })?;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RequestRejection {
+            status: StatusCode::UNAUTHORIZED,
+            reason: "signed_access_clock",
+        })?
+        .as_secs();
+    config
+        .key_ring
+        .verify(
+            token,
+            hostname,
+            now_unix,
+            config.maximum_ttl.as_secs(),
+            config.clock_skew.as_secs(),
+        )
+        .map_err(|error| RequestRejection {
+            status: StatusCode::UNAUTHORIZED,
+            reason: signed_access_rejection_reason(error),
+        })?;
+
+    let mut path_and_query = request.uri().path().to_owned();
+    if !retained.is_empty() {
+        path_and_query.push('?');
+        path_and_query.push_str(&retained.join("&"));
+    }
+    let mut parts = request.uri().clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().map_err(|_| RequestRejection {
+        status: StatusCode::BAD_REQUEST,
+        reason: "invalid_request_target",
+    })?);
+    *request.uri_mut() = Uri::from_parts(parts).map_err(|_| RequestRejection {
+        status: StatusCode::BAD_REQUEST,
+        reason: "invalid_request_target",
+    })?;
+    Ok(())
+}
+
+fn signed_access_rejection_reason(error: SignedAccessError) -> &'static str {
+    match error {
+        SignedAccessError::Expired
+        | SignedAccessError::NotYetValid
+        | SignedAccessError::LifetimeTooLong
+        | SignedAccessError::InvalidLifetime => "signed_access_expired",
+        SignedAccessError::MalformedToken => "signed_access_malformed",
+        _ => "signed_access_invalid",
+    }
+}
+
+fn finalize_request(
+    request: &mut Request<Incoming>,
+    peer: SocketAddr,
+    hostname: &HttpHostname,
+    kind: &PreparedRequestKind,
+) -> Result<(), RequestRejection> {
+    if matches!(kind, PreparedRequestKind::Connect(_)) {
+        return Ok(());
+    }
+    sanitize_request_headers(request, peer.ip(), hostname, kind)?;
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    *request.uri_mut() =
+        Uri::builder()
+            .path_and_query(path)
+            .build()
+            .map_err(|_| RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "invalid_request_target",
+            })?;
+    *request.version_mut() = Version::HTTP_11;
+    Ok(())
+}
+
+fn record_protocol_rejection(counters: &HttpIngressCounters, kind: &PreparedRequestKind) {
+    if matches!(kind, PreparedRequestKind::WebSocket(_)) {
+        counters
+            .rejected_websocket_upgrades
+            .fetch_add(1, Ordering::Relaxed);
+        if is_http2_websocket(kind) {
+            counters
+                .rejected_http2_websocket_sessions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if matches!(kind, PreparedRequestKind::Connect(_)) {
+        counters
+            .rejected_connect_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn validate_connect_request(
@@ -2964,6 +3183,15 @@ fn error_response(status: StatusCode) -> Response<ProxyBody> {
         .expect("static error response is valid")
 }
 
+fn unauthorized_response() -> Response<ProxyBody> {
+    let mut response = error_response(StatusCode::UNAUTHORIZED);
+    response.headers_mut().insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 fn rate_limited_response(retry_after: Duration) -> Response<ProxyBody> {
     let status = StatusCode::TOO_MANY_REQUESTS;
     let message = status.canonical_reason().unwrap_or("request rejected");
@@ -3225,6 +3453,7 @@ mod tests {
             http2: None,
             websocket: None,
             connect: None,
+            signed_access: None,
             request_rate_limit: HttpRequestRateLimitConfig::default(),
             header_read_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
@@ -3232,6 +3461,25 @@ mod tests {
             shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
         };
         assert!(config.validate().is_ok());
+        let cap_signer =
+            tunnelproxy_common::SignedAccessSigner::from_private_key(2, [2; 32]).unwrap();
+        config.signed_access = Some(SignedAccessIngressConfig {
+            key_ring: cap_signer.public_key_ring(),
+            maximum_ttl: MAX_SIGNED_ACCESS_TTL + Duration::from_secs(1),
+            clock_skew: Duration::ZERO,
+        });
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::SignedAccessMaximumTtlTooLarge)
+        );
+        let policy = config.signed_access.as_mut().unwrap();
+        policy.maximum_ttl = Duration::from_secs(60);
+        policy.clock_skew = MAX_SIGNED_ACCESS_CLOCK_SKEW + Duration::from_secs(1);
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::SignedAccessClockSkewTooLarge)
+        );
+        config.signed_access = None;
         config.max_requests_per_connection = 0;
         assert_eq!(
             config.validate(),
@@ -3358,6 +3606,17 @@ mod tests {
         );
         config.connect.as_mut().unwrap().enable_http2 = true;
         assert!(config.validate().is_ok());
+        let signer = tunnelproxy_common::SignedAccessSigner::from_private_key(1, [1; 32]).unwrap();
+        config.signed_access = Some(SignedAccessIngressConfig {
+            key_ring: signer.public_key_ring(),
+            maximum_ttl: Duration::from_secs(60),
+            clock_skew: Duration::ZERO,
+        });
+        assert_eq!(
+            config.validate(),
+            Err(HttpIngressConfigError::SignedAccessWithConnect)
+        );
+        config.signed_access = None;
         config.http2 = None;
         config.tls = PublicTlsConfig::from_pem(
             pki.cert.pem().as_bytes(),
@@ -3428,5 +3687,80 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(counters.request_timeouts.load(Ordering::Relaxed), 1);
         assert_eq!(counters.completed_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn signed_access_verification_strips_only_its_query_parameter() {
+        let signer = tunnelproxy_common::SignedAccessSigner::from_private_key(9, [17; 32]).unwrap();
+        let hostname = HttpHostname::new("demo.example.test").unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = signer.sign(&hostname, now - 1, now + 60).unwrap();
+        let config = SignedAccessIngressConfig {
+            key_ring: signer.public_key_ring(),
+            maximum_ttl: Duration::from_secs(120),
+            clock_skew: Duration::from_secs(1),
+        };
+        let mut request = Request::builder()
+            .uri(format!("/resource?a=1&tp_access={token}&b=2"))
+            .body(())
+            .unwrap();
+
+        authorize_signed_access(&mut request, &hostname, &config).unwrap();
+
+        assert_eq!(request.uri().path_and_query().unwrap(), "/resource?a=1&b=2");
+        assert!(!request.uri().to_string().contains(&token));
+    }
+
+    #[test]
+    fn signed_access_fails_closed_for_missing_duplicate_expired_and_wrong_host_tokens() {
+        let signer = tunnelproxy_common::SignedAccessSigner::from_private_key(9, [17; 32]).unwrap();
+        let hostname = HttpHostname::new("demo.example.test").unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let valid = signer.sign(&hostname, now - 1, now + 60).unwrap();
+        let expired = signer.sign(&hostname, now - 120, now - 60).unwrap();
+        let config = SignedAccessIngressConfig {
+            key_ring: signer.public_key_ring(),
+            maximum_ttl: Duration::from_secs(120),
+            clock_skew: Duration::ZERO,
+        };
+        for (uri, reason) in [
+            ("/resource".to_owned(), "signed_access_missing"),
+            (
+                format!("/resource?tp_access={valid}&tp_access={valid}"),
+                "signed_access_malformed",
+            ),
+            (
+                format!("/resource?tp_access={expired}"),
+                "signed_access_expired",
+            ),
+        ] {
+            let mut request = Request::builder().uri(uri).body(()).unwrap();
+            assert_eq!(
+                authorize_signed_access(&mut request, &hostname, &config)
+                    .unwrap_err()
+                    .reason,
+                reason
+            );
+        }
+        let mut wrong_host = Request::builder()
+            .uri(format!("/resource?tp_access={valid}"))
+            .body(())
+            .unwrap();
+        assert_eq!(
+            authorize_signed_access(
+                &mut wrong_host,
+                &HttpHostname::new("other.example.test").unwrap(),
+                &config,
+            )
+            .unwrap_err()
+            .reason,
+            "signed_access_invalid"
+        );
     }
 }

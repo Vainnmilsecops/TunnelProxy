@@ -1120,6 +1120,27 @@ retained and HTTP/2-specific accepted/rejected/current/peak/idle metrics add no
 hostname, peer, subprotocol, or payload labels. Agent behavior and Tunnel
 Protocol v2 are unchanged.
 
+### 2.47 Bounded expiring signed access URLs (Session 49)
+
+Signed access is a default-off admission layer for public HTTPS requests. An
+offline Ed25519 signer issues `tp_access=<payload>.<signature>` query tokens.
+The binary payload binds a version, non-zero key ID, canonical public hostname,
+issue time, and expiry. Edge loads only a bounded public-key ring (at most eight
+keys), enforces operator-configured maximum TTL and clock skew, and retains no
+per-token state; replay is therefore possible until expiry.
+
+Ingress admission is deliberately two phase. Edge first validates request
+shape, exact Host/authority/SNI agreement, and cached route identity, then runs
+the existing global/per-IP rate limiter. Only admitted work performs Ed25519
+verification. On success Edge removes exactly the `tp_access` query parameter,
+then sanitizes headers and translates to local HTTP/1.1. On failure it returns
+`401` with `Cache-Control: no-store` and never logs or echoes the token.
+
+The policy covers ordinary HTTP/1.1 and HTTP/2 plus HTTP/1.1 and RFC 8441
+WebSockets because all carry a path/query. It is configuration-incompatible
+with classic CONNECT, whose authority-form target has no query component. Raw
+TCP ingress and Tunnel Protocol v2 are unchanged.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

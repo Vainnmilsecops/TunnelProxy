@@ -377,3 +377,25 @@ selected TunnelId. Roll back one surface by removing its corresponding
 `--enable-connect` or `--enable-http2-connect` flag and restarting Edge.
 Existing HTTP/1.1, WebSocket, ordinary HTTP/2, route, TLS, and Tunnel Protocol
 state require no migration or rollback.
+
+## Signed access URL rollout and rollback
+
+Generate signing material offline, distribute only the public-key ring to Edge,
+and canary `--require-signed-access` on one HTTPS listener. Keep token TTLs well
+below the configured maximum and allow only the clock skew needed by measured
+host synchronization. Monitor:
+
+- `tunnelproxy_edge_https_signed_access_requests_total`
+- `tunnelproxy_edge_https_signed_access_missing_rejections_total`
+- `tunnelproxy_edge_https_signed_access_invalid_rejections_total`
+- `tunnelproxy_edge_https_signed_access_expired_rejections_total`
+- the existing global/per-IP rate-limit rejection counters
+
+Rate limiting precedes signature verification, so abusive invalid traffic is
+still subject to the configured buckets. A spike in expired rejections usually
+indicates stale links or clock drift; invalid rejections indicate corruption,
+wrong hostname/key, or tampering. Roll back by removing
+`--require-signed-access` and its key-ring/tuning flags, then restart Edge. Key
+rotation uses an overlapping public ring (maximum eight keys) while issuers
+move to the new non-zero key ID; live reload and pre-expiry revocation are not
+implemented.
