@@ -1389,3 +1389,28 @@ the listener, and retiring a key rejects its tokens on the next request after
 activation. Operators must wait out maximum TTL plus skew before retirement.
 Remote distribution, coordinated multi-edge rollout, HSM/KMS custody,
 stateful replay prevention, and individual-token revocation remain separate.
+
+## ADR-051 — Public reachability is an opt-in exact-route proof
+
+**Status:** Accepted (Session 51).
+
+**Context:** The managed HTTP stdout line previously proved durable hostname
+allocation and Agent registration, but could not distinguish working public
+DNS/TLS/routing from operator misconfiguration. A general health endpoint or a
+request forwarded to localhost would broaden attack surface, interfere with
+applications, and conflict with optional signed-access policy.
+
+**Decision:** Add a default-off Agent probe after registration. It sends a
+fresh bounded challenge over verified HTTPS to one fixed well-known path. Edge
+answers only after request-rate admission, exact Host/SNI route resolution, and
+live TunnelId lookup, using a domain-separated proof and `no-store`. This exact
+endpoint bypasses signed-access verification but never opens a tunnel stream.
+The Agent retries within finite attempt/total deadlines, trusts bundled public
+roots or one explicit bounded CA bundle, observes shutdown, and gates stdout.
+
+**Consequences:** Operators can make the one-line URL claim include public
+DNS, certificate, Edge, route, and live-tunnel evidence without changing
+Tunnel Protocol v2 or requiring the Agent to own a URL-signing key. Default
+startup stays compatible. Probe failure is terminal but preserves the durable
+hostname. DNS/certificate provisioning, distributed probing, OCSP/CRL policy,
+and multi-edge reachability remain separate concerns.

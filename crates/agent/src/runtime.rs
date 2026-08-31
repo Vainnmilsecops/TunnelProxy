@@ -178,6 +178,14 @@ pub struct AgentRuntimeStatus {
     pub disconnects: u64,
     pub connection_failures: u64,
     pub consecutive_failures: u64,
+    pub public_reachability_attempts: u64,
+    pub public_reachability_successes: u64,
+    pub public_reachability_timeouts: u64,
+    pub public_reachability_cancellations: u64,
+    pub public_reachability_tls_failures: u64,
+    pub public_reachability_connect_failures: u64,
+    pub public_reachability_route_failures: u64,
+    pub public_reachability_protocol_failures: u64,
 }
 
 impl AgentRuntimeStatus {
@@ -195,6 +203,14 @@ struct AgentRuntimeTelemetry {
     disconnects: AtomicU64,
     connection_failures: AtomicU64,
     consecutive_failures: AtomicU64,
+    public_reachability_attempts: AtomicU64,
+    public_reachability_successes: AtomicU64,
+    public_reachability_timeouts: AtomicU64,
+    public_reachability_cancellations: AtomicU64,
+    public_reachability_tls_failures: AtomicU64,
+    public_reachability_connect_failures: AtomicU64,
+    public_reachability_route_failures: AtomicU64,
+    public_reachability_protocol_failures: AtomicU64,
 }
 
 impl Default for AgentRuntimeTelemetry {
@@ -207,6 +223,14 @@ impl Default for AgentRuntimeTelemetry {
             disconnects: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
+            public_reachability_attempts: AtomicU64::new(0),
+            public_reachability_successes: AtomicU64::new(0),
+            public_reachability_timeouts: AtomicU64::new(0),
+            public_reachability_cancellations: AtomicU64::new(0),
+            public_reachability_tls_failures: AtomicU64::new(0),
+            public_reachability_connect_failures: AtomicU64::new(0),
+            public_reachability_route_failures: AtomicU64::new(0),
+            public_reachability_protocol_failures: AtomicU64::new(0),
         }
     }
 }
@@ -221,6 +245,26 @@ impl AgentRuntimeTelemetry {
             disconnects: self.disconnects.load(Ordering::Relaxed),
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
             consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+            public_reachability_attempts: self.public_reachability_attempts.load(Ordering::Relaxed),
+            public_reachability_successes: self
+                .public_reachability_successes
+                .load(Ordering::Relaxed),
+            public_reachability_timeouts: self.public_reachability_timeouts.load(Ordering::Relaxed),
+            public_reachability_cancellations: self
+                .public_reachability_cancellations
+                .load(Ordering::Relaxed),
+            public_reachability_tls_failures: self
+                .public_reachability_tls_failures
+                .load(Ordering::Relaxed),
+            public_reachability_connect_failures: self
+                .public_reachability_connect_failures
+                .load(Ordering::Relaxed),
+            public_reachability_route_failures: self
+                .public_reachability_route_failures
+                .load(Ordering::Relaxed),
+            public_reachability_protocol_failures: self
+                .public_reachability_protocol_failures
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -259,6 +303,53 @@ impl AgentRuntimeStatusHandle {
 
     pub fn transport_telemetry(&self) -> MultiplexTelemetrySnapshot {
         self.multiplex.snapshot()
+    }
+
+    pub(crate) fn record_public_reachability_success(&self, attempts: u64) {
+        self.telemetry
+            .public_reachability_attempts
+            .fetch_add(attempts, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_public_reachability_failure(
+        &self,
+        attempts: u64,
+        failure: Option<crate::PublicReachabilityFailureClass>,
+        cancelled: bool,
+    ) {
+        self.telemetry
+            .public_reachability_attempts
+            .fetch_add(attempts, Ordering::Relaxed);
+        if cancelled {
+            self.telemetry
+                .public_reachability_cancellations
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.telemetry
+            .public_reachability_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        match failure {
+            Some(crate::PublicReachabilityFailureClass::Tls) => {
+                &self.telemetry.public_reachability_tls_failures
+            }
+            Some(
+                crate::PublicReachabilityFailureClass::Resolve
+                | crate::PublicReachabilityFailureClass::Connect,
+            ) => &self.telemetry.public_reachability_connect_failures,
+            Some(crate::PublicReachabilityFailureClass::RouteUnavailable) => {
+                &self.telemetry.public_reachability_route_failures
+            }
+            Some(
+                crate::PublicReachabilityFailureClass::Http
+                | crate::PublicReachabilityFailureClass::InvalidProof,
+            )
+            | None => &self.telemetry.public_reachability_protocol_failures,
+        }
+        .fetch_add(1, Ordering::Relaxed);
     }
 }
 

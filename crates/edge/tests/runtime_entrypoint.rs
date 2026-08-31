@@ -31,7 +31,9 @@ use tunnelproxy_agent::{
     connect_registered_with_security, AgentError, AgentHostnameClient, AgentOperationsConfig,
     AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError,
     AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, RuntimeShutdownConfig,
+    AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, PublicReachabilityConfig,
+    PublicReachabilityError, PublicReachabilityFailureClass, PublicReachabilityProbe,
+    RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{
     generate_signed_access_keypair, load_signed_access_signer, merge_signed_access_key_rings,
@@ -974,6 +976,39 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     .await
     .expect("Agent did not become routable");
 
+    let wrong_pki = test_pki("demo.example.test");
+    let wrong_ca_probe = PublicReachabilityProbe::new(PublicReachabilityConfig {
+        hostname: HttpHostname::new("demo.example.test").unwrap(),
+        ca_pem: Some(wrong_pki.authority_pem.as_bytes().to_vec()),
+        total_timeout: Duration::from_millis(100),
+        attempt_timeout: Duration::from_millis(40),
+        retry_interval: Duration::from_millis(10),
+        server_addr_override: Some(https_addr),
+    })
+    .unwrap();
+    let (_, wrong_ca_signal) = shutdown_channel();
+    assert!(matches!(
+        wrong_ca_probe.verify_until_success(wrong_ca_signal).await,
+        Err(PublicReachabilityError::Timeout {
+            attempts: 2..,
+            last_failure: PublicReachabilityFailureClass::Tls,
+        })
+    ));
+
+    let probe = PublicReachabilityProbe::new(PublicReachabilityConfig {
+        hostname: HttpHostname::new("demo.example.test").unwrap(),
+        ca_pem: Some(public_pki.authority_pem.as_bytes().to_vec()),
+        total_timeout: Duration::from_secs(2),
+        attempt_timeout: Duration::from_secs(1),
+        retry_interval: Duration::from_millis(20),
+        server_addr_override: Some(https_addr),
+    })
+    .unwrap();
+    let (_, probe_signal) = shutdown_channel();
+    let probe_outcome = probe.verify_until_success(probe_signal).await.unwrap();
+    assert_eq!(probe_outcome.attempts, 1);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
     let connector = TlsConnector::from(raw_tls_client_config(
         &public_pki.authority_pem,
         None,
@@ -1134,12 +1169,15 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     let outcome = edge_task.await.unwrap().unwrap();
     assert_eq!(outcome.raw_addr, None);
     let https = outcome.https_ingress.unwrap();
-    assert_eq!(https.completed_requests, 1);
+    assert_eq!(https.completed_requests, 2);
     assert_eq!(https.rejected_requests, 5);
     assert_eq!(https.rejected_connect_sessions, 1);
     assert_eq!(https.accepted_signed_access_requests, 2);
     assert_eq!(https.missing_signed_access_rejections, 1);
     assert_eq!(https.global_rate_limit_rejections, 1);
+    assert_eq!(https.reachability_probe_requests, 1);
+    assert_eq!(https.successful_reachability_probes, 1);
+    assert_eq!(https.failed_reachability_probes, 0);
     local_task.await.unwrap();
     reload_trigger.shutdown();
     reload_task.await.unwrap();

@@ -18,6 +18,7 @@ mod generation_reload;
 mod multiplex_telemetry;
 mod process_logging;
 mod public_hostname;
+mod public_reachability;
 mod signed_access;
 mod signed_access_reload;
 mod tls_reload;
@@ -42,6 +43,12 @@ pub use process_logging::{
     init_process_logging, process_logging_snapshot, ProcessLogFormat, ProcessLoggingConfigError,
     ProcessLoggingGuard, ProcessLoggingSnapshot, LOG_BUFFER_CAPACITY_ENV, LOG_DRAIN_TIMEOUT_ENV,
     LOG_FORMAT_ENV, MAX_LOG_BUFFER_CAPACITY, MAX_LOG_DRAIN_TIMEOUT, MAX_LOG_EVENT_BYTES,
+};
+
+pub use public_reachability::{
+    PublicReachabilityChallenge, PublicReachabilityError, PUBLIC_REACHABILITY_CHALLENGE_HEADER,
+    PUBLIC_REACHABILITY_CHALLENGE_LENGTH, PUBLIC_REACHABILITY_PATH,
+    PUBLIC_REACHABILITY_PROOF_HEADER, PUBLIC_REACHABILITY_PROOF_LENGTH,
 };
 
 pub use public_hostname::{

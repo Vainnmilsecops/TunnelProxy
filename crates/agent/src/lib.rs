@@ -34,6 +34,7 @@ mod enrollment;
 mod hostname;
 mod multiplex;
 mod operations;
+mod public_reachability;
 mod runtime;
 mod tls;
 
@@ -57,6 +58,12 @@ pub use operations::{
     AgentOperationsConfig, AgentOperationsConfigError, AgentOperationsError,
     AgentOperationsOutcome, AgentOperationsRuntime, MAX_OPERATIONS_CONNECTIONS,
     MAX_OPERATIONS_HEADERS, MAX_OPERATIONS_HEADER_BYTES, MIN_OPERATIONS_HEADER_BYTES,
+};
+pub use public_reachability::{
+    PublicReachabilityConfig, PublicReachabilityError, PublicReachabilityFailureClass,
+    PublicReachabilityOutcome, PublicReachabilityProbe,
+    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
+    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_TIMEOUT,
 };
 pub use runtime::{
     AgentConnectionState, AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError,

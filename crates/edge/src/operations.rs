@@ -1071,6 +1071,21 @@ fn render_https_metrics(
             status.signed_access_keyring_reload_failures,
         ),
         (
+            "tunnelproxy_edge_https_reachability_probe_requests_total",
+            "counter",
+            status.reachability_probe_requests,
+        ),
+        (
+            "tunnelproxy_edge_https_reachability_probe_successes_total",
+            "counter",
+            status.successful_reachability_probes,
+        ),
+        (
+            "tunnelproxy_edge_https_reachability_probe_failures_total",
+            "counter",
+            status.failed_reachability_probes,
+        ),
+        (
             "tunnelproxy_edge_https_tracked_rate_limit_peers",
             "gauge",
             status.tracked_rate_limit_peers as u64,
@@ -1209,6 +1224,9 @@ mod tests {
                 signed_access_keyring_reload_failed: true,
                 signed_access_keyring_reload_successes: 19,
                 signed_access_keyring_reload_failures: 20,
+                reachability_probe_requests: 23,
+                successful_reachability_probes: 21,
+                failed_reachability_probes: 2,
                 ..HttpIngressStatus::default()
             },
             None,
@@ -1255,6 +1273,9 @@ mod tests {
             .contains("tunnelproxy_edge_https_signed_access_keyring_reload_successes_total 19\n"));
         assert!(https
             .contains("tunnelproxy_edge_https_signed_access_keyring_reload_failures_total 20\n"));
+        assert!(https.contains("tunnelproxy_edge_https_reachability_probe_requests_total 23\n"));
+        assert!(https.contains("tunnelproxy_edge_https_reachability_probe_successes_total 21\n"));
+        assert!(https.contains("tunnelproxy_edge_https_reachability_probe_failures_total 2\n"));
         assert!(!https.contains("hostname"));
     }
 

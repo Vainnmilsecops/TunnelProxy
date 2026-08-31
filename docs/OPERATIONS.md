@@ -409,3 +409,37 @@ the failure gauge/counter. Removing a key takes effect for new requests as
 soon as that generation activates, so wait at least the old token TTL plus
 clock skew before retiring it. Pre-expiry per-token revocation is not
 implemented.
+
+## Managed HTTP public reachability verification
+
+Canary the opt-in Agent flag after wildcard DNS and public TLS are already
+provisioned:
+
+```text
+tunnelproxy http 3000 --verify-public-reachability
+```
+
+The Agent waits for Protocol v2 registration, then connects to the allocated
+hostname on port 443, verifies SNI and the certificate chain, sends a fresh
+bounded challenge, and accepts only the exact no-store proof from Edge. Edge
+serves that well-known request only when Host/SNI map to a configured route and
+the exact TunnelId is live. It passes through existing global/per-IP request
+rate admission, bypasses signed URL verification only for this narrow endpoint,
+and never opens a tunnel stream or forwards the challenge to localhost.
+
+Monitor the Agent counters
+`tunnelproxy_agent_public_reachability_{attempts,successes,timeouts,cancellations}_total`
+and its fixed failure-class counters for TLS, connect, route, and protocol
+failures. Edge exports
+`tunnelproxy_edge_https_reachability_probe_{requests,successes,failures}_total`.
+None has hostname, TunnelId, address, or challenge labels. Logs likewise omit
+challenge/proof bytes.
+
+DNS/connect failures usually indicate propagation or network policy; TLS
+failures indicate trust/name/certificate issues; route failures indicate that
+Edge has no live exact tunnel; protocol failures indicate interception,
+misrouting, or an incompatible response. The default total deadline is 30
+seconds and the maximum is five minutes. Roll back by removing the opt-in flag
+or setting the optional config block to `enabled: false`; the default startup
+contract remains registration-only. A timeout exits 1 and intentionally leaves
+the durable hostname allocated for diagnosis and retry.

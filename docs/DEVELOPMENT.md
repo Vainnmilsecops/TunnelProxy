@@ -937,8 +937,21 @@ provided explicitly on the CLI.
 
 The file stores credential paths, never inline PEM or token bytes. Keep it and
 the referenced private key readable only by the intended local account. This
-feature does not provision accounts, DNS, wildcard certificates, or external
-reachability.
+feature does not provision accounts, DNS, or wildcard certificates. Session 51
+can verify operator-provisioned public reachability before printing the URL:
+
+```text
+tunnelproxy http 3000 --config ./config.json \
+  --verify-public-reachability \
+  --public-reachability-timeout-ms 30000
+```
+
+Public Web PKI roots are used by default. For local/private PKI add
+`--public-reachability-ca ./public-ca.pem`. Config validation parses that CA
+and validates all bounds offline without DNS, socket, hostname allocation, or
+other external mutation. The probe starts only after the Agent tunnel is
+routable, retries within one finite deadline, and is cancellation-aware.
+Failure returns exit code 1 without releasing the durable hostname.
 
 ## 29. Enabling bounded HTTP/2 at Edge
 

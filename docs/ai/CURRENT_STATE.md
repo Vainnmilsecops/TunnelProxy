@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Atomic Signed-Access Public-Key Ring Reload and Rotation** (Session 50).
+**Opt-in Bounded Managed-HTTP Public Reachability Verification** (Session 51).
 
 ## Completed
 
@@ -507,6 +507,22 @@
   peer credits.
 - 388 explicit workspace tests are present; all prior behavior is preserved.
 
+## Session 51 delivered
+
+- Managed HTTP can opt in to a bounded public HTTPS challenge after Agent
+  registration and gate the URL stdout line on its exact proof.
+- Edge answers the strict no-store well-known challenge only after normal
+  request-rate admission, Host/SNI route agreement, and live TunnelId lookup;
+  it never opens a tunnel stream or forwards the request to localhost.
+- The Agent uses bundled Web PKI roots or an explicit bounded CA, retries under
+  per-attempt and total deadlines, observes shutdown, and preserves the
+  durable hostname on terminal probe failure.
+- Config v1 remains compatible through one optional object, while CLI/config
+  validation is offline and tuning without opt-in fails closed.
+- Secret-safe fixed-cardinality metrics and unit/real-TLS tests cover strict
+  parsing, cancellation, success, wrong CA, signed-access coexistence, and no
+  local forwarding. The workspace contains 402 explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -523,9 +539,9 @@
   capacity denominator and operator decision guide.
 - Multiple tunnel registrations on one Agent transport.
 - Automatic account/profile creation, inline secret custody, named profiles,
-  wildcard DNS/public TLS provisioning, and external reachability probing.
-  The canonical `tunnelproxy http <port>` executable and strict path-based
-  local config are implemented.
+  and wildcard DNS/public TLS provisioning. The canonical
+  `tunnelproxy http <port>` executable, strict path-based local config, and
+  opt-in bounded external reachability verification are implemented.
 - Arbitrary forward-proxy CONNECT, non-WebSocket extended CONNECT, WebSocket
   extension negotiation, HTTP/3, and custom-domain administration. Bounded
   route-bound HTTP/1.1/classic HTTP/2 CONNECT plus HTTP/1.1/RFC 8441 WebSocket
@@ -548,7 +564,7 @@
 
 ## Next planned session
 
-Session 51 has not been selected. DNS/public-certificate automation and
+Session 52 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

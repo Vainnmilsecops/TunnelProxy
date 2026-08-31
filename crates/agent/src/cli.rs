@@ -12,7 +12,10 @@ use crate::{
     AgentOperationsError, AgentOperationsOutcome, AgentOperationsRuntime, AgentRuntime,
     AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
     AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, RuntimeShutdownConfig,
+    AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, PublicReachabilityConfig,
+    PublicReachabilityError, PublicReachabilityProbe, RuntimeShutdownConfig,
+    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
+    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_TIMEOUT,
 };
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -100,6 +103,9 @@ Managed HTTP options:
   --hostname-ca <path>              trusted hostname server CA PEM (required without config)
   --hostname-server-name <name>     verified hostname service DNS name (required without config)
   --hostname-request-timeout-ms <ms> allocation deadline (default 5000)
+  --verify-public-reachability        wait for a public HTTPS Edge challenge
+  --public-reachability-ca <path>     optional private/public probe CA bundle
+  --public-reachability-timeout-ms <ms> total probe deadline (default 30000)
   Uses the common Edge, Agent identity, TLS, reconnect, enrollment, and
   operations options above. The managed hostname remains allocated on exit.
   --help                         print this help and exit
@@ -107,6 +113,7 @@ Managed HTTP options:
 
 const AGENT_CONFIG_VERSION: u32 = 1;
 const MAX_AGENT_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_PUBLIC_REACHABILITY_CA_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +122,8 @@ struct AgentConfigFile {
     edge: AgentConfigEdge,
     hostname: AgentConfigHostname,
     identity: AgentConfigIdentity,
+    #[serde(default)]
+    public_reachability: Option<AgentConfigPublicReachability>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +149,14 @@ struct AgentConfigIdentity {
     tunnel_id: String,
     client_certificate: PathBuf,
     client_private_key: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigPublicReachability {
+    enabled: bool,
+    ca: Option<PathBuf>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +326,7 @@ fn apply_agent_config(
     config_path: &Path,
     config: AgentConfigFile,
 ) -> Result<(), AgentConfigError> {
+    let public_reachability = config.public_reachability;
     let edge = config
         .edge
         .address
@@ -364,6 +382,28 @@ fn apply_agent_config(
     if !parsed.hostname_server_name_explicit {
         parsed.hostname_server_name = Some(config.hostname.server_name);
     }
+    if let Some(reachability) = public_reachability {
+        if !reachability.enabled && (reachability.ca.is_some() || reachability.timeout_ms.is_some())
+        {
+            return Err(AgentConfigError::InvalidSchema);
+        }
+        if !parsed.verify_public_reachability_explicit {
+            parsed.verify_public_reachability = reachability.enabled;
+        }
+        if let Some(ca) = reachability.ca {
+            require_nonempty_path(&ca, "public reachability CA")?;
+            if !parsed.public_reachability_ca_explicit {
+                parsed.public_reachability_ca = Some(resolve_config_relative_path(config_path, ca));
+            }
+            parsed.public_reachability_options_present = true;
+        }
+        if let Some(timeout_ms) = reachability.timeout_ms {
+            if !parsed.public_reachability_timeout_explicit {
+                parsed.public_reachability_timeout = Duration::from_millis(timeout_ms);
+            }
+            parsed.public_reachability_options_present = true;
+        }
+    }
     parsed.hostname_options_present = true;
     Ok(())
 }
@@ -412,6 +452,15 @@ fn validate_http_configuration(parsed: &ParsedArgs) -> Result<(), ArgError> {
         (Some(_), Some(_), Some(_))
     ) {
         return Err(ArgError::IncompleteHostnameOptions);
+    }
+    if parsed.public_reachability_options_present && !parsed.verify_public_reachability {
+        return Err(ArgError::PublicReachabilityOptionsWithoutOptIn);
+    }
+    if parsed.verify_public_reachability
+        && (parsed.public_reachability_timeout.is_zero()
+            || parsed.public_reachability_timeout > MAX_PUBLIC_REACHABILITY_TIMEOUT)
+    {
+        return Err(ArgError::InvalidPublicReachabilityTimeout);
     }
     Ok(())
 }
@@ -480,6 +529,9 @@ async fn run_config_validate(args: &[String]) -> Result<(), ConfigValidateError>
         .await
         .map_err(|_| ConfigValidateError::Config(AgentConfigError::InvalidTls))?;
     load_http_hostname_client(&parsed)
+        .await
+        .map_err(|_| ConfigValidateError::Config(AgentConfigError::InvalidTls))?;
+    load_public_reachability_template(&parsed)
         .await
         .map_err(|_| ConfigValidateError::Config(AgentConfigError::InvalidTls))?;
     let mut runtime = AgentRuntimeConfig::new(parsed.edge, parsed.local);
@@ -669,6 +721,13 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
         }
         None => None,
     };
+    let public_reachability = match load_public_reachability_template(&parsed).await {
+        Ok(template) => template,
+        Err(error) => {
+            error!(%error, "failed to configure public reachability verification");
+            return ExitCode::from(2);
+        }
+    };
     let managed_http = match mode {
         RunMode::Tunnel => None,
         RunMode::Http => {
@@ -708,6 +767,11 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
                 "Managed HTTP hostname is durable and published"
             );
             Some(ManagedHttpAnnouncement {
+                probe: public_reachability
+                    .as_ref()
+                    .map(|template| template.build(allocation.hostname.clone()))
+                    .transpose()
+                    .expect("public reachability template was prevalidated"),
                 hostname: allocation.hostname,
                 local: parsed.local,
             })
@@ -723,13 +787,9 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
 
     let (trigger, signal) = shutdown_channel();
     let (operations_trigger, operations_signal) = shutdown_channel();
-    let ready_task = managed_http.map(|announcement| {
-        tokio::spawn(announce_managed_http_ready(
-            announcement,
-            runtime_status,
-            signal.clone(),
-        ))
-    });
+    let readiness_future =
+        run_optional_managed_http_readiness(managed_http, runtime_status, signal.clone());
+    tokio::pin!(readiness_future);
     let runtime_future = runtime.run_until_shutdown(signal.clone());
     tokio::pin!(runtime_future);
     let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
@@ -743,7 +803,7 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
     tokio::select! {
         result = &mut runtime_future => {
             trigger.shutdown();
-            join_ready_task(ready_task).await;
+            let _ = readiness_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
@@ -753,7 +813,7 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
         reload = &mut reload_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
-            join_ready_task(ready_task).await;
+            let _ = readiness_future.await;
             let _ = runtime_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
@@ -770,7 +830,7 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
         enrollment = &mut enrollment_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
-            join_ready_task(ready_task).await;
+            let _ = readiness_future.await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
             operations_trigger.shutdown();
@@ -787,7 +847,7 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
         operations = &mut operations_future => {
             runtime_control.begin_draining();
             trigger.shutdown();
-            join_ready_task(ready_task).await;
+            let _ = readiness_future.await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
@@ -800,7 +860,7 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
                     error!(%error, "OS shutdown listener failed");
                     runtime_control.begin_draining();
                     trigger.shutdown();
-                    join_ready_task(ready_task).await;
+                    let _ = readiness_future.await;
                     let _ = runtime_future.await;
                     let _ = reload_future.await;
                     let _ = enrollment_future.await;
@@ -811,13 +871,30 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
             }
             runtime_control.begin_draining();
             trigger.shutdown();
-            join_ready_task(ready_task).await;
+            let _ = readiness_future.await;
             let result = runtime_future.await;
             let _ = reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
             let operations = operations_future.await;
             combine_exit_codes(agent_exit_code(result), operations)
+        },
+        readiness = &mut readiness_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            operations_trigger.shutdown();
+            let operations = operations_future.await;
+            let code = match readiness {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(%error, event = "managed_http_public_reachability_failed", "Managed HTTP public reachability verification failed");
+                    ExitCode::from(1)
+                }
+            };
+            combine_exit_codes(code, operations)
         }
     }
 }
@@ -828,10 +905,81 @@ enum RunMode {
     Http,
 }
 
+#[derive(Debug, Clone)]
+struct PublicReachabilityTemplate {
+    ca_pem: Option<Vec<u8>>,
+    total_timeout: Duration,
+}
+
+impl PublicReachabilityTemplate {
+    fn build(
+        &self,
+        hostname: PublicHostname,
+    ) -> Result<PublicReachabilityProbe, PublicReachabilityError> {
+        PublicReachabilityProbe::new(PublicReachabilityConfig {
+            hostname,
+            ca_pem: self.ca_pem.clone(),
+            total_timeout: self.total_timeout,
+            attempt_timeout: DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT.min(self.total_timeout),
+            retry_interval: DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL.min(self.total_timeout),
+            server_addr_override: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum PublicReachabilityLoadError {
+    ReadCa,
+    Invalid(PublicReachabilityError),
+}
+
+impl std::fmt::Display for PublicReachabilityLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadCa => formatter.write_str("public reachability CA bundle could not be read"),
+            Self::Invalid(error) => write!(formatter, "invalid public reachability probe: {error}"),
+        }
+    }
+}
+
+async fn load_public_reachability_template(
+    parsed: &ParsedArgs,
+) -> Result<Option<PublicReachabilityTemplate>, PublicReachabilityLoadError> {
+    if !parsed.verify_public_reachability {
+        return Ok(None);
+    }
+    let ca_pem = match &parsed.public_reachability_ca {
+        Some(path) => {
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| PublicReachabilityLoadError::ReadCa)?;
+            let mut bytes = Vec::new();
+            file.take(MAX_PUBLIC_REACHABILITY_CA_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| PublicReachabilityLoadError::ReadCa)?;
+            if bytes.is_empty() || bytes.len() as u64 > MAX_PUBLIC_REACHABILITY_CA_BYTES {
+                return Err(PublicReachabilityLoadError::ReadCa);
+            }
+            Some(bytes)
+        }
+        None => None,
+    };
+    let template = PublicReachabilityTemplate {
+        ca_pem,
+        total_timeout: parsed.public_reachability_timeout,
+    };
+    template
+        .build(PublicHostname::new("reachability.invalid").expect("static hostname is valid"))
+        .map_err(PublicReachabilityLoadError::Invalid)?;
+    Ok(Some(template))
+}
+
 #[derive(Debug)]
 struct ManagedHttpAnnouncement {
     hostname: PublicHostname,
     local: SocketAddr,
+    probe: Option<PublicReachabilityProbe>,
 }
 
 impl ManagedHttpAnnouncement {
@@ -844,15 +992,43 @@ async fn announce_managed_http_ready(
     announcement: ManagedHttpAnnouncement,
     status: crate::AgentRuntimeStatusHandle,
     signal: ShutdownSignal,
-) {
+) -> Result<(), PublicReachabilityError> {
     let mut poll = tokio::time::interval(Duration::from_millis(10));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
-            () = signal.cancelled() => return,
+            () = signal.cancelled() => {
+                return Err(PublicReachabilityError::Cancelled { attempts: 0 });
+            },
             _ = poll.tick() => {
                 if status.snapshot().is_ready() {
+                    if let Some(probe) = &announcement.probe {
+                        info!(event = "managed_http_public_reachability_started", "Managed HTTP public reachability verification started");
+                        match probe.verify_until_success(signal.clone()).await {
+                            Ok(outcome) => {
+                                status.record_public_reachability_success(outcome.attempts);
+                                info!(
+                                    attempts = outcome.attempts,
+                                    event = "managed_http_public_reachability_succeeded",
+                                    "Managed HTTP public reachability verified"
+                                );
+                            }
+                            Err(error @ PublicReachabilityError::Timeout { attempts, last_failure }) => {
+                                status.record_public_reachability_failure(
+                                    attempts,
+                                    Some(last_failure),
+                                    false,
+                                );
+                                return Err(error);
+                            }
+                            Err(error @ PublicReachabilityError::Cancelled { attempts }) => {
+                                status.record_public_reachability_failure(attempts, None, true);
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                     println!("{}", announcement.mapping());
                     info!(
                         hostname = %announcement.hostname,
@@ -860,17 +1036,24 @@ async fn announce_managed_http_ready(
                         event = "managed_http_ready",
                         "Managed HTTP tunnel is ready"
                     );
-                    return;
+                    signal.cancelled().await;
+                    return Ok(());
                 }
             }
         }
     }
 }
 
-async fn join_ready_task(task: Option<tokio::task::JoinHandle<()>>) {
-    if let Some(task) = task {
-        if let Err(error) = task.await {
-            error!(%error, "managed HTTP readiness task failed");
+async fn run_optional_managed_http_readiness(
+    announcement: Option<ManagedHttpAnnouncement>,
+    status: crate::AgentRuntimeStatusHandle,
+    signal: ShutdownSignal,
+) -> Result<(), PublicReachabilityError> {
+    match announcement {
+        Some(announcement) => announce_managed_http_ready(announcement, status, signal).await,
+        None => {
+            signal.cancelled().await;
+            Ok(())
         }
     }
 }
@@ -1208,6 +1391,13 @@ struct ParsedArgs {
     hostname_server_name_explicit: bool,
     hostname_request_timeout: Duration,
     hostname_options_present: bool,
+    verify_public_reachability: bool,
+    verify_public_reachability_explicit: bool,
+    public_reachability_ca: Option<PathBuf>,
+    public_reachability_ca_explicit: bool,
+    public_reachability_timeout: Duration,
+    public_reachability_timeout_explicit: bool,
+    public_reachability_options_present: bool,
     enroll_only: bool,
     enrollment_server: Option<SocketAddr>,
     enrollment_ca: Option<PathBuf>,
@@ -1271,6 +1461,13 @@ impl Default for ParsedArgs {
             hostname_server_name_explicit: false,
             hostname_request_timeout: Duration::from_secs(5),
             hostname_options_present: false,
+            verify_public_reachability: false,
+            verify_public_reachability_explicit: false,
+            public_reachability_ca: None,
+            public_reachability_ca_explicit: false,
+            public_reachability_timeout: DEFAULT_PUBLIC_REACHABILITY_TIMEOUT,
+            public_reachability_timeout_explicit: false,
+            public_reachability_options_present: false,
             enroll_only: false,
             enrollment_server: None,
             enrollment_ca: None,
@@ -1304,6 +1501,9 @@ enum ArgError {
     IncompleteHostnameOptions,
     HostnameOptionsRequireHttp,
     ConfigRequiresHttp,
+    PublicReachabilityRequiresHttp,
+    PublicReachabilityOptionsWithoutOptIn,
+    InvalidPublicReachabilityTimeout,
     UnknownFlag(String),
 }
 
@@ -1343,6 +1543,15 @@ impl std::fmt::Display for ArgError {
             Self::ConfigRequiresHttp => {
                 f.write_str("--config is supported by http <port> and config validate")
             }
+            Self::PublicReachabilityRequiresHttp => {
+                f.write_str("public reachability options require the http <port> command")
+            }
+            Self::PublicReachabilityOptionsWithoutOptIn => {
+                f.write_str("public reachability tuning requires --verify-public-reachability")
+            }
+            Self::InvalidPublicReachabilityTimeout => f.write_str(
+                "public reachability timeout must be between 1 ms and 300000 ms",
+            ),
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
@@ -1356,6 +1565,9 @@ fn parse_run_command(args: &[String]) -> Result<(RunMode, ParsedArgs), ArgError>
         }
         if parsed.config_path.is_some() {
             return Err(ArgError::ConfigRequiresHttp);
+        }
+        if parsed.public_reachability_options_present || parsed.verify_public_reachability {
+            return Err(ArgError::PublicReachabilityRequiresHttp);
         }
         return Ok((RunMode::Tunnel, parsed));
     }
@@ -1539,6 +1751,24 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.hostname_request_timeout =
                     Duration::from_millis(parse_number(args, index, flag)?);
                 parsed.hostname_options_present = true;
+                index += 2;
+            }
+            "--verify-public-reachability" => {
+                parsed.verify_public_reachability = true;
+                parsed.verify_public_reachability_explicit = true;
+                index += 1;
+            }
+            "--public-reachability-ca" => {
+                parsed.public_reachability_ca = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.public_reachability_ca_explicit = true;
+                parsed.public_reachability_options_present = true;
+                index += 2;
+            }
+            "--public-reachability-timeout-ms" => {
+                parsed.public_reachability_timeout =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.public_reachability_timeout_explicit = true;
+                parsed.public_reachability_options_present = true;
                 index += 2;
             }
             "--enroll-only" => {
@@ -1908,6 +2138,11 @@ mod tests {
             "agent-prod",
             "--tunnel-id",
             "tunnel-prod",
+            "--verify-public-reachability",
+            "--public-reachability-ca",
+            "probe-ca.pem",
+            "--public-reachability-timeout-ms",
+            "12000",
         ]))
         .unwrap();
         assert_eq!(mode, RunMode::Http);
@@ -1919,10 +2154,17 @@ mod tests {
         assert_eq!(parsed.hostname_request_timeout, Duration::from_millis(900));
         assert_eq!(parsed.agent_id.as_str(), "agent-prod");
         assert_eq!(parsed.tunnel_id.as_str(), "tunnel-prod");
+        assert!(parsed.verify_public_reachability);
+        assert_eq!(
+            parsed.public_reachability_ca,
+            Some(PathBuf::from("probe-ca.pem"))
+        );
+        assert_eq!(parsed.public_reachability_timeout, Duration::from_secs(12));
         assert_eq!(
             ManagedHttpAnnouncement {
                 hostname: PublicHostname::new("tp-0123456789abcdef0123456789abcdef.test").unwrap(),
                 local: parsed.local,
+                probe: None,
             }
             .mapping(),
             "https://tp-0123456789abcdef0123456789abcdef.test -> http://127.0.0.1:8080"
@@ -1976,6 +2218,36 @@ mod tests {
             ])),
             Err(ArgError::HostnameOptionsRequireHttp)
         ));
+        assert!(matches!(
+            parse_run_command(&args(&["--verify-public-reachability"])),
+            Err(ArgError::PublicReachabilityRequiresHttp)
+        ));
+
+        let (_, tuning_without_opt_in) = parse_run_command(&args(&[
+            "http",
+            "3000",
+            "--tls-ca",
+            "edge-ca.pem",
+            "--tls-client-cert",
+            "agent.pem",
+            "--tls-client-key",
+            "agent-key.pem",
+            "--tls-server-name",
+            "edge.test",
+            "--hostname-server",
+            "127.0.0.1:17400",
+            "--hostname-ca",
+            "hostname-ca.pem",
+            "--hostname-server-name",
+            "control.test",
+            "--public-reachability-timeout-ms",
+            "1000",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            validate_http_configuration(&tuning_without_opt_in),
+            Err(ArgError::PublicReachabilityOptionsWithoutOptIn)
+        ));
     }
 
     fn valid_config_json() -> &'static [u8] {
@@ -2002,12 +2274,20 @@ mod tests {
 
     #[test]
     fn strict_config_layers_relative_paths_below_explicit_cli_values() {
-        let config = parse_agent_config(valid_config_json()).unwrap();
+        let config_json = String::from_utf8(valid_config_json().to_vec())
+            .unwrap()
+            .replace(
+                "\n            }\n        }",
+                "\n            },\n            \"public_reachability\": {\n                \"enabled\": true,\n                \"ca\": \"probe-ca.pem\",\n                \"timeout_ms\": 9000\n            }\n        }",
+            );
+        let config = parse_agent_config(config_json.as_bytes()).unwrap();
         let mut parsed = parse_args(&args(&[
             "--edge",
             "127.0.0.1:27100",
             "--tls-client-cert",
             "override-agent.pem",
+            "--public-reachability-timeout-ms",
+            "12000",
         ]))
         .unwrap();
         let config_path = PathBuf::from("profiles").join("config.json");
@@ -2032,6 +2312,12 @@ mod tests {
         );
         assert_eq!(parsed.tls_server_name.as_deref(), Some("edge.test"));
         assert_eq!(parsed.hostname_server_name.as_deref(), Some("control.test"));
+        assert!(parsed.verify_public_reachability);
+        assert_eq!(
+            parsed.public_reachability_ca,
+            Some(PathBuf::from("profiles/probe-ca.pem"))
+        );
+        assert_eq!(parsed.public_reachability_timeout, Duration::from_secs(12));
         assert!(validate_http_configuration(&parsed).is_ok());
     }
 
