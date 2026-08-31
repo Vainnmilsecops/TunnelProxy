@@ -1343,3 +1343,26 @@ Agents, routes, and Tunnel Protocol v2 remain unchanged. Metrics add only
 fixed-cardinality HTTP/2 WebSocket outcomes. Extension negotiation,
 non-WebSocket extended CONNECT, arbitrary destination dialing, h2c, HTTP/3,
 distributed admission, and multi-edge ownership remain separate concerns.
+
+## ADR-049 — Signed access is offline-issued, hostname-bound, and rate-first
+
+**Status:** Accepted (Session 49).
+
+**Context:** Public HTTPS routes need a shareable, expiring admission mechanism
+without introducing accounts, cookies, database lookups, or signing secrets at
+Edge. Signature verification is CPU work exposed to untrusted traffic, and the
+credential must not be forwarded to local applications.
+
+**Decision:** Use a versioned bounded binary claim signed with Ed25519 and
+encoded as the `tp_access` query parameter. Claims bind exact canonical
+hostname, non-zero key ID, issue time, and expiry. Offline tooling owns private
+keys; Edge owns a bounded public-key ring. Existing request-rate admission runs
+before verification. Successful admission strips the token before normal
+header sanitization/local HTTP/1.1 translation. Signed access is default-off
+and incompatible with classic CONNECT.
+
+**Consequences:** Ordinary HTTP/1.1/HTTP/2 and both supported WebSocket forms
+share one deterministic policy without Control Plane availability or Tunnel
+Protocol changes. Replay remains possible until expiry. Stateful nonces,
+per-user identity, raw TCP authentication, HSM/KMS integration, live key reload,
+and revocation before expiry remain separate work.

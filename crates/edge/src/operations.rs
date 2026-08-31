@@ -1031,6 +1031,26 @@ fn render_https_metrics(
             status.rate_limit_peer_capacity_rejections,
         ),
         (
+            "tunnelproxy_edge_https_signed_access_requests_total",
+            "counter",
+            status.accepted_signed_access_requests,
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_missing_rejections_total",
+            "counter",
+            status.missing_signed_access_rejections,
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_invalid_rejections_total",
+            "counter",
+            status.invalid_signed_access_rejections,
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_expired_rejections_total",
+            "counter",
+            status.expired_signed_access_rejections,
+        ),
+        (
             "tunnelproxy_edge_https_tracked_rate_limit_peers",
             "gauge",
             status.tracked_rate_limit_peers as u64,
@@ -1161,6 +1181,10 @@ mod tests {
                 active_http2_connect_sessions: 1,
                 peak_active_http2_connect_sessions: 2,
                 http2_connect_idle_timeouts: 3,
+                accepted_signed_access_requests: 14,
+                missing_signed_access_rejections: 15,
+                invalid_signed_access_rejections: 16,
+                expired_signed_access_rejections: 17,
                 ..HttpIngressStatus::default()
             },
             None,
@@ -1191,6 +1215,16 @@ mod tests {
         assert!(https.contains("tunnelproxy_edge_https_active_http2_connect_sessions 1\n"));
         assert!(https.contains("tunnelproxy_edge_https_peak_active_http2_connect_sessions 2\n"));
         assert!(https.contains("tunnelproxy_edge_https_http2_connect_idle_timeouts_total 3\n"));
+        assert!(https.contains("tunnelproxy_edge_https_signed_access_requests_total 14\n"));
+        assert!(
+            https.contains("tunnelproxy_edge_https_signed_access_missing_rejections_total 15\n")
+        );
+        assert!(
+            https.contains("tunnelproxy_edge_https_signed_access_invalid_rejections_total 16\n")
+        );
+        assert!(
+            https.contains("tunnelproxy_edge_https_signed_access_expired_rejections_total 17\n")
+        );
         assert!(!https.contains("hostname"));
     }
 

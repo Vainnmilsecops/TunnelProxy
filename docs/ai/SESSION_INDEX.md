@@ -52,6 +52,7 @@
 | 46      | Bounded Route-Bound HTTP/1.1 CONNECT Ingress  | complete |
 | 47      | Bounded Route-Bound Classic HTTP/2 CONNECT Ingress | complete |
 | 48      | Bounded Route-Bound RFC 8441 WebSocket Ingress | complete |
+| 49      | Bounded Expiring Signed Access URLs for Public HTTPS | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1564,3 +1565,28 @@ Out of scope:
 - WebSocket extension negotiation, non-WebSocket extended CONNECT, arbitrary
   forward-proxy destinations, public-client authorization, h2c, HTTP/3,
   distributed admission, multi-edge ownership, and Tunnel Protocol changes.
+
+## Session 49 — Bounded Expiring Signed Access URLs for Public HTTPS — complete
+
+Scope delivered:
+
+- Added a strict Ed25519 token codec binding non-zero key ID, canonical
+  hostname, issue time, and expiry. Key rings are capped at eight keys and all
+  key/token inputs have explicit byte limits.
+- Added offline `signed-access-keygen` and `sign-access-url` Control Plane CLI
+  commands; signer private keys are never printed or loaded by Edge.
+- Added default-off Edge policy with bounded maximum TTL and clock skew.
+  Request-rate admission happens before signature verification, and signed
+  access cannot be combined with classic CONNECT.
+- Missing, malformed, tampered, wrong-host/key, early, overlong, and expired
+  tokens fail closed with secret-free `401` responses. Valid `tp_access`
+  parameters are stripped before local forwarding.
+- Applied the policy to ordinary HTTP/1.1/HTTP/2 and HTTP/1.1/RFC 8441
+  WebSockets, with fixed-cardinality accepted/missing/invalid/expired metrics.
+  The workspace now contains 397 explicit tests.
+
+Out of scope:
+
+- Replay prevention before expiry, stateful nonces, per-user identity,
+  cookies/login, raw TCP authentication, online signing, HSM/KMS custody,
+  key-ring live reload, revocation lists, and Tunnel Protocol changes.

@@ -55,6 +55,10 @@ correct agent, which in turn proxies them into the local service.
   Classic HTTP/2 CONNECT has its own opt-in, reuses the same route-bound
   authority policy and shared CONNECT capacity, and isolates each upgraded h2
   stream while retaining graceful GOAWAY/drain behavior.
+  Expiring signed access URLs are independently opt-in for ordinary HTTP/1.1,
+  HTTP/2, and both WebSocket forms. Ed25519 tokens bind the canonical hostname
+  and bounded lifetime, are checked after request-rate admission, and are
+  removed before forwarding to the local application.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -279,6 +283,7 @@ and Definition of Done.
 | 46 _(complete)_ | bounded route-bound HTTP/1.1 CONNECT ingress |
 | 47 _(complete)_ | bounded route-bound classic HTTP/2 CONNECT ingress |
 | 48 _(complete)_ | bounded route-bound RFC 8441 WebSocket ingress |
+| 49 _(complete)_ | bounded expiring signed access URLs for public HTTPS |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt as _;
 use tracing::{error, info, warn};
 use tunnelproxy_common::{
-    init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
-    TunnelId,
+    init_process_logging, load_signed_access_key_ring, shutdown_channel, wait_for_process_shutdown,
+    AgentId, ProcessLogFormat, TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES,
 };
 use tunnelproxy_control_plane::{
     HttpsRouteClientConfig, HttpsRouteClientTlsReloadConfig, HttpsRouteClientTlsReloadRuntime,
@@ -24,8 +25,9 @@ use tunnelproxy_edge::{
     HttpHostRoutes, HttpHostname, HttpIngressConfig, HttpIngressExposurePolicy,
     HttpRequestRateLimitConfig, PublicHttpProtocolPolicy, PublicTlsConfig, PublicTlsConfigError,
     PublicTlsReloadBootstrapError, PublicTlsReloadConfig, PublicTlsReloadRuntime,
-    RawIngressExposurePolicy, RuntimeShutdownConfig, SnapshotAwareEdgeRuntime,
-    SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome, WebSocketIngressConfig,
+    RawIngressExposurePolicy, RuntimeShutdownConfig, SignedAccessIngressConfig,
+    SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
+    WebSocketIngressConfig,
 };
 
 const USAGE: &str = "\
@@ -69,6 +71,10 @@ Options:
   --max-connect-sessions <usize>   CONNECT session limit (default 32)
   --connect-idle-timeout-ms <ms>   CONNECT idle deadline (default 60000)
   --connect-authority-port <u16>   required CONNECT authority port (default 443)
+  --require-signed-access          require expiring tp_access URL signatures
+  --signed-access-keyring <path>   bounded Ed25519 public-key ring JSON
+  --signed-access-max-ttl-seconds <seconds> maximum token TTL (default 3600)
+  --signed-access-clock-skew-seconds <seconds> accepted clock skew (default 30)
   --http-requests-per-second <u64> global request rate (default 100)
   --http-request-burst <u64>       global burst capacity (default 200)
   --http-requests-per-ip-per-second <u64> per-IP rate (default 20)
@@ -454,6 +460,11 @@ struct ParsedArgs {
     connect_idle_timeout: Duration,
     connect_authority_port: u16,
     connect_options_present: bool,
+    require_signed_access: bool,
+    signed_access_keyring: Option<PathBuf>,
+    signed_access_maximum_ttl: Duration,
+    signed_access_clock_skew: Duration,
+    signed_access_options_present: bool,
     http_requests_per_second: u64,
     http_request_burst: u64,
     http_requests_per_ip_per_second: u64,
@@ -539,6 +550,11 @@ impl Default for ParsedArgs {
             connect_idle_timeout: Duration::from_secs(60),
             connect_authority_port: 443,
             connect_options_present: false,
+            require_signed_access: false,
+            signed_access_keyring: None,
+            signed_access_maximum_ttl: Duration::from_secs(60 * 60),
+            signed_access_clock_skew: Duration::from_secs(30),
+            signed_access_options_present: false,
             http_requests_per_second: 100,
             http_request_burst: 200,
             http_requests_per_ip_per_second: 20,
@@ -600,6 +616,8 @@ enum ArgError {
     Http2WebSocketWithoutHttp2,
     WebSocketOptionsWithoutOptIn,
     ConnectOptionsWithoutOptIn,
+    SignedAccessOptionsWithoutOptIn,
+    SignedAccessConnectConflict,
     IngressModeConflict,
     PublicHttpsOptInRequired,
     PublicHttpsPerIpLimitRequired,
@@ -658,6 +676,12 @@ impl std::fmt::Display for ArgError {
             }
             Self::ConnectOptionsWithoutOptIn => {
                 f.write_str("CONNECT tuning options require --enable-connect")
+            }
+            Self::SignedAccessOptionsWithoutOptIn => {
+                f.write_str("signed-access options require --require-signed-access")
+            }
+            Self::SignedAccessConnectConflict => {
+                f.write_str("--require-signed-access cannot be combined with CONNECT ingress")
             }
             Self::IngressModeConflict => {
                 f.write_str("raw-ingress options cannot be combined with --https-listen")
@@ -891,6 +915,31 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.https_options_present = true;
                 index += 2;
             }
+            "--require-signed-access" => {
+                parsed.require_signed_access = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--signed-access-keyring" => {
+                parsed.signed_access_keyring = Some(PathBuf::from(value(args, index, flag)?));
+                parsed.signed_access_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--signed-access-max-ttl-seconds" => {
+                parsed.signed_access_maximum_ttl =
+                    Duration::from_secs(parse_number(args, index, flag)?);
+                parsed.signed_access_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--signed-access-clock-skew-seconds" => {
+                parsed.signed_access_clock_skew =
+                    Duration::from_secs(parse_number(args, index, flag)?);
+                parsed.signed_access_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
             "--http-requests-per-second" => {
                 parsed.http_requests_per_second = parse_number(args, index, flag)?;
                 parsed.https_options_present = true;
@@ -1100,6 +1149,12 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.connect_options_present && !parsed.enable_connect && !parsed.enable_http2_connect {
         return Err(ArgError::ConnectOptionsWithoutOptIn);
     }
+    if parsed.signed_access_options_present && !parsed.require_signed_access {
+        return Err(ArgError::SignedAccessOptionsWithoutOptIn);
+    }
+    if parsed.require_signed_access && (parsed.enable_connect || parsed.enable_http2_connect) {
+        return Err(ArgError::SignedAccessConnectConflict);
+    }
     Ok(parsed)
 }
 
@@ -1181,6 +1236,9 @@ enum TlsLoadError {
     InvalidPublicTls(PublicTlsConfigError),
     InvalidHttpIngress(tunnelproxy_edge::HttpIngressConfigError),
     PublicReload(PublicTlsReloadBootstrapError),
+    MissingSignedAccessKeyRing,
+    ReadSignedAccessKeyRing,
+    InvalidSignedAccessKeyRing,
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -1236,6 +1294,15 @@ impl std::fmt::Display for TlsLoadError {
             Self::InvalidPublicTls(error) => write!(f, "invalid public TLS configuration: {error}"),
             Self::InvalidHttpIngress(error) => write!(f, "invalid HTTPS ingress: {error}"),
             Self::PublicReload(error) => write!(f, "public TLS reload is invalid: {error}"),
+            Self::MissingSignedAccessKeyRing => {
+                f.write_str("--require-signed-access requires --signed-access-keyring")
+            }
+            Self::ReadSignedAccessKeyRing => {
+                f.write_str("failed to read signed-access public-key ring")
+            }
+            Self::InvalidSignedAccessKeyRing => {
+                f.write_str("signed-access public-key ring is invalid")
+            }
         }
     }
 }
@@ -1611,6 +1678,22 @@ async fn load_https_configuration(
             tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(error),
         )
     })?;
+    let signed_access = if parsed.require_signed_access {
+        let path = parsed
+            .signed_access_keyring
+            .as_ref()
+            .ok_or(TlsLoadError::MissingSignedAccessKeyRing)?;
+        let bytes = read_signed_access_key_ring(path).await?;
+        let key_ring = load_signed_access_key_ring(&bytes)
+            .map_err(|_| TlsLoadError::InvalidSignedAccessKeyRing)?;
+        Some(SignedAccessIngressConfig {
+            key_ring,
+            maximum_ttl: parsed.signed_access_maximum_ttl,
+            clock_skew: parsed.signed_access_clock_skew,
+        })
+    } else {
+        None
+    };
     let protocols = if parsed.enable_http2 {
         PublicHttpProtocolPolicy::Http1AndHttp2
     } else {
@@ -1681,6 +1764,7 @@ async fn load_https_configuration(
                 authority_port: parsed.connect_authority_port,
             },
         ),
+        signed_access,
         request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
@@ -1758,6 +1842,21 @@ async fn read_tls_file(path: &PathBuf, kind: &'static str) -> Result<Vec<u8>, Tl
     tokio::fs::read(path)
         .await
         .map_err(|_| TlsLoadError::Read(kind))
+}
+
+async fn read_signed_access_key_ring(path: &PathBuf) -> Result<Vec<u8>, TlsLoadError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| TlsLoadError::ReadSignedAccessKeyRing)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_SIGNED_ACCESS_KEY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| TlsLoadError::ReadSignedAccessKeyRing)?;
+    if bytes.len() > MAX_SIGNED_ACCESS_KEY_FILE_BYTES {
+        return Err(TlsLoadError::InvalidSignedAccessKeyRing);
+    }
+    Ok(bytes)
 }
 
 fn value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ArgError> {
@@ -2301,5 +2400,34 @@ mod tests {
                 tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(_)
             ))
         ));
+    }
+
+    #[test]
+    fn signed_access_cli_is_explicit_bounded_and_connect_incompatible() {
+        let parsed = parse_args(&args(&[
+            "--require-signed-access",
+            "--signed-access-keyring",
+            "public-ring.json",
+            "--signed-access-max-ttl-seconds",
+            "300",
+            "--signed-access-clock-skew-seconds",
+            "15",
+        ]))
+        .unwrap();
+        assert!(parsed.require_signed_access);
+        assert_eq!(
+            parsed.signed_access_keyring,
+            Some(PathBuf::from("public-ring.json"))
+        );
+        assert_eq!(parsed.signed_access_maximum_ttl, Duration::from_secs(300));
+        assert_eq!(parsed.signed_access_clock_skew, Duration::from_secs(15));
+        assert_eq!(
+            parse_args(&args(&["--signed-access-keyring", "public-ring.json"])),
+            Err(ArgError::SignedAccessOptionsWithoutOptIn)
+        );
+        assert_eq!(
+            parse_args(&args(&["--require-signed-access", "--enable-connect"])),
+            Err(ArgError::SignedAccessConnectConflict)
+        );
     }
 }

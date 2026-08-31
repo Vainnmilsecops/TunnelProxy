@@ -1116,3 +1116,27 @@ both are enabled they share one session cap; HTTP/2 streams also remain bounded
 by the connection's normal concurrent-stream limit and GOAWAY/drain ownership.
 This does not enable extension negotiation, non-WebSocket extended CONNECT,
 h2c, HTTP/3, destination dialing, or any Agent/Tunnel Protocol change.
+
+## 34. Generating and enabling signed access URLs
+
+Generate one offline signer and its Edge public-key ring:
+
+```text
+tunnelproxy-control-plane signed-access-keygen --key-id 1 --private-key-output signed-access-private.json --public-keyring-output signed-access-public.json
+```
+
+Keep the private file off Edge. Start Edge HTTPS with
+`--require-signed-access --signed-access-keyring signed-access-public.json` and
+optionally tune `--signed-access-max-ttl-seconds` (default 3600) and
+`--signed-access-clock-skew-seconds` (default 30). This mode cannot be combined
+with either classic CONNECT flag.
+
+Issue a URL without contacting a running Control Plane:
+
+```text
+tunnelproxy-control-plane sign-access-url --private-key signed-access-private.json --url https://demo.example.test/path --ttl-seconds 300
+```
+
+The existing query is preserved, while any pre-existing exact `tp_access`
+parameter is rejected. A valid token is reusable until expiry and is removed
+before the request reaches the local application.

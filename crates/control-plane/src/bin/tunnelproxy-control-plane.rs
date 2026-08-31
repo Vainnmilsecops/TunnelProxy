@@ -1,15 +1,17 @@
 //! Runnable authorization snapshot import and distribution process.
 
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 use tunnelproxy_common::{
-    init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
-    PublicHostname, TunnelId,
+    generate_signed_access_keypair, init_process_logging, load_signed_access_signer,
+    replace_secret_file, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
+    PublicHostname, TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES, SIGNED_ACCESS_QUERY_PARAMETER,
 };
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
@@ -37,6 +39,8 @@ Usage:
   tunnelproxy-control-plane https-route-list [OPTIONS]
   tunnelproxy-control-plane https-hostname-allocate [OPTIONS]
   tunnelproxy-control-plane https-hostname-release [OPTIONS]
+  tunnelproxy-control-plane signed-access-keygen [OPTIONS]
+  tunnelproxy-control-plane sign-access-url [OPTIONS]
 
 Serve options:
   --database <path>                  SQLite snapshot database (required)
@@ -105,6 +109,16 @@ Managed HTTPS hostname options:
   --database <path>                  SQLite state database (required)
   --tunnel-id <id>                   target Tunnel ID (required)
   --base-domain <name>               allocation suffix (allocate only, required)
+
+Signed access keygen options:
+  --key-id <u32>                     non-zero public key identifier (required)
+  --private-key-output <path>        offline signer key JSON (required)
+  --public-keyring-output <path>     Edge public-key ring JSON (required)
+
+Sign access URL options:
+  --private-key <path>               offline signer key JSON (required)
+  --url <https-url>                  public HTTPS URL to sign (required)
+  --ttl-seconds <seconds>            token lifetime in whole seconds (required)
 
   --help                             print this help and exit
 ";
@@ -233,6 +247,26 @@ async fn main() -> ExitCode {
             }
             Err(error) => {
                 error!(%error, "managed HTTPS hostname release failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::SignedAccessKeygen(args) => match run_signed_access_keygen(args).await {
+            Ok(()) => {
+                info!("signed-access key pair generated");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "signed-access key generation failed");
+                ExitCode::from(1)
+            }
+        },
+        ParsedCommand::SignAccessUrl(args) => match run_sign_access_url(args).await {
+            Ok(url) => {
+                println!("{url}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(%error, "access URL signing failed");
                 ExitCode::from(1)
             }
         },
@@ -640,6 +674,8 @@ enum ParsedCommand {
     HttpsRouteList(HttpsRouteListArgs),
     HttpsHostnameAllocate(HttpsHostnameAllocateArgs),
     HttpsHostnameRelease(HttpsHostnameReleaseArgs),
+    SignedAccessKeygen(SignedAccessKeygenArgs),
+    SignAccessUrl(SignAccessUrlArgs),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -891,6 +927,145 @@ struct HttpsHostnameReleaseArgs {
     tunnel_id: TunnelId,
 }
 
+async fn run_signed_access_keygen(
+    args: SignedAccessKeygenArgs,
+) -> Result<(), SignedAccessCommandError> {
+    tokio::task::spawn_blocking(move || {
+        if args.private_key_output == args.public_keyring_output {
+            return Err(SignedAccessCommandError::ConflictingPaths);
+        }
+        let (private_key, public_keyring) = generate_signed_access_keypair(args.key_id)
+            .map_err(|_| SignedAccessCommandError::Crypto)?;
+        replace_secret_file(&args.public_keyring_output, &public_keyring)
+            .map_err(|_| SignedAccessCommandError::WriteKeyFile)?;
+        replace_secret_file(&args.private_key_output, &private_key)
+            .map_err(|_| SignedAccessCommandError::WriteKeyFile)
+    })
+    .await
+    .map_err(|_| SignedAccessCommandError::Worker)?
+}
+
+async fn run_sign_access_url(args: SignAccessUrlArgs) -> Result<String, SignedAccessCommandError> {
+    tokio::task::spawn_blocking(move || {
+        let key_file = read_bounded_key_file(&args.private_key)?;
+        let signer = load_signed_access_signer(&key_file)
+            .map_err(|_| SignedAccessCommandError::InvalidKeyFile)?;
+        let uri: hyper::Uri = args
+            .url
+            .parse()
+            .map_err(|_| SignedAccessCommandError::InvalidUrl)?;
+        if uri.scheme_str() != Some("https") {
+            return Err(SignedAccessCommandError::InvalidUrl);
+        }
+        let authority = uri
+            .authority()
+            .ok_or(SignedAccessCommandError::InvalidUrl)?;
+        let hostname = PublicHostname::new(authority.host())
+            .map_err(|_| SignedAccessCommandError::InvalidUrl)?;
+        if uri.query().is_some_and(|query| {
+            query.split('&').any(|parameter| {
+                parameter
+                    .split_once('=')
+                    .map_or(parameter, |(name, _)| name)
+                    == SIGNED_ACCESS_QUERY_PARAMETER
+            })
+        }) {
+            return Err(SignedAccessCommandError::ExistingToken);
+        }
+        let issued_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| SignedAccessCommandError::Clock)?
+            .as_secs();
+        let expires_at_unix = issued_at_unix
+            .checked_add(args.ttl_seconds)
+            .ok_or(SignedAccessCommandError::InvalidLifetime)?;
+        let token = signer
+            .sign(&hostname, issued_at_unix, expires_at_unix)
+            .map_err(|_| SignedAccessCommandError::Crypto)?;
+        let mut path_and_query = uri.path().to_owned();
+        if let Some(query) = uri.query() {
+            path_and_query.push('?');
+            path_and_query.push_str(query);
+            path_and_query.push('&');
+        } else {
+            path_and_query.push('?');
+        }
+        path_and_query.push_str(SIGNED_ACCESS_QUERY_PARAMETER);
+        path_and_query.push('=');
+        path_and_query.push_str(&token);
+        let mut parts = uri.into_parts();
+        parts.path_and_query = Some(
+            path_and_query
+                .parse()
+                .map_err(|_| SignedAccessCommandError::InvalidUrl)?,
+        );
+        hyper::Uri::from_parts(parts)
+            .map(|uri| uri.to_string())
+            .map_err(|_| SignedAccessCommandError::InvalidUrl)
+    })
+    .await
+    .map_err(|_| SignedAccessCommandError::Worker)?
+}
+
+fn read_bounded_key_file(path: &std::path::Path) -> Result<Vec<u8>, SignedAccessCommandError> {
+    let file = std::fs::File::open(path).map_err(|_| SignedAccessCommandError::ReadKeyFile)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_SIGNED_ACCESS_KEY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SignedAccessCommandError::ReadKeyFile)?;
+    if bytes.len() > MAX_SIGNED_ACCESS_KEY_FILE_BYTES {
+        return Err(SignedAccessCommandError::InvalidKeyFile);
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedAccessCommandError {
+    ConflictingPaths,
+    ReadKeyFile,
+    WriteKeyFile,
+    InvalidKeyFile,
+    InvalidUrl,
+    ExistingToken,
+    InvalidLifetime,
+    Clock,
+    Crypto,
+    Worker,
+}
+
+impl std::fmt::Display for SignedAccessCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ConflictingPaths => "private and public key outputs must be different",
+            Self::ReadKeyFile => "signed-access private key file could not be read",
+            Self::WriteKeyFile => "signed-access key files could not be published",
+            Self::InvalidKeyFile => "signed-access private key file is invalid",
+            Self::InvalidUrl => "URL must be an absolute HTTPS URL with a DNS hostname",
+            Self::ExistingToken => "URL already contains a tp_access query parameter",
+            Self::InvalidLifetime => "signed-access URL lifetime is invalid",
+            Self::Clock => "system clock is before the Unix epoch",
+            Self::Crypto => "signed-access cryptographic operation failed",
+            Self::Worker => "signed-access worker stopped unexpectedly",
+        })
+    }
+}
+
+impl std::error::Error for SignedAccessCommandError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedAccessKeygenArgs {
+    key_id: u32,
+    private_key_output: PathBuf,
+    public_keyring_output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignAccessUrlArgs {
+    private_key: PathBuf,
+    url: String,
+    ttl_seconds: u64,
+}
+
 fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(ArgError::MissingCommand);
@@ -919,6 +1094,10 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
         "https-hostname-release" => {
             parse_https_hostname_release(&args[1..]).map(ParsedCommand::HttpsHostnameRelease)
         }
+        "signed-access-keygen" => {
+            parse_signed_access_keygen(&args[1..]).map(ParsedCommand::SignedAccessKeygen)
+        }
+        "sign-access-url" => parse_sign_access_url(&args[1..]).map(ParsedCommand::SignAccessUrl),
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
 }
@@ -1370,6 +1549,60 @@ fn parse_https_hostname_release(args: &[String]) -> Result<HttpsHostnameReleaseA
     Ok(HttpsHostnameReleaseArgs {
         database: database.ok_or(ArgError::MissingRequired("--database"))?,
         tunnel_id: tunnel_id.ok_or(ArgError::MissingRequired("--tunnel-id"))?,
+    })
+}
+
+fn parse_signed_access_keygen(args: &[String]) -> Result<SignedAccessKeygenArgs, ArgError> {
+    let mut key_id = None;
+    let mut private_key_output = None;
+    let mut public_keyring_output = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--key-id" => key_id = Some(parse_positive(args, index, flag)?),
+            "--private-key-output" => private_key_output = Some(parse_path(args, index, flag)?),
+            "--public-keyring-output" => {
+                public_keyring_output = Some(parse_path(args, index, flag)?)
+            }
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(SignedAccessKeygenArgs {
+        key_id: key_id.ok_or(ArgError::MissingRequired("--key-id"))?,
+        private_key_output: private_key_output
+            .ok_or(ArgError::MissingRequired("--private-key-output"))?,
+        public_keyring_output: public_keyring_output
+            .ok_or(ArgError::MissingRequired("--public-keyring-output"))?,
+    })
+}
+
+fn parse_sign_access_url(args: &[String]) -> Result<SignAccessUrlArgs, ArgError> {
+    let mut private_key = None;
+    let mut url = None;
+    let mut ttl_seconds = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--private-key" => private_key = Some(parse_path(args, index, flag)?),
+            "--url" => {
+                let value = value(args, index, flag)?;
+                if value.is_empty() {
+                    return Err(ArgError::InvalidValue(flag.to_owned()));
+                }
+                url = Some(value.to_owned());
+            }
+            "--ttl-seconds" => ttl_seconds = Some(parse_positive(args, index, flag)?),
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(SignAccessUrlArgs {
+        private_key: private_key.ok_or(ArgError::MissingRequired("--private-key"))?,
+        url: url.ok_or(ArgError::MissingRequired("--url"))?,
+        ttl_seconds: ttl_seconds.ok_or(ArgError::MissingRequired("--ttl-seconds"))?,
     })
 }
 
@@ -2072,5 +2305,81 @@ mod tests {
             ])),
             Err(ArgError::MissingRequired("--tunnel-id"))
         ));
+    }
+
+    #[tokio::test]
+    async fn signed_access_cli_parses_generates_and_signs_https_urls_offline() {
+        assert_eq!(
+            parse_args(&args(&[
+                "signed-access-keygen",
+                "--key-id",
+                "49",
+                "--private-key-output",
+                "signer.json",
+                "--public-keyring-output",
+                "ring.json",
+            ])),
+            Ok(ParsedCommand::SignedAccessKeygen(SignedAccessKeygenArgs {
+                key_id: 49,
+                private_key_output: PathBuf::from("signer.json"),
+                public_keyring_output: PathBuf::from("ring.json"),
+            }))
+        );
+        assert!(matches!(
+            parse_args(&args(&[
+                "sign-access-url",
+                "--private-key",
+                "signer.json",
+                "--url",
+                "https://demo.example.test/path",
+            ])),
+            Err(ArgError::MissingRequired("--ttl-seconds"))
+        ));
+
+        let directory = std::env::temp_dir().join(format!(
+            "tunnelproxy-signed-access-cli-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let private_key = directory.join("private.json");
+        let public_keyring = directory.join("public.json");
+        run_signed_access_keygen(SignedAccessKeygenArgs {
+            key_id: 49,
+            private_key_output: private_key.clone(),
+            public_keyring_output: public_keyring.clone(),
+        })
+        .await
+        .unwrap();
+        let url = run_sign_access_url(SignAccessUrlArgs {
+            private_key,
+            url: "https://Demo.Example.Test/path?keep=yes".to_owned(),
+            ttl_seconds: 60,
+        })
+        .await
+        .unwrap();
+        assert!(url.starts_with("https://Demo.Example.Test/path?keep=yes&tp_access="));
+        let token = url.split("tp_access=").nth(1).unwrap();
+        let ring = tunnelproxy_common::load_signed_access_key_ring(
+            &std::fs::read(public_keyring).unwrap(),
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(ring
+            .verify(
+                token,
+                &PublicHostname::new("demo.example.test").unwrap(),
+                now,
+                60,
+                1,
+            )
+            .is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
