@@ -105,11 +105,16 @@
   configured authority port, Host, SNI, cached route, rate, session, and idle
   checks precede a direct opaque Tunnel Protocol relay; arbitrary destination
   dialing is deliberately not implemented.
+  Session 47 added independently opt-in classic HTTP/2 CONNECT using Hyper's
+  upgraded h2 stream, the same route-bound authority policy and shared CONNECT
+  admission, plus per-connection bounded relay ownership, idle enforcement,
+  fixed telemetry, stream isolation, and GOAWAY/drain coverage.
 - **Tracking:** HTTP/1.1 reuse resolved in Session 34 and HTTP/2 resolved in
   Session 44. HTTP/1.1 WebSocket upgrade resolved in Session 45. General
-  route-bound HTTP/1.1 CONNECT is resolved in Session 46. Arbitrary forward
-  proxying, HTTP/2 extended CONNECT/WebSocket, and extension negotiation remain
-  outside the implemented policy as separate surfaces.
+  route-bound HTTP/1.1 CONNECT is resolved in Session 46 and classic route-bound
+  HTTP/2 CONNECT in Session 47. Arbitrary forward proxying, RFC 8441 extended
+  CONNECT/WebSocket, and extension negotiation remain outside the implemented
+  policy as separate surfaces.
 
 ### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
 

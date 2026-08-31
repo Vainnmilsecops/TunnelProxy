@@ -50,6 +50,7 @@
 | 44      | Bounded HTTP/2 Public HTTPS Ingress           | complete |
 | 45      | Bounded WebSocket Upgrade Ingress             | complete |
 | 46      | Bounded Route-Bound HTTP/1.1 CONNECT Ingress  | complete |
+| 47      | Bounded Route-Bound Classic HTTP/2 CONNECT Ingress | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1491,3 +1492,41 @@ Out of scope:
 - Arbitrary forward-proxy destinations, HTTP/2 extended CONNECT/WebSocket,
   h2c, HTTP/3, public-client authorization, distributed admission, multi-edge
   ownership, and Tunnel Protocol changes.
+
+## Session 47 — Bounded Route-Bound Classic HTTP/2 CONNECT Ingress — complete
+
+Scope delivered:
+
+- Added a separate `--enable-http2-connect` policy that requires opt-in HTTP/2
+  and does not broaden the existing HTTP/1.1 CONNECT flag. Both protocols share
+  the configured authority port, activity idle deadline, and one bounded
+  global CONNECT session semaphore.
+- Required classic authority-form HTTP/2 CONNECT with exact configured port,
+  matching TLS SNI and optional Host, a cached enabled hostname route, and the
+  existing request-rate admission. Scheme/path ambiguity, host fronting,
+  unavailable routes, non-zero content length, upgrade headers, and RFC 8441
+  `:protocol` remain fail-closed.
+- Used Hyper's HTTP/2 `OnUpgrade` representation to relay opaque DATA through
+  the selected TunnelId's fixed Agent local target. No destination dialing,
+  local CONNECT forwarding, Agent change, or Tunnel Protocol change was added.
+- Added a bounded per-connection relay supervisor sized by CONNECT capacity.
+  It owns upgraded h2 streams through half-close/reset, applies the shared
+  activity idle deadline, participates in graceful GOAWAY, and is force-aborted
+  only by the existing HTTPS drain deadline.
+- Added fixed-cardinality HTTP/2 CONNECT accepted/rejected/current/peak/idle
+  metrics and strict CLI/config validation while retaining aggregate CONNECT
+  metrics and compatibility defaults.
+- Added two real TLS HTTP/2 Edge-to-Agent-to-local E2Es covering concurrent
+  streams, byte-exact bidirectional relay, request half-close, shared capacity
+  rejection/release, wrong port, Host/SNI fronting, extended-CONNECT rejection,
+  idle timeout, permit reuse, graceful isolation, and forced shutdown. The
+  workspace now contains 386 explicit tests.
+- Documented protocol semantics, Hyper ownership, rollout/rollback,
+  observability, compatibility, and remaining exclusions.
+
+Out of scope:
+
+- RFC 8441 extended CONNECT/WebSocket, WebSocket extension negotiation,
+  arbitrary forward-proxy destinations, public-client authorization, h2c,
+  HTTP/3, distributed admission, multi-edge ownership, and Tunnel Protocol
+  changes.

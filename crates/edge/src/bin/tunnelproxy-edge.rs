@@ -64,6 +64,7 @@ Options:
   --max-websocket-sessions <usize> WebSocket session limit (default 32)
   --websocket-idle-timeout-ms <ms> WebSocket idle deadline (default 60000)
   --enable-connect                 opt in to route-bound HTTP/1.1 CONNECT
+  --enable-http2-connect           opt in to route-bound classic HTTP/2 CONNECT
   --max-connect-sessions <usize>   CONNECT session limit (default 32)
   --connect-idle-timeout-ms <ms>   CONNECT idle deadline (default 60000)
   --connect-authority-port <u16>   required CONNECT authority port (default 443)
@@ -350,6 +351,7 @@ fn log_edge_started(agent_addr: SocketAddr, parsed: &ParsedArgs, authorization: 
         http2_enabled = parsed.enable_http2,
         websocket_enabled = parsed.enable_websocket_upgrade,
         connect_enabled = parsed.enable_connect,
+        http2_connect_enabled = parsed.enable_http2_connect,
         agent_id = %parsed.agent_id,
         tunnel_id = %parsed.tunnel_id,
         public_raw_ingress = parsed.allow_public_raw_ingress,
@@ -444,6 +446,7 @@ struct ParsedArgs {
     websocket_idle_timeout: Duration,
     websocket_options_present: bool,
     enable_connect: bool,
+    enable_http2_connect: bool,
     max_connect_sessions: usize,
     connect_idle_timeout: Duration,
     connect_authority_port: u16,
@@ -527,6 +530,7 @@ impl Default for ParsedArgs {
             websocket_idle_timeout: Duration::from_secs(60),
             websocket_options_present: false,
             enable_connect: false,
+            enable_http2_connect: false,
             max_connect_sessions: 32,
             connect_idle_timeout: Duration::from_secs(60),
             connect_authority_port: 443,
@@ -588,6 +592,7 @@ enum ArgError {
     HttpsRouteStaleWithoutServer,
     HttpsRouteReloadWithoutServer,
     Http2OptionsWithoutOptIn,
+    Http2ConnectWithoutHttp2,
     WebSocketOptionsWithoutOptIn,
     ConnectOptionsWithoutOptIn,
     IngressModeConflict,
@@ -636,6 +641,9 @@ impl std::fmt::Display for ArgError {
             }
             Self::Http2OptionsWithoutOptIn => {
                 f.write_str("HTTP/2 tuning options require --enable-http2")
+            }
+            Self::Http2ConnectWithoutHttp2 => {
+                f.write_str("--enable-http2-connect requires --enable-http2")
             }
             Self::WebSocketOptionsWithoutOptIn => {
                 f.write_str("WebSocket tuning options require --enable-websocket-upgrade")
@@ -843,6 +851,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             }
             "--enable-connect" => {
                 parsed.enable_connect = true;
+                parsed.https_options_present = true;
+                index += 1;
+            }
+            "--enable-http2-connect" => {
+                parsed.enable_http2_connect = true;
                 parsed.https_options_present = true;
                 index += 1;
             }
@@ -1059,10 +1072,13 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.http2_options_present && !parsed.enable_http2 {
         return Err(ArgError::Http2OptionsWithoutOptIn);
     }
+    if parsed.enable_http2_connect && !parsed.enable_http2 {
+        return Err(ArgError::Http2ConnectWithoutHttp2);
+    }
     if parsed.websocket_options_present && !parsed.enable_websocket_upgrade {
         return Err(ArgError::WebSocketOptionsWithoutOptIn);
     }
-    if parsed.connect_options_present && !parsed.enable_connect {
+    if parsed.connect_options_present && !parsed.enable_connect && !parsed.enable_http2_connect {
         return Err(ArgError::ConnectOptionsWithoutOptIn);
     }
     Ok(parsed)
@@ -1635,11 +1651,15 @@ async fn load_https_configuration(
                 max_concurrent_sessions: parsed.max_websocket_sessions,
                 idle_timeout: parsed.websocket_idle_timeout,
             }),
-        connect: parsed.enable_connect.then_some(ConnectIngressConfig {
-            max_concurrent_sessions: parsed.max_connect_sessions,
-            idle_timeout: parsed.connect_idle_timeout,
-            authority_port: parsed.connect_authority_port,
-        }),
+        connect: (parsed.enable_connect || parsed.enable_http2_connect).then_some(
+            ConnectIngressConfig {
+                enable_http1: parsed.enable_connect,
+                enable_http2: parsed.enable_http2_connect,
+                max_concurrent_sessions: parsed.max_connect_sessions,
+                idle_timeout: parsed.connect_idle_timeout,
+                authority_port: parsed.connect_authority_port,
+            },
+        ),
         request_rate_limit,
         header_read_timeout: parsed.http_header_timeout,
         request_timeout: parsed.http_request_timeout,
@@ -2008,6 +2028,7 @@ mod tests {
             "--websocket-idle-timeout-ms",
             "2500",
             "--enable-connect",
+            "--enable-http2-connect",
             "--max-connect-sessions",
             "7",
             "--connect-idle-timeout-ms",
@@ -2051,6 +2072,7 @@ mod tests {
         assert_eq!(parsed.max_websocket_sessions, 8);
         assert_eq!(parsed.websocket_idle_timeout, Duration::from_millis(2500));
         assert!(parsed.enable_connect);
+        assert!(parsed.enable_http2_connect);
         assert_eq!(parsed.max_connect_sessions, 7);
         assert_eq!(parsed.connect_idle_timeout, Duration::from_millis(2600));
         assert_eq!(parsed.connect_authority_port, 8443);
@@ -2099,6 +2121,20 @@ mod tests {
             parse_args(&args(&["--max-connect-sessions", "2"])),
             Err(ArgError::ConnectOptionsWithoutOptIn)
         );
+        assert_eq!(
+            parse_args(&args(&["--enable-http2-connect"])),
+            Err(ArgError::Http2ConnectWithoutHttp2)
+        );
+        let http2_connect = parse_args(&args(&[
+            "--enable-http2",
+            "--enable-http2-connect",
+            "--max-connect-sessions",
+            "2",
+        ]))
+        .unwrap();
+        assert!(http2_connect.enable_http2_connect);
+        assert!(!http2_connect.enable_connect);
+        assert_eq!(http2_connect.max_connect_sessions, 2);
     }
 
     #[test]

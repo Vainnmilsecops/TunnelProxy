@@ -1288,3 +1288,30 @@ fronting, and tunnel failures remain isolated and observable with
 fixed-cardinality counters. HTTP/2 extended CONNECT/WebSocket, arbitrary
 forward proxying, HTTP/3, public-client authorization, distributed admission,
 and multi-edge ownership remain separate concerns.
+
+---
+
+## ADR-047 — Classic HTTP/2 CONNECT is separately explicit and connection-owned
+
+**Status:** Accepted (Session 47).
+
+**Context:** Session 44 already owns bounded HTTP/2 connections and Session 46
+defines route-bound CONNECT policy, but silently applying the HTTP/1.1 opt-in
+to h2 would broaden an existing operator choice. Hyper 1.6 represents classic
+HTTP/2 CONNECT as an `OnUpgrade` stream rather than an ordinary request and
+response body; detaching that upgrade would bypass connection drain ownership.
+
+**Decision:** Add a separate default-off classic HTTP/2 CONNECT flag that
+requires HTTP/2. Reuse the same authority port, idle deadline, cached route,
+rate checks, and global CONNECT semaphore as HTTP/1.1. Require authority/SNI
+and optional Host agreement, reject ambiguous headers and RFC 8441
+`:protocol`, and open only the route's fixed TunnelId target. Each HTTP/2
+connection owns a relay channel and task set bounded by CONNECT capacity; the
+supervisor drives Hyper, upgraded streams, GOAWAY, and drain together.
+
+**Consequences:** Multiple classic CONNECT streams can share one h2 connection
+without cross-talk, half-close and reset stay stream-scoped, and enabling both
+protocols cannot double the configured session ceiling. No Agent or Tunnel
+Protocol change is needed. RFC 8441 WebSocket, extension negotiation,
+arbitrary forward proxying, public-client authorization, HTTP/3, distributed
+admission, and multi-edge ownership remain separate concerns.

@@ -926,6 +926,31 @@ fn render_https_metrics(
             status.connect_idle_timeouts,
         ),
         (
+            "tunnelproxy_edge_https_http2_connect_sessions_total",
+            "counter",
+            status.accepted_http2_connect_sessions,
+        ),
+        (
+            "tunnelproxy_edge_https_http2_connect_rejections_total",
+            "counter",
+            status.rejected_http2_connect_sessions,
+        ),
+        (
+            "tunnelproxy_edge_https_active_http2_connect_sessions",
+            "gauge",
+            status.active_http2_connect_sessions as u64,
+        ),
+        (
+            "tunnelproxy_edge_https_peak_active_http2_connect_sessions",
+            "gauge",
+            status.peak_active_http2_connect_sessions as u64,
+        ),
+        (
+            "tunnelproxy_edge_https_http2_connect_idle_timeouts_total",
+            "counter",
+            status.http2_connect_idle_timeouts,
+        ),
+        (
             "tunnelproxy_edge_https_completed_requests_total",
             "counter",
             status.completed_requests,
@@ -1101,6 +1126,11 @@ mod tests {
                 active_connect_sessions: 3,
                 peak_active_connect_sessions: 5,
                 connect_idle_timeouts: 2,
+                accepted_http2_connect_sessions: 10,
+                rejected_http2_connect_sessions: 11,
+                active_http2_connect_sessions: 1,
+                peak_active_http2_connect_sessions: 2,
+                http2_connect_idle_timeouts: 3,
                 ..HttpIngressStatus::default()
             },
             None,
@@ -1121,6 +1151,11 @@ mod tests {
         assert!(https.contains("tunnelproxy_edge_https_active_connect_sessions 3\n"));
         assert!(https.contains("tunnelproxy_edge_https_peak_active_connect_sessions 5\n"));
         assert!(https.contains("tunnelproxy_edge_https_connect_idle_timeouts_total 2\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_connect_sessions_total 10\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_connect_rejections_total 11\n"));
+        assert!(https.contains("tunnelproxy_edge_https_active_http2_connect_sessions 1\n"));
+        assert!(https.contains("tunnelproxy_edge_https_peak_active_http2_connect_sessions 2\n"));
+        assert!(https.contains("tunnelproxy_edge_https_http2_connect_idle_timeouts_total 3\n"));
         assert!(!https.contains("hostname"));
     }
 

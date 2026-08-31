@@ -1064,6 +1064,8 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
         }),
         websocket: None,
         connect: Some(ConnectIngressConfig {
+            enable_http1: true,
+            enable_http2: false,
             max_concurrent_sessions: 1,
             idle_timeout: Duration::from_secs(1),
             authority_port: 443,
@@ -1250,6 +1252,316 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     assert_eq!(https.rejected_requests, 4);
     assert_eq!(https.rejected_connect_sessions, 1);
     assert_eq!(https.request_timeouts, 1);
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
+async fn http2_connect_is_route_bound_half_close_safe_and_capacity_bounded() {
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(2);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let local_release = Arc::clone(&release);
+    let local_task = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (mut socket, _) = local_listener.accept().await.unwrap();
+            let ready_tx = ready_tx.clone();
+            let release = Arc::clone(&local_release);
+            tasks.spawn(async move {
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).await.unwrap();
+                ready_tx.send(()).await.unwrap();
+                let _permit = release.acquire().await.unwrap();
+                socket.write_all(b"local:").await.unwrap();
+                socket.write_all(&request).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem_with_protocols(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 2,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1,
+        max_requests_per_connection: 1,
+        http2: Some(Http2IngressConfig {
+            max_concurrent_streams: 4,
+            keep_alive_interval: Duration::from_secs(1),
+            keep_alive_timeout: Duration::from_secs(1),
+        }),
+        websocket: None,
+        connect: Some(ConnectIngressConfig {
+            enable_http1: false,
+            enable_http2: true,
+            max_concurrent_sessions: 2,
+            idle_timeout: Duration::from_secs(2),
+            authority_port: 443,
+        }),
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    wait_for_tunnel(&router, "tunnel-dev").await;
+
+    let connector = TlsConnector::from(public_tls_client_config(&public_pki.authority_pem, b"h2"));
+    let tls = connector
+        .connect(
+            ServerName::try_from("demo.example.test").unwrap(),
+            connect_eventually(https_addr).await,
+        )
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let connect_request = || {
+        Request::builder()
+            .method(Method::CONNECT)
+            .uri("demo.example.test:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let mut second_sender = sender.clone();
+    let (first, second) = tokio::join!(
+        sender.send_request(connect_request()),
+        second_sender.send_request(connect_request()),
+    );
+    let mut first = first.unwrap();
+    let mut second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let first = TokioIo::new(hyper::upgrade::on(&mut first).await.unwrap());
+    let second = TokioIo::new(hyper::upgrade::on(&mut second).await.unwrap());
+    let (mut first_read, mut first_write) = tokio::io::split(first);
+    let (mut second_read, mut second_write) = tokio::io::split(second);
+    first_write.write_all(b"alpha").await.unwrap();
+    first_write.shutdown().await.unwrap();
+    second_write.write_all(b"beta").await.unwrap();
+    second_write.shutdown().await.unwrap();
+    ready_rx.recv().await.unwrap();
+    ready_rx.recv().await.unwrap();
+
+    let limited = sender.send_request(connect_request()).await.unwrap();
+    assert_eq!(limited.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = limited.into_body().collect().await.unwrap();
+
+    release.add_permits(2);
+    let mut first_response = Vec::new();
+    first_read.read_to_end(&mut first_response).await.unwrap();
+    let mut second_response = Vec::new();
+    second_read.read_to_end(&mut second_response).await.unwrap();
+    assert_eq!(first_response, b"local:alpha");
+    assert_eq!(second_response, b"local:beta");
+
+    let wrong_port = sender
+        .send_request(
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("demo.example.test:8443")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_port.status(), StatusCode::BAD_REQUEST);
+    let _ = wrong_port.into_body().collect().await.unwrap();
+    let fronted = sender
+        .send_request(
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("demo.example.test:443")
+                .header(HOST, "other.example.test:443")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fronted.status(), StatusCode::MISDIRECTED_REQUEST);
+    let _ = fronted.into_body().collect().await.unwrap();
+
+    let mut extended = connect_request();
+    extended
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    assert!(sender.send_request(extended).await.is_err());
+
+    drop(sender);
+    drop(second_sender);
+    connection_task.await.unwrap().unwrap();
+    local_task.await.unwrap();
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    edge_trigger.shutdown();
+    let outcome = edge_task.await.unwrap().unwrap();
+    let https = outcome.https_ingress.unwrap();
+    assert_eq!(https.accepted_connect_sessions, 2);
+    assert_eq!(https.accepted_http2_connect_sessions, 2);
+    assert_eq!(https.rejected_connect_sessions, 3);
+    assert_eq!(https.rejected_http2_connect_sessions, 3);
+    assert_eq!(https.peak_active_connect_sessions, 2);
+    assert_eq!(https.peak_active_http2_connect_sessions, 2);
+    assert_eq!(https.connect_idle_timeouts, 0);
+    assert_eq!(https.http2_connect_idle_timeouts, 0);
+    wait_until_bindable(https_addr).await;
+}
+
+#[tokio::test]
+async fn http2_connect_idle_timeout_releases_capacity_and_shutdown_is_bounded() {
+    let public_pki = test_pki("demo.example.test");
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local_listener.local_addr().unwrap();
+    let (second_accepted_tx, second_accepted_rx) = tokio::sync::oneshot::channel();
+    let local_task = tokio::spawn(async move {
+        let (mut first, _) = local_listener.accept().await.unwrap();
+        let mut drained = Vec::new();
+        first.read_to_end(&mut drained).await.unwrap();
+        drop(first);
+        let (_second, _) = local_listener.accept().await.unwrap();
+        let _ = second_accepted_tx.send(());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let https_addr = unused_addr().await;
+    let mut config = edge_config(unused_addr().await);
+    config.shutdown = RuntimeShutdownConfig::new(Duration::from_millis(50));
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem_with_protocols(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+            PublicHttpProtocolPolicy::Http1AndHttp2,
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 1,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1,
+        max_requests_per_connection: 1,
+        http2: Some(Http2IngressConfig {
+            max_concurrent_streams: 2,
+            keep_alive_interval: Duration::from_secs(1),
+            keep_alive_timeout: Duration::from_secs(1),
+        }),
+        websocket: None,
+        connect: Some(ConnectIngressConfig {
+            enable_http1: false,
+            enable_http2: true,
+            max_concurrent_sessions: 1,
+            idle_timeout: Duration::from_millis(100),
+            authority_port: 443,
+        }),
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_millis(50)),
+    });
+    let edge = EdgeRuntime::bind(config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task =
+        tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
+    wait_for_tunnel(&router, "tunnel-dev").await;
+
+    let connector = TlsConnector::from(public_tls_client_config(&public_pki.authority_pem, b"h2"));
+    let tls = connector
+        .connect(
+            ServerName::try_from("demo.example.test").unwrap(),
+            connect_eventually(https_addr).await,
+        )
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let request = || {
+        Request::builder()
+            .method(Method::CONNECT)
+            .uri("demo.example.test:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let mut first = sender.send_request(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first = TokioIo::new(hyper::upgrade::on(&mut first).await.unwrap());
+    let mut drained = Vec::new();
+    timeout(Duration::from_millis(500), first.read_to_end(&mut drained))
+        .await
+        .expect("idle HTTP/2 CONNECT was not closed")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut second = sender.send_request(request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let mut second = TokioIo::new(hyper::upgrade::on(&mut second).await.unwrap());
+    second_accepted_rx.await.unwrap();
+    edge_trigger.shutdown();
+    let outcome = timeout(Duration::from_secs(2), edge_task)
+        .await
+        .expect("Edge did not enforce the HTTP/2 CONNECT drain deadline")
+        .unwrap()
+        .unwrap();
+    assert!(outcome.was_forced());
+    let https = outcome.https_ingress.unwrap();
+    assert!(https.was_forced());
+    assert_eq!(https.accepted_http2_connect_sessions, 2);
+    assert_eq!(https.peak_active_http2_connect_sessions, 1);
+    assert_eq!(https.http2_connect_idle_timeouts, 1);
+    let mut closed = Vec::new();
+    let _ = timeout(Duration::from_millis(500), second.read_to_end(&mut closed)).await;
+    let _ = connection_task.await;
+    agent_trigger.shutdown();
+    match agent_task.await.unwrap() {
+        Ok(_) => {}
+        Err(AgentRuntimeError::Terminal(AgentError::ProtocolDecode(
+            ProtocolError::TruncatedHeader { .. } | ProtocolError::TruncatedPayload { .. },
+        ))) => {}
+        Err(error) => panic!("unexpected Agent shutdown failure: {error}"),
+    }
+    local_task.abort();
+    let _ = local_task.await;
     wait_until_bindable(https_addr).await;
 }
 
@@ -1465,6 +1777,8 @@ async fn connect_ingress_is_route_bound_bounded_and_byte_exact() {
         http2: None,
         websocket: None,
         connect: Some(ConnectIngressConfig {
+            enable_http1: true,
+            enable_http2: false,
             max_concurrent_sessions: 1,
             idle_timeout: Duration::from_secs(2),
             authority_port: 443,
@@ -1703,6 +2017,8 @@ async fn connect_idle_timeout_and_forced_shutdown_are_bounded() {
         http2: None,
         websocket: None,
         connect: Some(ConnectIngressConfig {
+            enable_http1: true,
+            enable_http2: false,
             max_concurrent_sessions: 1,
             idle_timeout: Duration::from_millis(500),
             authority_port: 443,

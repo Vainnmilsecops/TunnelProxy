@@ -347,19 +347,30 @@ required.
 
 ### CONNECT rollout and rollback
 
-Canary `--enable-connect` independently from WebSocket and HTTP/2. Keep the
-session cap below HTTPS connection capacity, choose one authority port that
-matches the intended client contract, and set a finite idle timeout. Monitor
+Canary `--enable-connect` for HTTP/1.1 independently from WebSocket and HTTP/2.
+Canary classic h2 CONNECT separately with both `--enable-http2` and
+`--enable-http2-connect`; neither CONNECT flag enables the other protocol.
+Both protocols share one session cap, authority port, and finite idle timeout,
+so size the cap for their combined workload. Monitor
 `tunnelproxy_edge_https_connect_sessions_total`,
 `tunnelproxy_edge_https_connect_rejections_total`,
 `tunnelproxy_edge_https_active_connect_sessions`, its peak gauge,
 `tunnelproxy_edge_https_connect_idle_timeouts_total`, HTTPS connection
 occupancy, Tunnel DATA saturation, and forced drain outcomes.
 
+For the h2 slice, additionally monitor
+`tunnelproxy_edge_https_http2_connect_sessions_total`, its rejection counter,
+active/peak gauges, and idle-timeout counter. A successful stream is classic
+CONNECT carried by HTTP/2 DATA; Edge does not advertise RFC 8441 extended
+CONNECT, and clients attempting `:protocol=websocket` fail before route use.
+GOAWAY stops new streams while the bounded relay supervisor drains accepted
+ones under the normal HTTPS deadline.
+
 `400` indicates malformed authority/body/upgrade semantics, `421` indicates
 Host/SNI fronting, `404` indicates no cached route, and `503` indicates session
 or tunnel capacity/unavailability. CONNECT never uses the requested authority
 as a dial target; it always reaches the fixed local target already owned by the
-selected TunnelId. Roll back by removing `--enable-connect` and restarting
-Edge. Existing HTTP/1.1, WebSocket, HTTP/2, route, TLS, and Tunnel Protocol
+selected TunnelId. Roll back one surface by removing its corresponding
+`--enable-connect` or `--enable-http2-connect` flag and restarting Edge.
+Existing HTTP/1.1, WebSocket, ordinary HTTP/2, route, TLS, and Tunnel Protocol
 state require no migration or rollback.

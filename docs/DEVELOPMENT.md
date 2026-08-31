@@ -1044,4 +1044,40 @@ configured Agent local target. It never dials the requested authority and does
 not forward CONNECT as HTTP to the local application. Activity in either
 direction resets the idle deadline; graceful shutdown is bounded by the normal
 Edge drain timeout. This option does not enable an arbitrary forward proxy,
-HTTP/2 extended CONNECT, RFC 8441 WebSocket, h2c, or HTTP/3.
+classic or extended HTTP/2 CONNECT, RFC 8441 WebSocket, h2c, or HTTP/3.
+
+## 32. Enabling bounded route-bound classic HTTP/2 CONNECT at Edge
+
+Classic h2 CONNECT is a separate policy layered on the existing bounded HTTP/2
+listener. It uses the same CONNECT limit, idle timeout, and authority port as
+HTTP/1.1, but either protocol may be enabled independently:
+
+```text
+tunnelproxy-edge \
+  --https-listen 0.0.0.0:443 \
+  --https-route-server control.example.test:7201 \
+  --public-tls-cert wildcard.pem \
+  --public-tls-key wildcard-key.pem \
+  --allow-public-https-ingress \
+  --max-http-connections 32 \
+  --max-http-connections-per-ip 4 \
+  --enable-http2 \
+  --max-http2-concurrent-streams 32 \
+  --enable-http2-connect \
+  --max-connect-sessions 16 \
+  --connect-idle-timeout-ms 60000 \
+  --connect-authority-port 443 \
+  <snapshot, route, and Agent mTLS options>
+```
+
+The request must be classic HTTP/2 CONNECT with authority
+`<route-host>:<configured-port>`, matching TLS SNI and any optional Host field.
+Client DATA becomes opaque tunnel bytes only after cached-route, rate, and
+shared CONNECT admission succeeds. Half-close and reset stay scoped to that h2
+stream; multiple accepted CONNECT streams may share one connection.
+
+The Edge does not advertise RFC 8441 extended CONNECT and rejects a
+`:protocol` request. It also does not enable WebSocket over HTTP/2, arbitrary
+forward-proxy dialing, h2c, or HTTP/3. Removing `--enable-http2-connect`
+restores the previous HTTP/2 behavior without changing route, Agent, or Tunnel
+Protocol state.

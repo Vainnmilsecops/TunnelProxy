@@ -88,7 +88,9 @@ HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,
 session capacity, idle time, and task-owned drain. Session 46 adds separately
 opt-in route-bound HTTP/1.1 CONNECT with exact authority-port/Host/SNI checks,
-session/idle limits, direct opaque relay, and task-owned drain. The implemented public
+session/idle limits, direct opaque relay, and task-owned drain. Session 47 adds
+separately opt-in classic HTTP/2 CONNECT with the same route-bound authority
+policy, shared CONNECT capacity, and per-connection relay ownership. The implemented public
 surfaces are opt-in opaque raw TCP and a bounded operator-configured HTTPS route
 with default HTTP/1.1 and opt-in HTTP/2/WebSocket/CONNECT policies. Both use per-IP
 concurrency admission and authenticated dynamic Agent authority; the HTTPS
@@ -96,8 +98,9 @@ slice also terminates reloadable public TLS, enforces exact
 Host-or-authority/SNI routing from static or authenticated dynamically
 distributed state, supports
 opt-in capped sequential keep-alive with per-request deadlines, and applies
-process-local global/per-IP request token buckets. Accepted WebSockets and
-route-bound CONNECT sessions relay opaque upgraded bytes through the unchanged
+process-local global/per-IP request token buckets. Accepted WebSockets plus
+HTTP/1.1 and classic HTTP/2 route-bound CONNECT sessions relay opaque upgraded
+bytes through the unchanged
 tunnel after validation, but the
 HTTPS surface is not yet the automatic future product UX. Control Plane has a separate
 bounded, versioned SQLite catalog and operator CLI for durable exact-hostname

@@ -36,6 +36,8 @@ with strict client/local handshakes, bounded active sessions and idle time,
 opaque bidirectional relay, and bounded drain. Session 46 adds explicit
 route-bound HTTP/1.1 CONNECT with exact authority-port/Host/SNI validation,
 independent session and idle bounds, direct opaque tunnel relay, and bounded
-drain. Arbitrary forward-proxy CONNECT, HTTP/2 extended CONNECT, WebSocket
+drain. Session 47 adds independently opt-in classic HTTP/2 CONNECT with shared
+CONNECT capacity, stream-scoped upgraded relay, and GOAWAY-aware bounded
+ownership. Arbitrary forward-proxy CONNECT, RFC 8441 extended CONNECT, WebSocket
 extensions, HTTP/3, distributed rate limiting, and
 multi-edge ownership remain outside the current implementation.

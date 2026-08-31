@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Route-Bound HTTP/1.1 CONNECT Ingress** (Session 46).
+**Bounded Route-Bound Classic HTTP/2 CONNECT Ingress** (Session 47).
 
 ## Completed
 
@@ -338,12 +338,23 @@
 - HTTP/1.1 CONNECT is separately opt-in, default-off, and route-bound. The URI
   authority and Host must carry the exact cached route hostname plus the
   configured authority port, and TLS SNI must match; schemes, paths, bodies,
-  transfer encoding, upgrade headers, and HTTP/2 CONNECT fail closed.
+  transfer encoding, and upgrade headers fail closed.
 - CONNECT opens only the selected TunnelId's fixed Agent local target. Edge
   never dials the client authority or forwards CONNECT to the local service.
   Independent global session capacity, activity idle timeout, RAII metrics,
   connection-task ownership, and the existing drain deadline bound the opaque
   relay without a Tunnel Protocol change.
+- Classic HTTP/2 CONNECT is independently opt-in and requires the existing
+  bounded HTTP/2 policy. It reuses exact authority-port/SNI/optional-Host route
+  validation, request-rate admission, and the same global CONNECT semaphore as
+  HTTP/1.1 without silently expanding the older opt-in.
+- Hyper's HTTP/2 `OnUpgrade` stream is relayed opaquely through the cached
+  TunnelId. A per-connection bounded relay supervisor owns all upgraded h2
+  streams, preserves DATA half-close, isolates resets, applies the shared
+  activity idle deadline, and joins or force-aborts them under GOAWAY/drain.
+- HTTP/2 CONNECT exposes fixed-cardinality accepted/rejected/current/peak/idle
+  metrics. RFC 8441 extended CONNECT with `:protocol`, HTTP/2 WebSocket, and
+  arbitrary client-selected destination dialing remain rejected.
 - `EdgeSessionRouter` now accepts any bounded async byte stream internally, so
   the HTTP client connection can reuse the existing multiplexed Tunnel
   Protocol v2 path without a wire-format change.
@@ -482,7 +493,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 383 explicit workspace tests are present; all prior behavior is preserved.
+- 386 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Not implemented
 
@@ -503,11 +514,11 @@
   wildcard DNS/public TLS provisioning, and external reachability probing.
   The canonical `tunnelproxy http <port>` executable and strict path-based
   local config are implemented.
-- Arbitrary forward-proxy CONNECT, HTTP/2 extended CONNECT/WebSocket,
+- Arbitrary forward-proxy CONNECT, RFC 8441 extended CONNECT/WebSocket,
   WebSocket extension negotiation, HTTP/3, custom-domain administration, and
-  signed access URLs. Bounded route-bound HTTP/1.1 CONNECT and WebSocket
-  ingress are implemented; ordinary request forwarding and the WebSocket
-  handshake to the local application remain HTTP/1.1.
+  signed access URLs. Bounded route-bound HTTP/1.1 and classic HTTP/2 CONNECT
+  plus HTTP/1.1 WebSocket ingress are implemented; ordinary request forwarding
+  and the WebSocket handshake to the local application remain HTTP/1.1.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -520,7 +531,7 @@
 
 ## Next planned session
 
-Session 47 has not been selected. DNS/public-certificate automation, signed
-access URLs, HTTP/2 extended CONNECT, and multi-edge ownership remain separate scopes. Collect
+Session 48 has not been selected. DNS/public-certificate automation, signed
+access URLs, RFC 8441 WebSocket, and multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

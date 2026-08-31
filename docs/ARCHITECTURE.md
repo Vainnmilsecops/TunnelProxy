@@ -980,7 +980,8 @@ shared request service. HTTP/2 `:authority`, an optional Host field, and TLS SNI
 must canonicalize to the same exact hostname. Header count/list size, request
 body, request deadline, global/per-IP rate admission, cached route lookup, and
 Tunnel Protocol stream admission are repeated independently for every stream.
-CONNECT and upgrade semantics remain rejected.
+Ordinary requests reject CONNECT and upgrade semantics unless the independent
+Session 47 classic CONNECT policy is enabled.
 
 HTTP/2 connection state is explicitly bounded: concurrent and pending/local
 reset streams have the same hard cap, send buffers and initial flow-control
@@ -1037,9 +1038,10 @@ labels.
 CONNECT is a separate default-off HTTP/1.1 policy. It is not a general forward
 proxy: the authority hostname must resolve through the existing exact route
 cache, its port must equal the operator-configured CONNECT authority port, and
-the Host authority and TLS SNI must name the same hostname and port. HTTP/2
-CONNECT, schemes, paths, request bodies, transfer encoding, and upgrade headers
-fail closed before a tunnel stream opens. Existing header bounds and
+the Host authority and TLS SNI must name the same hostname and port. Schemes,
+paths, request bodies, transfer encoding, and upgrade headers fail closed
+before a tunnel stream opens. Classic HTTP/2 CONNECT requires the independent
+Session 47 opt-in. Existing header bounds and
 process-local global/per-IP request-rate admission still apply.
 
 After route and admission checks, Edge opens the existing Tunnel Protocol v2
@@ -1056,6 +1058,38 @@ permit, and timer; graceful shutdown may drain it only within the existing
 HTTPS deadline, after which one task abort releases all resources. Metrics
 expose accepted/rejected, active/peak, and idle-timeout totals without
 authority, hostname, peer, durable ID, or payload labels.
+
+### 2.45 Bounded route-bound classic HTTP/2 CONNECT ingress (Session 47)
+
+Classic HTTP/2 CONNECT is another explicit default-off policy. Enabling it
+requires the bounded HTTP/2 listener but does not implicitly enable HTTP/1.1
+CONNECT, and the older HTTP/1.1 flag does not broaden itself to h2. Both
+protocols reuse one `ConnectIngressConfig`: exact operator-selected authority
+port, finite activity idle deadline, and one shared session semaphore, so
+enabling both cannot double the configured CONNECT resource ceiling.
+
+The request must use classic CONNECT authority form. Its canonical authority
+hostname, optional Host field, and TLS SNI must agree with one enabled cached
+route, while schemes, paths, non-zero Content-Length, transfer encoding,
+upgrade headers, and RFC 8441 `:protocol` fail closed. Normal header and
+request-rate admission runs before route or stream creation. Edge never dials
+the authority and never forwards a CONNECT request; the authority selects only
+the existing route whose TunnelId owns one fixed Agent local target.
+
+Hyper 1.6 represents successful classic h2 CONNECT as `OnUpgrade` on both
+sides, backed by HTTP/2 DATA frames and flow control. Edge returns an empty
+successful response, awaits the upgraded stream under the request deadline,
+and reuses the fixed-buffer opaque relay used by HTTP/1.1 CONNECT. Half-close
+maps to h2 end-of-stream, resets affect only the selected logical stream, and
+Tunnel Protocol v2 remains unchanged.
+
+Each HTTP/2 connection owns a bounded relay channel and `JoinSet` sized by the
+shared CONNECT limit. The connection supervisor drives Hyper, starts accepted
+relays, observes their completion, sends graceful GOAWAY on shutdown, and owns
+all remaining relay tasks until the existing HTTPS drain deadline force-aborts
+the connection task. RAII retains both aggregate and HTTP/2-specific
+current/peak session gauges; fixed-cardinality counters expose accepted,
+rejected, and idle-timeout outcomes without identity or payload labels.
 
 ## 3. Control plane vs data plane
 

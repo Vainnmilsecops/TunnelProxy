@@ -49,6 +49,9 @@ correct agent, which in turn proxies them into the local service.
   HTTP/1.1 CONNECT is separately opt-in and route-bound: exact authority
   hostname/port, Host, and SNI must agree before a capped, idle-bounded opaque
   tunnel begins. It never acts as an arbitrary forward proxy.
+  Classic HTTP/2 CONNECT has its own opt-in, reuses the same route-bound
+  authority policy and shared CONNECT capacity, and isolates each upgraded h2
+  stream while retaining graceful GOAWAY/drain behavior.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -271,6 +274,7 @@ and Definition of Done.
 | 44 _(complete)_ | opt-in bounded HTTP/2 public HTTPS ingress |
 | 45 _(complete)_ | bounded HTTP/1.1 WebSocket upgrade ingress |
 | 46 _(complete)_ | bounded route-bound HTTP/1.1 CONNECT ingress |
+| 47 _(complete)_ | bounded route-bound classic HTTP/2 CONNECT ingress |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
