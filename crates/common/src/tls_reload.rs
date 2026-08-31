@@ -1,191 +1,29 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use x509_parser::parse_x509_certificate;
 
+use crate::generation_reload::{
+    load_generation_reload, GenerationReload, GenerationReloadError, GenerationReloadFile,
+    MAX_RELOAD_MANIFEST_BYTES, MAX_RELOAD_MATERIAL_BYTES,
+};
 use crate::ShutdownSignal;
 
-pub const MAX_TLS_RELOAD_MANIFEST_BYTES: usize = 64 * 1024;
-pub const MAX_TLS_MATERIAL_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsReloadFile {
-    pub name: String,
-    pub path: PathBuf,
-}
-
-impl TlsReloadFile {
-    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self {
-            name: name.into(),
-            path: path.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TlsReloadGeneration {
-    generation: u64,
-    manifest_digest: [u8; 32],
-    files: BTreeMap<String, Vec<u8>>,
-}
-
-impl TlsReloadGeneration {
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub const fn manifest_digest(&self) -> [u8; 32] {
-        self.manifest_digest
-    }
-
-    pub fn file(&self, name: &str) -> Result<&[u8], TlsReloadLoadError> {
-        self.files
-            .get(name)
-            .map(Vec::as_slice)
-            .ok_or_else(|| TlsReloadLoadError::MissingFile(name.to_owned()))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawManifest {
-    generation: u64,
-    files: BTreeMap<String, String>,
-}
+pub const MAX_TLS_RELOAD_MANIFEST_BYTES: usize = MAX_RELOAD_MANIFEST_BYTES;
+pub const MAX_TLS_MATERIAL_BYTES: usize = MAX_RELOAD_MATERIAL_BYTES;
+pub type TlsReloadFile = GenerationReloadFile;
+pub type TlsReloadGeneration = GenerationReload;
+pub type TlsReloadLoadError = GenerationReloadError;
 
 pub async fn load_tls_reload_generation(
     manifest_path: PathBuf,
     files: Vec<TlsReloadFile>,
 ) -> Result<TlsReloadGeneration, TlsReloadLoadError> {
-    tokio::task::spawn_blocking(move || load_generation_sync(&manifest_path, &files))
-        .await
-        .map_err(|_| TlsReloadLoadError::Task)?
+    load_generation_reload(manifest_path, files).await
 }
-
-fn load_generation_sync(
-    manifest_path: &Path,
-    files: &[TlsReloadFile],
-) -> Result<TlsReloadGeneration, TlsReloadLoadError> {
-    let manifest_bytes = read_bounded(manifest_path, MAX_TLS_RELOAD_MANIFEST_BYTES)
-        .map_err(TlsReloadLoadError::ManifestIo)?;
-    let manifest: RawManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|_| TlsReloadLoadError::ManifestSyntax)?;
-    if manifest.generation == 0 || manifest.files.is_empty() {
-        return Err(TlsReloadLoadError::InvalidManifest);
-    }
-    let expected: BTreeSet<_> = files.iter().map(|file| file.name.as_str()).collect();
-    let declared: BTreeSet<_> = manifest.files.keys().map(String::as_str).collect();
-    if expected != declared || expected.len() != files.len() {
-        return Err(TlsReloadLoadError::FileSet);
-    }
-
-    let mut loaded = BTreeMap::new();
-    for file in files {
-        if file.name.is_empty() {
-            return Err(TlsReloadLoadError::FileSet);
-        }
-        let expected_digest = decode_digest(
-            manifest
-                .files
-                .get(&file.name)
-                .ok_or(TlsReloadLoadError::FileSet)?,
-        )?;
-        let bytes = read_bounded(&file.path, MAX_TLS_MATERIAL_BYTES)
-            .map_err(|_| TlsReloadLoadError::MaterialIo(file.name.clone()))?;
-        let actual: [u8; 32] = Sha256::digest(&bytes).into();
-        if actual != expected_digest {
-            return Err(TlsReloadLoadError::DigestMismatch(file.name.clone()));
-        }
-        loaded.insert(file.name.clone(), bytes);
-    }
-    Ok(TlsReloadGeneration {
-        generation: manifest.generation,
-        manifest_digest: Sha256::digest(manifest_bytes).into(),
-        files: loaded,
-    })
-}
-
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, std::io::Error> {
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > limit as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bounded TLS input exceeds its limit",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bounded TLS input exceeds its limit",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn decode_digest(value: &str) -> Result<[u8; 32], TlsReloadLoadError> {
-    if value.len() != 64 {
-        return Err(TlsReloadLoadError::InvalidDigest);
-    }
-    let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
-            .map_err(|_| TlsReloadLoadError::InvalidDigest)?;
-    }
-    Ok(digest)
-}
-
-#[derive(Debug)]
-pub enum TlsReloadLoadError {
-    ManifestIo(std::io::Error),
-    MaterialIo(String),
-    ManifestSyntax,
-    InvalidManifest,
-    InvalidDigest,
-    FileSet,
-    DigestMismatch(String),
-    MissingFile(String),
-    Task,
-}
-
-impl std::fmt::Display for TlsReloadLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ManifestIo(_) => f.write_str("TLS reload manifest could not be read"),
-            Self::MaterialIo(name) => write!(f, "TLS reload material {name} could not be read"),
-            Self::ManifestSyntax => f.write_str("TLS reload manifest is invalid JSON"),
-            Self::InvalidManifest => f.write_str("TLS reload manifest fields are invalid"),
-            Self::InvalidDigest => f.write_str("TLS reload manifest contains an invalid digest"),
-            Self::FileSet => {
-                f.write_str("TLS reload manifest file set does not match configuration")
-            }
-            Self::DigestMismatch(name) => {
-                write!(
-                    f,
-                    "TLS reload material {name} does not match its manifest digest"
-                )
-            }
-            Self::MissingFile(name) => write!(f, "TLS reload material {name} is missing"),
-            Self::Task => f.write_str("TLS reload blocking task failed"),
-        }
-    }
-}
-
-impl std::error::Error for TlsReloadLoadError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsCertificateValidity {
@@ -557,6 +395,8 @@ impl std::error::Error for TlsReloadRuntimeError {}
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -14,10 +14,12 @@ use tokio::sync::watch;
 
 mod bounded_fair_queue;
 mod credential_bundle;
+mod generation_reload;
 mod multiplex_telemetry;
 mod process_logging;
 mod public_hostname;
 mod signed_access;
+mod signed_access_reload;
 mod tls_reload;
 
 pub use credential_bundle::{
@@ -48,9 +50,14 @@ pub use public_hostname::{
 
 pub use signed_access::{
     generate_signed_access_keypair, load_signed_access_key_ring, load_signed_access_signer,
-    SignedAccessClaims, SignedAccessError, SignedAccessKeyRing, SignedAccessSigner,
-    MAX_SIGNED_ACCESS_KEYS, MAX_SIGNED_ACCESS_KEY_FILE_BYTES, MAX_SIGNED_ACCESS_TOKEN_BYTES,
-    SIGNED_ACCESS_QUERY_PARAMETER,
+    merge_signed_access_key_rings, SignedAccessClaims, SignedAccessError, SignedAccessKeyRing,
+    SignedAccessKeyRingReloadStatus, SignedAccessSigner, MAX_SIGNED_ACCESS_KEYS,
+    MAX_SIGNED_ACCESS_KEY_FILE_BYTES, MAX_SIGNED_ACCESS_TOKEN_BYTES, SIGNED_ACCESS_QUERY_PARAMETER,
+};
+
+pub use signed_access_reload::{
+    SignedAccessKeyRingReloadConfig, SignedAccessKeyRingReloadError,
+    SignedAccessKeyRingReloadRuntime,
 };
 
 pub use tls_reload::{

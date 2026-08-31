@@ -1,6 +1,7 @@
 //! Bounded, offline-issued access tokens for public HTTPS ingress.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -61,9 +62,7 @@ impl SignedAccessSigner {
     }
 
     pub fn public_key_ring(&self) -> SignedAccessKeyRing {
-        SignedAccessKeyRing {
-            keys: BTreeMap::from([(self.key_id, self.key.verifying_key())]),
-        }
+        SignedAccessKeyRing::new(BTreeMap::from([(self.key_id, self.key.verifying_key())]))
     }
 
     pub fn sign(
@@ -87,25 +86,124 @@ impl SignedAccessSigner {
 
 #[derive(Clone)]
 pub struct SignedAccessKeyRing {
+    state: Arc<RwLock<SignedAccessKeyRingState>>,
+}
+
+struct SignedAccessKeyRingState {
     keys: BTreeMap<u32, VerifyingKey>,
+    reload: Option<SignedAccessKeyRingReloadStatus>,
+    manifest_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedAccessKeyRingReloadStatus {
+    pub generation: u64,
+    pub reload_failed: bool,
+    pub successful_reloads: u64,
+    pub failed_reloads: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignedAccessKeyRingActivation {
+    Activated,
+    Unchanged,
+    Stale,
+    ConflictingGeneration,
 }
 
 impl std::fmt::Debug for SignedAccessKeyRing {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.read_state();
         formatter
             .debug_struct("SignedAccessKeyRing")
-            .field("key_ids", &self.keys.keys().collect::<Vec<_>>())
+            .field("key_ids", &state.keys.keys().collect::<Vec<_>>())
+            .field("reload", &state.reload)
             .finish()
     }
 }
 
 impl SignedAccessKeyRing {
+    fn new(keys: BTreeMap<u32, VerifyingKey>) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(SignedAccessKeyRingState {
+                keys,
+                reload: None,
+                manifest_digest: None,
+            })),
+        }
+    }
+
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, SignedAccessKeyRingState> {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, SignedAccessKeyRingState> {
+        self.state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.read_state().keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.read_state().keys.is_empty()
+    }
+
+    pub fn reload_status(&self) -> Option<SignedAccessKeyRingReloadStatus> {
+        self.read_state().reload
+    }
+
+    pub(crate) fn initialize_reload(&self, generation: u64, manifest_digest: [u8; 32]) {
+        let mut state = self.write_state();
+        state.reload = Some(SignedAccessKeyRingReloadStatus {
+            generation,
+            reload_failed: false,
+            successful_reloads: 0,
+            failed_reloads: 0,
+        });
+        state.manifest_digest = Some(manifest_digest);
+    }
+
+    pub(crate) fn mark_reload_failed(&self) {
+        let mut state = self.write_state();
+        if let Some(status) = &mut state.reload {
+            status.reload_failed = true;
+            status.failed_reloads = status.failed_reloads.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn activate_reload_candidate(
+        &self,
+        generation: u64,
+        manifest_digest: [u8; 32],
+        candidate: &Self,
+    ) -> SignedAccessKeyRingActivation {
+        let candidate_keys = candidate.read_state().keys.clone();
+        let mut state = self.write_state();
+        let Some(status) = &state.reload else {
+            return SignedAccessKeyRingActivation::Stale;
+        };
+        if generation < status.generation {
+            return SignedAccessKeyRingActivation::Stale;
+        }
+        if generation == status.generation {
+            return if state.manifest_digest == Some(manifest_digest) {
+                SignedAccessKeyRingActivation::Unchanged
+            } else {
+                SignedAccessKeyRingActivation::ConflictingGeneration
+            };
+        }
+        state.keys = candidate_keys;
+        state.manifest_digest = Some(manifest_digest);
+        let status = state.reload.as_mut().expect("reload state exists");
+        status.generation = generation;
+        status.reload_failed = false;
+        status.successful_reloads = status.successful_reloads.saturating_add(1);
+        SignedAccessKeyRingActivation::Activated
     }
 
     pub fn verify(
@@ -129,7 +227,8 @@ impl SignedAccessKeyRing {
             .try_into()
             .map_err(|_| SignedAccessError::MalformedToken)?;
         let claims = decode_payload(&payload)?;
-        let key = self
+        let state = self.read_state();
+        let key = state
             .keys
             .get(&claims.key_id)
             .ok_or(SignedAccessError::UnknownKey)?;
@@ -290,7 +389,35 @@ pub fn load_signed_access_key_ring(bytes: &[u8]) -> Result<SignedAccessKeyRing, 
             return Err(SignedAccessError::DuplicateKeyId);
         }
     }
-    Ok(SignedAccessKeyRing { keys })
+    Ok(SignedAccessKeyRing::new(keys))
+}
+
+pub fn merge_signed_access_key_rings(
+    existing: &[u8],
+    additional: &[u8],
+) -> Result<Vec<u8>, SignedAccessError> {
+    let existing = load_signed_access_key_ring(existing)?;
+    let additional = load_signed_access_key_ring(additional)?;
+    let mut keys = existing.read_state().keys.clone();
+    for (key_id, key) in &additional.read_state().keys {
+        if keys.insert(*key_id, *key).is_some() {
+            return Err(SignedAccessError::DuplicateKeyId);
+        }
+    }
+    if keys.len() > MAX_SIGNED_ACCESS_KEYS {
+        return Err(SignedAccessError::TooManyKeys);
+    }
+    let file = PublicKeyRingFile {
+        version: KEY_FILE_VERSION,
+        keys: keys
+            .into_iter()
+            .map(|(key_id, key)| PublicKeyFile {
+                key_id,
+                public_key: URL_SAFE_NO_PAD.encode(key.to_bytes()),
+            })
+            .collect(),
+    };
+    serde_json::to_vec_pretty(&file).map_err(|_| SignedAccessError::InvalidKeyFile)
 }
 
 fn validate_key_id(key_id: u32) -> Result<(), SignedAccessError> {

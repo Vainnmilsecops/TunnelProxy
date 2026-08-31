@@ -389,6 +389,10 @@ host synchronization. Monitor:
 - `tunnelproxy_edge_https_signed_access_missing_rejections_total`
 - `tunnelproxy_edge_https_signed_access_invalid_rejections_total`
 - `tunnelproxy_edge_https_signed_access_expired_rejections_total`
+- `tunnelproxy_edge_https_signed_access_keyring_generation`
+- `tunnelproxy_edge_https_signed_access_keyring_reload_failed`
+- `tunnelproxy_edge_https_signed_access_keyring_reload_successes_total`
+- `tunnelproxy_edge_https_signed_access_keyring_reload_failures_total`
 - the existing global/per-IP rate-limit rejection counters
 
 Rate limiting precedes signature verification, so abusive invalid traffic is
@@ -397,5 +401,11 @@ indicates stale links or clock drift; invalid rejections indicate corruption,
 wrong hostname/key, or tampering. Roll back by removing
 `--require-signed-access` and its key-ring/tuning flags, then restart Edge. Key
 rotation uses an overlapping public ring (maximum eight keys) while issuers
-move to the new non-zero key ID; live reload and pre-expiry revocation are not
+move to the new non-zero key ID. With the reload manifest configured, publish
+the keyring file first and the matching SHA-256 manifest last. Only a higher
+generation activates; stale, conflicting, malformed, oversized, or
+digest-mismatched candidates leave the last-known-good ring active and raise
+the failure gauge/counter. Removing a key takes effect for new requests as
+soon as that generation activates, so wait at least the old token TTL plus
+clock skew before retiring it. Pre-expiry per-token revocation is not
 implemented.

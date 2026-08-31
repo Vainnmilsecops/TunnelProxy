@@ -1590,3 +1590,28 @@ Out of scope:
 - Replay prevention before expiry, stateful nonces, per-user identity,
   cookies/login, raw TCP authentication, online signing, HSM/KMS custody,
   key-ring live reload, revocation lists, and Tunnel Protocol changes.
+
+## Session 50 — Atomic Signed-Access Public-Key Ring Reload and Rotation — complete
+
+Scope delivered:
+
+- Extracted the strict SHA-256 digest/generation loader from TLS-specific
+  ownership and reused it for signed-access key-ring generations.
+- Added opt-in Edge reload flags, supervised polling, atomic whole-ring
+  activation, monotonic generation/conflict rules, and last-known-good
+  retention without listener restart. Static key-ring behavior remains the
+  default.
+- Added offline overlap generation and keyring-before-manifest publishing.
+  Rings remain bounded to eight non-zero, unique key IDs; Edge still loads no
+  private key.
+- Added generation, failure-health, success, and failure metrics with no
+  token, hostname, or key-ID labels.
+- Added unit/integration coverage for overlap, digest failure retention, and
+  key removal plus real-TLS coverage of key 1 to key 1+2 to key 2 while the
+  Edge listener remains live. The workspace now contains 398 explicit tests.
+
+Out of scope:
+
+- Remote key distribution, coordinated multi-edge rollout, HSM/KMS custody,
+  stateful replay prevention, individual-token revocation, live TTL/skew
+  policy reload, and Tunnel Protocol changes.

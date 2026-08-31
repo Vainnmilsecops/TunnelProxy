@@ -9,7 +9,8 @@ use tokio::io::AsyncReadExt as _;
 use tracing::{error, info, warn};
 use tunnelproxy_common::{
     init_process_logging, load_signed_access_key_ring, shutdown_channel, wait_for_process_shutdown,
-    AgentId, ProcessLogFormat, TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES,
+    AgentId, ProcessLogFormat, SignedAccessKeyRingReloadConfig, SignedAccessKeyRingReloadRuntime,
+    TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES,
 };
 use tunnelproxy_control_plane::{
     HttpsRouteClientConfig, HttpsRouteClientTlsReloadConfig, HttpsRouteClientTlsReloadRuntime,
@@ -73,6 +74,8 @@ Options:
   --connect-authority-port <u16>   required CONNECT authority port (default 443)
   --require-signed-access          require expiring tp_access URL signatures
   --signed-access-keyring <path>   bounded Ed25519 public-key ring JSON
+  --signed-access-keyring-reload-manifest <path> signed-access generation manifest
+  --signed-access-reload-interval-ms <ms> key-ring poll interval (default 1000)
   --signed-access-max-ttl-seconds <seconds> maximum token TTL (default 3600)
   --signed-access-clock-skew-seconds <seconds> accepted clock skew (default 30)
   --http-requests-per-second <u64> global request rate (default 100)
@@ -162,13 +165,14 @@ async fn main() -> ExitCode {
         operations.shutdown = config.shutdown;
         operations
     });
-    let (https_ingress, public_tls_reloader) = match load_https_configuration(&parsed).await {
-        Ok(configuration) => configuration,
-        Err(error) => {
-            error!(%error, "failed to configure public HTTPS ingress");
-            return ExitCode::from(2);
-        }
-    };
+    let (https_ingress, public_tls_reloader, signed_access_reloader) =
+        match load_https_configuration(&parsed).await {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                error!(%error, "failed to configure public HTTPS ingress");
+                return ExitCode::from(2);
+            }
+        };
     config.https_ingress = https_ingress;
     let (https_routes, https_route_reloader) = match load_https_route_configuration(&parsed).await {
         Ok(configuration) => configuration,
@@ -195,6 +199,7 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             reloaders.public = public_tls_reloader;
+            reloaders.signed_access = signed_access_reloader;
             config.multiplex.security = security;
             config.multiplex.registration = registration;
             run_static_edge(config, reloaders, &parsed).await
@@ -206,6 +211,7 @@ async fn main() -> ExitCode {
             mut reloaders,
         } => {
             reloaders.public = public_tls_reloader;
+            reloaders.signed_access = signed_access_reloader;
             reloaders.routes = https_route_reloader;
             config.multiplex.security = security;
             run_snapshot_edge(config, snapshots, cache, https_routes, reloaders, &parsed).await
@@ -462,6 +468,9 @@ struct ParsedArgs {
     connect_options_present: bool,
     require_signed_access: bool,
     signed_access_keyring: Option<PathBuf>,
+    signed_access_keyring_reload_manifest: Option<PathBuf>,
+    signed_access_reload_interval: Duration,
+    signed_access_reload_options_present: bool,
     signed_access_maximum_ttl: Duration,
     signed_access_clock_skew: Duration,
     signed_access_options_present: bool,
@@ -552,6 +561,9 @@ impl Default for ParsedArgs {
             connect_options_present: false,
             require_signed_access: false,
             signed_access_keyring: None,
+            signed_access_keyring_reload_manifest: None,
+            signed_access_reload_interval: Duration::from_secs(1),
+            signed_access_reload_options_present: false,
             signed_access_maximum_ttl: Duration::from_secs(60 * 60),
             signed_access_clock_skew: Duration::from_secs(30),
             signed_access_options_present: false,
@@ -617,6 +629,7 @@ enum ArgError {
     WebSocketOptionsWithoutOptIn,
     ConnectOptionsWithoutOptIn,
     SignedAccessOptionsWithoutOptIn,
+    SignedAccessReloadWithoutManifest,
     SignedAccessConnectConflict,
     IngressModeConflict,
     PublicHttpsOptInRequired,
@@ -680,6 +693,9 @@ impl std::fmt::Display for ArgError {
             Self::SignedAccessOptionsWithoutOptIn => {
                 f.write_str("signed-access options require --require-signed-access")
             }
+            Self::SignedAccessReloadWithoutManifest => f.write_str(
+                "--signed-access-reload-interval-ms requires --signed-access-keyring-reload-manifest",
+            ),
             Self::SignedAccessConnectConflict => {
                 f.write_str("--require-signed-access cannot be combined with CONNECT ingress")
             }
@@ -926,6 +942,22 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.https_options_present = true;
                 index += 2;
             }
+            "--signed-access-keyring-reload-manifest" => {
+                parsed.signed_access_keyring_reload_manifest =
+                    Some(PathBuf::from(value(args, index, flag)?));
+                parsed.signed_access_reload_options_present = true;
+                parsed.signed_access_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
+            "--signed-access-reload-interval-ms" => {
+                parsed.signed_access_reload_interval =
+                    Duration::from_millis(parse_number(args, index, flag)?);
+                parsed.signed_access_reload_options_present = true;
+                parsed.signed_access_options_present = true;
+                parsed.https_options_present = true;
+                index += 2;
+            }
             "--signed-access-max-ttl-seconds" => {
                 parsed.signed_access_maximum_ttl =
                     Duration::from_secs(parse_number(args, index, flag)?);
@@ -1152,6 +1184,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     if parsed.signed_access_options_present && !parsed.require_signed_access {
         return Err(ArgError::SignedAccessOptionsWithoutOptIn);
     }
+    if parsed.signed_access_reload_options_present
+        && parsed.signed_access_keyring_reload_manifest.is_none()
+    {
+        return Err(ArgError::SignedAccessReloadWithoutManifest);
+    }
     if parsed.require_signed_access && (parsed.enable_connect || parsed.enable_http2_connect) {
         return Err(ArgError::SignedAccessConnectConflict);
     }
@@ -1239,6 +1276,7 @@ enum TlsLoadError {
     MissingSignedAccessKeyRing,
     ReadSignedAccessKeyRing,
     InvalidSignedAccessKeyRing,
+    SignedAccessReload(tunnelproxy_common::SignedAccessKeyRingReloadError),
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -1303,6 +1341,9 @@ impl std::fmt::Display for TlsLoadError {
             Self::InvalidSignedAccessKeyRing => {
                 f.write_str("signed-access public-key ring is invalid")
             }
+            Self::SignedAccessReload(error) => {
+                write!(f, "signed-access key-ring reload is invalid: {error}")
+            }
         }
     }
 }
@@ -1313,6 +1354,7 @@ struct LoadedTlsReloaders {
     snapshot: Option<SnapshotClientTlsReloadRuntime>,
     public: Option<PublicTlsReloadRuntime>,
     routes: Option<HttpsRouteClientTlsReloadRuntime>,
+    signed_access: Option<SignedAccessKeyRingReloadRuntime>,
 }
 
 impl LoadedTlsReloaders {
@@ -1355,6 +1397,13 @@ impl LoadedTlsReloaders {
                     .run_until_shutdown(child_signal)
                     .await
                     .map_err(TlsReloadSupervisorError::HttpsRoute)
+            });
+        }
+        if let Some(runtime) = self.signed_access {
+            let child_signal = signal.clone();
+            tasks.spawn(async move {
+                runtime.run_until_shutdown(child_signal).await;
+                Ok(())
             });
         }
         if tasks.is_empty() {
@@ -1482,6 +1531,7 @@ async fn load_transport_configuration(
                             snapshot: None,
                             public: None,
                             routes: None,
+                            signed_access: None,
                         },
                     });
                 }
@@ -1540,6 +1590,7 @@ async fn load_transport_configuration(
                         snapshot: None,
                         public: None,
                         routes: None,
+                        signed_access: None,
                     },
                 })
             }
@@ -1620,6 +1671,7 @@ async fn load_snapshot_configuration(
             snapshot: snapshot_reloader,
             public: None,
             routes: None,
+            signed_access: None,
         },
     })
 }
@@ -1648,12 +1700,19 @@ fn snapshot_cache_configuration(
 
 async fn load_https_configuration(
     parsed: &ParsedArgs,
-) -> Result<(Option<HttpIngressConfig>, Option<PublicTlsReloadRuntime>), TlsLoadError> {
+) -> Result<
+    (
+        Option<HttpIngressConfig>,
+        Option<PublicTlsReloadRuntime>,
+        Option<SignedAccessKeyRingReloadRuntime>,
+    ),
+    TlsLoadError,
+> {
     let Some(listen_addr) = parsed.https_listen else {
         if parsed.https_options_present {
             return Err(TlsLoadError::PublicHttpsWithoutListener);
         }
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
     let (Some(certificate_path), Some(private_key_path)) = (
         parsed.public_tls_cert.clone(),
@@ -1678,21 +1737,40 @@ async fn load_https_configuration(
             tunnelproxy_edge::HttpIngressConfigError::InvalidRequestRateLimit(error),
         )
     })?;
-    let signed_access = if parsed.require_signed_access {
+    let (signed_access, signed_access_reloader) = if parsed.require_signed_access {
         let path = parsed
             .signed_access_keyring
             .as_ref()
             .ok_or(TlsLoadError::MissingSignedAccessKeyRing)?;
-        let bytes = read_signed_access_key_ring(path).await?;
-        let key_ring = load_signed_access_key_ring(&bytes)
-            .map_err(|_| TlsLoadError::InvalidSignedAccessKeyRing)?;
-        Some(SignedAccessIngressConfig {
-            key_ring,
-            maximum_ttl: parsed.signed_access_maximum_ttl,
-            clock_skew: parsed.signed_access_clock_skew,
-        })
+        let (key_ring, reloader) = match &parsed.signed_access_keyring_reload_manifest {
+            Some(manifest_path) => {
+                let (key_ring, runtime) =
+                    SignedAccessKeyRingReloadRuntime::bootstrap(SignedAccessKeyRingReloadConfig {
+                        manifest_path: manifest_path.clone(),
+                        key_ring_path: path.clone(),
+                        poll_interval: parsed.signed_access_reload_interval,
+                    })
+                    .await
+                    .map_err(TlsLoadError::SignedAccessReload)?;
+                (key_ring, Some(runtime))
+            }
+            None => {
+                let bytes = read_signed_access_key_ring(path).await?;
+                let key_ring = load_signed_access_key_ring(&bytes)
+                    .map_err(|_| TlsLoadError::InvalidSignedAccessKeyRing)?;
+                (key_ring, None)
+            }
+        };
+        (
+            Some(SignedAccessIngressConfig {
+                key_ring,
+                maximum_ttl: parsed.signed_access_maximum_ttl,
+                clock_skew: parsed.signed_access_clock_skew,
+            }),
+            reloader,
+        )
     } else {
-        None
+        (None, None)
     };
     let protocols = if parsed.enable_http2 {
         PublicHttpProtocolPolicy::Http1AndHttp2
@@ -1774,7 +1852,7 @@ async fn load_https_configuration(
     config
         .validate()
         .map_err(TlsLoadError::InvalidHttpIngress)?;
-    Ok((Some(config), reloader))
+    Ok((Some(config), reloader, signed_access_reloader))
 }
 
 async fn load_https_route_configuration(
@@ -2408,6 +2486,10 @@ mod tests {
             "--require-signed-access",
             "--signed-access-keyring",
             "public-ring.json",
+            "--signed-access-keyring-reload-manifest",
+            "signed-access-generation.json",
+            "--signed-access-reload-interval-ms",
+            "250",
             "--signed-access-max-ttl-seconds",
             "300",
             "--signed-access-clock-skew-seconds",
@@ -2422,12 +2504,30 @@ mod tests {
         assert_eq!(parsed.signed_access_maximum_ttl, Duration::from_secs(300));
         assert_eq!(parsed.signed_access_clock_skew, Duration::from_secs(15));
         assert_eq!(
+            parsed.signed_access_keyring_reload_manifest,
+            Some(PathBuf::from("signed-access-generation.json"))
+        );
+        assert_eq!(
+            parsed.signed_access_reload_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
             parse_args(&args(&["--signed-access-keyring", "public-ring.json"])),
             Err(ArgError::SignedAccessOptionsWithoutOptIn)
         );
         assert_eq!(
             parse_args(&args(&["--require-signed-access", "--enable-connect"])),
             Err(ArgError::SignedAccessConnectConflict)
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--require-signed-access",
+                "--signed-access-keyring",
+                "public-ring.json",
+                "--signed-access-reload-interval-ms",
+                "250",
+            ])),
+            Err(ArgError::SignedAccessReloadWithoutManifest)
         );
     }
 }

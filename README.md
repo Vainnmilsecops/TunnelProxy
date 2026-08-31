@@ -59,6 +59,9 @@ correct agent, which in turn proxies them into the local service.
   HTTP/2, and both WebSocket forms. Ed25519 tokens bind the canonical hostname
   and bounded lifetime, are checked after request-rate admission, and are
   removed before forwarding to the local application.
+  The public-key ring can be rotated without restarting Edge through an
+  opt-in digest-manifest generation protocol with atomic last-known-good
+  activation and bounded overlap.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
@@ -284,6 +287,7 @@ and Definition of Done.
 | 47 _(complete)_ | bounded route-bound classic HTTP/2 CONNECT ingress |
 | 48 _(complete)_ | bounded route-bound RFC 8441 WebSocket ingress |
 | 49 _(complete)_ | bounded expiring signed access URLs for public HTTPS |
+| 50 _(complete)_ | atomic signed-access public-key ring reload and rotation |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

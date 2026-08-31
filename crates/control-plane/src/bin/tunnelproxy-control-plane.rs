@@ -1,17 +1,21 @@
 //! Runnable authorization snapshot import and distribution process.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 use tunnelproxy_common::{
-    generate_signed_access_keypair, init_process_logging, load_signed_access_signer,
-    replace_secret_file, shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat,
-    PublicHostname, TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES, SIGNED_ACCESS_QUERY_PARAMETER,
+    generate_signed_access_keypair, init_process_logging, load_signed_access_key_ring,
+    load_signed_access_signer, merge_signed_access_key_rings, replace_secret_file,
+    shutdown_channel, wait_for_process_shutdown, AgentId, ProcessLogFormat, PublicHostname,
+    TunnelId, MAX_SIGNED_ACCESS_KEY_FILE_BYTES, SIGNED_ACCESS_QUERY_PARAMETER,
 };
 use tunnelproxy_control_plane::{
     parse_snapshot_manifest, provision_bootstrap_token, unix_time_now, AgentCertificateIssuer,
@@ -40,6 +44,7 @@ Usage:
   tunnelproxy-control-plane https-hostname-allocate [OPTIONS]
   tunnelproxy-control-plane https-hostname-release [OPTIONS]
   tunnelproxy-control-plane signed-access-keygen [OPTIONS]
+  tunnelproxy-control-plane signed-access-keyring-publish [OPTIONS]
   tunnelproxy-control-plane sign-access-url [OPTIONS]
 
 Serve options:
@@ -114,6 +119,13 @@ Signed access keygen options:
   --key-id <u32>                     non-zero public key identifier (required)
   --private-key-output <path>        offline signer key JSON (required)
   --public-keyring-output <path>     Edge public-key ring JSON (required)
+  --existing-public-keyring <path>   merge an overlap ring before publishing
+
+Signed access key-ring publish options:
+  --source-keyring <path>            staged public-key ring JSON (required)
+  --keyring-output <path>            active Edge key-ring path (required)
+  --reload-manifest-output <path>    generation manifest written last (required)
+  --generation <u64>                 strictly increasing generation (required)
 
 Sign access URL options:
   --private-key <path>               offline signer key JSON (required)
@@ -260,6 +272,18 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        ParsedCommand::SignedAccessKeyRingPublish(args) => {
+            match run_signed_access_keyring_publish(args).await {
+                Ok(()) => {
+                    info!("signed-access key-ring generation published");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    error!(%error, "signed-access key-ring publish failed");
+                    ExitCode::from(1)
+                }
+            }
+        }
         ParsedCommand::SignAccessUrl(args) => match run_sign_access_url(args).await {
             Ok(url) => {
                 println!("{url}");
@@ -675,6 +699,7 @@ enum ParsedCommand {
     HttpsHostnameAllocate(HttpsHostnameAllocateArgs),
     HttpsHostnameRelease(HttpsHostnameReleaseArgs),
     SignedAccessKeygen(SignedAccessKeygenArgs),
+    SignedAccessKeyRingPublish(SignedAccessKeyRingPublishArgs),
     SignAccessUrl(SignAccessUrlArgs),
 }
 
@@ -931,14 +956,65 @@ async fn run_signed_access_keygen(
     args: SignedAccessKeygenArgs,
 ) -> Result<(), SignedAccessCommandError> {
     tokio::task::spawn_blocking(move || {
-        if args.private_key_output == args.public_keyring_output {
+        if args.private_key_output == args.public_keyring_output
+            || args.existing_public_keyring.as_ref() == Some(&args.private_key_output)
+        {
             return Err(SignedAccessCommandError::ConflictingPaths);
         }
-        let (private_key, public_keyring) = generate_signed_access_keypair(args.key_id)
+        let existing = args
+            .existing_public_keyring
+            .as_deref()
+            .map(read_bounded_key_file)
+            .transpose()?;
+        let (private_key, generated_keyring) = generate_signed_access_keypair(args.key_id)
             .map_err(|_| SignedAccessCommandError::Crypto)?;
+        let public_keyring = match existing {
+            Some(existing) => merge_signed_access_key_rings(&existing, &generated_keyring)
+                .map_err(|_| SignedAccessCommandError::InvalidKeyFile)?,
+            None => generated_keyring,
+        };
         replace_secret_file(&args.public_keyring_output, &public_keyring)
             .map_err(|_| SignedAccessCommandError::WriteKeyFile)?;
         replace_secret_file(&args.private_key_output, &private_key)
+            .map_err(|_| SignedAccessCommandError::WriteKeyFile)
+    })
+    .await
+    .map_err(|_| SignedAccessCommandError::Worker)?
+}
+
+#[derive(Serialize)]
+struct SignedAccessReloadManifest {
+    generation: u64,
+    files: BTreeMap<&'static str, String>,
+}
+
+async fn run_signed_access_keyring_publish(
+    args: SignedAccessKeyRingPublishArgs,
+) -> Result<(), SignedAccessCommandError> {
+    tokio::task::spawn_blocking(move || {
+        if args.keyring_output == args.reload_manifest_output
+            || args.source_keyring == args.reload_manifest_output
+        {
+            return Err(SignedAccessCommandError::ConflictingPaths);
+        }
+        let keyring = read_bounded_key_file(&args.source_keyring)?;
+        load_signed_access_key_ring(&keyring)
+            .map_err(|_| SignedAccessCommandError::InvalidKeyFile)?;
+        let digest = Sha256::digest(&keyring)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let manifest = SignedAccessReloadManifest {
+            generation: args.generation,
+            files: BTreeMap::from([("keyring", digest)]),
+        };
+        let manifest = serde_json::to_vec_pretty(&manifest)
+            .map_err(|_| SignedAccessCommandError::WriteKeyFile)?;
+
+        // The material must become durable before its commit marker is replaced.
+        replace_secret_file(&args.keyring_output, &keyring)
+            .map_err(|_| SignedAccessCommandError::WriteKeyFile)?;
+        replace_secret_file(&args.reload_manifest_output, &manifest)
             .map_err(|_| SignedAccessCommandError::WriteKeyFile)
     })
     .await
@@ -1057,6 +1133,15 @@ struct SignedAccessKeygenArgs {
     key_id: u32,
     private_key_output: PathBuf,
     public_keyring_output: PathBuf,
+    existing_public_keyring: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedAccessKeyRingPublishArgs {
+    source_keyring: PathBuf,
+    keyring_output: PathBuf,
+    reload_manifest_output: PathBuf,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,6 +1182,8 @@ fn parse_args(args: &[String]) -> Result<ParsedCommand, ArgError> {
         "signed-access-keygen" => {
             parse_signed_access_keygen(&args[1..]).map(ParsedCommand::SignedAccessKeygen)
         }
+        "signed-access-keyring-publish" => parse_signed_access_keyring_publish(&args[1..])
+            .map(ParsedCommand::SignedAccessKeyRingPublish),
         "sign-access-url" => parse_sign_access_url(&args[1..]).map(ParsedCommand::SignAccessUrl),
         other => Err(ArgError::UnknownCommand(other.to_owned())),
     }
@@ -1556,6 +1643,7 @@ fn parse_signed_access_keygen(args: &[String]) -> Result<SignedAccessKeygenArgs,
     let mut key_id = None;
     let mut private_key_output = None;
     let mut public_keyring_output = None;
+    let mut existing_public_keyring = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -1564,6 +1652,9 @@ fn parse_signed_access_keygen(args: &[String]) -> Result<SignedAccessKeygenArgs,
             "--private-key-output" => private_key_output = Some(parse_path(args, index, flag)?),
             "--public-keyring-output" => {
                 public_keyring_output = Some(parse_path(args, index, flag)?)
+            }
+            "--existing-public-keyring" => {
+                existing_public_keyring = Some(parse_path(args, index, flag)?)
             }
             other => return Err(ArgError::UnknownFlag(other.to_owned())),
         }
@@ -1575,6 +1666,37 @@ fn parse_signed_access_keygen(args: &[String]) -> Result<SignedAccessKeygenArgs,
             .ok_or(ArgError::MissingRequired("--private-key-output"))?,
         public_keyring_output: public_keyring_output
             .ok_or(ArgError::MissingRequired("--public-keyring-output"))?,
+        existing_public_keyring,
+    })
+}
+
+fn parse_signed_access_keyring_publish(
+    args: &[String],
+) -> Result<SignedAccessKeyRingPublishArgs, ArgError> {
+    let mut source_keyring = None;
+    let mut keyring_output = None;
+    let mut reload_manifest_output = None;
+    let mut generation = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--source-keyring" => source_keyring = Some(parse_path(args, index, flag)?),
+            "--keyring-output" => keyring_output = Some(parse_path(args, index, flag)?),
+            "--reload-manifest-output" => {
+                reload_manifest_output = Some(parse_path(args, index, flag)?)
+            }
+            "--generation" => generation = Some(parse_positive(args, index, flag)?),
+            other => return Err(ArgError::UnknownFlag(other.to_owned())),
+        }
+        index += 2;
+    }
+    Ok(SignedAccessKeyRingPublishArgs {
+        source_keyring: source_keyring.ok_or(ArgError::MissingRequired("--source-keyring"))?,
+        keyring_output: keyring_output.ok_or(ArgError::MissingRequired("--keyring-output"))?,
+        reload_manifest_output: reload_manifest_output
+            .ok_or(ArgError::MissingRequired("--reload-manifest-output"))?,
+        generation: generation.ok_or(ArgError::MissingRequired("--generation"))?,
     })
 }
 
@@ -2323,6 +2445,7 @@ mod tests {
                 key_id: 49,
                 private_key_output: PathBuf::from("signer.json"),
                 public_keyring_output: PathBuf::from("ring.json"),
+                existing_public_keyring: None,
             }))
         );
         assert!(matches!(
@@ -2335,6 +2458,27 @@ mod tests {
             ])),
             Err(ArgError::MissingRequired("--ttl-seconds"))
         ));
+        assert_eq!(
+            parse_args(&args(&[
+                "signed-access-keyring-publish",
+                "--source-keyring",
+                "staged.json",
+                "--keyring-output",
+                "active.json",
+                "--reload-manifest-output",
+                "generation.json",
+                "--generation",
+                "2",
+            ])),
+            Ok(ParsedCommand::SignedAccessKeyRingPublish(
+                SignedAccessKeyRingPublishArgs {
+                    source_keyring: PathBuf::from("staged.json"),
+                    keyring_output: PathBuf::from("active.json"),
+                    reload_manifest_output: PathBuf::from("generation.json"),
+                    generation: 2,
+                }
+            ))
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "tunnelproxy-signed-access-cli-{}-{}",
@@ -2351,6 +2495,7 @@ mod tests {
             key_id: 49,
             private_key_output: private_key.clone(),
             public_keyring_output: public_keyring.clone(),
+            existing_public_keyring: None,
         })
         .await
         .unwrap();
@@ -2380,6 +2525,44 @@ mod tests {
                 1,
             )
             .is_ok());
+
+        let next_private_key = directory.join("private-2.json");
+        let overlap_keyring = directory.join("overlap.json");
+        run_signed_access_keygen(SignedAccessKeygenArgs {
+            key_id: 50,
+            private_key_output: next_private_key,
+            public_keyring_output: overlap_keyring.clone(),
+            existing_public_keyring: Some(directory.join("public.json")),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            load_signed_access_key_ring(&std::fs::read(&overlap_keyring).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        let active_keyring = directory.join("active.json");
+        let reload_manifest = directory.join("generation.json");
+        run_signed_access_keyring_publish(SignedAccessKeyRingPublishArgs {
+            source_keyring: overlap_keyring,
+            keyring_output: active_keyring.clone(),
+            reload_manifest_output: reload_manifest.clone(),
+            generation: 2,
+        })
+        .await
+        .unwrap();
+        let (published, _) = tunnelproxy_common::SignedAccessKeyRingReloadRuntime::bootstrap(
+            tunnelproxy_common::SignedAccessKeyRingReloadConfig {
+                manifest_path: reload_manifest,
+                key_ring_path: active_keyring,
+                poll_interval: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(published.len(), 2);
+        assert_eq!(published.reload_status().unwrap().generation, 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

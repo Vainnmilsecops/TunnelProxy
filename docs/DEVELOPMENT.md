@@ -1140,3 +1140,25 @@ tunnelproxy-control-plane sign-access-url --private-key signed-access-private.js
 The existing query is preserved, while any pre-existing exact `tp_access`
 parameter is rejected. A valid token is reusable until expiry and is removed
 before the request reaches the local application.
+
+### Rotating the Edge public-key ring without restart
+
+Create the next signer while retaining the active public key for an overlap
+generation:
+
+```text
+tunnelproxy-control-plane signed-access-keygen --key-id 2 --private-key-output signed-access-private-2.json --public-keyring-output signed-access-overlap.json --existing-public-keyring signed-access-public.json
+```
+
+Publish the validated keyring before its manifest commit marker:
+
+```text
+tunnelproxy-control-plane signed-access-keyring-publish --source-keyring signed-access-overlap.json --keyring-output signed-access-active.json --reload-manifest-output signed-access-generation.json --generation 2
+```
+
+Start Edge with `--signed-access-keyring signed-access-active.json` and
+`--signed-access-keyring-reload-manifest signed-access-generation.json`, then
+optionally set `--signed-access-reload-interval-ms` (default 1000). Generation
+numbers must be non-zero and strictly increase. After issuers have moved to
+key 2 and the maximum old-token lifetime has elapsed, publish a key-2-only
+ring at generation 3. At most eight keys may overlap.

@@ -762,6 +762,10 @@ pub struct HttpIngressStatus {
     pub missing_signed_access_rejections: u64,
     pub invalid_signed_access_rejections: u64,
     pub expired_signed_access_rejections: u64,
+    pub signed_access_keyring_generation: u64,
+    pub signed_access_keyring_reload_failed: bool,
+    pub signed_access_keyring_reload_successes: u64,
+    pub signed_access_keyring_reload_failures: u64,
     pub tracked_rate_limit_peers: usize,
     pub peak_tracked_rate_limit_peers: usize,
 }
@@ -770,11 +774,16 @@ pub struct HttpIngressStatus {
 pub struct HttpIngressStatusHandle {
     counters: Arc<HttpIngressCounters>,
     rate_limiter: HttpRequestRateLimiter,
+    signed_access_key_ring: Option<SignedAccessKeyRing>,
 }
 
 impl HttpIngressStatusHandle {
     pub fn snapshot(&self) -> HttpIngressStatus {
         let rate = self.rate_limiter.status();
+        let reload = self
+            .signed_access_key_ring
+            .as_ref()
+            .and_then(SignedAccessKeyRing::reload_status);
         HttpIngressStatus {
             active_connections: self.counters.active_connections.load(Ordering::Relaxed),
             accepted_connections: self.counters.accepted_connections.load(Ordering::Relaxed),
@@ -904,6 +913,11 @@ impl HttpIngressStatusHandle {
                 .counters
                 .expired_signed_access_rejections
                 .load(Ordering::Relaxed),
+            signed_access_keyring_generation: reload.map_or(0, |status| status.generation),
+            signed_access_keyring_reload_failed: reload.is_some_and(|status| status.reload_failed),
+            signed_access_keyring_reload_successes: reload
+                .map_or(0, |status| status.successful_reloads),
+            signed_access_keyring_reload_failures: reload.map_or(0, |status| status.failed_reloads),
             tracked_rate_limit_peers: rate.tracked_peer_ips,
             peak_tracked_rate_limit_peers: rate.peak_tracked_peer_ips,
         }
@@ -931,6 +945,10 @@ impl HttpIngressRuntime {
         let status = HttpIngressStatusHandle {
             counters: Arc::new(HttpIngressCounters::default()),
             rate_limiter: HttpRequestRateLimiter::new(config.request_rate_limit),
+            signed_access_key_ring: config
+                .signed_access
+                .as_ref()
+                .map(|signed_access| signed_access.key_ring.clone()),
         };
         Ok(Self {
             listener,
@@ -3320,6 +3338,7 @@ mod tests {
         let status = HttpIngressStatusHandle {
             counters: Arc::clone(&counters),
             rate_limiter: rate_limiter.clone(),
+            signed_access_key_ring: None,
         };
         counters.accepted_connections.store(3, Ordering::Relaxed);
         counters.admitted_requests.store(2, Ordering::Relaxed);
