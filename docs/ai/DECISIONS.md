@@ -1366,3 +1366,26 @@ share one deterministic policy without Control Plane availability or Tunnel
 Protocol changes. Replay remains possible until expiry. Stateful nonces,
 per-user identity, raw TCP authentication, HSM/KMS integration, live key reload,
 and revocation before expiry remain separate work.
+
+## ADR-050 — Signed-access key rotation is generation-committed and last-known-good
+
+**Status:** Accepted (Session 50).
+
+**Context:** Restarting Edge to rotate verifier keys interrupts operational
+ownership, while independently replacing a keyring and metadata can expose a
+partially published generation. Rotation must preserve the eight-key bound,
+keep private keys offline, and add no storage lookup to request admission.
+
+**Decision:** Reuse a component-neutral strict SHA-256 generation-manifest
+loader. Static loading remains the default; reload is explicit. Bootstrap
+requires a valid generation, then only a higher generation atomically replaces
+the shared ring. Same-generation digest conflicts, stale generations, invalid
+material, and read failures retain last-known-good and are observable without
+key IDs, hostnames, or tokens as metric labels. Offline tooling writes the
+validated keyring before the manifest and supports old+new overlap.
+
+**Consequences:** Issuers can move old to overlap to new without restarting
+the listener, and retiring a key rejects its tokens on the next request after
+activation. Operators must wait out maximum TTL plus skew before retirement.
+Remote distribution, coordinated multi-edge rollout, HSM/KMS custody,
+stateful replay prevention, and individual-token revocation remain separate.

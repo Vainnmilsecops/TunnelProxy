@@ -1141,6 +1141,24 @@ WebSockets because all carry a path/query. It is configuration-incompatible
 with classic CONNECT, whose authority-form target has no query component. Raw
 TCP ingress and Tunnel Protocol v2 are unchanged.
 
+### 2.48 Atomic signed-access public-key ring reload (Session 50)
+
+Static key-ring loading remains the default. An opt-in supervisor uses the
+same strict digest-manifest primitive as TLS reload: a manifest declares one
+non-zero generation and the SHA-256 digest of the bounded `keyring` material.
+Bootstrap fails closed; after bootstrap only a strictly higher generation can
+atomically replace the shared verification ring. Stale generations,
+same-generation digest conflicts, malformed rings, and I/O/digest failures
+retain the last-known-good ring and increment fixed-cardinality failure
+telemetry.
+
+Rotation is an offline three-phase sequence: old key, old+new overlap, then
+new key after the old token lifetime and skew window. The Control Plane CLI
+validates and publishes keyring material before replacing the manifest commit
+marker. Edge never receives a private key, never queries control-plane storage
+on the request path, and does not restart its HTTPS listener or existing
+connections. Key removal affects subsequent request verification immediately.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

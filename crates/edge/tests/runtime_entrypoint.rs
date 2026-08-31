@@ -33,7 +33,11 @@ use tunnelproxy_agent::{
     AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig, AgentTlsReloadRuntime,
     AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, RuntimeShutdownConfig,
 };
-use tunnelproxy_common::{AgentId, SignedAccessSigner, TlsConfigHealth, TunnelId};
+use tunnelproxy_common::{
+    generate_signed_access_keypair, load_signed_access_signer, merge_signed_access_key_rings,
+    AgentId, SignedAccessKeyRingReloadConfig, SignedAccessKeyRingReloadRuntime, TlsConfigHealth,
+    TunnelId,
+};
 use tunnelproxy_control_plane::{
     authorization_snapshot_channel, enrollment_token_hash, AgentGrant, AuthorizationSnapshot,
     CertificateFingerprint, ControlPlaneRuntime, ControlPlaneRuntimeConfig, EnrollmentRepository,
@@ -887,7 +891,27 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
 
     let https_addr = unused_addr().await;
     let mut config = edge_config(unused_addr().await);
-    let signer = SignedAccessSigner::from_private_key(49, [49; 32]).unwrap();
+    let (_, reload_directory) = snapshot_temp_database();
+    let keyring_path = reload_directory.join("signed-access-keyring.json");
+    let manifest_path = reload_directory.join("signed-access-manifest.json");
+    let (private_one, public_one) = generate_signed_access_keypair(49).unwrap();
+    let (private_two, public_two) = generate_signed_access_keypair(50).unwrap();
+    let overlap = merge_signed_access_key_rings(&public_one, &public_two).unwrap();
+    let signer = load_signed_access_signer(&private_one).unwrap();
+    let next_signer = load_signed_access_signer(&private_two).unwrap();
+    std::fs::write(&keyring_path, &public_one).unwrap();
+    write_reload_manifest(&manifest_path, 1, &[("keyring", &keyring_path)]);
+    let (reloadable_key_ring, keyring_reloader) =
+        SignedAccessKeyRingReloadRuntime::bootstrap(SignedAccessKeyRingReloadConfig {
+            manifest_path: manifest_path.clone(),
+            key_ring_path: keyring_path.clone(),
+            poll_interval: Duration::from_millis(10),
+        })
+        .await
+        .unwrap();
+    let keyring_status = reloadable_key_ring.clone();
+    let (reload_trigger, reload_signal) = shutdown_channel();
+    let reload_task = tokio::spawn(keyring_reloader.run_until_shutdown(reload_signal));
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
         routes: HttpHostRoutes::single(
@@ -910,7 +934,7 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
         websocket: None,
         connect: None,
         signed_access: Some(SignedAccessIngressConfig {
-            key_ring: signer.public_key_ring(),
+            key_ring: reloadable_key_ring,
             maximum_ttl: Duration::from_secs(120),
             clock_skew: Duration::from_secs(1),
         }),
@@ -1033,6 +1057,77 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     let response = String::from_utf8(read_http_head(&mut disabled_connect).await).unwrap();
     assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
 
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    std::fs::write(&keyring_path, &overlap).unwrap();
+    write_reload_manifest(&manifest_path, 2, &[("keyring", &keyring_path)]);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if keyring_status
+                .reload_status()
+                .is_some_and(|status| status.generation == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("overlap key-ring generation was not activated");
+    let next_token = next_signer
+        .sign(
+            &HttpHostname::new("demo.example.test").unwrap(),
+            now - 1,
+            now + 60,
+        )
+        .unwrap();
+    let tcp = connect_eventually(https_addr).await;
+    let mut rotated = connector
+        .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+        .await
+        .unwrap();
+    rotated
+        .write_all(
+            format!(
+                "GET /rotated?tp_access={next_token} HTTP/1.1\r\nHost: demo.example.test\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = String::from_utf8(read_http_head(&mut rotated).await).unwrap();
+    assert!(!response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    std::fs::write(&keyring_path, &public_two).unwrap();
+    write_reload_manifest(&manifest_path, 3, &[("keyring", &keyring_path)]);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if keyring_status
+                .reload_status()
+                .is_some_and(|status| status.generation == 3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retired key generation was not activated");
+    let tcp = connect_eventually(https_addr).await;
+    let mut retired = connector
+        .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+        .await
+        .unwrap();
+    retired
+        .write_all(
+            format!("GET /retired?tp_access={token} HTTP/1.1\r\nHost: demo.example.test\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = String::from_utf8(read_http_head(&mut retired).await).unwrap();
+    assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
     agent_trigger.shutdown();
     let _ = agent_task.await.unwrap().unwrap();
     edge_trigger.shutdown();
@@ -1040,12 +1135,15 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     assert_eq!(outcome.raw_addr, None);
     let https = outcome.https_ingress.unwrap();
     assert_eq!(https.completed_requests, 1);
-    assert_eq!(https.rejected_requests, 3);
+    assert_eq!(https.rejected_requests, 5);
     assert_eq!(https.rejected_connect_sessions, 1);
-    assert_eq!(https.accepted_signed_access_requests, 1);
+    assert_eq!(https.accepted_signed_access_requests, 2);
     assert_eq!(https.missing_signed_access_rejections, 1);
     assert_eq!(https.global_rate_limit_rejections, 1);
     local_task.await.unwrap();
+    reload_trigger.shutdown();
+    reload_task.await.unwrap();
+    std::fs::remove_dir_all(reload_directory).unwrap();
     wait_until_bindable(https_addr).await;
 }
 

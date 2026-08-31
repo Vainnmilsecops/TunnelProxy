@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Expiring Signed Access URLs for Public HTTPS** (Session 49).
+**Atomic Signed-Access Public-Key Ring Reload and Rotation** (Session 50).
 
 ## Completed
 
@@ -533,6 +533,9 @@
   HTTP/1.1/HTTP/2 plus both WebSocket forms; classic CONNECT is intentionally
   incompatible because it has no query component. Ordinary request forwarding
   and the WebSocket handshake to the local application remain HTTP/1.1.
+  Signed-access public-key rings support opt-in atomic digest-manifest reload,
+  monotonically increasing generations, bounded overlap, and last-known-good
+  retention without listener restart.
 - Public-client authentication for arbitrary raw protocols, distributed/shared
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
@@ -545,7 +548,7 @@
 
 ## Next planned session
 
-Session 50 has not been selected. DNS/public-certificate automation and
+Session 51 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

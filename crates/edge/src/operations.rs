@@ -1051,6 +1051,26 @@ fn render_https_metrics(
             status.expired_signed_access_rejections,
         ),
         (
+            "tunnelproxy_edge_https_signed_access_keyring_generation",
+            "gauge",
+            status.signed_access_keyring_generation,
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_keyring_reload_failed",
+            "gauge",
+            u64::from(status.signed_access_keyring_reload_failed),
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_keyring_reload_successes_total",
+            "counter",
+            status.signed_access_keyring_reload_successes,
+        ),
+        (
+            "tunnelproxy_edge_https_signed_access_keyring_reload_failures_total",
+            "counter",
+            status.signed_access_keyring_reload_failures,
+        ),
+        (
             "tunnelproxy_edge_https_tracked_rate_limit_peers",
             "gauge",
             status.tracked_rate_limit_peers as u64,
@@ -1185,6 +1205,10 @@ mod tests {
                 missing_signed_access_rejections: 15,
                 invalid_signed_access_rejections: 16,
                 expired_signed_access_rejections: 17,
+                signed_access_keyring_generation: 18,
+                signed_access_keyring_reload_failed: true,
+                signed_access_keyring_reload_successes: 19,
+                signed_access_keyring_reload_failures: 20,
                 ..HttpIngressStatus::default()
             },
             None,
@@ -1225,6 +1249,12 @@ mod tests {
         assert!(
             https.contains("tunnelproxy_edge_https_signed_access_expired_rejections_total 17\n")
         );
+        assert!(https.contains("tunnelproxy_edge_https_signed_access_keyring_generation 18\n"));
+        assert!(https.contains("tunnelproxy_edge_https_signed_access_keyring_reload_failed 1\n"));
+        assert!(https
+            .contains("tunnelproxy_edge_https_signed_access_keyring_reload_successes_total 19\n"));
+        assert!(https
+            .contains("tunnelproxy_edge_https_signed_access_keyring_reload_failures_total 20\n"));
         assert!(!https.contains("hostname"));
     }
 

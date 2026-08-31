@@ -17,6 +17,9 @@
   nonblocking writer, lifetime guard, and fixed-cardinality sink telemetry.
 - Fixed-cardinality process-local multiplex telemetry and RAII lifecycle
   guards shared by Agent and Edge.
+- Strict component-neutral digest/generation loading plus the bounded
+  signed-access token, key-ring, overlap, and reload handle shared by offline
+  tooling and Edge.
 
 **Prohibited**
 
@@ -110,7 +113,9 @@ separate reloadable public TLS identity, requires exact SNI/Host-or-authority ro
 sanitizes forwarding/hop-by-hop headers, streams through the cached tunnel
 router, and enforces connection/header/body/time bounds plus process-local
 global/per-source-IP request token buckets without hot-path control-plane
-access. Validated HTTP/1.1 and RFC 8441 WebSocket upgrades reuse that route and
+access. Signed-access verification can atomically reload a bounded public-key
+ring from a digest manifest while retaining last-known-good and exposing only
+fixed-cardinality generation/health counters. Validated HTTP/1.1 and RFC 8441 WebSocket upgrades reuse that route and
 Tunnel Protocol v2 stream as opaque bytes without frame inspection. Validated HTTP/1.1 and
 classic HTTP/2 CONNECT sessions
 reuse the route's fixed local target directly and never dial client-selected
