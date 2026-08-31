@@ -44,9 +44,19 @@ incomplete objects fail before any network connection or hostname mutation.
     "tunnel_id": "tunnel-a",
     "client_certificate": "agent.pem",
     "client_private_key": "agent-key.pem"
+  },
+  "public_reachability": {
+    "enabled": true,
+    "ca": "public-ca.pem",
+    "timeout_ms": 30000
   }
 }
 ```
+
+`public_reachability` is optional, so every existing v1 file remains valid.
+Its `ca` and `timeout_ms` fields are optional, but may only be supplied when
+`enabled` is true. Without `ca`, the probe uses the Agent's bundled public Web
+PKI roots. The timeout must be between 1 ms and 300000 ms.
 
 Relative CA, certificate, and key paths resolve from the directory containing
 the config file, not the process working directory. The file contains paths,
@@ -76,11 +86,14 @@ tunnelproxy http 3000
 https://tp-0123456789abcdef0123456789abcdef.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
-The Session 42 lifecycle is unchanged: allocation is idempotent, stdout waits
-for the first registered Agent transport, reconnect uses the normal bounded
-policy, and process shutdown does not release the durable hostname. This
-configuration does not provision wildcard DNS/public TLS or probe external
-reachability.
+The Session 42 default lifecycle is unchanged: allocation is idempotent,
+stdout waits for the first registered Agent transport, reconnect uses the
+normal bounded policy, and process shutdown does not release the durable
+hostname. When `public_reachability.enabled` is true (or the matching CLI flag
+is supplied), stdout additionally waits for a successful public HTTPS
+challenge. Probe timeout is terminal with exit code 1, while the durable
+hostname remains allocated. This configuration does not provision wildcard
+DNS or public TLS.
 
 The backwards-compatible `tunnelproxy-agent` executable uses the same driver
 and also accepts `http <port> --config <path>`. Manual hostname commands and

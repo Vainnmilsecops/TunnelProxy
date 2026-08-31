@@ -97,6 +97,10 @@ correct agent, which in turn proxies them into the local service.
   TLS configuration before allocation, idempotently creates or reuses the
   durable hostname, starts the reconnecting Agent runtime, and prints the
   public URL once Protocol v2 registration succeeds.
+- Optional bounded public reachability verification for managed HTTP. The
+  Agent performs an exact-host HTTPS challenge through the public Edge after
+  registration and prints the URL only after the proof succeeds; bundled Web
+  PKI roots are the default and a private CA bundle may be selected explicitly.
 - A strict bounded local Agent config v1 with CLI/environment/platform path
   resolution, relative credential paths, CLI override precedence, offline TLS
   validation, and no inline secret values. It enables `tunnelproxy http 3000`
@@ -115,8 +119,8 @@ The following are **not yet implemented**:
 - Automatic config/account provisioning, custom-domain administration, DNS or
   certificate automation, HTTP/2 extended CONNECT, WebSocket
   extensions, and HTTP/3.
-- Public-client access authorization, signed URLs, distributed request-rate
-  coordination, and DDoS mitigation.
+- General public-client identity/login, distributed request-rate coordination,
+  and DDoS mitigation. Bounded expiring signed URLs are implemented.
 - General administrative/account API and protected issuer-key custody/CA
   rollover.
 - Request inspection, replay, and webhook debugging.
@@ -186,12 +190,17 @@ tunnelproxy http 3000
 https://tp-0123456789abcdef0123456789abcdef.tunnelproxy.dev -> http://127.0.0.1:3000
 ```
 
-The URL is printed once the allocation response has durably published the
-catalog and the Agent transport is connected. Shutdown and reconnect never
-release or rename the hostname; use `hostname-release` explicitly. This is not
-an external reachability probe and does not create DNS records or public
-certificates. See [`docs/AGENT_CONFIG.md`](docs/AGENT_CONFIG.md) for the strict
-schema, platform paths, precedence, trust boundary, and long-form fallback.
+By default the URL is printed once the allocation response has durably
+published the catalog and the Agent transport is connected. Add
+`--verify-public-reachability` to wait for a bounded HTTPS challenge through
+the public hostname before stdout is emitted. Use
+`--public-reachability-ca <path>` for a private/public test CA and
+`--public-reachability-timeout-ms <ms>` to change the 30-second deadline.
+Shutdown and reconnect never release or rename the hostname; use
+`hostname-release` explicitly. The probe verifies existing DNS/TLS/routing but
+does not create DNS records or public certificates. See
+[`docs/AGENT_CONFIG.md`](docs/AGENT_CONFIG.md) for the strict schema, platform
+paths, precedence, trust boundary, and long-form fallback.
 
 ## Repository structure
 
@@ -288,6 +297,7 @@ and Definition of Done.
 | 48 _(complete)_ | bounded route-bound RFC 8441 WebSocket ingress |
 | 49 _(complete)_ | bounded expiring signed access URLs for public HTTPS |
 | 50 _(complete)_ | atomic signed-access public-key ring reload and rotation |
+| 51 _(complete)_ | opt-in bounded managed-HTTP public reachability verification |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

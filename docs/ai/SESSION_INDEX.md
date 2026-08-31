@@ -1615,3 +1615,27 @@ Out of scope:
 - Remote key distribution, coordinated multi-edge rollout, HSM/KMS custody,
   stateful replay prevention, individual-token revocation, live TTL/skew
   policy reload, and Tunnel Protocol changes.
+
+## Session 51 — Opt-in Bounded Managed-HTTP Public Reachability Verification — complete
+
+- Added a default-off managed HTTP public HTTPS probe that begins after the
+  exact Agent/Tunnel is registered and gates the URL stdout line.
+- Added bounded random challenge/proof encoding, strict no-store response
+  validation, bundled Web PKI roots, optional bounded CA PEM, finite
+  attempt/total deadlines, retries, and shutdown cancellation.
+- Added an Edge-only well-known response requiring exact Host/SNI route and a
+  live TunnelId after existing request-rate admission. It is a narrow signed
+  URL exception and never opens a tunnel stream or reaches localhost.
+- Preserved config v1 compatibility with one optional object, CLI override
+  precedence, offline validation, and durable hostname ownership after probe
+  failure.
+- Added fixed-cardinality secret-safe telemetry and unit/real-TLS coverage for
+  canonical parsing, opt-in validation, cancellation, success, wrong CA,
+  signed-access coexistence, and no local forwarding. The workspace now
+  contains 402 explicit tests.
+
+Out of scope:
+
+- DNS/public-certificate provisioning, distributed vantage-point probes,
+  custom domains, OCSP/CRL policy, multi-edge reachability/ownership, and
+  Tunnel Protocol changes.

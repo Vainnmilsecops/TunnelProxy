@@ -464,6 +464,46 @@ fn render_metrics(
             status.consecutive_failures,
         ),
         (
+            "tunnelproxy_agent_public_reachability_attempts_total",
+            "counter",
+            status.public_reachability_attempts,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_successes_total",
+            "counter",
+            status.public_reachability_successes,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_timeouts_total",
+            "counter",
+            status.public_reachability_timeouts,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_cancellations_total",
+            "counter",
+            status.public_reachability_cancellations,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_tls_failures_total",
+            "counter",
+            status.public_reachability_tls_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_connect_failures_total",
+            "counter",
+            status.public_reachability_connect_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_route_failures_total",
+            "counter",
+            status.public_reachability_route_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_protocol_failures_total",
+            "counter",
+            status.public_reachability_protocol_failures,
+        ),
+        (
             "tunnelproxy_agent_operations_active_connections",
             "gauge",
             operations.active_connections as u64,
@@ -655,8 +695,16 @@ mod tests {
 
     #[test]
     fn metric_rendering_has_fixed_state_labels_and_no_identity_values() {
+        let status = status();
+        status.record_public_reachability_success(3);
+        status.record_public_reachability_failure(
+            2,
+            Some(crate::PublicReachabilityFailureClass::Tls),
+            false,
+        );
+        status.record_public_reachability_failure(0, None, true);
         let rendered = render_metrics(
-            status().snapshot(),
+            status.snapshot(),
             MultiplexTelemetrySnapshot {
                 sent_data_frames: 2,
                 sent_data_bytes: 17,
@@ -678,6 +726,11 @@ mod tests {
         }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
         assert!(rendered.contains("tunnelproxy_agent_logging_nonblocking_enabled 0"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_attempts_total 5"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_successes_total 1"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_timeouts_total 1"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_cancellations_total 1"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_tls_failures_total 1"));
         let mut logging = String::new();
         render_logging_metrics(
             &mut logging,

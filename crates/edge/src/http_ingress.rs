@@ -31,8 +31,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tunnelproxy_common::{
-    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, SignedAccessError,
-    SignedAccessKeyRing, TunnelId, SIGNED_ACCESS_QUERY_PARAMETER,
+    PublicReachabilityChallenge, RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
+    SignedAccessError, SignedAccessKeyRing, TunnelId, PUBLIC_REACHABILITY_CHALLENGE_HEADER,
+    PUBLIC_REACHABILITY_PATH, PUBLIC_REACHABILITY_PROOF_HEADER, SIGNED_ACCESS_QUERY_PARAMETER,
 };
 use tunnelproxy_control_plane::{
     HttpsRouteCatalogSubscription, HttpsRouteSourceHealth, HttpsRouteStatus,
@@ -644,6 +645,9 @@ pub struct HttpIngressOutcome {
     pub missing_signed_access_rejections: u64,
     pub invalid_signed_access_rejections: u64,
     pub expired_signed_access_rejections: u64,
+    pub reachability_probe_requests: u64,
+    pub successful_reachability_probes: u64,
+    pub failed_reachability_probes: u64,
     pub tracked_rate_limit_peers: usize,
     pub peak_tracked_rate_limit_peers: usize,
     pub shutdown: RuntimeShutdownOutcome,
@@ -717,6 +721,9 @@ struct HttpIngressCounters {
     missing_signed_access_rejections: AtomicU64,
     invalid_signed_access_rejections: AtomicU64,
     expired_signed_access_rejections: AtomicU64,
+    reachability_probe_requests: AtomicU64,
+    successful_reachability_probes: AtomicU64,
+    failed_reachability_probes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -762,6 +769,9 @@ pub struct HttpIngressStatus {
     pub missing_signed_access_rejections: u64,
     pub invalid_signed_access_rejections: u64,
     pub expired_signed_access_rejections: u64,
+    pub reachability_probe_requests: u64,
+    pub successful_reachability_probes: u64,
+    pub failed_reachability_probes: u64,
     pub signed_access_keyring_generation: u64,
     pub signed_access_keyring_reload_failed: bool,
     pub signed_access_keyring_reload_successes: u64,
@@ -912,6 +922,18 @@ impl HttpIngressStatusHandle {
             expired_signed_access_rejections: self
                 .counters
                 .expired_signed_access_rejections
+                .load(Ordering::Relaxed),
+            reachability_probe_requests: self
+                .counters
+                .reachability_probe_requests
+                .load(Ordering::Relaxed),
+            successful_reachability_probes: self
+                .counters
+                .successful_reachability_probes
+                .load(Ordering::Relaxed),
+            failed_reachability_probes: self
+                .counters
+                .failed_reachability_probes
                 .load(Ordering::Relaxed),
             signed_access_keyring_generation: reload.map_or(0, |status| status.generation),
             signed_access_keyring_reload_failed: reload.is_some_and(|status| status.reload_failed),
@@ -1106,6 +1128,9 @@ impl HttpIngressRuntime {
             missing_signed_access_rejections: status.missing_signed_access_rejections,
             invalid_signed_access_rejections: status.invalid_signed_access_rejections,
             expired_signed_access_rejections: status.expired_signed_access_rejections,
+            reachability_probe_requests: status.reachability_probe_requests,
+            successful_reachability_probes: status.successful_reachability_probes,
+            failed_reachability_probes: status.failed_reachability_probes,
             tracked_rate_limit_peers: status.tracked_rate_limit_peers,
             peak_tracked_rate_limit_peers: status.peak_tracked_rate_limit_peers,
             shutdown,
@@ -1547,6 +1572,7 @@ async fn proxy_request(
         connect_permits,
         opaque_relay_tx,
     } = context;
+    let reachability_intent = request.uri().path() == PUBLIC_REACHABILITY_PATH;
     let http2_websocket_intent = request.version() == Version::HTTP_2
         && request
             .extensions()
@@ -1565,6 +1591,14 @@ async fn proxy_request(
         Ok(value) => value,
         Err(rejection) => {
             counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            if reachability_intent {
+                counters
+                    .reachability_probe_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                counters
+                    .failed_reachability_probes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if websocket_intent {
                 counters
                     .rejected_websocket_upgrades
@@ -1592,6 +1626,14 @@ async fn proxy_request(
 
     if let Err(rejection) = rate_limiter.try_admit(peer.ip()) {
         counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        if reachability_intent {
+            counters
+                .reachability_probe_requests
+                .fetch_add(1, Ordering::Relaxed);
+            counters
+                .failed_reachability_probes
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if matches!(&kind, PreparedRequestKind::WebSocket(_)) {
             counters
                 .rejected_websocket_upgrades
@@ -1636,6 +1678,26 @@ async fn proxy_request(
             }
         }
         return Ok(rate_limited_response(rejection.retry_after()));
+    }
+    if let PreparedRequestKind::ReachabilityProbe(proof) = &kind {
+        counters
+            .reachability_probe_requests
+            .fetch_add(1, Ordering::Relaxed);
+        if router.resolve_tunnel(&tunnel_id).await.is_none() {
+            counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            counters
+                .failed_reachability_probes
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%peer, %hostname, event = "https_reachability_probe_route_unavailable");
+            return Ok(no_store_error_response(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        counters.admitted_requests.fetch_add(1, Ordering::Relaxed);
+        counters.completed_requests.fetch_add(1, Ordering::Relaxed);
+        counters
+            .successful_reachability_probes
+            .fetch_add(1, Ordering::Relaxed);
+        info!(%peer, %hostname, event = "https_reachability_probe_succeeded");
+        return Ok(reachability_probe_response(proof));
     }
     if let Some(signed_access) = &config.signed_access {
         if let Err(rejection) = authorize_signed_access(&mut request, &hostname, signed_access) {
@@ -1893,6 +1955,9 @@ async fn proxy_request(
         }
     };
     match kind {
+        PreparedRequestKind::ReachabilityProbe(_) => {
+            unreachable!("reachability probes return before tunnel opening")
+        }
         PreparedRequestKind::Regular => {
             tokio::spawn(async move {
                 let _ = connection.await;
@@ -2328,6 +2393,7 @@ struct RequestRejection {
 
 enum PreparedRequestKind {
     Regular,
+    ReachabilityProbe(String),
     WebSocket(WebSocketHandshake),
     Connect(NegotiatedHttpProtocol),
 }
@@ -2387,7 +2453,9 @@ fn prepare_request(
             reason: "headers_too_large",
         });
     }
-    let kind = if request.method() == Method::CONNECT
+    let kind = if request.uri().path() == PUBLIC_REACHABILITY_PATH {
+        PreparedRequestKind::ReachabilityProbe(validate_reachability_probe(request)?)
+    } else if request.method() == Method::CONNECT
         && request.version() == Version::HTTP_2
         && request.extensions().get::<hyper::ext::Protocol>().is_some()
     {
@@ -2502,6 +2570,49 @@ fn prepare_request(
         tunnel_id,
         kind,
     })
+}
+
+fn validate_reachability_probe<B>(request: &Request<B>) -> Result<String, RequestRejection> {
+    if request.method() != Method::GET
+        || request.uri().query().is_some()
+        || request.headers().contains_key(TRANSFER_ENCODING)
+    {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_reachability_probe",
+        });
+    }
+    if let Some(length) = request.headers().get(CONTENT_LENGTH) {
+        if length.as_bytes() != b"0" {
+            return Err(RequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                reason: "reachability_probe_body",
+            });
+        }
+    }
+    let mut values = request
+        .headers()
+        .get_all(PUBLIC_REACHABILITY_CHALLENGE_HEADER)
+        .iter();
+    let value = values.next().ok_or(RequestRejection {
+        status: StatusCode::BAD_REQUEST,
+        reason: "missing_reachability_challenge",
+    })?;
+    if values.next().is_some() {
+        return Err(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "duplicate_reachability_challenge",
+        });
+    }
+    let challenge = value
+        .to_str()
+        .ok()
+        .and_then(|value| PublicReachabilityChallenge::parse(value).ok())
+        .ok_or(RequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_reachability_challenge",
+        })?;
+    Ok(challenge.proof())
 }
 
 fn authorize_signed_access<B>(
@@ -3018,6 +3129,7 @@ fn sanitize_request_headers(
         request.headers_mut().remove(name);
     }
     match kind {
+        PreparedRequestKind::ReachabilityProbe(_) => {}
         PreparedRequestKind::Regular => {
             request
                 .headers_mut()
@@ -3202,12 +3314,30 @@ fn error_response(status: StatusCode) -> Response<ProxyBody> {
 }
 
 fn unauthorized_response() -> Response<ProxyBody> {
-    let mut response = error_response(StatusCode::UNAUTHORIZED);
+    no_store_error_response(StatusCode::UNAUTHORIZED)
+}
+
+fn no_store_error_response(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = error_response(status);
     response.headers_mut().insert(
         HeaderName::from_static("cache-control"),
         HeaderValue::from_static("no-store"),
     );
     response
+}
+
+fn reachability_probe_response(proof: &str) -> Response<ProxyBody> {
+    let body = Full::new(Bytes::new())
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed_unsync();
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(CONNECTION, "close")
+        .header(CONTENT_LENGTH, "0")
+        .header("cache-control", "no-store")
+        .header(PUBLIC_REACHABILITY_PROOF_HEADER, proof)
+        .body(body)
+        .expect("validated reachability proof is a valid response header")
 }
 
 fn rate_limited_response(retry_after: Duration) -> Response<ProxyBody> {
@@ -3234,6 +3364,32 @@ fn rate_limited_response(retry_after: Duration) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_probe_is_strict_bounded_and_produces_no_store_proof() {
+        let challenge = PublicReachabilityChallenge::generate().unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(PUBLIC_REACHABILITY_PATH)
+            .header(PUBLIC_REACHABILITY_CHALLENGE_HEADER, challenge.encoded())
+            .body(())
+            .unwrap();
+        let proof = validate_reachability_probe(&request).unwrap();
+        assert_eq!(proof, challenge.proof());
+        let response = reachability_probe_response(&proof);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+
+        let missing = Request::builder()
+            .method(Method::GET)
+            .uri(PUBLIC_REACHABILITY_PATH)
+            .body(())
+            .unwrap();
+        assert_eq!(
+            validate_reachability_probe(&missing).unwrap_err().reason,
+            "missing_reachability_challenge"
+        );
+    }
 
     struct PendingBody;
 

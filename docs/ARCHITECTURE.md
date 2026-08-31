@@ -1159,6 +1159,30 @@ marker. Edge never receives a private key, never queries control-plane storage
 on the request path, and does not restart its HTTPS listener or existing
 connections. Key removal affects subsequent request verification immediately.
 
+### 2.49 Managed HTTP public reachability verification (Session 51)
+
+Managed HTTP may explicitly extend readiness beyond durable allocation and
+Agent registration with a bounded public HTTPS probe. The Agent creates a
+16-byte random, canonical base64url challenge and requests the fixed
+`/.well-known/tunnelproxy/reachability` path through the allocated hostname.
+It validates DNS/connect, certificate chain and exact SNI, HTTP status,
+`Cache-Control: no-store`, and a SHA-256 domain-separated proof. Challenges and
+proofs have strict lengths and never enter logs or metric labels.
+
+Edge recognizes only the exact GET shape after normal request-rate admission.
+It requires Host/SNI route agreement and a currently live TunnelId, then
+returns the proof directly without opening an Agent stream or reaching the
+local service. The endpoint is a narrow exception to optional signed-access
+URLs so an Agent can verify reachability without possessing an issuer private
+key. All other signed-access behavior is unchanged.
+
+The Agent retries under bounded per-attempt and total deadlines, uses bundled
+public roots unless an explicit bounded CA PEM is configured, and observes
+process cancellation. Success gates the managed URL stdout line. Timeout is a
+terminal startup failure but does not release the durable hostname. The
+feature changes neither Tunnel Protocol v2 nor default startup behavior and
+does not provision DNS or certificates.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

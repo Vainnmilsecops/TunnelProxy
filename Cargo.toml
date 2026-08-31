@@ -61,6 +61,7 @@ bytes = "1"
 hyper = { version = "=1.6.0", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "=0.1.10", default-features = false, features = ["tokio"] }
 http-body-util = "=0.1.2"
+webpki-roots = "=0.26.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
