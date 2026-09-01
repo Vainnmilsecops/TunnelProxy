@@ -1639,3 +1639,26 @@ Out of scope:
 - DNS/public-certificate provisioning, distributed vantage-point probes,
   custom domains, OCSP/CRL policy, multi-edge reachability/ownership, and
   Tunnel Protocol changes.
+
+## Session 52 — Continuous Public Reachability Health Monitoring and Recovery — complete
+
+- Added optional continuous probing after the Session 51 startup proof using a
+  bounded fixed delay after completion, so attempts never overlap.
+- Added strict 10-second to one-hour interval and 1-to-10 failure-threshold
+  CLI/config v1 fields with backward-compatible defaults and offline
+  validation.
+- Added fixed reachability states for pending, healthy, degraded, unhealthy,
+  and disabled. Threshold failure gates Agent `/readyz`; one valid proof
+  recovers it without process restart or hostname release.
+- Monitored reconnects require a fresh proof while one-shot Session 51 users
+  retain prior reconnect readiness. Shutdown cancels sleep and in-flight I/O.
+- Added fixed-cardinality state/cycle/failure/transition/recovery telemetry and
+  secret-safe transition logs. Unit and real-TLS coverage includes threshold,
+  scheduler cancellation, route loss, Agent re-registration, and recovery. The
+  workspace now contains 405 explicit tests.
+
+Out of scope:
+
+- Persistent health history, external alerts, distributed vantage-point
+  probes, DNS/public-certificate provisioning, custom domains, multi-edge
+  aggregation/ownership, and Tunnel Protocol changes.

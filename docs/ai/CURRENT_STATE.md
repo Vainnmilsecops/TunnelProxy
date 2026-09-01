@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Opt-in Bounded Managed-HTTP Public Reachability Verification** (Session 51).
+**Continuous Public Reachability Health Monitoring and Recovery** (Session 52).
 
 ## Completed
 
@@ -523,6 +523,23 @@
   parsing, cancellation, success, wrong CA, signed-access coexistence, and no
   local forwarding. The workspace contains 402 explicit tests.
 
+## Session 52 delivered
+
+- Added separately opt-in continuous fixed-delay probing after the Session 51
+  startup proof, with 10-second to one-hour interval and 1-to-10 consecutive
+  failure threshold bounds.
+- Added `Disabled`, `Pending`, `Healthy`, `Degraded`, and `Unhealthy` Agent
+  reachability states. The threshold gates `/readyz`; one valid proof recovers
+  readiness without stopping the tunnel or releasing the durable hostname.
+- Prevented overlapping attempts, made monitor sleep/I/O shutdown-aware, and
+  returned monitored reconnects to pending until a fresh public proof.
+  Session 51 one-shot reconnect behavior remains unchanged.
+- Extended config v1 compatibly, added fixed-cardinality state/cycle/failure/
+  transition/recovery telemetry, and logs only state and failure class.
+- Added parser, validation, scheduler, threshold, reconnect-compatibility, and
+  real-TLS route-loss/re-registration/recovery coverage. The workspace contains
+  405 explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -564,7 +581,7 @@
 
 ## Next planned session
 
-Session 52 has not been selected. DNS/public-certificate automation and
+Session 53 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

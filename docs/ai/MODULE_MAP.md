@@ -63,7 +63,10 @@ the transport becomes ready without coupling hostname lifetime to process
 lifetime. A shared library driver powers the canonical `tunnelproxy`
 executable and compatibility `tunnelproxy-agent` wrapper. Strict bounded local
 config v1 supplies the repeated managed HTTP endpoints, identities, and
-credential paths, with offline validation and deterministic layering.
+credential paths, with offline validation and deterministic layering. Managed
+HTTP can gate stdout on a bounded exact-host public HTTPS proof and optionally
+continue non-overlapping checks that drive fixed-cardinality local readiness
+through pending, degraded, unhealthy, and recovery states.
 
 **Responsibility (future)**
 
@@ -121,6 +124,9 @@ classic HTTP/2 CONNECT sessions
 reuse the route's fixed local target directly and never dial client-selected
 destinations. Its rate-limit peer state and
 live counters are explicitly bounded.
+The fixed public reachability endpoint runs after request-rate admission,
+requires exact Host/SNI route plus a live TunnelId, returns a no-store proof,
+and never opens a local tunnel stream.
 An optional loopback-only operations listener reads these in-memory snapshots
 for health/readiness and fixed-cardinality Prometheus output, remains available
 during ingress drain, and performs no Control Plane or storage lookup.

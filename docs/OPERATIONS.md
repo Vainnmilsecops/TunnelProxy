@@ -419,6 +419,15 @@ provisioned:
 tunnelproxy http 3000 --verify-public-reachability
 ```
 
+For continuous monitoring, add for example
+`--public-reachability-monitor-interval-ms 60000`. The interval is a delay
+after each completed attempt, not a fixed-rate ticker, so slow attempts cannot
+overlap. `--public-reachability-failure-threshold` defaults to 3. Failures below
+the threshold are degraded but keep readiness available; reaching it makes
+`/readyz` return `503`. A later valid proof recovers readiness without process
+restart. Transport disconnect always makes readiness false, and monitored
+reconnect remains pending until a fresh proof.
+
 The Agent waits for Protocol v2 registration, then connects to the allocated
 hostname on port 443, verifies SNI and the certificate chain, sends a fresh
 bounded challenge, and accepts only the exact no-store proof from Edge. Edge
@@ -434,6 +443,13 @@ failures. Edge exports
 `tunnelproxy_edge_https_reachability_probe_{requests,successes,failures}_total`.
 None has hostname, TunnelId, address, or challenge labels. Logs likewise omit
 challenge/proof bytes.
+
+Continuous monitoring additionally exports the fixed-label
+`tunnelproxy_agent_public_reachability_state` gauge and counters/gauges for
+monitor cycles, monitor failures, consecutive failures, unhealthy transitions,
+and recoveries. Alert on sustained `state="unhealthy"` or an increasing
+unhealthy-transition counter; use degraded as diagnostic context rather than a
+paging condition.
 
 DNS/connect failures usually indicate propagation or network policy; TLS
 failures indicate trust/name/certificate issues; route failures indicate that
