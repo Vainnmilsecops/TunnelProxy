@@ -101,6 +101,10 @@ correct agent, which in turn proxies them into the local service.
   Agent performs an exact-host HTTPS challenge through the public Edge after
   registration and prints the URL only after the proof succeeds; bundled Web
   PKI roots are the default and a private CA bundle may be selected explicitly.
+- Optional continuous reachability monitoring reuses that exact proof without
+  overlapping attempts. Consecutive failures move Agent readiness through
+  degraded to unhealthy, and a later proof recovers it without restarting or
+  releasing the durable hostname.
 - A strict bounded local Agent config v1 with CLI/environment/platform path
   resolution, relative credential paths, CLI override precedence, offline TLS
   validation, and no inline secret values. It enables `tunnelproxy http 3000`
@@ -196,6 +200,10 @@ published the catalog and the Agent transport is connected. Add
 the public hostname before stdout is emitted. Use
 `--public-reachability-ca <path>` for a private/public test CA and
 `--public-reachability-timeout-ms <ms>` to change the 30-second deadline.
+Add `--public-reachability-monitor-interval-ms <ms>` to continue checking after
+startup and optionally set `--public-reachability-failure-threshold <n>`.
+Background failures do not stop the tunnel; they make `/readyz` return `503`
+after the threshold and recover on the next successful proof.
 Shutdown and reconnect never release or rename the hostname; use
 `hostname-release` explicitly. The probe verifies existing DNS/TLS/routing but
 does not create DNS records or public certificates. See
@@ -298,6 +306,7 @@ and Definition of Done.
 | 49 _(complete)_ | bounded expiring signed access URLs for public HTTPS |
 | 50 _(complete)_ | atomic signed-access public-key ring reload and rotation |
 | 51 _(complete)_ | opt-in bounded managed-HTTP public reachability verification |
+| 52 _(complete)_ | continuous public reachability health monitoring and recovery |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

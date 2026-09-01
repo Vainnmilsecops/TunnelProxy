@@ -1183,6 +1183,29 @@ terminal startup failure but does not release the durable hostname. The
 feature changes neither Tunnel Protocol v2 nor default startup behavior and
 does not provision DNS or certificates.
 
+### 2.50 Continuous public reachability health monitoring (Session 52)
+
+The Session 51 proof can optionally continue after startup. Monitoring uses a
+fixed delay after each bounded single attempt rather than a fixed-rate ticker,
+so attempts cannot overlap or accumulate. Interval and consecutive-failure
+threshold are strictly bounded and valid only with startup verification.
+
+Agent operations expose a fixed-cardinality state machine: `Disabled`,
+`Pending`, `Healthy`, `Degraded`, and `Unhealthy`. Initial verification moves
+pending to healthy before stdout. A background failure moves healthy to
+degraded; reaching the configured threshold moves it to unhealthy and makes
+`/readyz` fail. One later successful exact proof resets the streak and restores
+healthy readiness. Transport disconnect remains independently unready and a
+monitored reconnect returns reachability to pending until a fresh proof.
+Session 51 one-shot reconnect behavior remains compatible.
+
+Background probe failure is deliberately not a process failure and never
+releases durable hostname ownership. The existing Edge endpoint, request-rate
+admission, exact route/live-TunnelId check, signed-access exception, and no
+local forwarding semantics are unchanged. Metrics and transition logs contain
+only fixed states/failure classes, never hostnames, identities, challenges, or
+proofs.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

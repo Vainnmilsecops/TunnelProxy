@@ -48,15 +48,20 @@ incomplete objects fail before any network connection or hostname mutation.
   "public_reachability": {
     "enabled": true,
     "ca": "public-ca.pem",
-    "timeout_ms": 30000
+    "timeout_ms": 30000,
+    "monitor_interval_ms": 60000,
+    "failure_threshold": 3
   }
 }
 ```
 
 `public_reachability` is optional, so every existing v1 file remains valid.
-Its `ca` and `timeout_ms` fields are optional, but may only be supplied when
+All nested fields except `enabled` are optional, but may only be supplied when
 `enabled` is true. Without `ca`, the probe uses the Agent's bundled public Web
-PKI roots. The timeout must be between 1 ms and 300000 ms.
+PKI roots. The startup timeout must be between 1 ms and 300000 ms.
+`monitor_interval_ms` enables continuous fixed-delay checks and must be between
+10000 and 3600000 ms. `failure_threshold` requires a monitor interval, must be
+between 1 and 10, and defaults to 3.
 
 Relative CA, certificate, and key paths resolve from the directory containing
 the config file, not the process working directory. The file contains paths,
@@ -92,8 +97,11 @@ normal bounded policy, and process shutdown does not release the durable
 hostname. When `public_reachability.enabled` is true (or the matching CLI flag
 is supplied), stdout additionally waits for a successful public HTTPS
 challenge. Probe timeout is terminal with exit code 1, while the durable
-hostname remains allocated. This configuration does not provision wildcard
-DNS or public TLS.
+hostname remains allocated. With a monitor interval, subsequent failures are
+non-terminal: readiness becomes degraded and then returns `503` at the failure
+threshold. The next successful proof restores readiness. Attempts never
+overlap, and disconnect/reconnect requires a fresh proof before readiness is
+restored. This configuration does not provision wildcard DNS or public TLS.
 
 The backwards-compatible `tunnelproxy-agent` executable uses the same driver
 and also accepts `http <port> --config <path>`. Manual hostname commands and

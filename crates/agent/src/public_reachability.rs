@@ -21,6 +21,10 @@ pub const DEFAULT_PUBLIC_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(30
 pub const DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 pub const MAX_PUBLIC_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub const MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+pub const MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD: u64 = 3;
+pub const MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD: u64 = 10;
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 const MAX_RESPONSE_BODY_BYTES: usize = 1024;
 
@@ -44,6 +48,25 @@ impl PublicReachabilityConfig {
             || self.retry_interval > self.total_timeout
         {
             return Err(PublicReachabilityError::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicReachabilityMonitorConfig {
+    pub interval: Duration,
+    pub failure_threshold: u64,
+}
+
+impl PublicReachabilityMonitorConfig {
+    pub fn validate(self) -> Result<(), PublicReachabilityError> {
+        if self.interval < MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL
+            || self.interval > MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL
+            || self.failure_threshold == 0
+            || self.failure_threshold > MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD
+        {
+            return Err(PublicReachabilityError::InvalidMonitorConfig);
         }
         Ok(())
     }
@@ -80,8 +103,10 @@ impl PublicReachabilityFailureClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicReachabilityError {
     InvalidConfig,
+    InvalidMonitorConfig,
     InvalidCa,
     Challenge,
+    AttemptFailed(PublicReachabilityFailureClass),
     Cancelled {
         attempts: u64,
     },
@@ -97,10 +122,18 @@ impl std::fmt::Display for PublicReachabilityError {
             Self::InvalidConfig => {
                 formatter.write_str("public reachability configuration is invalid")
             }
+            Self::InvalidMonitorConfig => {
+                formatter.write_str("public reachability monitor configuration is invalid")
+            }
             Self::InvalidCa => formatter.write_str("public reachability CA bundle is invalid"),
             Self::Challenge => {
                 formatter.write_str("public reachability challenge generation failed")
             }
+            Self::AttemptFailed(failure) => write!(
+                formatter,
+                "public reachability attempt failed ({})",
+                failure.as_str()
+            ),
             Self::Cancelled { attempts } => write!(
                 formatter,
                 "public reachability verification was cancelled after {attempts} attempts"
@@ -210,6 +243,26 @@ impl PublicReachabilityProbe {
                 () = signal.cancelled() => return Err(PublicReachabilityError::Cancelled { attempts }),
                 () = tokio::time::sleep(delay) => {}
             }
+        }
+    }
+
+    pub async fn verify_once(&self, signal: ShutdownSignal) -> Result<(), PublicReachabilityError> {
+        if signal.is_shutdown() {
+            return Err(PublicReachabilityError::Cancelled { attempts: 0 });
+        }
+        let attempted = tokio::select! {
+            biased;
+            () = signal.cancelled() => {
+                return Err(PublicReachabilityError::Cancelled { attempts: 0 });
+            }
+            result = tokio::time::timeout(self.config.attempt_timeout, self.attempt_once()) => result,
+        };
+        match attempted {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(failure)) => Err(PublicReachabilityError::AttemptFailed(failure)),
+            Err(_) => Err(PublicReachabilityError::AttemptFailed(
+                PublicReachabilityFailureClass::Http,
+            )),
         }
     }
 
@@ -325,6 +378,21 @@ mod tests {
             PublicReachabilityProbe::new(invalid),
             Err(PublicReachabilityError::InvalidCa)
         ));
+
+        assert!(PublicReachabilityMonitorConfig {
+            interval: MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
+            failure_threshold: DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+        }
+        .validate()
+        .is_ok());
+        assert!(matches!(
+            PublicReachabilityMonitorConfig {
+                interval: Duration::from_secs(1),
+                failure_threshold: 1,
+            }
+            .validate(),
+            Err(PublicReachabilityError::InvalidMonitorConfig)
+        ));
     }
 
     #[tokio::test]
@@ -334,6 +402,12 @@ mod tests {
         trigger.shutdown();
         assert_eq!(
             probe.verify_until_success(signal).await,
+            Err(PublicReachabilityError::Cancelled { attempts: 0 })
+        );
+        let (trigger, signal) = shutdown_channel();
+        trigger.shutdown();
+        assert_eq!(
+            probe.verify_once(signal).await,
             Err(PublicReachabilityError::Cancelled { attempts: 0 })
         );
     }

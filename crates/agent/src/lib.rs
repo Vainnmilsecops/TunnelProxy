@@ -61,14 +61,16 @@ pub use operations::{
 };
 pub use public_reachability::{
     PublicReachabilityConfig, PublicReachabilityError, PublicReachabilityFailureClass,
-    PublicReachabilityOutcome, PublicReachabilityProbe,
-    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
-    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_TIMEOUT,
+    PublicReachabilityMonitorConfig, PublicReachabilityOutcome, PublicReachabilityProbe,
+    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+    DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL, DEFAULT_PUBLIC_REACHABILITY_TIMEOUT,
+    MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
+    MAX_PUBLIC_REACHABILITY_TIMEOUT, MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
 };
 pub use runtime::{
     AgentConnectionState, AgentRuntime, AgentRuntimeConfig, AgentRuntimeConfigError,
     AgentRuntimeControl, AgentRuntimeError, AgentRuntimeOutcome, AgentRuntimeStatus,
-    AgentRuntimeStatusHandle, ReconnectConfig, ReconnectConfigError,
+    AgentRuntimeStatusHandle, PublicReachabilityState, ReconnectConfig, ReconnectConfigError,
 };
 pub use tls::{
     AgentTlsConfig, AgentTlsConfigError, AgentTlsReloadBootstrapError, AgentTlsReloadConfig,

@@ -953,6 +953,21 @@ other external mutation. The probe starts only after the Agent tunnel is
 routable, retries within one finite deadline, and is cancellation-aware.
 Failure returns exit code 1 without releasing the durable hostname.
 
+To continue checking after startup, add a fixed delay and optional consecutive
+failure threshold:
+
+```text
+tunnelproxy http 3000 --config ./config.json \
+  --verify-public-reachability \
+  --public-reachability-monitor-interval-ms 60000 \
+  --public-reachability-failure-threshold 3
+```
+
+The delay starts after the preceding attempt finishes, so probes cannot
+overlap. Background failure is health data rather than a process error;
+`/readyz` becomes `503` only at the threshold and recovers on the next valid
+proof. A reconnect returns monitored readiness to pending until a new proof.
+
 ## 29. Enabling bounded HTTP/2 at Edge
 
 HTTP/1.1 remains the default. Enable HTTP/2 only on an HTTPS listener and keep

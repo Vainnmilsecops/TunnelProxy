@@ -1414,3 +1414,27 @@ Tunnel Protocol v2 or requiring the Agent to own a URL-signing key. Default
 startup stays compatible. Probe failure is terminal but preserves the durable
 hostname. DNS/certificate provisioning, distributed probing, OCSP/CRL policy,
 and multi-edge reachability remain separate concerns.
+
+## ADR-052 — Continuous reachability is health state, not process fate
+
+**Status:** Accepted (Session 52).
+
+**Context:** A successful startup proof does not detect later DNS, certificate,
+Edge-route, or live-tunnel regressions. Re-running the full startup retry loop
+on a fixed-rate timer could overlap work, amplify request load, and terminate a
+healthy tunnel for a transient public-path failure.
+
+**Decision:** Continuous monitoring remains separately opt-in under the
+Session 51 verification policy. Run one bounded attempt after each bounded
+fixed delay, never concurrently. Track a fixed state machine from pending to
+healthy/degraded/unhealthy; only the configured consecutive-failure threshold
+makes operations readiness false, and one valid proof recovers it. Ordinary
+background failures are recorded, not returned as supervisor errors. Process
+shutdown cancels sleep or I/O immediately.
+
+**Consequences:** Operators gain ongoing public-path health and recovery
+without durable mutation, restart loops, or Tunnel Protocol changes. Existing
+one-shot users retain their reconnect behavior. Detection and recovery latency
+are bounded by the chosen interval plus one attempt. External alert delivery,
+persistent history, distributed probe locations, DNS/certificate provisioning,
+and multi-edge aggregation remain separate work.

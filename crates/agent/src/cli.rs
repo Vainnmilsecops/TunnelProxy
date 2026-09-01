@@ -13,9 +13,12 @@ use crate::{
     AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
     AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
     AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, PublicReachabilityConfig,
-    PublicReachabilityError, PublicReachabilityProbe, RuntimeShutdownConfig,
-    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
-    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_TIMEOUT,
+    PublicReachabilityError, PublicReachabilityMonitorConfig, PublicReachabilityProbe,
+    PublicReachabilityState, RuntimeShutdownConfig, DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT,
+    DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
+    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+    MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL, MAX_PUBLIC_REACHABILITY_TIMEOUT,
+    MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
 };
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -36,6 +39,12 @@ macro_rules! error {
 macro_rules! info {
     ($($tokens:tt)*) => {
         tracing::info!(target: "tunnelproxy_agent", $($tokens)*)
+    };
+}
+
+macro_rules! warn {
+    ($($tokens:tt)*) => {
+        tracing::warn!(target: "tunnelproxy_agent", $($tokens)*)
     };
 }
 
@@ -106,6 +115,8 @@ Managed HTTP options:
   --verify-public-reachability        wait for a public HTTPS Edge challenge
   --public-reachability-ca <path>     optional private/public probe CA bundle
   --public-reachability-timeout-ms <ms> total probe deadline (default 30000)
+  --public-reachability-monitor-interval-ms <ms> continuous check delay (10000..3600000)
+  --public-reachability-failure-threshold <n> failures before unready (default 3)
   Uses the common Edge, Agent identity, TLS, reconnect, enrollment, and
   operations options above. The managed hostname remains allocated on exit.
   --help                         print this help and exit
@@ -157,6 +168,8 @@ struct AgentConfigPublicReachability {
     enabled: bool,
     ca: Option<PathBuf>,
     timeout_ms: Option<u64>,
+    monitor_interval_ms: Option<u64>,
+    failure_threshold: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +396,11 @@ fn apply_agent_config(
         parsed.hostname_server_name = Some(config.hostname.server_name);
     }
     if let Some(reachability) = public_reachability {
-        if !reachability.enabled && (reachability.ca.is_some() || reachability.timeout_ms.is_some())
+        if !reachability.enabled
+            && (reachability.ca.is_some()
+                || reachability.timeout_ms.is_some()
+                || reachability.monitor_interval_ms.is_some()
+                || reachability.failure_threshold.is_some())
         {
             return Err(AgentConfigError::InvalidSchema);
         }
@@ -401,6 +418,20 @@ fn apply_agent_config(
             if !parsed.public_reachability_timeout_explicit {
                 parsed.public_reachability_timeout = Duration::from_millis(timeout_ms);
             }
+            parsed.public_reachability_options_present = true;
+        }
+        if let Some(interval_ms) = reachability.monitor_interval_ms {
+            if !parsed.public_reachability_monitor_interval_explicit {
+                parsed.public_reachability_monitor_interval =
+                    Some(Duration::from_millis(interval_ms));
+            }
+            parsed.public_reachability_options_present = true;
+        }
+        if let Some(failure_threshold) = reachability.failure_threshold {
+            if !parsed.public_reachability_failure_threshold_explicit {
+                parsed.public_reachability_failure_threshold = failure_threshold;
+            }
+            parsed.public_reachability_failure_threshold_present = true;
             parsed.public_reachability_options_present = true;
         }
     }
@@ -461,6 +492,23 @@ fn validate_http_configuration(parsed: &ParsedArgs) -> Result<(), ArgError> {
             || parsed.public_reachability_timeout > MAX_PUBLIC_REACHABILITY_TIMEOUT)
     {
         return Err(ArgError::InvalidPublicReachabilityTimeout);
+    }
+    if let Some(interval) = parsed.public_reachability_monitor_interval {
+        if !(MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL..=MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL)
+            .contains(&interval)
+        {
+            return Err(ArgError::InvalidPublicReachabilityMonitorInterval);
+        }
+    }
+    if parsed.public_reachability_failure_threshold_present
+        && parsed.public_reachability_monitor_interval.is_none()
+    {
+        return Err(ArgError::PublicReachabilityThresholdRequiresMonitor);
+    }
+    if parsed.public_reachability_failure_threshold == 0
+        || parsed.public_reachability_failure_threshold > MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD
+    {
+        return Err(ArgError::InvalidPublicReachabilityFailureThreshold);
     }
     Ok(())
 }
@@ -728,6 +776,9 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(template) = &public_reachability {
+        runtime_status.require_public_reachability(template.monitor.is_some());
+    }
     let managed_http = match mode {
         RunMode::Tunnel => None,
         RunMode::Http => {
@@ -772,6 +823,9 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
                     .map(|template| template.build(allocation.hostname.clone()))
                     .transpose()
                     .expect("public reachability template was prevalidated"),
+                monitor: public_reachability
+                    .as_ref()
+                    .and_then(|template| template.monitor),
                 hostname: allocation.hostname,
                 local: parsed.local,
             })
@@ -909,6 +963,7 @@ enum RunMode {
 struct PublicReachabilityTemplate {
     ca_pem: Option<Vec<u8>>,
     total_timeout: Duration,
+    monitor: Option<PublicReachabilityMonitorConfig>,
 }
 
 impl PublicReachabilityTemplate {
@@ -968,7 +1023,18 @@ async fn load_public_reachability_template(
     let template = PublicReachabilityTemplate {
         ca_pem,
         total_timeout: parsed.public_reachability_timeout,
+        monitor: parsed.public_reachability_monitor_interval.map(|interval| {
+            PublicReachabilityMonitorConfig {
+                interval,
+                failure_threshold: parsed.public_reachability_failure_threshold,
+            }
+        }),
     };
+    if let Some(monitor) = template.monitor {
+        monitor
+            .validate()
+            .map_err(PublicReachabilityLoadError::Invalid)?;
+    }
     template
         .build(PublicHostname::new("reachability.invalid").expect("static hostname is valid"))
         .map_err(PublicReachabilityLoadError::Invalid)?;
@@ -980,6 +1046,7 @@ struct ManagedHttpAnnouncement {
     hostname: PublicHostname,
     local: SocketAddr,
     probe: Option<PublicReachabilityProbe>,
+    monitor: Option<PublicReachabilityMonitorConfig>,
 }
 
 impl ManagedHttpAnnouncement {
@@ -1002,7 +1069,7 @@ async fn announce_managed_http_ready(
                 return Err(PublicReachabilityError::Cancelled { attempts: 0 });
             },
             _ = poll.tick() => {
-                if status.snapshot().is_ready() {
+                if status.snapshot().is_transport_ready() {
                     if let Some(probe) = &announcement.probe {
                         info!(event = "managed_http_public_reachability_started", "Managed HTTP public reachability verification started");
                         match probe.verify_until_success(signal.clone()).await {
@@ -1036,10 +1103,69 @@ async fn announce_managed_http_ready(
                         event = "managed_http_ready",
                         "Managed HTTP tunnel is ready"
                     );
+                    if let (Some(probe), Some(monitor)) =
+                        (announcement.probe, announcement.monitor)
+                    {
+                        return run_public_reachability_monitor(
+                            probe,
+                            monitor,
+                            status,
+                            signal,
+                        )
+                        .await;
+                    }
                     signal.cancelled().await;
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+async fn run_public_reachability_monitor(
+    probe: PublicReachabilityProbe,
+    config: PublicReachabilityMonitorConfig,
+    status: crate::AgentRuntimeStatusHandle,
+    signal: ShutdownSignal,
+) -> Result<(), PublicReachabilityError> {
+    loop {
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => return Ok(()),
+            () = tokio::time::sleep(config.interval) => {}
+        }
+        let previous = status.snapshot().public_reachability_state;
+        match probe.verify_once(signal.clone()).await {
+            Ok(()) => {
+                status.record_public_reachability_monitor_success();
+                if previous != PublicReachabilityState::Healthy {
+                    info!(
+                        previous_state = previous.as_str(),
+                        event = "managed_http_public_reachability_recovered",
+                        "Managed HTTP public reachability recovered"
+                    );
+                }
+            }
+            Err(PublicReachabilityError::AttemptFailed(failure)) => {
+                let state = status
+                    .record_public_reachability_monitor_failure(failure, config.failure_threshold);
+                if state != previous {
+                    warn!(
+                        previous_state = previous.as_str(),
+                        state = state.as_str(),
+                        failure = failure.as_str(),
+                        consecutive_failures =
+                            status.snapshot().public_reachability_consecutive_failures,
+                        event = "managed_http_public_reachability_state_changed",
+                        "Managed HTTP public reachability state changed"
+                    );
+                }
+            }
+            Err(PublicReachabilityError::Cancelled { .. }) => {
+                status.record_public_reachability_monitor_cancellation();
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1345,7 +1471,7 @@ fn agent_exit_code(result: Result<AgentRuntimeOutcome, crate::AgentRuntimeError>
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedArgs {
     config_path: Option<PathBuf>,
     edge: SocketAddr,
@@ -1397,6 +1523,11 @@ struct ParsedArgs {
     public_reachability_ca_explicit: bool,
     public_reachability_timeout: Duration,
     public_reachability_timeout_explicit: bool,
+    public_reachability_monitor_interval: Option<Duration>,
+    public_reachability_monitor_interval_explicit: bool,
+    public_reachability_failure_threshold: u64,
+    public_reachability_failure_threshold_explicit: bool,
+    public_reachability_failure_threshold_present: bool,
     public_reachability_options_present: bool,
     enroll_only: bool,
     enrollment_server: Option<SocketAddr>,
@@ -1467,6 +1598,11 @@ impl Default for ParsedArgs {
             public_reachability_ca_explicit: false,
             public_reachability_timeout: DEFAULT_PUBLIC_REACHABILITY_TIMEOUT,
             public_reachability_timeout_explicit: false,
+            public_reachability_monitor_interval: None,
+            public_reachability_monitor_interval_explicit: false,
+            public_reachability_failure_threshold: DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+            public_reachability_failure_threshold_explicit: false,
+            public_reachability_failure_threshold_present: false,
             public_reachability_options_present: false,
             enroll_only: false,
             enrollment_server: None,
@@ -1504,6 +1640,9 @@ enum ArgError {
     PublicReachabilityRequiresHttp,
     PublicReachabilityOptionsWithoutOptIn,
     InvalidPublicReachabilityTimeout,
+    InvalidPublicReachabilityMonitorInterval,
+    PublicReachabilityThresholdRequiresMonitor,
+    InvalidPublicReachabilityFailureThreshold,
     UnknownFlag(String),
 }
 
@@ -1551,6 +1690,15 @@ impl std::fmt::Display for ArgError {
             }
             Self::InvalidPublicReachabilityTimeout => f.write_str(
                 "public reachability timeout must be between 1 ms and 300000 ms",
+            ),
+            Self::InvalidPublicReachabilityMonitorInterval => f.write_str(
+                "public reachability monitor interval must be between 10000 ms and 3600000 ms",
+            ),
+            Self::PublicReachabilityThresholdRequiresMonitor => f.write_str(
+                "public reachability failure threshold requires a monitor interval",
+            ),
+            Self::InvalidPublicReachabilityFailureThreshold => f.write_str(
+                "public reachability failure threshold must be between 1 and 10",
             ),
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
@@ -1768,6 +1916,20 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.public_reachability_timeout =
                     Duration::from_millis(parse_number(args, index, flag)?);
                 parsed.public_reachability_timeout_explicit = true;
+                parsed.public_reachability_options_present = true;
+                index += 2;
+            }
+            "--public-reachability-monitor-interval-ms" => {
+                parsed.public_reachability_monitor_interval =
+                    Some(Duration::from_millis(parse_number(args, index, flag)?));
+                parsed.public_reachability_monitor_interval_explicit = true;
+                parsed.public_reachability_options_present = true;
+                index += 2;
+            }
+            "--public-reachability-failure-threshold" => {
+                parsed.public_reachability_failure_threshold = parse_number(args, index, flag)?;
+                parsed.public_reachability_failure_threshold_explicit = true;
+                parsed.public_reachability_failure_threshold_present = true;
                 parsed.public_reachability_options_present = true;
                 index += 2;
             }
@@ -2143,6 +2305,10 @@ mod tests {
             "probe-ca.pem",
             "--public-reachability-timeout-ms",
             "12000",
+            "--public-reachability-monitor-interval-ms",
+            "15000",
+            "--public-reachability-failure-threshold",
+            "4",
         ]))
         .unwrap();
         assert_eq!(mode, RunMode::Http);
@@ -2161,10 +2327,17 @@ mod tests {
         );
         assert_eq!(parsed.public_reachability_timeout, Duration::from_secs(12));
         assert_eq!(
+            parsed.public_reachability_monitor_interval,
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(parsed.public_reachability_failure_threshold, 4);
+        assert!(validate_http_configuration(&parsed).is_ok());
+        assert_eq!(
             ManagedHttpAnnouncement {
                 hostname: PublicHostname::new("tp-0123456789abcdef0123456789abcdef.test").unwrap(),
                 local: parsed.local,
                 probe: None,
+                monitor: None,
             }
             .mapping(),
             "https://tp-0123456789abcdef0123456789abcdef.test -> http://127.0.0.1:8080"
@@ -2248,6 +2421,46 @@ mod tests {
             validate_http_configuration(&tuning_without_opt_in),
             Err(ArgError::PublicReachabilityOptionsWithoutOptIn)
         ));
+
+        let (_, threshold_without_monitor) = parse_run_command(&args(&[
+            "http",
+            "3000",
+            "--tls-ca",
+            "edge-ca.pem",
+            "--tls-client-cert",
+            "agent.pem",
+            "--tls-client-key",
+            "agent-key.pem",
+            "--tls-server-name",
+            "edge.test",
+            "--hostname-server",
+            "127.0.0.1:17400",
+            "--hostname-ca",
+            "hostname-ca.pem",
+            "--hostname-server-name",
+            "control.test",
+            "--verify-public-reachability",
+            "--public-reachability-failure-threshold",
+            "3",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            validate_http_configuration(&threshold_without_monitor),
+            Err(ArgError::PublicReachabilityThresholdRequiresMonitor)
+        ));
+        let mut invalid_interval = threshold_without_monitor.clone();
+        invalid_interval.public_reachability_monitor_interval = Some(Duration::from_millis(9_999));
+        assert!(matches!(
+            validate_http_configuration(&invalid_interval),
+            Err(ArgError::InvalidPublicReachabilityMonitorInterval)
+        ));
+        let mut invalid_threshold = invalid_interval;
+        invalid_threshold.public_reachability_monitor_interval = Some(Duration::from_secs(10));
+        invalid_threshold.public_reachability_failure_threshold = 11;
+        assert!(matches!(
+            validate_http_configuration(&invalid_threshold),
+            Err(ArgError::InvalidPublicReachabilityFailureThreshold)
+        ));
     }
 
     fn valid_config_json() -> &'static [u8] {
@@ -2278,7 +2491,7 @@ mod tests {
             .unwrap()
             .replace(
                 "\n            }\n        }",
-                "\n            },\n            \"public_reachability\": {\n                \"enabled\": true,\n                \"ca\": \"probe-ca.pem\",\n                \"timeout_ms\": 9000\n            }\n        }",
+                "\n            },\n            \"public_reachability\": {\n                \"enabled\": true,\n                \"ca\": \"probe-ca.pem\",\n                \"timeout_ms\": 9000,\n                \"monitor_interval_ms\": 10000,\n                \"failure_threshold\": 4\n            }\n        }",
             );
         let config = parse_agent_config(config_json.as_bytes()).unwrap();
         let mut parsed = parse_args(&args(&[
@@ -2288,6 +2501,8 @@ mod tests {
             "override-agent.pem",
             "--public-reachability-timeout-ms",
             "12000",
+            "--public-reachability-failure-threshold",
+            "5",
         ]))
         .unwrap();
         let config_path = PathBuf::from("profiles").join("config.json");
@@ -2318,6 +2533,11 @@ mod tests {
             Some(PathBuf::from("profiles/probe-ca.pem"))
         );
         assert_eq!(parsed.public_reachability_timeout, Duration::from_secs(12));
+        assert_eq!(
+            parsed.public_reachability_monitor_interval,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(parsed.public_reachability_failure_threshold, 5);
         assert!(validate_http_configuration(&parsed).is_ok());
     }
 
@@ -2344,6 +2564,73 @@ mod tests {
             parse_agent_config(unsupported.as_bytes()),
             Err(AgentConfigError::UnsupportedVersion)
         ));
+        let disabled_monitor = String::from_utf8(valid_config_json().to_vec())
+            .unwrap()
+            .replace(
+                "\n            }\n        }",
+                "\n            },\n            \"public_reachability\": {\n                \"enabled\": false,\n                \"monitor_interval_ms\": 10000\n            }\n        }",
+            );
+        let config = parse_agent_config(disabled_monitor.as_bytes()).unwrap();
+        assert!(matches!(
+            apply_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config,),
+            Err(AgentConfigError::InvalidSchema)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reachability_monitor_crosses_threshold_and_stops_on_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let probe = PublicReachabilityProbe::new(PublicReachabilityConfig {
+            hostname: PublicHostname::new("monitor.example.test").unwrap(),
+            ca_pem: None,
+            total_timeout: Duration::from_millis(50),
+            attempt_timeout: Duration::from_millis(20),
+            retry_interval: Duration::from_millis(5),
+            server_addr_override: Some(unavailable),
+        })
+        .unwrap();
+        let runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ))
+        .unwrap();
+        let status = runtime.status_handle();
+        status.require_public_reachability(true);
+        status.record_public_reachability_success(1);
+        let (trigger, signal) = shutdown_channel();
+        let monitor = tokio::spawn(run_public_reachability_monitor(
+            probe,
+            PublicReachabilityMonitorConfig {
+                interval: Duration::from_millis(1),
+                failure_threshold: 2,
+            },
+            status.clone(),
+            signal,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if status.snapshot().public_reachability_state == PublicReachabilityState::Unhealthy
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("monitor did not cross the failure threshold");
+        trigger.shutdown();
+        monitor.await.unwrap().unwrap();
+        let snapshot = status.snapshot();
+        assert!(snapshot.public_reachability_monitor_cycles >= 2);
+        assert_eq!(
+            snapshot.public_reachability_monitor_failures,
+            snapshot.public_reachability_monitor_cycles
+        );
+        assert!(snapshot.public_reachability_consecutive_failures >= 2);
+        assert_eq!(snapshot.public_reachability_unhealthy_transitions, 1);
+        assert!(!snapshot.is_ready());
     }
 
     #[test]

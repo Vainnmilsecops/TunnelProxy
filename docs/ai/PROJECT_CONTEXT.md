@@ -121,7 +121,10 @@ Managed HTTP startup validates complete Edge and hostname-service mTLS inputs,
 allocates or reuses the hostname with the same AgentId/TunnelId, and starts the
 normal reconnecting Agent runtime. By default it prints the mapping after its
 first successful registration. An explicit Session 51 option instead gates
-stdout on a bounded exact-host public HTTPS proof using system roots or one
-custom CA. The hostname remains durable across shutdown, reconnect, and probe
-failure. Wildcard DNS/public TLS remain operator-provisioned prerequisites;
-the probe verifies them but does not create them.
+stdout on a bounded exact-host public HTTPS proof using bundled roots or one
+custom CA. Session 52 can continue that proof at a bounded fixed delay and
+drive local readiness through pending, degraded, unhealthy, and recovery
+without terminating the tunnel. The hostname remains durable across shutdown,
+reconnect, and probe failure. Wildcard DNS/public TLS remain
+operator-provisioned prerequisites; the probe verifies them but does not
+create them.

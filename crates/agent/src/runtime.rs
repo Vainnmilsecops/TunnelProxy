@@ -1,7 +1,7 @@
 //! Process-level composition and reconnect supervision for one Agent.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -168,6 +168,46 @@ impl AgentConnectionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PublicReachabilityState {
+    Disabled = 0,
+    Pending = 1,
+    Healthy = 2,
+    Degraded = 3,
+    Unhealthy = 4,
+}
+
+impl PublicReachabilityState {
+    pub const ALL: [Self; 5] = [
+        Self::Disabled,
+        Self::Pending,
+        Self::Healthy,
+        Self::Degraded,
+        Self::Unhealthy,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Pending => "pending",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Pending,
+            2 => Self::Healthy,
+            3 => Self::Degraded,
+            4 => Self::Unhealthy,
+            _ => Self::Disabled,
+        }
+    }
+}
+
 /// Fixed-cardinality process state exposed to local operations consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentRuntimeStatus {
@@ -186,11 +226,25 @@ pub struct AgentRuntimeStatus {
     pub public_reachability_connect_failures: u64,
     pub public_reachability_route_failures: u64,
     pub public_reachability_protocol_failures: u64,
+    pub public_reachability_state: PublicReachabilityState,
+    pub public_reachability_monitor_cycles: u64,
+    pub public_reachability_monitor_failures: u64,
+    pub public_reachability_consecutive_failures: u64,
+    pub public_reachability_unhealthy_transitions: u64,
+    pub public_reachability_recoveries: u64,
 }
 
 impl AgentRuntimeStatus {
-    pub const fn is_ready(self) -> bool {
+    pub const fn is_transport_ready(self) -> bool {
         matches!(self.state, AgentConnectionState::Connected)
+    }
+
+    pub const fn is_ready(self) -> bool {
+        self.is_transport_ready()
+            && !matches!(
+                self.public_reachability_state,
+                PublicReachabilityState::Pending | PublicReachabilityState::Unhealthy
+            )
     }
 }
 
@@ -211,6 +265,13 @@ struct AgentRuntimeTelemetry {
     public_reachability_connect_failures: AtomicU64,
     public_reachability_route_failures: AtomicU64,
     public_reachability_protocol_failures: AtomicU64,
+    public_reachability_state: AtomicU8,
+    public_reachability_monitor_enabled: AtomicBool,
+    public_reachability_monitor_cycles: AtomicU64,
+    public_reachability_monitor_failures: AtomicU64,
+    public_reachability_consecutive_failures: AtomicU64,
+    public_reachability_unhealthy_transitions: AtomicU64,
+    public_reachability_recoveries: AtomicU64,
 }
 
 impl Default for AgentRuntimeTelemetry {
@@ -231,6 +292,13 @@ impl Default for AgentRuntimeTelemetry {
             public_reachability_connect_failures: AtomicU64::new(0),
             public_reachability_route_failures: AtomicU64::new(0),
             public_reachability_protocol_failures: AtomicU64::new(0),
+            public_reachability_state: AtomicU8::new(PublicReachabilityState::Disabled as u8),
+            public_reachability_monitor_enabled: AtomicBool::new(false),
+            public_reachability_monitor_cycles: AtomicU64::new(0),
+            public_reachability_monitor_failures: AtomicU64::new(0),
+            public_reachability_consecutive_failures: AtomicU64::new(0),
+            public_reachability_unhealthy_transitions: AtomicU64::new(0),
+            public_reachability_recoveries: AtomicU64::new(0),
         }
     }
 }
@@ -265,10 +333,38 @@ impl AgentRuntimeTelemetry {
             public_reachability_protocol_failures: self
                 .public_reachability_protocol_failures
                 .load(Ordering::Relaxed),
+            public_reachability_state: PublicReachabilityState::from_raw(
+                self.public_reachability_state.load(Ordering::Relaxed),
+            ),
+            public_reachability_monitor_cycles: self
+                .public_reachability_monitor_cycles
+                .load(Ordering::Relaxed),
+            public_reachability_monitor_failures: self
+                .public_reachability_monitor_failures
+                .load(Ordering::Relaxed),
+            public_reachability_consecutive_failures: self
+                .public_reachability_consecutive_failures
+                .load(Ordering::Relaxed),
+            public_reachability_unhealthy_transitions: self
+                .public_reachability_unhealthy_transitions
+                .load(Ordering::Relaxed),
+            public_reachability_recoveries: self
+                .public_reachability_recoveries
+                .load(Ordering::Relaxed),
         }
     }
 
     fn set_runtime_state(&self, state: AgentConnectionState) {
+        if state != AgentConnectionState::Connected
+            && self
+                .public_reachability_monitor_enabled
+                .load(Ordering::Relaxed)
+            && self.public_reachability_state.load(Ordering::Relaxed)
+                != PublicReachabilityState::Disabled as u8
+        {
+            self.public_reachability_state
+                .store(PublicReachabilityState::Pending as u8, Ordering::Relaxed);
+        }
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
             if current == AgentConnectionState::Draining as u8
@@ -305,6 +401,15 @@ impl AgentRuntimeStatusHandle {
         self.multiplex.snapshot()
     }
 
+    pub(crate) fn require_public_reachability(&self, monitor_enabled: bool) {
+        self.telemetry
+            .public_reachability_monitor_enabled
+            .store(monitor_enabled, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_state
+            .store(PublicReachabilityState::Pending as u8, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_public_reachability_success(&self, attempts: u64) {
         self.telemetry
             .public_reachability_attempts
@@ -312,6 +417,12 @@ impl AgentRuntimeStatusHandle {
         self.telemetry
             .public_reachability_successes
             .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_consecutive_failures
+            .store(0, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_state
+            .store(PublicReachabilityState::Healthy as u8, Ordering::Relaxed);
     }
 
     pub(crate) fn record_public_reachability_failure(
@@ -348,6 +459,101 @@ impl AgentRuntimeStatusHandle {
                 | crate::PublicReachabilityFailureClass::InvalidProof,
             )
             | None => &self.telemetry.public_reachability_protocol_failures,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_public_reachability_monitor_success(&self) -> PublicReachabilityState {
+        self.telemetry
+            .public_reachability_monitor_cycles
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_successes
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_consecutive_failures
+            .store(0, Ordering::Relaxed);
+        let previous = PublicReachabilityState::from_raw(
+            self.telemetry
+                .public_reachability_state
+                .swap(PublicReachabilityState::Healthy as u8, Ordering::Relaxed),
+        );
+        if previous == PublicReachabilityState::Unhealthy {
+            self.telemetry
+                .public_reachability_recoveries
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        previous
+    }
+
+    pub(crate) fn record_public_reachability_monitor_failure(
+        &self,
+        failure: crate::PublicReachabilityFailureClass,
+        failure_threshold: u64,
+    ) -> PublicReachabilityState {
+        self.telemetry
+            .public_reachability_monitor_cycles
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_monitor_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .public_reachability_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_public_reachability_failure_class(failure);
+        let consecutive = self
+            .telemetry
+            .public_reachability_consecutive_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let state = if consecutive >= failure_threshold {
+            PublicReachabilityState::Unhealthy
+        } else {
+            PublicReachabilityState::Degraded
+        };
+        let previous = PublicReachabilityState::from_raw(
+            self.telemetry
+                .public_reachability_state
+                .swap(state as u8, Ordering::Relaxed),
+        );
+        if state == PublicReachabilityState::Unhealthy
+            && previous != PublicReachabilityState::Unhealthy
+        {
+            self.telemetry
+                .public_reachability_unhealthy_transitions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        state
+    }
+
+    pub(crate) fn record_public_reachability_monitor_cancellation(&self) {
+        self.telemetry
+            .public_reachability_cancellations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_public_reachability_failure_class(
+        &self,
+        failure: crate::PublicReachabilityFailureClass,
+    ) {
+        match failure {
+            crate::PublicReachabilityFailureClass::Tls => {
+                &self.telemetry.public_reachability_tls_failures
+            }
+            crate::PublicReachabilityFailureClass::Resolve
+            | crate::PublicReachabilityFailureClass::Connect => {
+                &self.telemetry.public_reachability_connect_failures
+            }
+            crate::PublicReachabilityFailureClass::RouteUnavailable => {
+                &self.telemetry.public_reachability_route_failures
+            }
+            crate::PublicReachabilityFailureClass::Http
+            | crate::PublicReachabilityFailureClass::InvalidProof => {
+                &self.telemetry.public_reachability_protocol_failures
+            }
         }
         .fetch_add(1, Ordering::Relaxed);
     }
@@ -839,6 +1045,99 @@ mod tests {
             .set_runtime_state(AgentConnectionState::Connected);
         assert_eq!(status.snapshot().state, AgentConnectionState::Draining);
         assert!(!status.snapshot().is_ready());
+    }
+
+    #[test]
+    fn public_reachability_threshold_controls_readiness_and_recovers() {
+        let runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ))
+        .unwrap();
+        let status = runtime.status_handle();
+        status.require_public_reachability(true);
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        assert_eq!(
+            status.snapshot().public_reachability_state,
+            PublicReachabilityState::Pending
+        );
+        assert!(!status.snapshot().is_ready());
+
+        status.record_public_reachability_success(1);
+        assert!(status.snapshot().is_ready());
+        assert_eq!(
+            status.record_public_reachability_monitor_failure(
+                crate::PublicReachabilityFailureClass::RouteUnavailable,
+                3,
+            ),
+            PublicReachabilityState::Degraded
+        );
+        assert!(status.snapshot().is_ready());
+        status.record_public_reachability_monitor_failure(
+            crate::PublicReachabilityFailureClass::RouteUnavailable,
+            3,
+        );
+        assert_eq!(
+            status.record_public_reachability_monitor_failure(
+                crate::PublicReachabilityFailureClass::RouteUnavailable,
+                3,
+            ),
+            PublicReachabilityState::Unhealthy
+        );
+        assert!(!status.snapshot().is_ready());
+        assert_eq!(
+            status.snapshot().public_reachability_unhealthy_transitions,
+            1
+        );
+
+        assert_eq!(
+            status.record_public_reachability_monitor_success(),
+            PublicReachabilityState::Unhealthy
+        );
+        let recovered = status.snapshot();
+        assert!(recovered.is_ready());
+        assert_eq!(recovered.public_reachability_recoveries, 1);
+        assert_eq!(recovered.public_reachability_consecutive_failures, 0);
+
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Backoff);
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        assert_eq!(
+            status.snapshot().public_reachability_state,
+            PublicReachabilityState::Pending
+        );
+        assert!(!status.snapshot().is_ready());
+    }
+
+    #[test]
+    fn one_shot_reachability_keeps_session_51_reconnect_readiness() {
+        let runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ))
+        .unwrap();
+        let status = runtime.status_handle();
+        status.require_public_reachability(false);
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        status.record_public_reachability_success(1);
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Backoff);
+        runtime
+            .telemetry
+            .set_runtime_state(AgentConnectionState::Connected);
+        assert_eq!(
+            status.snapshot().public_reachability_state,
+            PublicReachabilityState::Healthy
+        );
+        assert!(status.snapshot().is_ready());
     }
 
     #[test]

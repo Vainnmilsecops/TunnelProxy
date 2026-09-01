@@ -1009,6 +1009,39 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     assert_eq!(probe_outcome.attempts, 1);
     tokio::time::sleep(Duration::from_millis(1_100)).await;
 
+    agent_trigger.shutdown();
+    agent_task.await.unwrap().unwrap();
+    let (_, offline_probe_signal) = shutdown_channel();
+    assert_eq!(
+        probe.verify_once(offline_probe_signal).await,
+        Err(PublicReachabilityError::AttemptFailed(
+            PublicReachabilityFailureClass::RouteUnavailable,
+        ))
+    );
+
+    let replacement_agent = agent_runtime(edge_addr, local_addr);
+    let (replacement_agent_trigger, replacement_agent_signal) = shutdown_channel();
+    let replacement_agent_task =
+        tokio::spawn(replacement_agent.run_until_shutdown(replacement_agent_signal));
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .resolve_tunnel(&TunnelId::new("tunnel-dev").unwrap())
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement Agent did not become routable");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (_, recovered_probe_signal) = shutdown_channel();
+    probe.verify_once(recovered_probe_signal).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
     let connector = TlsConnector::from(raw_tls_client_config(
         &public_pki.authority_pem,
         None,
@@ -1163,21 +1196,21 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     let response = String::from_utf8(read_http_head(&mut retired).await).unwrap();
     assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
 
-    agent_trigger.shutdown();
-    let _ = agent_task.await.unwrap().unwrap();
+    replacement_agent_trigger.shutdown();
+    let _ = replacement_agent_task.await.unwrap().unwrap();
     edge_trigger.shutdown();
     let outcome = edge_task.await.unwrap().unwrap();
     assert_eq!(outcome.raw_addr, None);
     let https = outcome.https_ingress.unwrap();
-    assert_eq!(https.completed_requests, 2);
-    assert_eq!(https.rejected_requests, 5);
+    assert_eq!(https.completed_requests, 3);
+    assert_eq!(https.rejected_requests, 6);
     assert_eq!(https.rejected_connect_sessions, 1);
     assert_eq!(https.accepted_signed_access_requests, 2);
     assert_eq!(https.missing_signed_access_rejections, 1);
     assert_eq!(https.global_rate_limit_rejections, 1);
-    assert_eq!(https.reachability_probe_requests, 1);
-    assert_eq!(https.successful_reachability_probes, 1);
-    assert_eq!(https.failed_reachability_probes, 0);
+    assert_eq!(https.reachability_probe_requests, 3);
+    assert_eq!(https.successful_reachability_probes, 2);
+    assert_eq!(https.failed_reachability_probes, 1);
     local_task.await.unwrap();
     reload_trigger.shutdown();
     reload_task.await.unwrap();

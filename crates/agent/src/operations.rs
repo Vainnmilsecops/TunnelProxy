@@ -432,6 +432,18 @@ fn render_metrics(
             u8::from(status.state == state)
         );
     }
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_agent_public_reachability_state gauge"
+    );
+    for state in crate::PublicReachabilityState::ALL {
+        let _ = writeln!(
+            output,
+            "tunnelproxy_agent_public_reachability_state{{state=\"{}\"}} {}",
+            state.as_str(),
+            u8::from(status.public_reachability_state == state)
+        );
+    }
     for (name, kind, value) in [
         (
             "tunnelproxy_agent_connection_attempts_total",
@@ -502,6 +514,31 @@ fn render_metrics(
             "tunnelproxy_agent_public_reachability_protocol_failures_total",
             "counter",
             status.public_reachability_protocol_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_monitor_cycles_total",
+            "counter",
+            status.public_reachability_monitor_cycles,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_monitor_failures_total",
+            "counter",
+            status.public_reachability_monitor_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_consecutive_failures",
+            "gauge",
+            status.public_reachability_consecutive_failures,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_unhealthy_transitions_total",
+            "counter",
+            status.public_reachability_unhealthy_transitions,
+        ),
+        (
+            "tunnelproxy_agent_public_reachability_recoveries_total",
+            "counter",
+            status.public_reachability_recoveries,
         ),
         (
             "tunnelproxy_agent_operations_active_connections",
@@ -703,6 +740,11 @@ mod tests {
             false,
         );
         status.record_public_reachability_failure(0, None, true);
+        status.record_public_reachability_monitor_failure(
+            crate::PublicReachabilityFailureClass::RouteUnavailable,
+            1,
+        );
+        status.record_public_reachability_monitor_success();
         let rendered = render_metrics(
             status.snapshot(),
             MultiplexTelemetrySnapshot {
@@ -724,13 +766,27 @@ mod tests {
         for state in AgentConnectionState::ALL {
             assert!(rendered.contains(&format!("state=\"{}\"", state.as_str())));
         }
+        for state in crate::PublicReachabilityState::ALL {
+            assert!(rendered.contains(&format!(
+                "tunnelproxy_agent_public_reachability_state{{state=\"{}\"}}",
+                state.as_str()
+            )));
+        }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
         assert!(rendered.contains("tunnelproxy_agent_logging_nonblocking_enabled 0"));
-        assert!(rendered.contains("tunnelproxy_agent_public_reachability_attempts_total 5"));
-        assert!(rendered.contains("tunnelproxy_agent_public_reachability_successes_total 1"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_attempts_total 7"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_successes_total 2"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_timeouts_total 1"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_cancellations_total 1"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_tls_failures_total 1"));
+        assert!(
+            rendered.contains("tunnelproxy_agent_public_reachability_state{state=\"healthy\"} 1")
+        );
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_monitor_cycles_total 2"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_monitor_failures_total 1"));
+        assert!(rendered
+            .contains("tunnelproxy_agent_public_reachability_unhealthy_transitions_total 1"));
+        assert!(rendered.contains("tunnelproxy_agent_public_reachability_recoveries_total 1"));
         let mut logging = String::new();
         render_logging_metrics(
             &mut logging,
