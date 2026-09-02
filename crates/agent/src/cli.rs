@@ -1,6 +1,6 @@
 //! Shared runnable Agent CLI driver used by both installed executables.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,17 +16,19 @@ use crate::{
     AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, MultiAgentRuntime,
     MultiAgentRuntimeError, MultiAgentRuntimeOutcome, PublicReachabilityConfig,
     PublicReachabilityError, PublicReachabilityMonitorConfig, PublicReachabilityProbe,
-    PublicReachabilityState, RuntimeShutdownConfig, DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT,
-    DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
-    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_MANAGED_HTTP_TUNNELS,
-    MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
-    MAX_PUBLIC_REACHABILITY_TIMEOUT, MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
+    PublicReachabilityState, RuntimeShutdownConfig, TunnelTargetApplyOutcome, TunnelTargetSet,
+    DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT, DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+    DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL, DEFAULT_PUBLIC_REACHABILITY_TIMEOUT,
+    MAX_MANAGED_HTTP_TUNNELS, MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
+    MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL, MAX_PUBLIC_REACHABILITY_TIMEOUT,
+    MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
 };
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tunnelproxy_common::{
-    init_process_logging, shutdown_channel, wait_for_process_shutdown, AgentCredentialPaths,
-    AgentId, ProcessLogFormat, PublicHostname, ShutdownSignal, TunnelId,
+    init_process_logging, load_generation_reload, shutdown_channel, wait_for_process_shutdown,
+    AgentCredentialPaths, AgentId, GenerationReloadError, GenerationReloadFile, ProcessLogFormat,
+    PublicHostname, ShutdownSignal, TunnelId,
 };
 use tunnelproxy_protocol::RegistrationRequest;
 
@@ -133,8 +135,11 @@ const AGENT_CONFIG_VERSION: u32 = 1;
 const MULTI_AGENT_CONFIG_VERSION: u32 = 2;
 const MAX_AGENT_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_PUBLIC_REACHABILITY_CA_BYTES: u64 = 1024 * 1024;
+const MIN_TUNNEL_RELOAD_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_TUNNEL_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+const TUNNEL_CONFIG_MATERIAL_NAME: &str = "config";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigFile {
     version: u32,
@@ -145,7 +150,7 @@ struct AgentConfigFile {
     public_reachability: Option<AgentConfigPublicReachability>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MultiAgentConfigFile {
     version: u32,
@@ -154,10 +159,12 @@ struct MultiAgentConfigFile {
     identity: MultiAgentConfigIdentity,
     tunnels: Vec<AgentConfigTunnel>,
     #[serde(default)]
+    tunnel_reload: Option<AgentConfigTunnelReload>,
+    #[serde(default)]
     public_reachability: Option<AgentConfigPublicReachability>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MultiAgentConfigIdentity {
     agent_id: String,
@@ -165,11 +172,18 @@ struct MultiAgentConfigIdentity {
     client_private_key: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigTunnel {
     tunnel_id: String,
     local_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigTunnelReload {
+    manifest: PathBuf,
+    poll_interval_ms: u64,
 }
 
 #[derive(Debug)]
@@ -184,7 +198,7 @@ struct ManagedTunnelSpec {
     local: SocketAddr,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigEdge {
     address: String,
@@ -192,7 +206,7 @@ struct AgentConfigEdge {
     server_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigHostname {
     address: String,
@@ -200,7 +214,7 @@ struct AgentConfigHostname {
     server_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigIdentity {
     agent_id: String,
@@ -209,7 +223,7 @@ struct AgentConfigIdentity {
     client_private_key: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigPublicReachability {
     enabled: bool,
@@ -232,6 +246,22 @@ struct SelectedConfigPath {
     source: ConfigPathSource,
 }
 
+#[derive(Debug, Clone)]
+struct TunnelReloadBootstrap {
+    config_path: PathBuf,
+    manifest_path: PathBuf,
+    poll_interval: Duration,
+    generation: u64,
+    manifest_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct LoadedMultiAgentProfile {
+    config: MultiAgentConfigFile,
+    tunnels: Vec<ManagedTunnelSpec>,
+    reload: Option<TunnelReloadBootstrap>,
+}
+
 #[derive(Debug)]
 enum AgentConfigError {
     MissingPath,
@@ -249,6 +279,11 @@ enum AgentConfigError {
     ZeroLocalPort,
     EmptyPath(&'static str),
     InvalidTls,
+    EmptyTunnelReloadManifest,
+    InvalidTunnelReloadInterval,
+    InvalidTunnelReloadGeneration,
+    TunnelReloadChangedSharedConfig,
+    TunnelReloadChangedTunnelSet,
 }
 
 impl std::fmt::Display for AgentConfigError {
@@ -273,6 +308,17 @@ impl std::fmt::Display for AgentConfigError {
             Self::ZeroLocalPort => "Agent config tunnel local_port must be greater than zero",
             Self::EmptyPath(kind) => return write!(formatter, "Agent config {kind} path is empty"),
             Self::InvalidTls => "Agent config TLS material is invalid",
+            Self::EmptyTunnelReloadManifest => "Agent tunnel reload manifest path is empty",
+            Self::InvalidTunnelReloadInterval => {
+                "Agent tunnel reload interval must be between 100 ms and 60000 ms"
+            }
+            Self::InvalidTunnelReloadGeneration => "Agent tunnel reload generation is invalid",
+            Self::TunnelReloadChangedSharedConfig => {
+                "Agent tunnel reload may only change local_port values"
+            }
+            Self::TunnelReloadChangedTunnelSet => {
+                "Agent tunnel reload may not add or remove TunnelIds"
+            }
         })
     }
 }
@@ -378,6 +424,66 @@ fn parse_agent_config(bytes: &[u8]) -> Result<AgentConfigDocument, AgentConfigEr
     Ok(AgentConfigDocument::Multi(config))
 }
 
+fn validate_tunnel_reload_config(
+    config_path: &Path,
+    reload: &AgentConfigTunnelReload,
+) -> Result<(PathBuf, Duration), AgentConfigError> {
+    if reload.manifest.as_os_str().is_empty() {
+        return Err(AgentConfigError::EmptyTunnelReloadManifest);
+    }
+    let poll_interval = Duration::from_millis(reload.poll_interval_ms);
+    if !(MIN_TUNNEL_RELOAD_INTERVAL..=MAX_TUNNEL_RELOAD_INTERVAL).contains(&poll_interval) {
+        return Err(AgentConfigError::InvalidTunnelReloadInterval);
+    }
+    Ok((
+        resolve_config_relative_path(config_path, reload.manifest.clone()),
+        poll_interval,
+    ))
+}
+
+async fn bootstrap_multi_agent_config(
+    config_path: &Path,
+    discovered: MultiAgentConfigFile,
+) -> Result<(MultiAgentConfigFile, Option<TunnelReloadBootstrap>), AgentConfigError> {
+    let Some(reload) = discovered.tunnel_reload.as_ref() else {
+        return Ok((discovered, None));
+    };
+    let (manifest_path, poll_interval) = validate_tunnel_reload_config(config_path, reload)?;
+    let generation = load_generation_reload(
+        manifest_path.clone(),
+        vec![GenerationReloadFile::new(
+            TUNNEL_CONFIG_MATERIAL_NAME,
+            config_path,
+        )],
+    )
+    .await
+    .map_err(|_| AgentConfigError::InvalidTunnelReloadGeneration)?;
+    let bytes = generation
+        .file(TUNNEL_CONFIG_MATERIAL_NAME)
+        .map_err(|_| AgentConfigError::InvalidTunnelReloadGeneration)?;
+    if bytes.len() as u64 > MAX_AGENT_CONFIG_BYTES {
+        return Err(AgentConfigError::TooLarge);
+    }
+    let candidate = match parse_agent_config(bytes)? {
+        AgentConfigDocument::Multi(config) => config,
+        AgentConfigDocument::Single(_) => return Err(AgentConfigError::VersionRequiresCommand),
+    };
+    if candidate.tunnel_reload != discovered.tunnel_reload {
+        return Err(AgentConfigError::TunnelReloadChangedSharedConfig);
+    }
+    validate_tunnel_reload_config(config_path, candidate.tunnel_reload.as_ref().unwrap())?;
+    Ok((
+        candidate,
+        Some(TunnelReloadBootstrap {
+            config_path: config_path.to_owned(),
+            manifest_path,
+            poll_interval,
+            generation: generation.generation(),
+            manifest_digest: generation.manifest_digest(),
+        }),
+    ))
+}
+
 fn resolve_config_relative_path(config_path: &Path, value: PathBuf) -> PathBuf {
     if value.is_absolute() {
         value
@@ -422,17 +528,34 @@ fn apply_agent_config(
 fn apply_multi_agent_config(
     parsed: &mut ParsedArgs,
     config_path: &Path,
-    config: MultiAgentConfigFile,
+    config: &MultiAgentConfigFile,
 ) -> Result<Vec<ManagedTunnelSpec>, AgentConfigError> {
-    if config.tunnels.is_empty() {
+    let tunnels = parse_managed_tunnels(&config.tunnels)?;
+    apply_shared_agent_config(
+        parsed,
+        config_path,
+        config.edge.clone(),
+        config.hostname.clone(),
+        config.identity.agent_id.clone(),
+        config.identity.client_certificate.clone(),
+        config.identity.client_private_key.clone(),
+        config.public_reachability.clone(),
+    )?;
+    Ok(tunnels)
+}
+
+fn parse_managed_tunnels(
+    configured: &[AgentConfigTunnel],
+) -> Result<Vec<ManagedTunnelSpec>, AgentConfigError> {
+    if configured.is_empty() {
         return Err(AgentConfigError::EmptyTunnels);
     }
-    if config.tunnels.len() > MAX_MANAGED_HTTP_TUNNELS {
+    if configured.len() > MAX_MANAGED_HTTP_TUNNELS {
         return Err(AgentConfigError::TooManyTunnels);
     }
-    let mut seen = HashSet::with_capacity(config.tunnels.len());
-    let mut tunnels = Vec::with_capacity(config.tunnels.len());
-    for tunnel in config.tunnels {
+    let mut seen = HashSet::with_capacity(configured.len());
+    let mut tunnels = Vec::with_capacity(configured.len());
+    for tunnel in configured {
         let tunnel_id = TunnelId::new(&tunnel.tunnel_id)
             .map_err(|_| AgentConfigError::InvalidIdentifier("TunnelId"))?;
         if !seen.insert(tunnel_id.clone()) {
@@ -446,16 +569,6 @@ fn apply_multi_agent_config(
             local: SocketAddr::from(([127, 0, 0, 1], tunnel.local_port)),
         });
     }
-    apply_shared_agent_config(
-        parsed,
-        config_path,
-        config.edge,
-        config.hostname,
-        config.identity.agent_id,
-        config.identity.client_certificate,
-        config.identity.client_private_key,
-        config.public_reachability,
-    )?;
     Ok(tunnels)
 }
 
@@ -704,8 +817,11 @@ async fn run_config_validate(args: &[String]) -> Result<(), ConfigValidateError>
                 local: parsed.local,
             }]
         }
-        AgentConfigDocument::Multi(config) => {
-            apply_multi_agent_config(&mut parsed, &selected.path, config)
+        AgentConfigDocument::Multi(discovered) => {
+            let (config, _) = bootstrap_multi_agent_config(&selected.path, discovered)
+                .await
+                .map_err(ConfigValidateError::Config)?;
+            apply_multi_agent_config(&mut parsed, &selected.path, &config)
                 .map_err(ConfigValidateError::Config)?
         }
     };
@@ -736,13 +852,153 @@ async fn run_config_validate(args: &[String]) -> Result<(), ConfigValidateError>
 
 async fn apply_required_multi_config(
     parsed: &mut ParsedArgs,
-) -> Result<Vec<ManagedTunnelSpec>, AgentConfigError> {
+) -> Result<LoadedMultiAgentProfile, AgentConfigError> {
     let selected = select_config_path(parsed.config_path.as_deref())?;
     match load_agent_config(&selected.path).await? {
-        AgentConfigDocument::Multi(config) => {
-            apply_multi_agent_config(parsed, &selected.path, config)
+        AgentConfigDocument::Multi(discovered) => {
+            let (config, reload) = bootstrap_multi_agent_config(&selected.path, discovered).await?;
+            let tunnels = apply_multi_agent_config(parsed, &selected.path, &config)?;
+            Ok(LoadedMultiAgentProfile {
+                config,
+                tunnels,
+                reload,
+            })
         }
         AgentConfigDocument::Single(_) => Err(AgentConfigError::VersionRequiresCommand),
+    }
+}
+
+fn target_map(tunnels: &[ManagedTunnelSpec]) -> BTreeMap<TunnelId, SocketAddr> {
+    tunnels
+        .iter()
+        .map(|tunnel| (tunnel.tunnel_id.clone(), tunnel.local))
+        .collect()
+}
+
+fn validate_tunnel_reload_candidate(
+    baseline: &MultiAgentConfigFile,
+    candidate: &MultiAgentConfigFile,
+) -> Result<BTreeMap<TunnelId, SocketAddr>, AgentConfigError> {
+    if candidate.version != baseline.version
+        || candidate.edge != baseline.edge
+        || candidate.hostname != baseline.hostname
+        || candidate.identity != baseline.identity
+        || candidate.public_reachability != baseline.public_reachability
+        || candidate.tunnel_reload != baseline.tunnel_reload
+    {
+        return Err(AgentConfigError::TunnelReloadChangedSharedConfig);
+    }
+    let baseline_targets = target_map(&parse_managed_tunnels(&baseline.tunnels)?);
+    let candidate_targets = target_map(&parse_managed_tunnels(&candidate.tunnels)?);
+    if baseline_targets.keys().ne(candidate_targets.keys()) {
+        return Err(AgentConfigError::TunnelReloadChangedTunnelSet);
+    }
+    Ok(candidate_targets)
+}
+
+#[derive(Debug)]
+enum TunnelConfigReloadError {
+    Generation(GenerationReloadError),
+    Config(AgentConfigError),
+    Target(crate::TunnelTargetSetError),
+}
+
+impl std::fmt::Display for TunnelConfigReloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(error) => write!(formatter, "reload generation rejected: {error}"),
+            Self::Config(error) => write!(formatter, "reload config rejected: {error}"),
+            Self::Target(error) => write!(formatter, "reload target set rejected: {error}"),
+        }
+    }
+}
+
+struct TunnelConfigReloadRuntime {
+    bootstrap: TunnelReloadBootstrap,
+    baseline: MultiAgentConfigFile,
+    targets: TunnelTargetSet,
+}
+
+impl TunnelConfigReloadRuntime {
+    async fn run_until_shutdown(self, signal: ShutdownSignal) {
+        loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => return,
+                () = tokio::time::sleep(self.bootstrap.poll_interval) => {}
+            }
+            let reload = self.reload_once();
+            let outcome = tokio::select! {
+                biased;
+                () = signal.cancelled() => return,
+                outcome = reload => outcome,
+            };
+            match outcome {
+                Ok((generation, TunnelTargetApplyOutcome::Applied)) => info!(
+                    generation,
+                    event = "agent_tunnel_config_reload_applied",
+                    "Agent tunnel target generation applied"
+                ),
+                Ok((_, TunnelTargetApplyOutcome::Unchanged)) => {}
+                Err(error) => {
+                    self.targets.record_reload_failure();
+                    warn!(
+                        %error,
+                        event = "agent_tunnel_config_reload_failed",
+                        "Agent tunnel target reload retained last-known-good"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn reload_once(
+        &self,
+    ) -> Result<(u64, TunnelTargetApplyOutcome), TunnelConfigReloadError> {
+        let generation = load_generation_reload(
+            self.bootstrap.manifest_path.clone(),
+            vec![GenerationReloadFile::new(
+                TUNNEL_CONFIG_MATERIAL_NAME,
+                self.bootstrap.config_path.clone(),
+            )],
+        )
+        .await
+        .map_err(TunnelConfigReloadError::Generation)?;
+        let bytes = generation
+            .file(TUNNEL_CONFIG_MATERIAL_NAME)
+            .map_err(TunnelConfigReloadError::Generation)?;
+        if bytes.len() as u64 > MAX_AGENT_CONFIG_BYTES {
+            return Err(TunnelConfigReloadError::Config(AgentConfigError::TooLarge));
+        }
+        let candidate = match parse_agent_config(bytes).map_err(TunnelConfigReloadError::Config)? {
+            AgentConfigDocument::Multi(config) => config,
+            AgentConfigDocument::Single(_) => {
+                return Err(TunnelConfigReloadError::Config(
+                    AgentConfigError::VersionRequiresCommand,
+                ))
+            }
+        };
+        let targets = validate_tunnel_reload_candidate(&self.baseline, &candidate)
+            .map_err(TunnelConfigReloadError::Config)?;
+        let outcome = self
+            .targets
+            .apply(
+                generation.generation(),
+                generation.manifest_digest(),
+                targets,
+            )
+            .map_err(TunnelConfigReloadError::Target)?;
+        Ok((generation.generation(), outcome))
+    }
+}
+
+async fn run_optional_tunnel_config_reloader(
+    runtime: Option<TunnelConfigReloadRuntime>,
+    signal: ShutdownSignal,
+) {
+    match runtime {
+        Some(runtime) => runtime.run_until_shutdown(signal).await,
+        None => signal.cancelled().await,
     }
 }
 
@@ -1150,8 +1406,8 @@ async fn run_multi_tunnel(
         println!("{}", usage(binary_name));
         return ExitCode::SUCCESS;
     }
-    let tunnels = match apply_required_multi_config(&mut parsed).await {
-        Ok(tunnels) => tunnels,
+    let profile = match apply_required_multi_config(&mut parsed).await {
+        Ok(profile) => profile,
         Err(error) => {
             error!(%error, "failed to load multi-tunnel Agent config");
             print_usage_for_error(log_format, binary_name);
@@ -1163,6 +1419,25 @@ async fn run_multi_tunnel(
         print_usage_for_error(log_format, binary_name);
         return ExitCode::from(2);
     }
+    let LoadedMultiAgentProfile {
+        config: baseline_config,
+        tunnels,
+        reload: reload_bootstrap,
+    } = profile;
+    let targets = match &reload_bootstrap {
+        Some(reload) => TunnelTargetSet::reloadable(
+            reload.generation,
+            reload.manifest_digest,
+            target_map(&tunnels),
+        ),
+        None => TunnelTargetSet::fixed(target_map(&tunnels)),
+    }
+    .expect("validated config v2 produces a bounded loopback target set");
+    let tunnel_config_reloader = reload_bootstrap.map(|bootstrap| TunnelConfigReloadRuntime {
+        bootstrap,
+        baseline: baseline_config,
+        targets: targets.clone(),
+    });
 
     let enrollment_config = match load_enrollment_config(&parsed).await {
         Ok(config) => config,
@@ -1216,7 +1491,16 @@ async fn run_multi_tunnel(
 
     let configs = tunnels
         .iter()
-        .map(|tunnel| build_runtime_config(&parsed, tunnel, loaded_tls.security.clone()))
+        .map(|tunnel| {
+            build_runtime_config(
+                &parsed,
+                tunnel,
+                loaded_tls.security.clone(),
+                targets
+                    .target(&tunnel.tunnel_id)
+                    .expect("validated tunnel has an active local target"),
+            )
+        })
         .collect();
     let runtime = match MultiAgentRuntime::new(configs) {
         Ok(runtime) => runtime,
@@ -1231,7 +1515,13 @@ async fn run_multi_tunnel(
         .iter()
         .zip(&runtime_statuses)
         .map(|(tunnel, status)| {
-            AgentOperationsTunnel::new(tunnel.tunnel_id.clone(), tunnel.local, status.clone())
+            AgentOperationsTunnel::reloadable(
+                tunnel.tunnel_id.clone(),
+                targets
+                    .target(&tunnel.tunnel_id)
+                    .expect("validated tunnel has operations target metadata"),
+                status.clone(),
+            )
         })
         .collect::<Vec<_>>();
     if let Some(template) = &public_reachability {
@@ -1246,7 +1536,13 @@ async fn run_multi_tunnel(
             config.header_read_timeout = parsed.ops_header_timeout;
             config.request_timeout = parsed.ops_request_timeout;
             config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-            match AgentOperationsRuntime::bind_tunnels(config, operations_tunnels.clone()).await {
+            match AgentOperationsRuntime::bind_reloadable_tunnels(
+                config,
+                operations_tunnels.clone(),
+                targets.clone(),
+            )
+            .await
+            {
                 Ok(runtime) => {
                     info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
                     Some(runtime)
@@ -1326,6 +1622,9 @@ async fn run_multi_tunnel(
     tokio::pin!(runtime_future);
     let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
     tokio::pin!(reload_future);
+    let tunnel_config_reload_future =
+        run_optional_tunnel_config_reloader(tunnel_config_reloader, signal.clone());
+    tokio::pin!(tunnel_config_reload_future);
     let enrollment_future = run_optional_enrollment(enrollment_runtime, signal.clone());
     tokio::pin!(enrollment_future);
     let operations_future = run_optional_operations(operations, operations_signal);
@@ -1337,6 +1636,7 @@ async fn run_multi_tunnel(
             trigger.shutdown();
             let _ = readiness_future.await;
             let _ = reload_future.await;
+            tunnel_config_reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
             combine_exit_codes(multi_agent_exit_code(result), operations_future.await)
@@ -1346,6 +1646,7 @@ async fn run_multi_tunnel(
             trigger.shutdown();
             let _ = readiness_future.await;
             let _ = runtime_future.await;
+            tunnel_config_reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
             let code = match reload {
@@ -1363,6 +1664,7 @@ async fn run_multi_tunnel(
             let _ = readiness_future.await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
+            tunnel_config_reload_future.await;
             operations_trigger.shutdown();
             let code = match enrollment {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1379,6 +1681,7 @@ async fn run_multi_tunnel(
             let _ = readiness_future.await;
             let _ = runtime_future.await;
             let _ = reload_future.await;
+            tunnel_config_reload_future.await;
             let _ = enrollment_future.await;
             combine_exit_codes(ExitCode::from(1), operations)
         },
@@ -1392,6 +1695,7 @@ async fn run_multi_tunnel(
                     let _ = readiness_future.await;
                     let _ = runtime_future.await;
                     let _ = reload_future.await;
+                    tunnel_config_reload_future.await;
                     let _ = enrollment_future.await;
                     operations_trigger.shutdown();
                     return combine_exit_codes(ExitCode::from(1), operations_future.await);
@@ -1402,6 +1706,7 @@ async fn run_multi_tunnel(
             let _ = readiness_future.await;
             let result = runtime_future.await;
             let _ = reload_future.await;
+            tunnel_config_reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
             combine_exit_codes(multi_agent_exit_code(result), operations_future.await)
@@ -1411,6 +1716,7 @@ async fn run_multi_tunnel(
             trigger.shutdown();
             let _ = runtime_future.await;
             let _ = reload_future.await;
+            tunnel_config_reload_future.await;
             let _ = enrollment_future.await;
             operations_trigger.shutdown();
             let code = match readiness {
@@ -1433,11 +1739,13 @@ fn build_runtime_config(
     parsed: &ParsedArgs,
     tunnel: &ManagedTunnelSpec,
     security: AgentTransportSecurity,
+    target: crate::TunnelTarget,
 ) -> AgentRuntimeConfig {
     let mut config = AgentRuntimeConfig::new(parsed.edge, tunnel.local);
     config.connect_timeout = parsed.connect_timeout;
     config.handshake_timeout = parsed.handshake_timeout;
     config.multiplex.max_concurrent_streams = parsed.max_streams;
+    config.multiplex.set_local_target(target);
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
     config.reconnect.initial_delay = parsed.reconnect_initial;
     config.reconnect.max_delay = parsed.reconnect_max;
@@ -2804,6 +3112,9 @@ fn parse_tunnel_id(args: &[String], index: usize, flag: &str) -> Result<TunnelId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    static NEXT_RELOAD_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -3086,6 +3397,53 @@ mod tests {
         }"#
     }
 
+    fn reloadable_multi_config_json(port_a: u16, port_b: u16, agent_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "version": 2,
+                "edge": {{
+                    "address": "127.0.0.1:17100",
+                    "ca": "edge-ca.pem",
+                    "server_name": "edge.test"
+                }},
+                "hostname": {{
+                    "address": "127.0.0.1:17400",
+                    "ca": "hostname-ca.pem",
+                    "server_name": "control.test"
+                }},
+                "identity": {{
+                    "agent_id": "{agent_id}",
+                    "client_certificate": "agent.pem",
+                    "client_private_key": "agent-key.pem"
+                }},
+                "tunnels": [
+                    {{ "tunnel_id": "tunnel-a", "local_port": {port_a} }},
+                    {{ "tunnel_id": "tunnel-b", "local_port": {port_b} }}
+                ],
+                "tunnel_reload": {{
+                    "manifest": "reload.json",
+                    "poll_interval_ms": 100
+                }}
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    fn publish_reload_generation(
+        config_path: &Path,
+        manifest_path: &Path,
+        generation: u64,
+        config: &[u8],
+    ) {
+        std::fs::write(config_path, config).unwrap();
+        let digest = format!("{:x}", Sha256::digest(config));
+        std::fs::write(
+            manifest_path,
+            format!("{{\"generation\":{generation},\"files\":{{\"config\":\"{digest}\"}}}}"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn multi_config_is_strict_bounded_and_resolves_loopback_tunnels() {
         let AgentConfigDocument::Multi(config) =
@@ -3095,7 +3453,7 @@ mod tests {
         };
         let mut parsed = ParsedArgs::default();
         let config_path = PathBuf::from("profiles").join("config.json");
-        let tunnels = apply_multi_agent_config(&mut parsed, &config_path, config).unwrap();
+        let tunnels = apply_multi_agent_config(&mut parsed, &config_path, &config).unwrap();
         assert_eq!(
             tunnels,
             vec![
@@ -3120,7 +3478,11 @@ mod tests {
             panic!("expected config v2");
         };
         assert!(matches!(
-            apply_multi_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config),
+            apply_multi_agent_config(
+                &mut ParsedArgs::default(),
+                Path::new("config.json"),
+                &config
+            ),
             Err(AgentConfigError::DuplicateTunnel)
         ));
 
@@ -3132,7 +3494,11 @@ mod tests {
             panic!("expected config v2");
         };
         assert!(matches!(
-            apply_multi_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config),
+            apply_multi_agent_config(
+                &mut ParsedArgs::default(),
+                Path::new("config.json"),
+                &config
+            ),
             Err(AgentConfigError::ZeroLocalPort)
         ));
 
@@ -3154,13 +3520,14 @@ mod tests {
                 client_private_key: PathBuf::from("agent-key.pem"),
             },
             tunnels,
+            tunnel_reload: None,
             public_reachability: None,
         };
         assert!(matches!(
             apply_multi_agent_config(
                 &mut ParsedArgs::default(),
                 Path::new("config.json"),
-                make_config(Vec::new()),
+                &make_config(Vec::new()),
             ),
             Err(AgentConfigError::EmptyTunnels)
         ));
@@ -3174,10 +3541,182 @@ mod tests {
             apply_multi_agent_config(
                 &mut ParsedArgs::default(),
                 Path::new("config.json"),
-                make_config(too_many),
+                &make_config(too_many),
             ),
             Err(AgentConfigError::TooManyTunnels)
         ));
+    }
+
+    #[tokio::test]
+    async fn tunnel_reload_bootstrap_applies_only_local_port_generations() {
+        let directory = std::env::temp_dir().join(format!(
+            "tunnelproxy-agent-target-reload-{}-{}",
+            std::process::id(),
+            NEXT_RELOAD_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let config_path = directory.join("config.json");
+        let manifest_path = directory.join("reload.json");
+        let first = reloadable_multi_config_json(3000, 4000, "agent-profile");
+        publish_reload_generation(&config_path, &manifest_path, 1, &first);
+
+        let AgentConfigDocument::Multi(discovered) = load_agent_config(&config_path).await.unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        let (baseline, bootstrap) = bootstrap_multi_agent_config(&config_path, discovered)
+            .await
+            .unwrap();
+        let bootstrap = bootstrap.unwrap();
+        assert_eq!(bootstrap.generation, 1);
+        let targets = TunnelTargetSet::reloadable(
+            bootstrap.generation,
+            bootstrap.manifest_digest,
+            target_map(&parse_managed_tunnels(&baseline.tunnels).unwrap()),
+        )
+        .unwrap();
+        let runtime = TunnelConfigReloadRuntime {
+            bootstrap,
+            baseline: baseline.clone(),
+            targets: targets.clone(),
+        };
+
+        let second = reloadable_multi_config_json(3001, 4001, "agent-profile");
+        publish_reload_generation(&config_path, &manifest_path, 2, &second);
+        assert_eq!(
+            runtime.reload_once().await.unwrap(),
+            (2, TunnelTargetApplyOutcome::Applied)
+        );
+        assert_eq!(
+            targets
+                .target(&TunnelId::new("tunnel-a").unwrap())
+                .unwrap()
+                .current()
+                .port(),
+            3001
+        );
+
+        let invalid = reloadable_multi_config_json(3002, 4002, "different-agent");
+        publish_reload_generation(&config_path, &manifest_path, 3, &invalid);
+        assert!(matches!(
+            runtime.reload_once().await,
+            Err(TunnelConfigReloadError::Config(
+                AgentConfigError::TunnelReloadChangedSharedConfig
+            ))
+        ));
+        assert_eq!(targets.status().generation, 2);
+        assert_eq!(
+            targets
+                .target(&TunnelId::new("tunnel-a").unwrap())
+                .unwrap()
+                .current()
+                .port(),
+            3001
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_reload_bootstrap_requires_a_digest_matching_manifest() {
+        let directory = std::env::temp_dir().join(format!(
+            "tunnelproxy-agent-target-reload-invalid-{}-{}",
+            std::process::id(),
+            NEXT_RELOAD_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let config_path = directory.join("config.json");
+        let manifest_path = directory.join("reload.json");
+        let config = reloadable_multi_config_json(3000, 4000, "agent-profile");
+        std::fs::write(&config_path, &config).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "{{\"generation\":1,\"files\":{{\"config\":\"{}\"}}}}",
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+
+        let AgentConfigDocument::Multi(discovered) = load_agent_config(&config_path).await.unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        assert!(matches!(
+            bootstrap_multi_agent_config(&config_path, discovered).await,
+            Err(AgentConfigError::InvalidTunnelReloadGeneration)
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tunnel_reload_candidate_rejects_tunnel_set_and_shared_mutation() {
+        let AgentConfigDocument::Multi(baseline) =
+            parse_agent_config(&reloadable_multi_config_json(3000, 4000, "agent-profile")).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        let AgentConfigDocument::Multi(mut changed_set) =
+            parse_agent_config(&reloadable_multi_config_json(3001, 4001, "agent-profile")).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        changed_set.tunnels.pop();
+        assert!(matches!(
+            validate_tunnel_reload_candidate(&baseline, &changed_set),
+            Err(AgentConfigError::TunnelReloadChangedTunnelSet)
+        ));
+
+        let mut changed_shared = baseline.clone();
+        changed_shared.edge.server_name = "other.test".to_owned();
+        assert!(matches!(
+            validate_tunnel_reload_candidate(&baseline, &changed_shared),
+            Err(AgentConfigError::TunnelReloadChangedSharedConfig)
+        ));
+
+        let mut invalid_interval = baseline.tunnel_reload.clone().unwrap();
+        invalid_interval.poll_interval_ms = 99;
+        assert!(matches!(
+            validate_tunnel_reload_config(Path::new("config.json"), &invalid_interval),
+            Err(AgentConfigError::InvalidTunnelReloadInterval)
+        ));
+        invalid_interval.poll_interval_ms = 60_001;
+        assert!(matches!(
+            validate_tunnel_reload_config(Path::new("config.json"), &invalid_interval),
+            Err(AgentConfigError::InvalidTunnelReloadInterval)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tunnel_reload_runtime_honors_preexisting_shutdown() {
+        let AgentConfigDocument::Multi(baseline) =
+            parse_agent_config(&reloadable_multi_config_json(3000, 4000, "agent-profile")).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        let targets = TunnelTargetSet::reloadable(
+            1,
+            [1; 32],
+            target_map(&parse_managed_tunnels(&baseline.tunnels).unwrap()),
+        )
+        .unwrap();
+        let runtime = TunnelConfigReloadRuntime {
+            bootstrap: TunnelReloadBootstrap {
+                config_path: PathBuf::from("missing-config.json"),
+                manifest_path: PathBuf::from("missing-manifest.json"),
+                poll_interval: MIN_TUNNEL_RELOAD_INTERVAL,
+                generation: 1,
+                manifest_digest: [1; 32],
+            },
+            baseline,
+            targets,
+        };
+        let (trigger, signal) = shutdown_channel();
+        trigger.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), runtime.run_until_shutdown(signal))
+            .await
+            .expect("preexisting shutdown must skip reload I/O");
     }
 
     #[test]

@@ -114,6 +114,9 @@ correct agent, which in turn proxies them into the local service.
   tunnels in one process. Each TunnelId keeps an independent reconnecting
   transport and local loopback port while sharing Agent identity, TLS reload,
   enrollment, hostname service, operations, and shutdown ownership.
+- Config v2 can optionally hot-reload one atomic, digest-bound generation of
+  local ports. Existing streams stay on their admitted targets, new streams
+  use the new ports, and Agent transports remain connected.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, HTTPS route, and Agent hostname transports with last-known-good
   rollback, expiry enforcement, and static Agent-certificate authorization
@@ -229,7 +232,11 @@ reconnects only its own transport; a terminal child failure drains the set and
 exits non-zero. Edge must allow at least the same number of Agent sessions.
 When `--ops-listen` is enabled, `GET /tunnels` returns the bounded local mapping
 and live state for each managed tunnel; raw tunnel mode intentionally does not
-expose that inventory.
+expose that inventory. An optional `tunnel_reload` manifest lets operators
+publish higher digest-bound generations that change only existing tunnels'
+`local_port` values. Invalid candidates retain the complete last-known-good
+mapping; see [`docs/AGENT_CONFIG.md`](docs/AGENT_CONFIG.md) for the publish
+contract and [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health metrics.
 
 ## Repository structure
 
@@ -330,6 +337,7 @@ and Definition of Done.
 | 52 _(complete)_ | continuous public reachability health monitoring and recovery |
 | 53 _(complete)_ | bounded multi-tunnel managed HTTP Agent orchestration |
 | 54 _(complete)_ | bounded loopback per-tunnel managed HTTP operations inventory |
+| 55 _(complete)_ | atomic config-v2 local-target generation reload |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

@@ -292,16 +292,36 @@ Managed `http` and `start` commands return a versioned JSON document containing
 the configured and ready counts plus each TunnelId, loopback local address,
 published public URL, connection state, reachability state, and readiness. The
 entries are sorted by TunnelId, capped by the 16-tunnel process limit, and
-updated when hostname allocation completes. A `null` public URL means the
-allocation has not yet been published. `HEAD` is supported; other methods are
-rejected. Raw tunnel mode returns `404` because it does not own a managed HTTP
-mapping.
+updated when hostname allocation completes. For config-v2 target reload, each
+entry also reads the currently active local address, so the whole inventory
+reflects a newly committed generation without restarting the listener. A
+`null` public URL means the allocation has not yet been published. `HEAD` is
+supported; other methods are rejected. Raw tunnel mode returns `404` because
+it does not own a managed HTTP mapping.
 
 The inventory is intentionally identity-bearing and therefore stays out of
 Prometheus labels. The unauthenticated operations listener must remain on
 loopback: do not publish, proxy, or port-forward `/tunnels`. Responses use
 `Cache-Control: no-store` and never include AgentId, credential paths,
 certificate material, tokens, peer addresses, or reachability challenges.
+
+Config-v2 target reload adds these identity-free metrics:
+
+- `tunnelproxy_agent_tunnel_config_generation`
+- `tunnelproxy_agent_tunnel_config_reload_successes_total`
+- `tunnelproxy_agent_tunnel_config_reload_failures_total`
+- `tunnelproxy_agent_tunnel_config_reload_health{state="disabled|healthy|reload_failed"}`
+
+The health metric always emits all three fixed labels. Static profiles report
+`disabled`, generation `0`, and zero reload counters. A rejected poll reports
+`reload_failed` and increments the failure counter while generation and all
+local targets retain their last-known-good values. An accepted newer
+generation changes health back to `healthy` and increments the success
+counter. Re-reading an unchanged valid generation is not counted as a reload.
+Alert on sustained `reload_failed`, then compare the manifest digest to the
+exact config bytes and verify that only existing tunnels' `local_port` values
+changed. Do not restart solely to recover: publishing a valid higher generation
+recovers the same process and transport sessions.
 
 ### Hostname TLS and Agent-CA rotation
 

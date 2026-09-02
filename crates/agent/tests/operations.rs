@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Instant};
 use tunnelproxy_agent::{
     AgentOperationsConfig, AgentOperationsRuntime, AgentOperationsTunnel, AgentRuntime,
-    AgentRuntimeConfig, RuntimeShutdownConfig,
+    AgentRuntimeConfig, RuntimeShutdownConfig, TunnelTargetApplyOutcome, TunnelTargetSet,
 };
 use tunnelproxy_common::{shutdown_channel, PublicHostname, TunnelId};
 use tunnelproxy_edge::agent_transport::{AgentListenerConfig, AgentTransportListener};
@@ -203,19 +204,33 @@ async fn managed_inventory_is_sorted_live_and_method_bounded() {
         "127.0.0.1:3000".parse().unwrap(),
     ))
     .unwrap();
-    let tunnel_b = AgentOperationsTunnel::new(
-        TunnelId::new("tunnel-b").unwrap(),
-        "127.0.0.1:3001".parse().unwrap(),
+    let tunnel_a_id = TunnelId::new("tunnel-a").unwrap();
+    let tunnel_b_id = TunnelId::new("tunnel-b").unwrap();
+    let targets = TunnelTargetSet::reloadable(
+        1,
+        [1; 32],
+        [
+            (tunnel_a_id.clone(), "127.0.0.1:3000".parse().unwrap()),
+            (tunnel_b_id.clone(), "127.0.0.1:3001".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    let tunnel_b = AgentOperationsTunnel::reloadable(
+        tunnel_b_id.clone(),
+        targets.target(&tunnel_b_id).unwrap(),
         first_runtime.status_handle(),
     );
-    let tunnel_a = AgentOperationsTunnel::new(
-        TunnelId::new("tunnel-a").unwrap(),
-        "127.0.0.1:3000".parse().unwrap(),
+    let tunnel_a = AgentOperationsTunnel::reloadable(
+        tunnel_a_id.clone(),
+        targets.target(&tunnel_a_id).unwrap(),
         second_runtime.status_handle(),
     );
-    let operations = AgentOperationsRuntime::bind_tunnels(
+    let operations = AgentOperationsRuntime::bind_reloadable_tunnels(
         AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap()),
         vec![tunnel_b.clone(), tunnel_a],
+        targets.clone(),
     )
     .await
     .unwrap();
@@ -237,9 +252,27 @@ async fn managed_inventory_is_sorted_live_and_method_bounded() {
     assert!(parsed["tunnels"][1]["public_url"].is_null());
 
     tunnel_b.publish_hostname(PublicHostname::new("b.example.test").unwrap());
+    let updated_targets: BTreeMap<_, _> = [
+        (tunnel_a_id, "127.0.0.1:3010".parse().unwrap()),
+        (tunnel_b_id, "127.0.0.1:3011".parse().unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        targets.apply(2, [2; 32], updated_targets),
+        Ok(TunnelTargetApplyOutcome::Applied)
+    );
     let updated = request(addr, "/tunnels").await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(response_body(&updated)).unwrap();
+    assert_eq!(parsed["tunnels"][0]["local_addr"], "127.0.0.1:3010");
+    assert_eq!(parsed["tunnels"][1]["local_addr"], "127.0.0.1:3011");
     assert_eq!(parsed["tunnels"][1]["public_url"], "https://b.example.test");
+    let metrics = request(addr, "/metrics").await.unwrap();
+    assert!(metrics.contains("tunnelproxy_agent_tunnel_config_generation 2"));
+    assert!(metrics.contains("tunnelproxy_agent_tunnel_config_reload_successes_total 1"));
+    assert!(metrics.contains("tunnelproxy_agent_tunnel_config_reload_health{state=\"healthy\"} 1"));
+    assert!(!metrics.contains("tunnel-a"));
+    assert!(!metrics.contains("127.0.0.1:3010"));
 
     let head = request_method(addr, "HEAD", "/tunnels").await.unwrap();
     assert!(head.starts_with("HTTP/1.1 200"));

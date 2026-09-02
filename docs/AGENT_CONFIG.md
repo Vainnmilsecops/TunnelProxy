@@ -7,6 +7,10 @@ arguments required by managed HTTP startup.
 Session 53 adds config v2 for a bounded multi-tunnel process. Config v1 and
 `tunnelproxy http <port>` remain unchanged.
 
+Session 55 adds optional digest-bound hot reload of config-v2 `local_port`
+values. The TunnelId set and every shared setting remain immutable for the
+life of the process.
+
 ## Resolution order
 
 For `tunnelproxy http <port>`, configuration is selected in this order:
@@ -87,6 +91,10 @@ TunnelIds may intentionally point to the same local port.
     { "tunnel_id": "frontend", "local_port": 3000 },
     { "tunnel_id": "webhooks", "local_port": 4000 }
   ],
+  "tunnel_reload": {
+    "manifest": "config-generation.json",
+    "poll_interval_ms": 1000
+  },
   "public_reachability": {
     "enabled": true,
     "monitor_interval_ms": 60000,
@@ -115,6 +123,42 @@ the config file, not the process working directory. The file contains paths,
 not PEM, private-key, or token bytes. It is still security-sensitive because
 it selects trust roots, identities, and credential locations; protect it and
 its referenced files using normal host filesystem controls.
+
+## Config v2 local-target reload
+
+`tunnel_reload` is optional and valid only in config v2. Its manifest path is
+resolved relative to the config file. `poll_interval_ms` must be between 100
+and 60000 inclusive. When enabled, startup and offline validation require a
+valid non-zero generation whose manifest contains exactly one SHA-256 digest:
+
+```json
+{
+  "generation": 1,
+  "files": {
+    "config": "<64 lowercase or uppercase hexadecimal characters>"
+  }
+}
+```
+
+The digest covers the exact config-file bytes. Publish a complete generation
+in this order:
+
+1. Write and durably replace the config file containing the new ports.
+2. Compute its SHA-256 digest.
+3. Write and durably replace the manifest last, with a generation greater than
+   the active generation and the matching digest.
+
+The manifest is the commit point. A missing, malformed, stale, conflicting, or
+digest-mismatched generation is rejected and the complete last-known-good
+target map remains active. A candidate may change only `local_port` values;
+adding/removing a TunnelId or changing identity, Edge, hostname, credentials,
+reachability, or reload settings is rejected as one generation.
+
+Each new logical stream snapshots its local target once. Streams already
+connected to a local service remain there until they close; later streams use
+the newly published port. Agent transports, hostname allocations, and public
+routes are not reconnected or recreated. Without `tunnel_reload`, config v2
+keeps the Session 53 static behavior and reports generation `0`.
 
 ## Offline validation
 

@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Continuous Public Reachability Health Monitoring and Recovery** (Session 52).
+**Atomic Config-v2 Local-Target Generation Reload** (Session 55).
 
 ## Completed
 
@@ -490,6 +490,10 @@
 - Strict config v2 moves tunnel shape into a bounded 1â€“16 entry list for
   `tunnelproxy start`; shared identity, endpoints, TLS paths, public
   reachability policy, and offline validation retain the v1 trust boundary.
+- Config v2 can opt into strict digest-manifest polling for atomic local-port
+  generations. Only the existing TunnelIds' ports may change; invalid
+  candidates retain the complete last-known-good map. New streams snapshot the
+  active target while existing streams and Agent transports remain unchanged.
 - `tunnelproxy config validate` performs bounded offline schema, runtime, path,
   and dual-TLS validation without network access or durable mutation.
 - The Control Plane may expose an independent bounded mutual-TLS route service
@@ -508,7 +512,7 @@
   documents loopback scrape topology, process-restart semantics, capacity
   utilization, privacy constraints, and the evidence required before adding
   peer credits.
-- 388 explicit workspace tests are present; all prior behavior is preserved.
+- 423 explicit workspace tests are present; all prior behavior is preserved.
 
 ## Session 51 delivered
 
@@ -583,6 +587,25 @@
   loopback HTTP, compatibility, and real-mTLS two-tunnel inventory coverage.
   The workspace contains 416 explicit tests.
 
+## Session 55 delivered
+
+- Added optional strict `tunnel_reload` config-v2 settings with a relative
+  digest manifest and a bounded 100â€“60000 ms polling interval. Startup and
+  offline validation require a valid non-zero initial generation.
+- Reused the shared bounded generation loader to verify the exact config bytes,
+  enforce monotonic generations, and atomically publish one complete map. Only
+  `local_port` values may change; TunnelId set or shared profile mutation is
+  rejected while the last-known-good generation remains active.
+- New logical streams snapshot the current target once. Existing streams stay
+  connected to their original local service and all Protocol v2 transports,
+  registrations, hostnames, and routes remain live across a reload.
+- `/tunnels` reports the active target map. Fixed-cardinality metrics expose
+  generation, successful/failed reload counts, and disabled/healthy/failed
+  health without identity, address, path, or digest labels.
+- Added atomic snapshot, manifest/bootstrap, mutation rejection, cancellation,
+  operations, and real-TCP continuity coverage. The workspace contains 423
+  explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -625,7 +648,7 @@
 
 ## Next planned session
 
-Session 55 has not been selected. DNS/public-certificate automation and
+Session 56 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

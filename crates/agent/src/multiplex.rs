@@ -22,6 +22,7 @@ use tunnelproxy_protocol::{
 
 use crate::agent_transport::{AgentError, AgentSession, AgentSessionCloseReason};
 use crate::tls::BoxedTransport;
+use crate::TunnelTarget;
 
 /// Maximum DATA payload emitted or accepted by the multiplexed runtime.
 pub const MULTIPLEXED_DATA_PAYLOAD_SIZE: usize = 16 * 1024;
@@ -33,6 +34,8 @@ const MAX_CONTROL_FRAME_BURST: usize = 8;
 pub struct MultiplexedAgentConfig {
     /// Local service reached by every logical stream.
     pub local_addr: SocketAddr,
+    /// Optional managed target handle consulted once for each new stream.
+    local_target: Option<TunnelTarget>,
     /// Deadline for connecting a new logical stream to `local_addr`.
     pub connect_timeout: Duration,
     /// Maximum number of active logical streams.
@@ -55,6 +58,7 @@ impl MultiplexedAgentConfig {
     pub fn new(local_addr: SocketAddr) -> Self {
         Self {
             local_addr,
+            local_target: None,
             connect_timeout: Duration::from_secs(5),
             max_concurrent_streams: 32,
             per_stream_queue_capacity: 8,
@@ -86,6 +90,16 @@ impl MultiplexedAgentConfig {
             return Err(MultiplexedAgentConfigError::ZeroIdleTimeout);
         }
         Ok(())
+    }
+
+    pub fn set_local_target(&mut self, target: TunnelTarget) {
+        self.local_target = Some(target);
+    }
+
+    fn current_local_addr(&self) -> SocketAddr {
+        self.local_target
+            .as_ref()
+            .map_or(self.local_addr, TunnelTarget::current)
     }
 }
 
@@ -337,10 +351,9 @@ async fn run_local_stream(
     event_tx: mpsc::Sender<StreamEvent>,
 ) {
     let _stream = config.telemetry.stream_opened();
-    let connect = tokio::time::timeout(
-        config.connect_timeout,
-        TcpStream::connect(config.local_addr),
-    );
+    // One stream remains bound to the target generation observed at admission.
+    let local_addr = config.current_local_addr();
+    let connect = tokio::time::timeout(config.connect_timeout, TcpStream::connect(local_addr));
     tokio::pin!(connect);
     let connected = tokio::select! {
         result = &mut connect => result,

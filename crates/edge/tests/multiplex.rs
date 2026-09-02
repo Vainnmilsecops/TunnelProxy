@@ -1,5 +1,6 @@
 //! Session 09 real-TCP coverage for bounded stream multiplexing and routing.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use tokio::time::timeout;
 
 use tunnelproxy_agent::{
     connect, connect_registered_with_security, AgentTransportSecurity, ConnectOutcome,
-    MultiplexedAgentConfig,
+    MultiplexedAgentConfig, TunnelTargetApplyOutcome, TunnelTargetSet,
 };
 use tunnelproxy_common::{AgentId, TunnelId};
 use tunnelproxy_edge::{
@@ -253,6 +254,23 @@ async fn spawn_echo_service(connection_count: usize) -> (SocketAddr, tokio::task
     (addr, task)
 }
 
+async fn spawn_tagged_service(tag: u8) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut byte = [0_u8; 1];
+        loop {
+            let count = socket.read(&mut byte).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            socket.write_all(&[tag, byte[0]]).await.unwrap();
+        }
+    });
+    (addr, task)
+}
+
 async fn route_client(
     router: &EdgeSessionRouter,
     session_id: TransportSessionId,
@@ -276,6 +294,69 @@ async fn round_trip(mut client: TcpStream, payload: Vec<u8>) -> Vec<u8> {
         .expect("stream timed out")
         .unwrap();
     received
+}
+
+#[tokio::test]
+async fn target_generation_moves_new_streams_without_reconnecting_or_moving_active_streams() {
+    let (local_a, service_a) = spawn_tagged_service(b'a').await;
+    let (local_b, service_b) = spawn_tagged_service(b'b').await;
+    let tunnel_id = TunnelId::new("tunnel-dev").unwrap();
+    let targets =
+        TunnelTargetSet::reloadable(1, [1; 32], BTreeMap::from([(tunnel_id.clone(), local_a)]))
+            .unwrap();
+
+    let edge_config = fast_edge_config();
+    let runtime = MultiplexedEdgeRuntime::bind(edge_config).await.unwrap();
+    let edge_addr = runtime.agent_addr();
+    let router = runtime.router();
+    let edge = tokio::spawn(runtime.run());
+    let session = match connect(edge_addr, Duration::from_secs(1), Duration::from_secs(1)).await {
+        ConnectOutcome::Established(session) => session,
+        ConnectOutcome::Failed { reason } => panic!("Agent handshake failed: {reason}"),
+    };
+    let session_id = session.session_id;
+    let mut agent_config = MultiplexedAgentConfig::new(local_a);
+    agent_config.set_local_target(targets.target(&tunnel_id).unwrap());
+    let agent = tokio::spawn(session.run_multiplexed(agent_config));
+    wait_until_registered(&router, session_id).await;
+
+    let mut existing = route_client(&router, session_id).await.unwrap();
+    existing.write_all(b"1").await.unwrap();
+    let mut response = [0_u8; 2];
+    existing.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"a1");
+
+    assert_eq!(
+        targets
+            .apply(2, [2; 32], BTreeMap::from([(tunnel_id.clone(), local_b)]),)
+            .unwrap(),
+        TunnelTargetApplyOutcome::Applied
+    );
+    assert_eq!(router.resolve_tunnel(&tunnel_id).await, Some(session_id));
+
+    existing.write_all(b"2").await.unwrap();
+    existing.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"a2");
+
+    let mut fresh = route_client(&router, session_id).await.unwrap();
+    fresh.write_all(b"3").await.unwrap();
+    fresh.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"b3");
+    assert_eq!(router.resolve_tunnel(&tunnel_id).await, Some(session_id));
+
+    drop(existing);
+    drop(fresh);
+    timeout(Duration::from_secs(1), service_a)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(1), service_b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!agent.is_finished());
+    agent.abort();
+    edge.abort();
 }
 
 #[tokio::test]

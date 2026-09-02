@@ -1713,3 +1713,31 @@ Out of scope:
 - Public/authenticated operations access, history or paging, dashboards,
   request inspection/replay, hot tunnel mutation, identity-bearing metric
   labels, Tunnel Protocol changes, and multi-edge ownership.
+
+## Session 55 — Atomic Config-v2 Local-Target Generation Reload — complete
+
+- Added optional strict `tunnel_reload` config-v2 settings with a relative
+  manifest and a bounded 100–60000 ms poll interval. Opt-in bootstrap and
+  offline validation require an exact digest-bound non-zero generation.
+- Added a process-local atomic target snapshot shared by every managed child
+  and the operations inventory. Higher generations may change only
+  `local_port`; shared settings and the exact TunnelId set stay immutable.
+- Retained the complete last-known-good map on malformed, missing, stale,
+  conflicting, digest-mismatched, or otherwise invalid generations. A later
+  valid generation recovers without a process or transport restart.
+- Each new logical stream resolves its target once at admission. Active streams
+  stay on their original local socket while later streams use the new port;
+  Protocol v2 sessions, registrations, durable hostnames, and routes remain
+  unchanged.
+- Extended `/tunnels` with the active target values and `/metrics` with
+  fixed-cardinality generation, success/failure counters, and reload-health
+  states. No identity, local address, path, or digest is added to labels.
+- Added atomic snapshot/LKG, strict bootstrap and candidate validation,
+  cancellation, live operations, and real-TCP stream continuity coverage. The
+  workspace contains 423 explicit tests.
+
+Out of scope:
+
+- Hot add/remove or rename, shared identity/TLS/endpoint/policy mutation,
+  per-tunnel generation independence, transport reconnect-on-reload, public
+  config distribution, DNS/public certificates, and multi-edge ownership.
