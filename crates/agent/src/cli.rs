@@ -10,8 +10,8 @@ use std::time::Duration;
 use crate::{
     bootstrap_agent_credentials, AgentEnrollmentConfig, AgentEnrollmentError,
     AgentEnrollmentRuntime, AgentHostnameClient, AgentHostnameError, AgentOperationsConfig,
-    AgentOperationsError, AgentOperationsOutcome, AgentOperationsRuntime, AgentRuntime,
-    AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
+    AgentOperationsError, AgentOperationsOutcome, AgentOperationsRuntime, AgentOperationsTunnel,
+    AgentRuntime, AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
     AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
     AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, MultiAgentRuntime,
     MultiAgentRuntimeError, MultiAgentRuntimeOutcome, PublicReachabilityConfig,
@@ -912,6 +912,13 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
     };
     let runtime_status = runtime.status_handle();
     let runtime_control = runtime.control();
+    let operations_tunnel = (mode == RunMode::Http).then(|| {
+        AgentOperationsTunnel::new(
+            parsed.tunnel_id.clone(),
+            parsed.local,
+            runtime_status.clone(),
+        )
+    });
     let operations = match parsed.ops_listen {
         Some(listen_addr) => {
             let mut config = AgentOperationsConfig::loopback(listen_addr);
@@ -919,7 +926,13 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
             config.header_read_timeout = parsed.ops_header_timeout;
             config.request_timeout = parsed.ops_request_timeout;
             config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-            match AgentOperationsRuntime::bind(config, runtime_status.clone()).await {
+            let result = match &operations_tunnel {
+                Some(tunnel) => {
+                    AgentOperationsRuntime::bind_tunnels(config, vec![tunnel.clone()]).await
+                }
+                None => AgentOperationsRuntime::bind(config, runtime_status.clone()).await,
+            };
+            match result {
                 Ok(runtime) => {
                     info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
                     Some(runtime)
@@ -980,6 +993,10 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
                 event = "managed_http_hostname_published",
                 "Managed HTTP hostname is durable and published"
             );
+            operations_tunnel
+                .as_ref()
+                .expect("managed HTTP operations metadata exists")
+                .publish_hostname(allocation.hostname.clone());
             Some(ManagedHttpAnnouncement {
                 probe: public_reachability
                     .as_ref()
@@ -1210,6 +1227,13 @@ async fn run_multi_tunnel(
     };
     let runtime_statuses = runtime.status_handles();
     let runtime_control = runtime.control();
+    let operations_tunnels = tunnels
+        .iter()
+        .zip(&runtime_statuses)
+        .map(|(tunnel, status)| {
+            AgentOperationsTunnel::new(tunnel.tunnel_id.clone(), tunnel.local, status.clone())
+        })
+        .collect::<Vec<_>>();
     if let Some(template) = &public_reachability {
         for status in &runtime_statuses {
             status.require_public_reachability(template.monitor.is_some());
@@ -1222,7 +1246,7 @@ async fn run_multi_tunnel(
             config.header_read_timeout = parsed.ops_header_timeout;
             config.request_timeout = parsed.ops_request_timeout;
             config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
-            match AgentOperationsRuntime::bind_many(config, runtime_statuses.clone()).await {
+            match AgentOperationsRuntime::bind_tunnels(config, operations_tunnels.clone()).await {
                 Ok(runtime) => {
                     info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
                     Some(runtime)
@@ -1237,7 +1261,7 @@ async fn run_multi_tunnel(
     };
 
     let mut announcements = Vec::with_capacity(tunnels.len());
-    for tunnel in &tunnels {
+    for (tunnel, operations_tunnel) in tunnels.iter().zip(&operations_tunnels) {
         info!(
             agent_id = %parsed.agent_id,
             tunnel_id = %tunnel.tunnel_id,
@@ -1265,6 +1289,7 @@ async fn run_multi_tunnel(
             event = "managed_http_hostname_published",
             "Managed HTTP hostname is durable and published"
         );
+        operations_tunnel.publish_hostname(allocation.hostname.clone());
         announcements.push(ManagedHttpAnnouncement {
             probe: public_reachability
                 .as_ref()

@@ -27,7 +27,8 @@
 //! `tunnelproxy-agent http <port>`. Session 43 adds the canonical `tunnelproxy`
 //! wrapper and a shared CLI driver with strict bounded local config v1.
 //! Session 53 adds strict config v2 plus a bounded supervisor for multiple
-//! managed HTTP tunnels over independent Agent transports. See
+//! managed HTTP tunnels over independent Agent transports. Session 54 adds a
+//! bounded per-tunnel managed HTTP inventory to the loopback operations API. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
@@ -63,8 +64,9 @@ pub use multiplex::{
 };
 pub use operations::{
     AgentOperationsConfig, AgentOperationsConfigError, AgentOperationsError,
-    AgentOperationsOutcome, AgentOperationsRuntime, MAX_OPERATIONS_CONNECTIONS,
-    MAX_OPERATIONS_HEADERS, MAX_OPERATIONS_HEADER_BYTES, MIN_OPERATIONS_HEADER_BYTES,
+    AgentOperationsOutcome, AgentOperationsRuntime, AgentOperationsTunnel,
+    MAX_OPERATIONS_CONNECTIONS, MAX_OPERATIONS_HEADERS, MAX_OPERATIONS_HEADER_BYTES,
+    MAX_TUNNEL_INVENTORY_RESPONSE_BYTES, MIN_OPERATIONS_HEADER_BYTES,
 };
 pub use public_reachability::{
     PublicReachabilityConfig, PublicReachabilityError, PublicReachabilityFailureClass,

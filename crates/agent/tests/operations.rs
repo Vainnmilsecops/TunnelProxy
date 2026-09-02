@@ -5,20 +5,31 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Instant};
 use tunnelproxy_agent::{
-    AgentOperationsConfig, AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig,
-    RuntimeShutdownConfig,
+    AgentOperationsConfig, AgentOperationsRuntime, AgentOperationsTunnel, AgentRuntime,
+    AgentRuntimeConfig, RuntimeShutdownConfig,
 };
-use tunnelproxy_common::shutdown_channel;
+use tunnelproxy_common::{shutdown_channel, PublicHostname, TunnelId};
 use tunnelproxy_edge::agent_transport::{AgentListenerConfig, AgentTransportListener};
 
 async fn request(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+    request_method(addr, "GET", path).await
+}
+
+async fn request_method(addr: SocketAddr, method: &str, path: &str) -> std::io::Result<String> {
     let mut socket = TcpStream::connect(addr).await?;
     socket
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
         .await?;
     let mut response = Vec::new();
     socket.read_to_end(&mut response).await?;
     Ok(String::from_utf8(response).unwrap())
+}
+
+fn response_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("HTTP response has a header terminator")
 }
 
 async fn wait_for_status(addr: SocketAddr, code: u16) -> String {
@@ -178,4 +189,92 @@ async fn capacity_rejection_releases_after_the_stalled_connection_closes() {
     trigger.shutdown();
     let outcome = task.await.unwrap().unwrap();
     assert!(!outcome.was_forced());
+}
+
+#[tokio::test]
+async fn managed_inventory_is_sorted_live_and_method_bounded() {
+    let first_runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:3001".parse().unwrap(),
+    ))
+    .unwrap();
+    let second_runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:3000".parse().unwrap(),
+    ))
+    .unwrap();
+    let tunnel_b = AgentOperationsTunnel::new(
+        TunnelId::new("tunnel-b").unwrap(),
+        "127.0.0.1:3001".parse().unwrap(),
+        first_runtime.status_handle(),
+    );
+    let tunnel_a = AgentOperationsTunnel::new(
+        TunnelId::new("tunnel-a").unwrap(),
+        "127.0.0.1:3000".parse().unwrap(),
+        second_runtime.status_handle(),
+    );
+    let operations = AgentOperationsRuntime::bind_tunnels(
+        AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap()),
+        vec![tunnel_b.clone(), tunnel_a],
+    )
+    .await
+    .unwrap();
+    let addr = operations.local_addr();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(operations.run_until_shutdown(signal));
+
+    let initial = request(addr, "/tunnels").await.unwrap();
+    assert!(initial.starts_with("HTTP/1.1 200"));
+    assert!(initial.contains("content-type: application/json; charset=utf-8"));
+    assert!(initial.contains("cache-control: no-store"));
+    let body = response_body(&initial);
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["configured"], 2);
+    assert_eq!(parsed["ready"], 0);
+    assert_eq!(parsed["tunnels"][0]["tunnel_id"], "tunnel-a");
+    assert_eq!(parsed["tunnels"][1]["tunnel_id"], "tunnel-b");
+    assert!(parsed["tunnels"][1]["public_url"].is_null());
+
+    tunnel_b.publish_hostname(PublicHostname::new("b.example.test").unwrap());
+    let updated = request(addr, "/tunnels").await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(response_body(&updated)).unwrap();
+    assert_eq!(parsed["tunnels"][1]["public_url"], "https://b.example.test");
+
+    let head = request_method(addr, "HEAD", "/tunnels").await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert!(response_body(&head).is_empty());
+    assert!(request_method(addr, "POST", "/tunnels")
+        .await
+        .unwrap()
+        .starts_with("HTTP/1.1 405"));
+
+    trigger.shutdown();
+    assert!(!task.await.unwrap().unwrap().was_forced());
+}
+
+#[tokio::test]
+async fn unmanaged_operations_do_not_expose_tunnel_inventory() {
+    let runtime = AgentRuntime::new(AgentRuntimeConfig::new(
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+    ))
+    .unwrap();
+    let operations = AgentOperationsRuntime::bind(
+        AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap()),
+        runtime.status_handle(),
+    )
+    .await
+    .unwrap();
+    let addr = operations.local_addr();
+    let (trigger, signal) = shutdown_channel();
+    let task = tokio::spawn(operations.run_until_shutdown(signal));
+
+    assert!(request(addr, "/tunnels")
+        .await
+        .unwrap()
+        .starts_with("HTTP/1.1 404"));
+
+    trigger.shutdown();
+    assert!(!task.await.unwrap().unwrap().was_forced());
 }

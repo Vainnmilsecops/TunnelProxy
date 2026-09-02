@@ -563,6 +563,26 @@
   config validation, and real-mTLS/public-TLS two-hostname-to-two-local-service
   coverage. The workspace contains 412 explicit tests.
 
+## Session 54 delivered
+
+- Added a bounded, versioned `GET`/`HEAD /tunnels` JSON inventory to the
+  loopback-only Agent operations listener for managed `http` and `start`
+  commands. Raw tunnel operations remain compatible and return `404`.
+- Each deterministic TunnelId-sorted entry reports only its configured
+  loopback target, published public URL, connection state, reachability state,
+  and readiness. Configured/ready totals match the same live status handles
+  used by aggregate `/readyz` and metrics.
+- Kept hostname publication live through a cloneable metadata handle while
+  preserving the existing fail-fast order: the operations socket binds before
+  any durable hostname allocation. Public URL remains `null` until allocation
+  succeeds.
+- Enforced the existing 1-to-16 tunnel bound, duplicate rejection, a 16 KiB
+  response invariant, no-store responses, GET/HEAD-only access, and no AgentId,
+  credential, certificate, token, peer, or challenge fields.
+- Preserved fixed-cardinality identity-free Prometheus metrics and added unit,
+  loopback HTTP, compatibility, and real-mTLS two-tunnel inventory coverage.
+  The workspace contains 416 explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -605,7 +625,7 @@
 
 ## Next planned session
 
-Session 54 has not been selected. DNS/public-certificate automation and
+Session 55 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

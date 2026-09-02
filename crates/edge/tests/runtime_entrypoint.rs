@@ -29,11 +29,11 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use tunnelproxy_agent::{
     connect_registered_with_security, AgentError, AgentHostnameClient, AgentOperationsConfig,
-    AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError,
-    AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, MultiAgentRuntime,
-    PublicReachabilityConfig, PublicReachabilityError, PublicReachabilityFailureClass,
-    PublicReachabilityProbe, RuntimeShutdownConfig,
+    AgentOperationsRuntime, AgentOperationsTunnel, AgentRuntime, AgentRuntimeConfig,
+    AgentRuntimeError, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig,
+    AgentTlsReloadRuntime, AgentTransportSecurity, ConnectOutcome, HostnameClientConfig,
+    MultiAgentRuntime, PublicReachabilityConfig, PublicReachabilityError,
+    PublicReachabilityFailureClass, PublicReachabilityProbe, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{
     generate_signed_access_keypair, load_signed_access_signer, merge_signed_access_key_rings,
@@ -3010,6 +3010,21 @@ async fn multi_tunnel_agent_routes_two_managed_hostnames_to_distinct_local_servi
     config_b.shutdown = RuntimeShutdownConfig::new(Duration::from_secs(1));
     let agent = MultiAgentRuntime::new(vec![config_a, config_b]).unwrap();
     let statuses = agent.status_handles();
+    let operations_a =
+        AgentOperationsTunnel::new(tunnel_a.clone(), local_a_addr, statuses[0].clone());
+    operations_a.publish_hostname(allocated_a.hostname.clone());
+    let operations_b =
+        AgentOperationsTunnel::new(tunnel_b.clone(), local_b_addr, statuses[1].clone());
+    operations_b.publish_hostname(allocated_b.hostname.clone());
+    let operations = AgentOperationsRuntime::bind_tunnels(
+        AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap()),
+        vec![operations_b, operations_a],
+    )
+    .await
+    .unwrap();
+    let operations_addr = operations.local_addr();
+    let (operations_trigger, operations_signal) = shutdown_channel();
+    let operations_task = tokio::spawn(operations.run_until_shutdown(operations_signal));
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3026,6 +3041,23 @@ async fn multi_tunnel_agent_routes_two_managed_hostnames_to_distinct_local_servi
     assert!(statuses
         .iter()
         .all(|status| status.snapshot().is_transport_ready()));
+    let inventory = operations_request(operations_addr, "GET", "/tunnels").await;
+    let inventory_body = inventory.split_once("\r\n\r\n").unwrap().1;
+    let inventory: serde_json::Value = serde_json::from_str(inventory_body).unwrap();
+    assert_eq!(inventory["configured"], 2);
+    assert_eq!(inventory["ready"], 2);
+    assert_eq!(inventory["tunnels"][0]["tunnel_id"], "tunnel-a");
+    assert_eq!(
+        inventory["tunnels"][0]["public_url"],
+        format!("https://{}", allocated_a.hostname)
+    );
+    assert_eq!(inventory["tunnels"][0]["connection_state"], "connected");
+    assert_eq!(inventory["tunnels"][1]["tunnel_id"], "tunnel-b");
+    assert_eq!(
+        inventory["tunnels"][1]["public_url"],
+        format!("https://{}", allocated_b.hostname)
+    );
+    assert_eq!(inventory["tunnels"][1]["connection_state"], "connected");
 
     let connector = TlsConnector::from(raw_tls_client_config(
         &public_pki.authority_pem,
@@ -3058,6 +3090,8 @@ async fn multi_tunnel_agent_routes_two_managed_hostnames_to_distinct_local_servi
     agent_trigger.shutdown();
     let outcome = agent_task.await.unwrap().unwrap();
     assert_eq!(outcome.tunnels.len(), 2);
+    operations_trigger.shutdown();
+    assert!(!operations_task.await.unwrap().unwrap().was_forced());
     edge_trigger.shutdown();
     edge_task.await.unwrap().unwrap();
     hostname_trigger.shutdown();

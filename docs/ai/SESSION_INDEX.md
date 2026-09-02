@@ -1687,3 +1687,29 @@ Out of scope:
 - Multiple registrations on one Agent transport, hot profile mutation,
   partial-success terminal policy, per-tunnel identities/policies, automatic
   DNS/public certificates, custom domains, and multi-edge ownership.
+
+## Session 54 — Bounded Per-Tunnel Agent Operations Inventory — complete
+
+- Added `GET` and `HEAD /tunnels` to the bounded loopback-only Agent operations
+  listener for managed HTTP runtimes. The versioned JSON contains configured
+  and ready totals plus deterministic TunnelId-sorted entries.
+- Each entry exposes the managed TunnelId, configured loopback local address,
+  optional published public URL, connection state, reachability state, and
+  readiness. Hostname allocation updates the live inventory without restarting
+  the listener; the URL remains `null` before publication.
+- Preserved `AgentOperationsRuntime::bind`/`bind_many` compatibility and added a
+  managed-only binding path. Raw tunnel mode returns `404` for `/tunnels`, and
+  `/healthz`, `/readyz`, and `/metrics` retain their existing contracts.
+- Enforced the existing 16-tunnel cap, duplicate rejection, a 16 KiB response
+  invariant, no-store responses, and GET/HEAD-only access. Prometheus remains
+  identity-free, and the inventory contains no AgentId, credentials,
+  certificates, tokens, peer addresses, or reachability challenges.
+- Added unit, loopback HTTP, compatibility, and real-mTLS/public-TLS coverage
+  proving two connected hostnames map to their distinct local services and
+  appear ready in the inventory. The workspace contains 416 explicit tests.
+
+Out of scope:
+
+- Public/authenticated operations access, history or paging, dashboards,
+  request inspection/replay, hot tunnel mutation, identity-bearing metric
+  labels, Tunnel Protocol changes, and multi-edge ownership.
