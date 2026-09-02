@@ -25,13 +25,16 @@
 //! a bounded loopback operations endpoint and connection-lifecycle metrics.
 //! Session 42 composes managed-hostname allocation with the runnable Agent in
 //! `tunnelproxy-agent http <port>`. Session 43 adds the canonical `tunnelproxy`
-//! wrapper and a shared CLI driver with strict bounded local config v1. See
+//! wrapper and a shared CLI driver with strict bounded local config v1.
+//! Session 53 adds strict config v2 plus a bounded supervisor for multiple
+//! managed HTTP tunnels over independent Agent transports. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
 pub mod cli;
 mod enrollment;
 mod hostname;
+mod multi_runtime;
 mod multiplex;
 mod operations;
 mod public_reachability;
@@ -50,6 +53,10 @@ pub use enrollment::{
 pub use hostname::{
     AgentHostnameClient, AgentHostnameError, HostnameAllocation, HostnameClientConfig,
     HostnameRelease,
+};
+pub use multi_runtime::{
+    MultiAgentRuntime, MultiAgentRuntimeControl, MultiAgentRuntimeError, MultiAgentRuntimeOutcome,
+    MAX_MANAGED_HTTP_TUNNELS,
 };
 pub use multiplex::{
     MultiplexedAgentConfig, MultiplexedAgentConfigError, MULTIPLEXED_DATA_PAYLOAD_SIZE,

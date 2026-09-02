@@ -255,6 +255,32 @@ is offline. This makes restart URL-stable and avoids destructive rollback after
 an ambiguous client failure. Permanent withdrawal remains an explicit
 `hostname-release` operation.
 
+### Multi-tunnel Agent lifecycle
+
+Use config v2 with `tunnelproxy start --config <path>` to run 1â€“16 managed
+HTTP tunnels in one process. Validate first, and configure the Edge
+`--max-agent-sessions` ceiling at or above the number of profile entries. Each
+entry consumes one independent Agent transport and its own per-transport
+stream/queue capacity; size total capacity as the per-tunnel bounds multiplied
+by the configured count.
+
+Every tunnel allocates or reuses a durable hostname before runtime startup.
+Partial allocation or later terminal failure does not release earlier routes;
+use explicit `hostname-release` after diagnosis. Transient connection loss
+uses only the affected child's reconnect loop. A terminal registration,
+protocol, or reconnect-budget failure fails the process closed and drains all
+siblings, preventing a service manager from treating a partially configured
+set as healthy.
+
+`/readyz` returns success only when every configured tunnel is ready, including
+any enabled reachability proof. Use
+`tunnelproxy_agent_{configured,ready}_tunnels` and the fixed state-count gauges
+to identify aggregate loss without identity labels. `/healthz` remains process
+liveness. URL mappings arrive independently on stdout as children become
+ready; do not depend on config-order output. TLS reload, renewal, operations,
+and shutdown are shared process owners, so one failure in those supervisors
+also drains the set.
+
 ### Hostname TLS and Agent-CA rotation
 
 Use an independent `--hostname-tls-reload-manifest` when the hostname endpoint

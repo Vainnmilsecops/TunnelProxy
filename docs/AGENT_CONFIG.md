@@ -1,8 +1,11 @@
-# Local Agent Configuration v1
+# Local Agent Configuration v1 and v2
 
 Session 43 adds the canonical `tunnelproxy` executable and one strict local
 configuration file for the repeated identity, Edge, and hostname-service
 arguments required by managed HTTP startup.
+
+Session 53 adds config v2 for a bounded multi-tunnel process. Config v1 and
+`tunnelproxy http <port>` remain unchanged.
 
 ## Resolution order
 
@@ -20,7 +23,7 @@ ignored only when every required value was supplied explicitly, preserving the
 Session 42 long-form command. An explicit or environment-selected missing file
 is always an error.
 
-## Schema
+## Config v1 schema
 
 The UTF-8 JSON file is limited to 64 KiB. Version mismatch, unknown fields,
 duplicate fields, malformed addresses, unsafe identifiers, empty paths, and
@@ -55,7 +58,51 @@ incomplete objects fail before any network connection or hostname mutation.
 }
 ```
 
-`public_reachability` is optional, so every existing v1 file remains valid.
+## Config v2 multi-tunnel schema
+
+Config v2 moves `tunnel_id` out of the shared identity and requires a
+`tunnels` array containing 1â€“16 entries. Every local target is loopback-only;
+`local_port` must be non-zero. TunnelIds must be unique, while multiple
+TunnelIds may intentionally point to the same local port.
+
+```json
+{
+  "version": 2,
+  "edge": {
+    "address": "edge.example.test:7100",
+    "ca": "edge-ca.pem",
+    "server_name": "edge.example.test"
+  },
+  "hostname": {
+    "address": "control.example.test:7400",
+    "ca": "control-plane-ca.pem",
+    "server_name": "control.example.test"
+  },
+  "identity": {
+    "agent_id": "agent-a",
+    "client_certificate": "agent.pem",
+    "client_private_key": "agent-key.pem"
+  },
+  "tunnels": [
+    { "tunnel_id": "frontend", "local_port": 3000 },
+    { "tunnel_id": "webhooks", "local_port": 4000 }
+  ],
+  "public_reachability": {
+    "enabled": true,
+    "monitor_interval_ms": 60000,
+    "failure_threshold": 3
+  }
+}
+```
+
+Run v2 only through `tunnelproxy start [--config <path>]`. `--local`,
+`--tunnel-id`, and `--enroll-only` are rejected because tunnel shape belongs
+to the profile. Shared CLI values still override shared config fields. Config
+v1 is rejected by `start`, and config v2 is rejected by `http <port>`, so a
+version mismatch cannot silently select a different runtime shape.
+
+`public_reachability` is optional in both versions, so every existing v1 file
+remains valid.
 All nested fields except `enabled` are optional, but may only be supplied when
 `enabled` is true. Without `ca`, the probe uses the Agent's bundled public Web
 PKI roots. The startup timeout must be between 1 ms and 300000 ms.
@@ -102,6 +149,24 @@ non-terminal: readiness becomes degraded and then returns `503` at the failure
 threshold. The next successful proof restores readiness. Attempts never
 overlap, and disconnect/reconnect requires a fresh proof before readiness is
 restored. This configuration does not provision wildcard DNS or public TLS.
+
+## Multi-tunnel startup
+
+After validating config v2, start every configured tunnel with one command:
+
+```text
+tunnelproxy config validate --config path/to/config-v2.json
+tunnelproxy start --config path/to/config-v2.json
+```
+
+Each tunnel allocates or reuses its durable hostname and runs on a separate
+Agent transport. URL lines appear independently after each transport and any
+enabled public proof become ready. `/healthz` remains process health;
+`/readyz` requires all configured tunnels. Metrics expose only aggregate
+configured/ready counts and fixed state counts, never TunnelId or hostname
+labels. Terminal failure in any child fails closed and drains all children;
+ordinary reconnect remains isolated to that child. Hostname allocations are
+not automatically released on partial startup failure or shutdown.
 
 The backwards-compatible `tunnelproxy-agent` executable uses the same driver
 and also accepts `http <port> --config <path>`. Manual hostname commands and

@@ -86,6 +86,8 @@ impl AgentOperationsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentOperationsConfigError {
     NonLoopbackListener,
+    EmptyStatusSet,
+    TooManyStatuses,
     InvalidConnectionLimit,
     InvalidHeaderBytes,
     InvalidHeaderCount,
@@ -98,6 +100,8 @@ impl std::fmt::Display for AgentOperationsConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::NonLoopbackListener => "operations listener must use a loopback address",
+            Self::EmptyStatusSet => "operations runtime requires at least one Agent status",
+            Self::TooManyStatuses => "operations runtime exceeds the 16-tunnel status limit",
             Self::InvalidConnectionLimit => {
                 "operations connection limit must be between 1 and 1024"
             }
@@ -160,7 +164,7 @@ pub struct AgentOperationsRuntime {
     listener: TcpListener,
     local_addr: SocketAddr,
     config: AgentOperationsConfig,
-    status: AgentRuntimeStatusHandle,
+    statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     counters: Arc<AgentOperationsCounters>,
 }
 
@@ -169,9 +173,26 @@ impl AgentOperationsRuntime {
         config: AgentOperationsConfig,
         status: AgentRuntimeStatusHandle,
     ) -> Result<Self, AgentOperationsError> {
+        Self::bind_many(config, vec![status]).await
+    }
+
+    pub async fn bind_many(
+        config: AgentOperationsConfig,
+        statuses: Vec<AgentRuntimeStatusHandle>,
+    ) -> Result<Self, AgentOperationsError> {
         config
             .validate()
             .map_err(AgentOperationsError::InvalidConfig)?;
+        if statuses.is_empty() {
+            return Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::EmptyStatusSet,
+            ));
+        }
+        if statuses.len() > crate::MAX_MANAGED_HTTP_TUNNELS {
+            return Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::TooManyStatuses,
+            ));
+        }
         let listener = TcpListener::bind(config.listen_addr)
             .await
             .map_err(AgentOperationsError::Bind)?;
@@ -180,7 +201,7 @@ impl AgentOperationsRuntime {
             listener,
             local_addr,
             config,
-            status,
+            statuses: Arc::new(statuses),
             counters: Arc::new(AgentOperationsCounters::default()),
         })
     }
@@ -224,7 +245,7 @@ impl AgentOperationsRuntime {
                         socket,
                         peer,
                         self.config,
-                        self.status.clone(),
+                        Arc::clone(&self.statuses),
                         Arc::clone(&self.counters),
                         permit,
                         active,
@@ -290,14 +311,18 @@ async fn run_connection(
     socket: TcpStream,
     peer: SocketAddr,
     config: AgentOperationsConfig,
-    status: AgentRuntimeStatusHandle,
+    statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     counters: Arc<AgentOperationsCounters>,
     _permit: OwnedSemaphorePermit,
     _active: ActiveConnectionGuard,
 ) {
     let service_counters = Arc::clone(&counters);
     let service = hyper::service::service_fn(move |request| {
-        serve_request(request, status.clone(), Arc::clone(&service_counters))
+        serve_request(
+            request,
+            Arc::clone(&statuses),
+            Arc::clone(&service_counters),
+        )
     });
     let mut http = hyper::server::conn::http1::Builder::new();
     http.keep_alive(false)
@@ -320,7 +345,7 @@ async fn run_connection(
 
 async fn serve_request(
     request: Request<Incoming>,
-    status: AgentRuntimeStatusHandle,
+    statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     counters: Arc<AgentOperationsCounters>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let head = request.method() == Method::HEAD;
@@ -331,7 +356,7 @@ async fn serve_request(
         match request.uri().path() {
             "/healthz" => plain_response(StatusCode::OK, "ok\n", head),
             "/readyz" => {
-                if status.snapshot().is_ready() {
+                if statuses.iter().all(|status| status.snapshot().is_ready()) {
                     plain_response(StatusCode::OK, "ready\n", head)
                 } else {
                     plain_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n", head)
@@ -339,8 +364,14 @@ async fn serve_request(
             }
             "/metrics" => metrics_response(
                 &render_metrics(
-                    status.snapshot(),
-                    status.transport_telemetry(),
+                    &statuses
+                        .iter()
+                        .map(AgentRuntimeStatusHandle::snapshot)
+                        .collect::<Vec<_>>(),
+                    &statuses
+                        .iter()
+                        .map(AgentRuntimeStatusHandle::transport_telemetry)
+                        .collect::<Vec<_>>(),
                     counters.snapshot(),
                 ),
                 head,
@@ -411,17 +442,30 @@ impl AgentOperationsCounters {
 }
 
 fn render_metrics(
-    status: AgentRuntimeStatus,
-    transport: MultiplexTelemetrySnapshot,
+    statuses: &[AgentRuntimeStatus],
+    transports: &[MultiplexTelemetrySnapshot],
     operations: OperationsCounterSnapshot,
 ) -> String {
     let mut output = String::with_capacity(2 * 1024);
+    let transport = aggregate_transport(transports);
     metric(&mut output, "tunnelproxy_agent_up", "gauge", 1);
     metric(
         &mut output,
         "tunnelproxy_agent_ready",
         "gauge",
-        u8::from(status.is_ready()),
+        u8::from(statuses.iter().all(|status| status.is_ready())),
+    );
+    metric(
+        &mut output,
+        "tunnelproxy_agent_configured_tunnels",
+        "gauge",
+        statuses.len(),
+    );
+    metric(
+        &mut output,
+        "tunnelproxy_agent_ready_tunnels",
+        "gauge",
+        statuses.iter().filter(|status| status.is_ready()).count(),
     );
     let _ = writeln!(output, "# TYPE tunnelproxy_agent_connection_state gauge");
     for state in AgentConnectionState::ALL {
@@ -429,7 +473,10 @@ fn render_metrics(
             output,
             "tunnelproxy_agent_connection_state{{state=\"{}\"}} {}",
             state.as_str(),
-            u8::from(status.state == state)
+            statuses
+                .iter()
+                .filter(|status| status.state == state)
+                .count()
         );
     }
     let _ = writeln!(
@@ -441,104 +488,117 @@ fn render_metrics(
             output,
             "tunnelproxy_agent_public_reachability_state{{state=\"{}\"}} {}",
             state.as_str(),
-            u8::from(status.public_reachability_state == state)
+            statuses
+                .iter()
+                .filter(|status| status.public_reachability_state == state)
+                .count()
         );
     }
     for (name, kind, value) in [
         (
             "tunnelproxy_agent_connection_attempts_total",
             "counter",
-            status.connection_attempts,
+            sum_status(statuses, |status| status.connection_attempts),
         ),
         (
             "tunnelproxy_agent_sessions_established_total",
             "counter",
-            status.established_sessions,
+            sum_status(statuses, |status| status.established_sessions),
         ),
         (
             "tunnelproxy_agent_reconnects_total",
             "counter",
-            status.successful_reconnects,
+            sum_status(statuses, |status| status.successful_reconnects),
         ),
         (
             "tunnelproxy_agent_disconnects_total",
             "counter",
-            status.disconnects,
+            sum_status(statuses, |status| status.disconnects),
         ),
         (
             "tunnelproxy_agent_connection_failures_total",
             "counter",
-            status.connection_failures,
+            sum_status(statuses, |status| status.connection_failures),
         ),
         (
             "tunnelproxy_agent_consecutive_failures",
             "gauge",
-            status.consecutive_failures,
+            sum_status(statuses, |status| status.consecutive_failures),
         ),
         (
             "tunnelproxy_agent_public_reachability_attempts_total",
             "counter",
-            status.public_reachability_attempts,
+            sum_status(statuses, |status| status.public_reachability_attempts),
         ),
         (
             "tunnelproxy_agent_public_reachability_successes_total",
             "counter",
-            status.public_reachability_successes,
+            sum_status(statuses, |status| status.public_reachability_successes),
         ),
         (
             "tunnelproxy_agent_public_reachability_timeouts_total",
             "counter",
-            status.public_reachability_timeouts,
+            sum_status(statuses, |status| status.public_reachability_timeouts),
         ),
         (
             "tunnelproxy_agent_public_reachability_cancellations_total",
             "counter",
-            status.public_reachability_cancellations,
+            sum_status(statuses, |status| status.public_reachability_cancellations),
         ),
         (
             "tunnelproxy_agent_public_reachability_tls_failures_total",
             "counter",
-            status.public_reachability_tls_failures,
+            sum_status(statuses, |status| status.public_reachability_tls_failures),
         ),
         (
             "tunnelproxy_agent_public_reachability_connect_failures_total",
             "counter",
-            status.public_reachability_connect_failures,
+            sum_status(statuses, |status| {
+                status.public_reachability_connect_failures
+            }),
         ),
         (
             "tunnelproxy_agent_public_reachability_route_failures_total",
             "counter",
-            status.public_reachability_route_failures,
+            sum_status(statuses, |status| status.public_reachability_route_failures),
         ),
         (
             "tunnelproxy_agent_public_reachability_protocol_failures_total",
             "counter",
-            status.public_reachability_protocol_failures,
+            sum_status(statuses, |status| {
+                status.public_reachability_protocol_failures
+            }),
         ),
         (
             "tunnelproxy_agent_public_reachability_monitor_cycles_total",
             "counter",
-            status.public_reachability_monitor_cycles,
+            sum_status(statuses, |status| status.public_reachability_monitor_cycles),
         ),
         (
             "tunnelproxy_agent_public_reachability_monitor_failures_total",
             "counter",
-            status.public_reachability_monitor_failures,
+            sum_status(statuses, |status| {
+                status.public_reachability_monitor_failures
+            }),
         ),
         (
             "tunnelproxy_agent_public_reachability_consecutive_failures",
             "gauge",
-            status.public_reachability_consecutive_failures,
+            sum_status(statuses, |status| {
+                status.public_reachability_consecutive_failures
+            }),
         ),
         (
             "tunnelproxy_agent_public_reachability_unhealthy_transitions_total",
             "counter",
-            status.public_reachability_unhealthy_transitions,
+            sum_status(statuses, |status| {
+                status.public_reachability_unhealthy_transitions
+            }),
         ),
         (
             "tunnelproxy_agent_public_reachability_recoveries_total",
             "counter",
-            status.public_reachability_recoveries,
+            sum_status(statuses, |status| status.public_reachability_recoveries),
         ),
         (
             "tunnelproxy_agent_operations_active_connections",
@@ -571,6 +631,50 @@ fn render_metrics(
     render_logging_metrics(&mut output, process_logging_snapshot());
     render_transport_metrics(&mut output, transport);
     output
+}
+
+fn sum_status(statuses: &[AgentRuntimeStatus], field: impl Fn(&AgentRuntimeStatus) -> u64) -> u64 {
+    statuses
+        .iter()
+        .fold(0_u64, |sum, status| sum.saturating_add(field(status)))
+}
+
+fn aggregate_transport(transports: &[MultiplexTelemetrySnapshot]) -> MultiplexTelemetrySnapshot {
+    transports
+        .iter()
+        .fold(MultiplexTelemetrySnapshot::default(), |mut total, item| {
+            total.active_streams = total.active_streams.saturating_add(item.active_streams);
+            total.peak_active_streams = total
+                .peak_active_streams
+                .saturating_add(item.peak_active_streams);
+            total.sent_data_frames = total.sent_data_frames.saturating_add(item.sent_data_frames);
+            total.sent_data_bytes = total.sent_data_bytes.saturating_add(item.sent_data_bytes);
+            total.received_data_frames = total
+                .received_data_frames
+                .saturating_add(item.received_data_frames);
+            total.received_data_bytes = total
+                .received_data_bytes
+                .saturating_add(item.received_data_bytes);
+            total.data_admission_waits = total
+                .data_admission_waits
+                .saturating_add(item.data_admission_waits);
+            total.data_pipeline_frames = total
+                .data_pipeline_frames
+                .saturating_add(item.data_pipeline_frames);
+            total.data_pipeline_capacity_frames = total
+                .data_pipeline_capacity_frames
+                .saturating_add(item.data_pipeline_capacity_frames);
+            total.peak_data_pipeline_frames = total
+                .peak_data_pipeline_frames
+                .saturating_add(item.peak_data_pipeline_frames);
+            total.flow_control_resets = total
+                .flow_control_resets
+                .saturating_add(item.flow_control_resets);
+            total.control_burst_yields = total
+                .control_burst_yields
+                .saturating_add(item.control_burst_yields);
+            total
+        })
 }
 
 fn render_logging_metrics(output: &mut String, logging: ProcessLoggingSnapshot) {
@@ -730,6 +834,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn multi_status_set_is_nonempty_and_bounded() {
+        let config = AgentOperationsConfig::loopback("127.0.0.1:0".parse().unwrap());
+        assert!(matches!(
+            AgentOperationsRuntime::bind_many(config, Vec::new()).await,
+            Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::EmptyStatusSet
+            ))
+        ));
+        assert!(matches!(
+            AgentOperationsRuntime::bind_many(
+                config,
+                (0..=crate::MAX_MANAGED_HTTP_TUNNELS)
+                    .map(|_| status())
+                    .collect(),
+            )
+            .await,
+            Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::TooManyStatuses
+            ))
+        ));
+    }
+
     #[test]
     fn metric_rendering_has_fixed_state_labels_and_no_identity_values() {
         let status = status();
@@ -746,15 +873,15 @@ mod tests {
         );
         status.record_public_reachability_monitor_success();
         let rendered = render_metrics(
-            status.snapshot(),
-            MultiplexTelemetrySnapshot {
+            &[status.snapshot()],
+            &[MultiplexTelemetrySnapshot {
                 sent_data_frames: 2,
                 sent_data_bytes: 17,
                 received_data_frames: 3,
                 received_data_bytes: 29,
                 data_pipeline_capacity_frames: 128,
                 ..MultiplexTelemetrySnapshot::default()
-            },
+            }],
             OperationsCounterSnapshot {
                 active_connections: 1,
                 accepted_connections: 2,
@@ -773,6 +900,7 @@ mod tests {
             )));
         }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
+        assert!(rendered.contains("tunnelproxy_agent_configured_tunnels 1"));
         assert!(rendered.contains("tunnelproxy_agent_logging_nonblocking_enabled 0"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_attempts_total 7"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_successes_total 2"));
@@ -806,5 +934,39 @@ mod tests {
         assert!(!rendered.contains("agent-dev"));
         assert!(!rendered.contains("tunnel-dev"));
         assert!(!rendered.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn metric_rendering_aggregates_multiple_tunnels_without_identity_labels() {
+        let first = status();
+        let second = status();
+        first.record_public_reachability_success(1);
+        second.require_public_reachability(true);
+        let rendered = render_metrics(
+            &[first.snapshot(), second.snapshot()],
+            &[
+                MultiplexTelemetrySnapshot {
+                    sent_data_bytes: 7,
+                    ..MultiplexTelemetrySnapshot::default()
+                },
+                MultiplexTelemetrySnapshot {
+                    sent_data_bytes: 11,
+                    ..MultiplexTelemetrySnapshot::default()
+                },
+            ],
+            OperationsCounterSnapshot {
+                active_connections: 0,
+                accepted_connections: 0,
+                completed_requests: 0,
+                rejected_requests: 0,
+                capacity_rejections: 0,
+            },
+        );
+        assert!(rendered.contains("tunnelproxy_agent_configured_tunnels 2"));
+        assert!(rendered.contains("tunnelproxy_agent_ready_tunnels 0"));
+        assert!(rendered.contains("connection_state{state=\"offline\"} 2"));
+        assert!(rendered.contains("transport_data_bytes_total{direction=\"sent\"} 18"));
+        assert!(!rendered.contains("tunnel-a"));
+        assert!(!rendered.contains("hostname"));
     }
 }

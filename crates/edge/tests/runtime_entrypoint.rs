@@ -31,9 +31,9 @@ use tunnelproxy_agent::{
     connect_registered_with_security, AgentError, AgentHostnameClient, AgentOperationsConfig,
     AgentOperationsRuntime, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError,
     AgentRuntimeOutcome, AgentTlsConfig, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, PublicReachabilityConfig,
-    PublicReachabilityError, PublicReachabilityFailureClass, PublicReachabilityProbe,
-    RuntimeShutdownConfig,
+    AgentTransportSecurity, ConnectOutcome, HostnameClientConfig, MultiAgentRuntime,
+    PublicReachabilityConfig, PublicReachabilityError, PublicReachabilityFailureClass,
+    PublicReachabilityProbe, RuntimeShutdownConfig,
 };
 use tunnelproxy_common::{
     generate_signed_access_keypair, load_signed_access_signer, merge_signed_access_key_rings,
@@ -2881,6 +2881,218 @@ async fn managed_hostname_allocation_activates_end_to_end_https_without_auto_rel
     local_task.await.unwrap();
     drop(routes);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn multi_tunnel_agent_routes_two_managed_hostnames_to_distinct_local_services() {
+    let agent_pki = test_pki("edge.test");
+    let public_pki = test_pki("*.agents.example.test");
+    let agent_id = AgentId::new("agent-dev").unwrap();
+    let tunnel_a = TunnelId::new("tunnel-a").unwrap();
+    let tunnel_b = TunnelId::new("tunnel-b").unwrap();
+    let versioned = VersionedAuthorizationSnapshot::new(
+        SnapshotVersion::new(1).unwrap(),
+        AuthorizationSnapshot::new(vec![AgentGrant::new(
+            client_fingerprint(&agent_pki.client),
+            agent_id.clone(),
+            vec![
+                TunnelGrant::new(tunnel_a.clone(), TunnelStatus::Enabled),
+                TunnelGrant::new(tunnel_b.clone(), TunnelStatus::Enabled),
+            ],
+        )])
+        .unwrap(),
+    );
+    let (_authorization_publisher, authorization) = authorization_snapshot_channel(versioned);
+    let (database, directory) = snapshot_temp_database();
+    let routes = PersistentHttpsRouteCatalog::open(HttpsRouteRepository::open(&database).unwrap())
+        .await
+        .unwrap();
+
+    let hostname_server = HostnameServer::bind(
+        HostnameServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            max_clients: 4,
+            request_timeout: Duration::from_secs(2),
+            base_domain: ManagedHostnameBaseDomain::new("agents.example.test").unwrap(),
+            tls: HostnameServerTlsConfig::from_pem(
+                agent_pki.server.certificate_pem.as_bytes(),
+                agent_pki.server.private_key_pem.as_bytes(),
+                agent_pki.authority_pem.as_bytes(),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        },
+        authorization.clone(),
+        routes.clone(),
+    )
+    .await
+    .unwrap();
+    let hostname_addr = hostname_server.local_addr();
+    let (hostname_trigger, hostname_signal) = shutdown_channel();
+    let hostname_task = tokio::spawn(hostname_server.run_until_shutdown(hostname_signal));
+
+    let hostname_client = AgentHostnameClient::new(HostnameClientConfig {
+        server_addr: hostname_addr,
+        server_name: "edge.test".to_owned(),
+        server_ca_pem: agent_pki.authority_pem.as_bytes().to_vec(),
+        client_cert_pem: agent_pki.client.certificate_pem.as_bytes().to_vec(),
+        client_key_pem: agent_pki.client.private_key_pem.as_bytes().to_vec(),
+        connect_timeout: Duration::from_secs(1),
+        handshake_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    let allocated_a = hostname_client
+        .allocate(agent_id.clone(), tunnel_a.clone())
+        .await
+        .unwrap();
+    let allocated_b = hostname_client
+        .allocate(agent_id.clone(), tunnel_b.clone())
+        .await
+        .unwrap();
+    assert_ne!(allocated_a.hostname, allocated_b.hostname);
+
+    let https_addr = unused_addr().await;
+    let mut edge_config = edge_config(unused_addr().await);
+    edge_config.multiplex.agent_listener.max_agent_sessions = 2;
+    edge_config.multiplex.security = edge_tls_security(&agent_pki, Duration::from_secs(1));
+    edge_config.multiplex.registration = EdgeRegistrationPolicy::mutual_tls_updates(authorization);
+    edge_config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::dynamic(routes.subscribe()),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 4,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        max_requests_per_connection: 1,
+        http2: None,
+        websocket: None,
+        connect: None,
+        signed_access: None,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(3),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    let edge = EdgeRuntime::bind(edge_config).await.unwrap();
+    let edge_addr = edge.agent_addr();
+    let router = edge.router();
+    let (edge_trigger, edge_signal) = shutdown_channel();
+    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+
+    let local_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_a_addr = local_a.local_addr().unwrap();
+    let local_a_task = tokio::spawn(serve_one_local_http(local_a, "/alpha", b"alpha"));
+    let local_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_b_addr = local_b.local_addr().unwrap();
+    let local_b_task = tokio::spawn(serve_one_local_http(local_b, "/bravo", b"bravo"));
+
+    let security = agent_tls_security(&agent_pki.authority_pem, &agent_pki.client, "edge.test");
+    let mut config_a = AgentRuntimeConfig::new(edge_addr, local_a_addr);
+    config_a.security = security.clone();
+    config_a.registration = RegistrationRequest::new(agent_id.clone(), tunnel_a.clone());
+    config_a.connect_timeout = Duration::from_secs(1);
+    config_a.handshake_timeout = Duration::from_secs(1);
+    config_a.shutdown = RuntimeShutdownConfig::new(Duration::from_secs(1));
+    let mut config_b = AgentRuntimeConfig::new(edge_addr, local_b_addr);
+    config_b.security = security;
+    config_b.registration = RegistrationRequest::new(agent_id, tunnel_b.clone());
+    config_b.connect_timeout = Duration::from_secs(1);
+    config_b.handshake_timeout = Duration::from_secs(1);
+    config_b.shutdown = RuntimeShutdownConfig::new(Duration::from_secs(1));
+    let agent = MultiAgentRuntime::new(vec![config_a, config_b]).unwrap();
+    let statuses = agent.status_handles();
+    let (agent_trigger, agent_signal) = shutdown_channel();
+    let agent_task = tokio::spawn(agent.run_until_shutdown(agent_signal));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !agent_task.is_finished(),
+        "multi Agent stopped early: {:?}",
+        statuses
+            .iter()
+            .map(|status| status.snapshot())
+            .collect::<Vec<_>>()
+    );
+    wait_for_tunnel(&router, tunnel_a.as_str()).await;
+    wait_for_tunnel(&router, tunnel_b.as_str()).await;
+    assert!(statuses
+        .iter()
+        .all(|status| status.snapshot().is_transport_ready()));
+
+    let connector = TlsConnector::from(raw_tls_client_config(
+        &public_pki.authority_pem,
+        None,
+        false,
+    ));
+    for (allocation, path, body) in [
+        (&allocated_a, "/alpha", "alpha"),
+        (&allocated_b, "/bravo", "bravo"),
+    ] {
+        let tcp = connect_eventually(https_addr).await;
+        let server_name = ServerName::try_from(allocation.hostname.as_str().to_owned()).unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                allocation.hostname
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with(&format!("\r\n\r\n{body}")));
+    }
+
+    agent_trigger.shutdown();
+    let outcome = agent_task.await.unwrap().unwrap();
+    assert_eq!(outcome.tunnels.len(), 2);
+    edge_trigger.shutdown();
+    edge_task.await.unwrap().unwrap();
+    hostname_trigger.shutdown();
+    hostname_task.await.unwrap().unwrap();
+    local_a_task.await.unwrap();
+    local_b_task.await.unwrap();
+    let durable = HttpsRouteRepository::open(&database)
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(durable.routes().len(), 2);
+    drop(routes);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+async fn serve_one_local_http(
+    listener: TcpListener,
+    expected_path: &'static str,
+    body: &'static [u8],
+) {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let request = String::from_utf8(read_http_head(&mut socket).await).unwrap();
+    assert!(request.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    socket.write_all(body).await.unwrap();
+    socket.shutdown().await.unwrap();
 }
 
 #[tokio::test]

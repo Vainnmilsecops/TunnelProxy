@@ -83,7 +83,9 @@ allocate/release and independent atomic hostname server identity/Agent-CA
 rotation on the existing route catalog, followed by single-process
 `tunnelproxy-agent http <port>` orchestration. Session 43 adds the canonical
 `tunnelproxy http <port>` wrapper and strict local config v1 with offline
-validation. Session 44 adds opt-in bounded HTTP/2 termination at Edge with
+validation. Session 53 adds strict config v2 plus `tunnelproxy start` for 1â€“16
+managed HTTP tunnels over independent transports in one bounded process.
+Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,
 session capacity, idle time, and task-owned drain. Session 46 adds separately
@@ -128,3 +130,6 @@ without terminating the tunnel. The hostname remains durable across shutdown,
 reconnect, and probe failure. Wildcard DNS/public TLS remain
 operator-provisioned prerequisites; the probe verifies them but does not
 create them.
+Config v2 reuses the same durable allocation and reachability semantics per
+tunnel. Aggregate readiness requires the full configured set, while transient
+reconnect remains child-local and terminal failure drains the process.
