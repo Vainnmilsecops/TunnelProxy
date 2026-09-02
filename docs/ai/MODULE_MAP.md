@@ -69,7 +69,10 @@ continue non-overlapping checks that drive fixed-cardinality local readiness
 through pending, degraded, unhealthy, and recovery states.
 Strict config v2 and `tunnelproxy start` compose 1â€“16 managed HTTP tunnels,
 each on an independent transport, while aggregating readiness and
-fixed-cardinality telemetry under one process lifecycle.
+fixed-cardinality telemetry under one process lifecycle. Optional config-v2
+target reload verifies a digest-bound generation and atomically replaces only
+the existing TunnelIds' local ports; new streams read the active snapshot and
+existing streams retain their local sockets.
 
 **Responsibility (future)**
 

@@ -1465,3 +1465,29 @@ capacity must account for every configured tunnel. Hostname allocation remains
 durable on partial failure. Hot add/remove, partial-success terminal policy,
 per-tunnel identities, multiple registrations on one transport, DNS/public
 certificate automation, and multi-edge ownership remain separate work.
+
+## ADR-055 — Local target reload is generation-atomic and stream-admission scoped
+
+**Status:** Accepted (Session 55).
+
+**Context:** Config v2 can keep several durable tunnels live, but moving a
+local application between ports required restarting the Agent process and all
+of its transports. Reloading the entire profile would make identity, TLS,
+hostname, and supervisor ownership mutable at runtime, while changing a target
+under an established logical stream would split one byte stream across local
+services.
+
+**Decision:** Make target reload explicitly opt-in and reuse the strict bounded
+digest-manifest generation loader. The manifest commits the exact config bytes
+as one monotonic generation. The candidate must preserve all shared fields and
+the exact TunnelId set; only non-zero loopback `local_port` values may change.
+Publish the complete process-local map atomically. Each logical stream
+snapshots one target at admission and retains that local socket for its
+lifetime. Invalid candidates keep the complete last-known-good generation.
+
+**Consequences:** Operators can move local services without changing Protocol
+v2, reconnecting Agent transports, reallocating hostnames, or disrupting active
+streams. `/tunnels` follows the active snapshot and fixed-cardinality metrics
+report generation and reload health without identity-bearing labels. Hot
+add/remove, shared profile mutation, remote distribution, and independently
+versioned per-tunnel targets remain out of scope.

@@ -28,6 +28,11 @@ pub use credential_bundle::{
     CredentialBundleError,
 };
 
+pub use generation_reload::{
+    load_generation_reload, GenerationReload, GenerationReloadError, GenerationReloadFile,
+    MAX_RELOAD_MANIFEST_BYTES, MAX_RELOAD_MATERIAL_BYTES,
+};
+
 pub use bounded_fair_queue::{
     bounded_queue_channel, bounded_queue_channel_with_telemetry, BoundedFairQueue,
     BoundedQueueClosed, BoundedQueueItem, BoundedQueueSender, BoundedQueueTelemetry,

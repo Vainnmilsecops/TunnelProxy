@@ -1229,9 +1229,33 @@ only after that child's registration and optional public proof. Aggregate
 connection/reachability/transport metrics are summed, fixed state gauges carry
 counts, and new configured/ready tunnel gauges expose capacity without
 identity labels. Config v1 and `http <port>` preserve their exact single-tunnel
-contract. Hot profile reload, partial-success daemon policy, per-tunnel
-credentials, one-transport multi-registration, DNS/TLS provisioning, and
-multi-edge ownership remain separate work.
+contract. Hot add/remove and shared-profile reload, partial-success daemon
+policy, per-tunnel credentials, one-transport multi-registration, DNS/TLS
+provisioning, and multi-edge ownership remain separate work.
+
+### 2.52 Atomic config-v2 local-target reload (Session 55)
+
+Config v2 may opt into polling a strict generation manifest that binds the
+exact profile bytes by SHA-256. The initial generation is validated before any
+socket or durable hostname mutation. Later candidates must preserve the full
+shared profile and exact TunnelId set; only the loopback `local_port` values
+may differ. Missing, malformed, stale, conflicting, or digest-mismatched input
+never partially updates the process-local target map.
+
+The active generation and every TunnelId-to-address entry live behind one
+small shared snapshot lock. Publication swaps the complete map in one critical
+section. A logical stream reads its address once before connecting locally, so
+an admitted stream owns that socket until closure while subsequent streams
+observe the new generation. The existing Protocol v2 transports,
+registrations, hostname allocations, public routes, and reconnect state are
+not restarted.
+
+The same snapshot feeds the bounded `/tunnels` inventory. Prometheus exposes
+only a generation gauge, success/failure counters, and a fixed reload-health
+state set; it does not label TunnelIds, addresses, paths, or digests. Static
+config v2 remains compatible as disabled generation zero. Hot tunnel
+add/remove, per-tunnel generation control, and shared profile mutation remain
+separate scopes.
 
 ## 3. Control plane vs data plane
 

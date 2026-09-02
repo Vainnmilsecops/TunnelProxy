@@ -24,7 +24,10 @@ use tunnelproxy_common::{
     RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
 };
 
-use crate::{AgentConnectionState, AgentRuntimeStatus, AgentRuntimeStatusHandle};
+use crate::{
+    AgentConnectionState, AgentRuntimeStatus, AgentRuntimeStatusHandle, TunnelTarget,
+    TunnelTargetReloadHealth, TunnelTargetReloadStatus, TunnelTargetSet,
+};
 
 pub const MIN_OPERATIONS_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_OPERATIONS_HEADER_BYTES: usize = 64 * 1024;
@@ -36,9 +39,15 @@ pub const MAX_TUNNEL_INVENTORY_RESPONSE_BYTES: usize = 16 * 1024;
 #[derive(Debug, Clone)]
 pub struct AgentOperationsTunnel {
     tunnel_id: TunnelId,
-    local_addr: SocketAddr,
+    local_target: OperationsTunnelTarget,
     public_hostname: Arc<RwLock<Option<PublicHostname>>>,
     status: AgentRuntimeStatusHandle,
+}
+
+#[derive(Debug, Clone)]
+enum OperationsTunnelTarget {
+    Fixed(SocketAddr),
+    Reloadable(TunnelTarget),
 }
 
 impl AgentOperationsTunnel {
@@ -49,7 +58,20 @@ impl AgentOperationsTunnel {
     ) -> Self {
         Self {
             tunnel_id,
-            local_addr,
+            local_target: OperationsTunnelTarget::Fixed(local_addr),
+            public_hostname: Arc::new(RwLock::new(None)),
+            status,
+        }
+    }
+
+    pub fn reloadable(
+        tunnel_id: TunnelId,
+        local_target: TunnelTarget,
+        status: AgentRuntimeStatusHandle,
+    ) -> Self {
+        Self {
+            tunnel_id,
+            local_target: OperationsTunnelTarget::Reloadable(local_target),
             public_hostname: Arc::new(RwLock::new(None)),
             status,
         }
@@ -68,6 +90,13 @@ impl AgentOperationsTunnel {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        match &self.local_target {
+            OperationsTunnelTarget::Fixed(addr) => *addr,
+            OperationsTunnelTarget::Reloadable(target) => target.current(),
+        }
     }
 }
 
@@ -210,6 +239,7 @@ pub struct AgentOperationsRuntime {
     config: AgentOperationsConfig,
     statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
+    tunnel_targets: Option<TunnelTargetSet>,
     counters: Arc<AgentOperationsCounters>,
 }
 
@@ -225,13 +255,29 @@ impl AgentOperationsRuntime {
         config: AgentOperationsConfig,
         statuses: Vec<AgentRuntimeStatusHandle>,
     ) -> Result<Self, AgentOperationsError> {
-        Self::bind_inner(config, statuses, None).await
+        Self::bind_inner(config, statuses, None, None).await
     }
 
     /// Binds an operations runtime with a bounded, deterministic managed-tunnel inventory.
     pub async fn bind_tunnels(
         config: AgentOperationsConfig,
+        tunnels: Vec<AgentOperationsTunnel>,
+    ) -> Result<Self, AgentOperationsError> {
+        Self::bind_tunnels_inner(config, tunnels, None).await
+    }
+
+    pub async fn bind_reloadable_tunnels(
+        config: AgentOperationsConfig,
+        tunnels: Vec<AgentOperationsTunnel>,
+        targets: TunnelTargetSet,
+    ) -> Result<Self, AgentOperationsError> {
+        Self::bind_tunnels_inner(config, tunnels, Some(targets)).await
+    }
+
+    async fn bind_tunnels_inner(
+        config: AgentOperationsConfig,
         mut tunnels: Vec<AgentOperationsTunnel>,
+        targets: Option<TunnelTargetSet>,
     ) -> Result<Self, AgentOperationsError> {
         if tunnels.is_empty() {
             return Err(AgentOperationsError::InvalidConfig(
@@ -254,13 +300,14 @@ impl AgentOperationsRuntime {
         }
         tunnels.sort_by(|left, right| left.tunnel_id.cmp(&right.tunnel_id));
         let statuses = tunnels.iter().map(|tunnel| tunnel.status.clone()).collect();
-        Self::bind_inner(config, statuses, Some(tunnels)).await
+        Self::bind_inner(config, statuses, Some(tunnels), targets).await
     }
 
     async fn bind_inner(
         config: AgentOperationsConfig,
         statuses: Vec<AgentRuntimeStatusHandle>,
         tunnels: Option<Vec<AgentOperationsTunnel>>,
+        tunnel_targets: Option<TunnelTargetSet>,
     ) -> Result<Self, AgentOperationsError> {
         config
             .validate()
@@ -285,6 +332,7 @@ impl AgentOperationsRuntime {
             config,
             statuses: Arc::new(statuses),
             tunnels: tunnels.map(Arc::new),
+            tunnel_targets,
             counters: Arc::new(AgentOperationsCounters::default()),
         })
     }
@@ -331,6 +379,7 @@ impl AgentOperationsRuntime {
                         AgentOperationsRequestState {
                             statuses: Arc::clone(&self.statuses),
                             tunnels: self.tunnels.as_ref().map(Arc::clone),
+                            tunnel_targets: self.tunnel_targets.clone(),
                             counters: Arc::clone(&self.counters),
                         },
                         permit,
@@ -396,6 +445,7 @@ impl Drop for ActiveConnectionGuard {
 struct AgentOperationsRequestState {
     statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
+    tunnel_targets: Option<TunnelTargetSet>,
     counters: Arc<AgentOperationsCounters>,
 }
 
@@ -409,12 +459,14 @@ async fn run_connection(
 ) {
     let statuses = Arc::clone(&state.statuses);
     let tunnels = state.tunnels.as_ref().map(Arc::clone);
+    let tunnel_targets = state.tunnel_targets.clone();
     let service_counters = Arc::clone(&state.counters);
     let service = hyper::service::service_fn(move |request| {
         serve_request(
             request,
             Arc::clone(&statuses),
             tunnels.as_ref().map(Arc::clone),
+            tunnel_targets.clone(),
             Arc::clone(&service_counters),
         )
     });
@@ -441,6 +493,7 @@ async fn serve_request(
     request: Request<Incoming>,
     statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
     tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
+    tunnel_targets: Option<TunnelTargetSet>,
     counters: Arc<AgentOperationsCounters>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let head = request.method() == Method::HEAD;
@@ -468,6 +521,7 @@ async fn serve_request(
                         .map(AgentRuntimeStatusHandle::transport_telemetry)
                         .collect::<Vec<_>>(),
                     counters.snapshot(),
+                    tunnel_targets.as_ref().map(TunnelTargetSet::status),
                 ),
                 head,
             ),
@@ -529,7 +583,7 @@ fn render_tunnel_inventory(tunnels: &[AgentOperationsTunnel]) -> String {
             let status = tunnel.status.snapshot();
             TunnelInventoryEntry {
                 tunnel_id: tunnel.tunnel_id.to_string(),
-                local_addr: tunnel.local_addr.to_string(),
+                local_addr: tunnel.local_addr().to_string(),
                 public_url: tunnel
                     .public_hostname()
                     .map(|hostname| format!("https://{hostname}")),
@@ -609,6 +663,7 @@ fn render_metrics(
     statuses: &[AgentRuntimeStatus],
     transports: &[MultiplexTelemetrySnapshot],
     operations: OperationsCounterSnapshot,
+    target_reload: Option<TunnelTargetReloadStatus>,
 ) -> String {
     let mut output = String::with_capacity(2 * 1024);
     let transport = aggregate_transport(transports);
@@ -631,6 +686,42 @@ fn render_metrics(
         "gauge",
         statuses.iter().filter(|status| status.is_ready()).count(),
     );
+    let target_reload = target_reload.unwrap_or(TunnelTargetReloadStatus {
+        generation: 0,
+        health: TunnelTargetReloadHealth::Disabled,
+        successful_reloads: 0,
+        failed_reloads: 0,
+    });
+    metric(
+        &mut output,
+        "tunnelproxy_agent_tunnel_config_generation",
+        "gauge",
+        target_reload.generation,
+    );
+    metric(
+        &mut output,
+        "tunnelproxy_agent_tunnel_config_reload_successes_total",
+        "counter",
+        target_reload.successful_reloads,
+    );
+    metric(
+        &mut output,
+        "tunnelproxy_agent_tunnel_config_reload_failures_total",
+        "counter",
+        target_reload.failed_reloads,
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_agent_tunnel_config_reload_health gauge"
+    );
+    for health in TunnelTargetReloadHealth::ALL {
+        let _ = writeln!(
+            output,
+            "tunnelproxy_agent_tunnel_config_reload_health{{state=\"{}\"}} {}",
+            health.as_str(),
+            u8::from(target_reload.health == health)
+        );
+    }
     let _ = writeln!(output, "# TYPE tunnelproxy_agent_connection_state gauge");
     for state in AgentConnectionState::ALL {
         let _ = writeln!(
@@ -1127,6 +1218,7 @@ mod tests {
                 rejected_requests: 4,
                 capacity_rejections: 5,
             },
+            None,
         );
         for state in AgentConnectionState::ALL {
             assert!(rendered.contains(&format!("state=\"{}\"", state.as_str())));
@@ -1139,6 +1231,15 @@ mod tests {
         }
         assert!(rendered.contains("tunnelproxy_agent_ready 0"));
         assert!(rendered.contains("tunnelproxy_agent_configured_tunnels 1"));
+        assert!(rendered.contains("tunnelproxy_agent_tunnel_config_generation 0"));
+        for health in TunnelTargetReloadHealth::ALL {
+            assert!(rendered.contains(&format!(
+                "tunnelproxy_agent_tunnel_config_reload_health{{state=\"{}\"}}",
+                health.as_str()
+            )));
+        }
+        assert!(rendered
+            .contains("tunnelproxy_agent_tunnel_config_reload_health{state=\"disabled\"} 1"));
         assert!(rendered.contains("tunnelproxy_agent_logging_nonblocking_enabled 0"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_attempts_total 7"));
         assert!(rendered.contains("tunnelproxy_agent_public_reachability_successes_total 2"));
@@ -1199,6 +1300,7 @@ mod tests {
                 rejected_requests: 0,
                 capacity_rejections: 0,
             },
+            None,
         );
         assert!(rendered.contains("tunnelproxy_agent_configured_tunnels 2"));
         assert!(rendered.contains("tunnelproxy_agent_ready_tunnels 0"));

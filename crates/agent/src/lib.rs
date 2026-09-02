@@ -28,13 +28,16 @@
 //! wrapper and a shared CLI driver with strict bounded local config v1.
 //! Session 53 adds strict config v2 plus a bounded supervisor for multiple
 //! managed HTTP tunnels over independent Agent transports. Session 54 adds a
-//! bounded per-tunnel managed HTTP inventory to the loopback operations API. See
+//! bounded per-tunnel managed HTTP inventory to the loopback operations API.
+//! Session 55 adds atomic digest-bound config-v2 local-target generations for
+//! new streams without reconnecting Agent transports. See
 //! `docs/ai/SESSION_INDEX.md` and `docs/TECH_DEBT.md` for the limitations.
 
 mod agent_transport;
 pub mod cli;
 mod enrollment;
 mod hostname;
+mod local_target;
 mod multi_runtime;
 mod multiplex;
 mod operations;
@@ -54,6 +57,10 @@ pub use enrollment::{
 pub use hostname::{
     AgentHostnameClient, AgentHostnameError, HostnameAllocation, HostnameClientConfig,
     HostnameRelease,
+};
+pub use local_target::{
+    TunnelTarget, TunnelTargetApplyOutcome, TunnelTargetReloadHealth, TunnelTargetReloadStatus,
+    TunnelTargetSet, TunnelTargetSetError,
 };
 pub use multi_runtime::{
     MultiAgentRuntime, MultiAgentRuntimeControl, MultiAgentRuntimeError, MultiAgentRuntimeOutcome,

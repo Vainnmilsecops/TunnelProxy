@@ -85,6 +85,9 @@ rotation on the existing route catalog, followed by single-process
 `tunnelproxy http <port>` wrapper and strict local config v1 with offline
 validation. Session 53 adds strict config v2 plus `tunnelproxy start` for 1â€“16
 managed HTTP tunnels over independent transports in one bounded process.
+Session 55 lets that config-v2 process opt into atomic digest-manifest local
+port generations: only existing TunnelIds' targets change, new streams use the
+active snapshot, and existing streams/transports remain connected.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,
