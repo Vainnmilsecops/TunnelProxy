@@ -109,6 +109,10 @@ correct agent, which in turn proxies them into the local service.
   resolution, relative credential paths, CLI override precedence, offline TLS
   validation, and no inline secret values. It enables `tunnelproxy http 3000`
   while retaining the long-form Session 42 command.
+- A strict config v2 and `tunnelproxy start` mode can run 1â€“16 managed HTTP
+  tunnels in one process. Each TunnelId keeps an independent reconnecting
+  transport and local loopback port while sharing Agent identity, TLS reload,
+  enrollment, hostname service, operations, and shutdown ownership.
 - Opt-in digest-bound TLS generation reload for Agent, Edge, snapshot, public
   HTTPS, HTTPS route, and Agent hostname transports with last-known-good
   rollback, expiry enforcement, and static Agent-certificate authorization
@@ -210,6 +214,19 @@ does not create DNS records or public certificates. See
 [`docs/AGENT_CONFIG.md`](docs/AGENT_CONFIG.md) for the strict schema, platform
 paths, precedence, trust boundary, and long-form fallback.
 
+For multiple local services, validate a config v2 profile and start the whole
+bounded set:
+
+```text
+tunnelproxy config validate --config ./config-v2.json
+tunnelproxy start --config ./config-v2.json
+```
+
+One mapping is printed as each tunnel becomes ready. Aggregate `/readyz` is
+successful only when every configured tunnel is ready. A transient disconnect
+reconnects only its own transport; a terminal child failure drains the set and
+exits non-zero. Edge must allow at least the same number of Agent sessions.
+
 ## Repository structure
 
 ```
@@ -307,6 +324,7 @@ and Definition of Done.
 | 50 _(complete)_ | atomic signed-access public-key ring reload and rotation |
 | 51 _(complete)_ | opt-in bounded managed-HTTP public reachability verification |
 | 52 _(complete)_ | continuous public reachability health monitoring and recovery |
+| 53 _(complete)_ | bounded multi-tunnel managed HTTP Agent orchestration |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

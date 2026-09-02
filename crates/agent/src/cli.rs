@@ -1,5 +1,6 @@
 //! Shared runnable Agent CLI driver used by both installed executables.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -12,13 +13,14 @@ use crate::{
     AgentOperationsError, AgentOperationsOutcome, AgentOperationsRuntime, AgentRuntime,
     AgentRuntimeConfig, AgentRuntimeOutcome, AgentTlsConfig, AgentTlsConfigError,
     AgentTlsReloadBootstrapError, AgentTlsReloadConfig, AgentTlsReloadRuntime,
-    AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, PublicReachabilityConfig,
+    AgentTransportSecurity, EnrollmentClientConfig, HostnameClientConfig, MultiAgentRuntime,
+    MultiAgentRuntimeError, MultiAgentRuntimeOutcome, PublicReachabilityConfig,
     PublicReachabilityError, PublicReachabilityMonitorConfig, PublicReachabilityProbe,
     PublicReachabilityState, RuntimeShutdownConfig, DEFAULT_PUBLIC_REACHABILITY_ATTEMPT_TIMEOUT,
     DEFAULT_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, DEFAULT_PUBLIC_REACHABILITY_RETRY_INTERVAL,
-    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD,
-    MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL, MAX_PUBLIC_REACHABILITY_TIMEOUT,
-    MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
+    DEFAULT_PUBLIC_REACHABILITY_TIMEOUT, MAX_MANAGED_HTTP_TUNNELS,
+    MAX_PUBLIC_REACHABILITY_FAILURE_THRESHOLD, MAX_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
+    MAX_PUBLIC_REACHABILITY_TIMEOUT, MIN_PUBLIC_REACHABILITY_MONITOR_INTERVAL,
 };
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -52,12 +54,13 @@ const USAGE_TEMPLATE: &str = "\
 Usage:
   tunnelproxy-agent [OPTIONS]
   tunnelproxy-agent http <port> [OPTIONS]
+  tunnelproxy-agent start [--config <path>] [OPTIONS]
   tunnelproxy-agent config validate [--config <path>]
   tunnelproxy-agent hostname-allocate [OPTIONS]
   tunnelproxy-agent hostname-release [OPTIONS]
 
 Options:
-  --config <path>                strict local Agent config v1
+  --config <path>                strict local Agent config v1/v2
   --edge <addr>                  Edge address  (default 127.0.0.1:7100)
   --local <addr>                 local service (default 127.0.0.1:3000)
   --agent-id <id>                durable Agent ID (default agent-dev)
@@ -119,10 +122,15 @@ Managed HTTP options:
   --public-reachability-failure-threshold <n> failures before unready (default 3)
   Uses the common Edge, Agent identity, TLS, reconnect, enrollment, and
   operations options above. The managed hostname remains allocated on exit.
+Multi-tunnel options:
+  start requires config v2 with 1..16 unique TunnelIds and loopback ports.
+  Shared CLI options override shared config; --local, --tunnel-id, and
+  --enroll-only are rejected. Each tunnel uses one Agent transport.
   --help                         print this help and exit
 ";
 
 const AGENT_CONFIG_VERSION: u32 = 1;
+const MULTI_AGENT_CONFIG_VERSION: u32 = 2;
 const MAX_AGENT_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_PUBLIC_REACHABILITY_CA_BYTES: u64 = 1024 * 1024;
 
@@ -135,6 +143,45 @@ struct AgentConfigFile {
     identity: AgentConfigIdentity,
     #[serde(default)]
     public_reachability: Option<AgentConfigPublicReachability>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultiAgentConfigFile {
+    version: u32,
+    edge: AgentConfigEdge,
+    hostname: AgentConfigHostname,
+    identity: MultiAgentConfigIdentity,
+    tunnels: Vec<AgentConfigTunnel>,
+    #[serde(default)]
+    public_reachability: Option<AgentConfigPublicReachability>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultiAgentConfigIdentity {
+    agent_id: String,
+    client_certificate: PathBuf,
+    client_private_key: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigTunnel {
+    tunnel_id: String,
+    local_port: u16,
+}
+
+#[derive(Debug)]
+enum AgentConfigDocument {
+    Single(AgentConfigFile),
+    Multi(MultiAgentConfigFile),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedTunnelSpec {
+    tunnel_id: TunnelId,
+    local: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,8 +240,13 @@ enum AgentConfigError {
     TooLarge,
     InvalidSchema,
     UnsupportedVersion,
+    VersionRequiresCommand,
     InvalidAddress(&'static str),
     InvalidIdentifier(&'static str),
+    EmptyTunnels,
+    TooManyTunnels,
+    DuplicateTunnel,
+    ZeroLocalPort,
     EmptyPath(&'static str),
     InvalidTls,
 }
@@ -208,12 +260,17 @@ impl std::fmt::Display for AgentConfigError {
             Self::TooLarge => "Agent config file exceeds the 64 KiB limit",
             Self::InvalidSchema => "Agent config schema is invalid",
             Self::UnsupportedVersion => "Agent config version is unsupported",
+            Self::VersionRequiresCommand => "Agent config version does not support this command",
             Self::InvalidAddress(kind) => {
                 return write!(formatter, "Agent config {kind} address is invalid")
             }
             Self::InvalidIdentifier(kind) => {
                 return write!(formatter, "Agent config {kind} is invalid")
             }
+            Self::EmptyTunnels => "Agent config must contain at least one tunnel",
+            Self::TooManyTunnels => "Agent config exceeds the 16-tunnel limit",
+            Self::DuplicateTunnel => "Agent config contains a duplicate TunnelId",
+            Self::ZeroLocalPort => "Agent config tunnel local_port must be greater than zero",
             Self::EmptyPath(kind) => return write!(formatter, "Agent config {kind} path is empty"),
             Self::InvalidTls => "Agent config TLS material is invalid",
         })
@@ -287,7 +344,7 @@ fn select_config_path(explicit: Option<&Path>) -> Result<SelectedConfigPath, Age
     )
 }
 
-async fn load_agent_config(path: &Path) -> Result<AgentConfigFile, AgentConfigError> {
+async fn load_agent_config(path: &Path) -> Result<AgentConfigDocument, AgentConfigError> {
     let file = tokio::fs::File::open(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AgentConfigError::NotFound
@@ -306,13 +363,19 @@ async fn load_agent_config(path: &Path) -> Result<AgentConfigFile, AgentConfigEr
     parse_agent_config(&bytes)
 }
 
-fn parse_agent_config(bytes: &[u8]) -> Result<AgentConfigFile, AgentConfigError> {
-    let config: AgentConfigFile =
+fn parse_agent_config(bytes: &[u8]) -> Result<AgentConfigDocument, AgentConfigError> {
+    if let Ok(config) = serde_json::from_slice::<AgentConfigFile>(bytes) {
+        if config.version != AGENT_CONFIG_VERSION {
+            return Err(AgentConfigError::UnsupportedVersion);
+        }
+        return Ok(AgentConfigDocument::Single(config));
+    }
+    let config: MultiAgentConfigFile =
         serde_json::from_slice(bytes).map_err(|_| AgentConfigError::InvalidSchema)?;
-    if config.version != AGENT_CONFIG_VERSION {
+    if config.version != MULTI_AGENT_CONFIG_VERSION {
         return Err(AgentConfigError::UnsupportedVersion);
     }
-    Ok(config)
+    Ok(AgentConfigDocument::Multi(config))
 }
 
 fn resolve_config_relative_path(config_path: &Path, value: PathBuf) -> PathBuf {
@@ -339,31 +402,92 @@ fn apply_agent_config(
     config_path: &Path,
     config: AgentConfigFile,
 ) -> Result<(), AgentConfigError> {
-    let public_reachability = config.public_reachability;
-    let edge = config
-        .edge
+    let tunnel_id = TunnelId::new(&config.identity.tunnel_id)
+        .map_err(|_| AgentConfigError::InvalidIdentifier("TunnelId"))?;
+    if !parsed.tunnel_id_explicit {
+        parsed.tunnel_id = tunnel_id;
+    }
+    apply_shared_agent_config(
+        parsed,
+        config_path,
+        config.edge,
+        config.hostname,
+        config.identity.agent_id,
+        config.identity.client_certificate,
+        config.identity.client_private_key,
+        config.public_reachability,
+    )
+}
+
+fn apply_multi_agent_config(
+    parsed: &mut ParsedArgs,
+    config_path: &Path,
+    config: MultiAgentConfigFile,
+) -> Result<Vec<ManagedTunnelSpec>, AgentConfigError> {
+    if config.tunnels.is_empty() {
+        return Err(AgentConfigError::EmptyTunnels);
+    }
+    if config.tunnels.len() > MAX_MANAGED_HTTP_TUNNELS {
+        return Err(AgentConfigError::TooManyTunnels);
+    }
+    let mut seen = HashSet::with_capacity(config.tunnels.len());
+    let mut tunnels = Vec::with_capacity(config.tunnels.len());
+    for tunnel in config.tunnels {
+        let tunnel_id = TunnelId::new(&tunnel.tunnel_id)
+            .map_err(|_| AgentConfigError::InvalidIdentifier("TunnelId"))?;
+        if !seen.insert(tunnel_id.clone()) {
+            return Err(AgentConfigError::DuplicateTunnel);
+        }
+        if tunnel.local_port == 0 {
+            return Err(AgentConfigError::ZeroLocalPort);
+        }
+        tunnels.push(ManagedTunnelSpec {
+            tunnel_id,
+            local: SocketAddr::from(([127, 0, 0, 1], tunnel.local_port)),
+        });
+    }
+    apply_shared_agent_config(
+        parsed,
+        config_path,
+        config.edge,
+        config.hostname,
+        config.identity.agent_id,
+        config.identity.client_certificate,
+        config.identity.client_private_key,
+        config.public_reachability,
+    )?;
+    Ok(tunnels)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_shared_agent_config(
+    parsed: &mut ParsedArgs,
+    config_path: &Path,
+    edge_config: AgentConfigEdge,
+    hostname_config: AgentConfigHostname,
+    agent_id_raw: String,
+    client_certificate_path: PathBuf,
+    client_private_key_path: PathBuf,
+    public_reachability: Option<AgentConfigPublicReachability>,
+) -> Result<(), AgentConfigError> {
+    let edge = edge_config
         .address
         .parse::<SocketAddr>()
         .map_err(|_| AgentConfigError::InvalidAddress("Edge"))?;
-    let hostname = config
-        .hostname
+    let hostname = hostname_config
         .address
         .parse::<SocketAddr>()
         .map_err(|_| AgentConfigError::InvalidAddress("hostname service"))?;
-    let agent_id = AgentId::new(&config.identity.agent_id)
-        .map_err(|_| AgentConfigError::InvalidIdentifier("AgentId"))?;
-    let tunnel_id = TunnelId::new(&config.identity.tunnel_id)
-        .map_err(|_| AgentConfigError::InvalidIdentifier("TunnelId"))?;
-    require_nonempty_path(&config.edge.ca, "Edge CA")?;
-    require_nonempty_path(&config.hostname.ca, "hostname CA")?;
-    require_nonempty_path(&config.identity.client_certificate, "client certificate")?;
-    require_nonempty_path(&config.identity.client_private_key, "client private key")?;
-    let edge_ca = resolve_config_relative_path(config_path, config.edge.ca);
-    let hostname_ca = resolve_config_relative_path(config_path, config.hostname.ca);
-    let client_certificate =
-        resolve_config_relative_path(config_path, config.identity.client_certificate);
-    let client_private_key =
-        resolve_config_relative_path(config_path, config.identity.client_private_key);
+    let agent_id =
+        AgentId::new(&agent_id_raw).map_err(|_| AgentConfigError::InvalidIdentifier("AgentId"))?;
+    require_nonempty_path(&edge_config.ca, "Edge CA")?;
+    require_nonempty_path(&hostname_config.ca, "hostname CA")?;
+    require_nonempty_path(&client_certificate_path, "client certificate")?;
+    require_nonempty_path(&client_private_key_path, "client private key")?;
+    let edge_ca = resolve_config_relative_path(config_path, edge_config.ca);
+    let hostname_ca = resolve_config_relative_path(config_path, hostname_config.ca);
+    let client_certificate = resolve_config_relative_path(config_path, client_certificate_path);
+    let client_private_key = resolve_config_relative_path(config_path, client_private_key_path);
 
     if !parsed.edge_explicit {
         parsed.edge = edge;
@@ -373,9 +497,6 @@ fn apply_agent_config(
     }
     if !parsed.agent_id_explicit {
         parsed.agent_id = agent_id;
-    }
-    if !parsed.tunnel_id_explicit {
-        parsed.tunnel_id = tunnel_id;
     }
     if !parsed.tls_ca_explicit {
         parsed.tls_ca = Some(edge_ca);
@@ -390,10 +511,10 @@ fn apply_agent_config(
         parsed.tls_client_key = Some(client_private_key);
     }
     if !parsed.tls_server_name_explicit {
-        parsed.tls_server_name = Some(config.edge.server_name);
+        parsed.tls_server_name = Some(edge_config.server_name);
     }
     if !parsed.hostname_server_name_explicit {
-        parsed.hostname_server_name = Some(config.hostname.server_name);
+        parsed.hostname_server_name = Some(hostname_config.server_name);
     }
     if let Some(reachability) = public_reachability {
         if !reachability.enabled
@@ -520,7 +641,10 @@ async fn apply_optional_http_config(parsed: &mut ParsedArgs) -> Result<(), Agent
         Err(error) => return Err(error),
     };
     match load_agent_config(&selected.path).await {
-        Ok(config) => apply_agent_config(parsed, &selected.path, config),
+        Ok(AgentConfigDocument::Single(config)) => {
+            apply_agent_config(parsed, &selected.path, config)
+        }
+        Ok(AgentConfigDocument::Multi(_)) => Err(AgentConfigError::VersionRequiresCommand),
         Err(AgentConfigError::NotFound)
             if selected.source == ConfigPathSource::PlatformDefault
                 && http_configuration_complete(parsed) =>
@@ -567,11 +691,24 @@ impl std::fmt::Display for ConfigValidateError {
 async fn run_config_validate(args: &[String]) -> Result<(), ConfigValidateError> {
     let explicit = parse_config_validate_command(args).map_err(ConfigValidateError::Arguments)?;
     let selected = select_config_path(explicit.as_deref()).map_err(ConfigValidateError::Config)?;
-    let config = load_agent_config(&selected.path)
+    let document = load_agent_config(&selected.path)
         .await
         .map_err(ConfigValidateError::Config)?;
     let mut parsed = ParsedArgs::default();
-    apply_agent_config(&mut parsed, &selected.path, config).map_err(ConfigValidateError::Config)?;
+    let tunnels = match document {
+        AgentConfigDocument::Single(config) => {
+            apply_agent_config(&mut parsed, &selected.path, config)
+                .map_err(ConfigValidateError::Config)?;
+            vec![ManagedTunnelSpec {
+                tunnel_id: parsed.tunnel_id.clone(),
+                local: parsed.local,
+            }]
+        }
+        AgentConfigDocument::Multi(config) => {
+            apply_multi_agent_config(&mut parsed, &selected.path, config)
+                .map_err(ConfigValidateError::Config)?
+        }
+    };
     validate_http_configuration(&parsed).map_err(ConfigValidateError::Arguments)?;
     let loaded = load_transport_security(&parsed)
         .await
@@ -582,12 +719,31 @@ async fn run_config_validate(args: &[String]) -> Result<(), ConfigValidateError>
     load_public_reachability_template(&parsed)
         .await
         .map_err(|_| ConfigValidateError::Config(AgentConfigError::InvalidTls))?;
-    let mut runtime = AgentRuntimeConfig::new(parsed.edge, parsed.local);
-    runtime.registration = RegistrationRequest::new(parsed.agent_id, parsed.tunnel_id);
-    runtime.security = loaded.security;
-    AgentRuntime::new(runtime)
+    let configs = tunnels
+        .into_iter()
+        .map(|tunnel| {
+            let mut runtime = AgentRuntimeConfig::new(parsed.edge, tunnel.local);
+            runtime.registration =
+                RegistrationRequest::new(parsed.agent_id.clone(), tunnel.tunnel_id);
+            runtime.security = loaded.security.clone();
+            runtime
+        })
+        .collect::<Vec<_>>();
+    MultiAgentRuntime::new(configs)
         .map_err(|_| ConfigValidateError::Config(AgentConfigError::InvalidSchema))?;
     Ok(())
+}
+
+async fn apply_required_multi_config(
+    parsed: &mut ParsedArgs,
+) -> Result<Vec<ManagedTunnelSpec>, AgentConfigError> {
+    let selected = select_config_path(parsed.config_path.as_deref())?;
+    match load_agent_config(&selected.path).await? {
+        AgentConfigDocument::Multi(config) => {
+            apply_multi_agent_config(parsed, &selected.path, config)
+        }
+        AgentConfigDocument::Single(_) => Err(AgentConfigError::VersionRequiresCommand),
+    }
 }
 
 /// Runs the shared Agent CLI using the executable name supplied by its wrapper.
@@ -643,6 +799,13 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
                 }
             }
         };
+    }
+    if args.first().map(String::as_str) == Some("start") {
+        if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
+            println!("{}", usage(binary_name));
+            return ExitCode::SUCCESS;
+        }
+        return run_multi_tunnel(binary_name, log_format, &args[1..]).await;
     }
     if matches!(
         (
@@ -953,6 +1116,316 @@ pub async fn run(binary_name: &'static str) -> ExitCode {
     }
 }
 
+async fn run_multi_tunnel(
+    binary_name: &'static str,
+    log_format: ProcessLogFormat,
+    args: &[String],
+) -> ExitCode {
+    let mut parsed = match parse_start_command(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            error!(%error, "invalid multi-tunnel Agent CLI arguments");
+            print_usage_for_error(log_format, binary_name);
+            return ExitCode::from(2);
+        }
+    };
+    if parsed.help {
+        println!("{}", usage(binary_name));
+        return ExitCode::SUCCESS;
+    }
+    let tunnels = match apply_required_multi_config(&mut parsed).await {
+        Ok(tunnels) => tunnels,
+        Err(error) => {
+            error!(%error, "failed to load multi-tunnel Agent config");
+            print_usage_for_error(log_format, binary_name);
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = validate_http_configuration(&parsed) {
+        error!(%error, "invalid multi-tunnel managed HTTP configuration");
+        print_usage_for_error(log_format, binary_name);
+        return ExitCode::from(2);
+    }
+
+    let enrollment_config = match load_enrollment_config(&parsed).await {
+        Ok(config) => config,
+        Err(error) => {
+            error!(%error, "failed to configure Agent enrollment");
+            return ExitCode::from(2);
+        }
+    };
+    let loaded_tls = match load_transport_security(&parsed).await {
+        Ok(security) => security,
+        Err(error) => {
+            error!(%error, "failed to configure Agent TLS");
+            return ExitCode::from(2);
+        }
+    };
+    let enrollment_runtime = match (&enrollment_config, &loaded_tls.security) {
+        (Some(enrollment), AgentTransportSecurity::MutualTls(tls)) => {
+            match AgentEnrollmentRuntime::new(enrollment.clone(), tls.clone()) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    error!(%error, "failed to configure Agent renewal runtime");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        (Some(_), AgentTransportSecurity::PlaintextLoopback) => {
+            error!("automatic renewal requires Agent mutual TLS");
+            return ExitCode::from(2);
+        }
+        (None, _) => None,
+    };
+    let public_reachability = match load_public_reachability_template(&parsed).await {
+        Ok(template) => template,
+        Err(error) => {
+            error!(%error, "failed to configure public reachability verification");
+            return ExitCode::from(2);
+        }
+    };
+    let hostname_client = match load_http_hostname_client(&parsed).await {
+        Ok(client) => client,
+        Err(error) => {
+            let configuration_error = error.is_configuration_error();
+            error!(%error, "failed to configure managed HTTP hostname client");
+            if configuration_error {
+                print_usage_for_error(log_format, binary_name);
+                return ExitCode::from(2);
+            }
+            return ExitCode::from(1);
+        }
+    };
+
+    let configs = tunnels
+        .iter()
+        .map(|tunnel| build_runtime_config(&parsed, tunnel, loaded_tls.security.clone()))
+        .collect();
+    let runtime = match MultiAgentRuntime::new(configs) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            error!(%error, "failed to configure multi-tunnel Agent runtime");
+            return ExitCode::from(2);
+        }
+    };
+    let runtime_statuses = runtime.status_handles();
+    let runtime_control = runtime.control();
+    if let Some(template) = &public_reachability {
+        for status in &runtime_statuses {
+            status.require_public_reachability(template.monitor.is_some());
+        }
+    }
+    let operations = match parsed.ops_listen {
+        Some(listen_addr) => {
+            let mut config = AgentOperationsConfig::loopback(listen_addr);
+            config.max_concurrent_connections = parsed.max_ops_connections;
+            config.header_read_timeout = parsed.ops_header_timeout;
+            config.request_timeout = parsed.ops_request_timeout;
+            config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+            match AgentOperationsRuntime::bind_many(config, runtime_statuses.clone()).await {
+                Ok(runtime) => {
+                    info!(listen_addr = %runtime.local_addr(), "Agent operations endpoint started");
+                    Some(runtime)
+                }
+                Err(error) => {
+                    error!(%error, "failed to start Agent operations endpoint");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut announcements = Vec::with_capacity(tunnels.len());
+    for tunnel in &tunnels {
+        info!(
+            agent_id = %parsed.agent_id,
+            tunnel_id = %tunnel.tunnel_id,
+            event = "managed_http_allocation_started",
+            "Managed HTTP hostname allocation started"
+        );
+        let allocation = match hostname_client
+            .allocate(parsed.agent_id.clone(), tunnel.tunnel_id.clone())
+            .await
+        {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                error!(
+                    tunnel_id = %tunnel.tunnel_id,
+                    %error,
+                    "managed HTTP hostname allocation failed"
+                );
+                return ExitCode::from(1);
+            }
+        };
+        info!(
+            hostname = %allocation.hostname,
+            catalog_version = allocation.catalog_version,
+            changed = allocation.changed,
+            event = "managed_http_hostname_published",
+            "Managed HTTP hostname is durable and published"
+        );
+        announcements.push(ManagedHttpAnnouncement {
+            probe: public_reachability
+                .as_ref()
+                .map(|template| template.build(allocation.hostname.clone()))
+                .transpose()
+                .expect("public reachability template was prevalidated"),
+            monitor: public_reachability
+                .as_ref()
+                .and_then(|template| template.monitor),
+            hostname: allocation.hostname,
+            local: tunnel.local,
+        });
+    }
+
+    for tunnel in &tunnels {
+        info!(
+            edge = %parsed.edge,
+            local = %tunnel.local,
+            agent_id = %parsed.agent_id,
+            tunnel_id = %tunnel.tunnel_id,
+            "Agent tunnel runtime starting"
+        );
+    }
+
+    let readiness = announcements
+        .into_iter()
+        .zip(runtime_statuses)
+        .collect::<Vec<_>>();
+    let (trigger, signal) = shutdown_channel();
+    let (operations_trigger, operations_signal) = shutdown_channel();
+    let readiness_future = run_multi_managed_http_readiness(readiness, signal.clone());
+    tokio::pin!(readiness_future);
+    let runtime_future = runtime.run_until_shutdown(signal.clone());
+    tokio::pin!(runtime_future);
+    let reload_future = run_optional_tls_reloader(loaded_tls.reloader, signal.clone());
+    tokio::pin!(reload_future);
+    let enrollment_future = run_optional_enrollment(enrollment_runtime, signal.clone());
+    tokio::pin!(enrollment_future);
+    let operations_future = run_optional_operations(operations, operations_signal);
+    tokio::pin!(operations_future);
+    let os_signal = wait_for_process_shutdown();
+    tokio::pin!(os_signal);
+    tokio::select! {
+        result = &mut runtime_future => {
+            trigger.shutdown();
+            let _ = readiness_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            operations_trigger.shutdown();
+            combine_exit_codes(multi_agent_exit_code(result), operations_future.await)
+        },
+        reload = &mut reload_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = readiness_future.await;
+            let _ = runtime_future.await;
+            let _ = enrollment_future.await;
+            operations_trigger.shutdown();
+            let code = match reload {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(%error, "Agent TLS reload runtime failed");
+                    ExitCode::from(1)
+                }
+            };
+            combine_exit_codes(code, operations_future.await)
+        },
+        enrollment = &mut enrollment_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = readiness_future.await;
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            operations_trigger.shutdown();
+            let code = match enrollment {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(%error, "Agent enrollment runtime failed");
+                    ExitCode::from(1)
+                }
+            };
+            combine_exit_codes(code, operations_future.await)
+        },
+        operations = &mut operations_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = readiness_future.await;
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            combine_exit_codes(ExitCode::from(1), operations)
+        },
+        observed = &mut os_signal => {
+            match observed {
+                Ok(cause) => info!(%cause, "process shutdown requested"),
+                Err(error) => {
+                    error!(%error, "OS shutdown listener failed");
+                    runtime_control.begin_draining();
+                    trigger.shutdown();
+                    let _ = readiness_future.await;
+                    let _ = runtime_future.await;
+                    let _ = reload_future.await;
+                    let _ = enrollment_future.await;
+                    operations_trigger.shutdown();
+                    return combine_exit_codes(ExitCode::from(1), operations_future.await);
+                }
+            }
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = readiness_future.await;
+            let result = runtime_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            operations_trigger.shutdown();
+            combine_exit_codes(multi_agent_exit_code(result), operations_future.await)
+        },
+        readiness = &mut readiness_future => {
+            runtime_control.begin_draining();
+            trigger.shutdown();
+            let _ = runtime_future.await;
+            let _ = reload_future.await;
+            let _ = enrollment_future.await;
+            operations_trigger.shutdown();
+            let code = match readiness {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    error!(
+                        %error,
+                        event = "managed_http_public_reachability_failed",
+                        "Multi-tunnel public reachability verification failed"
+                    );
+                    ExitCode::from(1)
+                }
+            };
+            combine_exit_codes(code, operations_future.await)
+        }
+    }
+}
+
+fn build_runtime_config(
+    parsed: &ParsedArgs,
+    tunnel: &ManagedTunnelSpec,
+    security: AgentTransportSecurity,
+) -> AgentRuntimeConfig {
+    let mut config = AgentRuntimeConfig::new(parsed.edge, tunnel.local);
+    config.connect_timeout = parsed.connect_timeout;
+    config.handshake_timeout = parsed.handshake_timeout;
+    config.multiplex.max_concurrent_streams = parsed.max_streams;
+    config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
+    config.reconnect.initial_delay = parsed.reconnect_initial;
+    config.reconnect.max_delay = parsed.reconnect_max;
+    config.reconnect.multiplier = parsed.reconnect_multiplier;
+    config.reconnect.jitter_percent = parsed.reconnect_jitter_percent;
+    config.reconnect.stable_session_reset_after = parsed.stable_session_reset;
+    config.reconnect.max_attempts = parsed.max_reconnect_attempts;
+    config.registration =
+        RegistrationRequest::new(parsed.agent_id.clone(), tunnel.tunnel_id.clone());
+    config.security = security;
+    config
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunMode {
     Tunnel,
@@ -1182,6 +1655,30 @@ async fn run_optional_managed_http_readiness(
             Ok(())
         }
     }
+}
+
+async fn run_multi_managed_http_readiness(
+    announcements: Vec<(ManagedHttpAnnouncement, crate::AgentRuntimeStatusHandle)>,
+    signal: ShutdownSignal,
+) -> Result<(), PublicReachabilityError> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (announcement, status) in announcements {
+        let child_signal = signal.clone();
+        tasks.spawn(async move {
+            announce_managed_http_ready(announcement, status, child_signal).await
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) if signal.is_shutdown() => {}
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(_)) if signal.is_shutdown() => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) if signal.is_shutdown() => {}
+            Err(_) => return Err(PublicReachabilityError::Cancelled { attempts: 0 }),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1471,6 +1968,31 @@ fn agent_exit_code(result: Result<AgentRuntimeOutcome, crate::AgentRuntimeError>
     }
 }
 
+fn multi_agent_exit_code(
+    result: Result<MultiAgentRuntimeOutcome, MultiAgentRuntimeError>,
+) -> ExitCode {
+    match result {
+        Ok(outcome) if outcome.is_graceful_shutdown() => {
+            info!(
+                tunnels = outcome.tunnels.len(),
+                "Multi-tunnel Agent shutdown completed"
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(outcome) => {
+            error!(
+                tunnels = outcome.tunnels.len(),
+                "Multi-tunnel Agent stopped unexpectedly"
+            );
+            ExitCode::from(1)
+        }
+        Err(error) => {
+            error!(%error, "Multi-tunnel Agent runtime failed");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedArgs {
     config_path: Option<PathBuf>,
@@ -1634,6 +2156,9 @@ enum ArgError {
     HttpLocalConflict,
     HttpEnrollOnlyConflict,
     HttpRequiresMutualTls,
+    StartLocalConflict,
+    StartTunnelConflict,
+    StartEnrollOnlyConflict,
     IncompleteHostnameOptions,
     HostnameOptionsRequireHttp,
     ConfigRequiresHttp,
@@ -1673,17 +2198,26 @@ impl std::fmt::Display for ArgError {
             Self::HttpRequiresMutualTls => f.write_str(
                 "http <port> requires --tls-ca, --tls-client-cert, --tls-client-key, and --tls-server-name",
             ),
+            Self::StartLocalConflict => {
+                f.write_str("start reads local ports from config v2 and rejects --local")
+            }
+            Self::StartTunnelConflict => {
+                f.write_str("start reads TunnelIds from config v2 and rejects --tunnel-id")
+            }
+            Self::StartEnrollOnlyConflict => {
+                f.write_str("start cannot be combined with --enroll-only")
+            }
             Self::IncompleteHostnameOptions => f.write_str(
                 "http <port> requires --hostname-server, --hostname-ca, and --hostname-server-name",
             ),
             Self::HostnameOptionsRequireHttp => {
-                f.write_str("managed HTTP hostname options require the http <port> command")
+                f.write_str("managed HTTP hostname options require http <port> or start")
             }
             Self::ConfigRequiresHttp => {
-                f.write_str("--config is supported by http <port> and config validate")
+                f.write_str("--config is supported by http <port>, start, and config validate")
             }
             Self::PublicReachabilityRequiresHttp => {
-                f.write_str("public reachability options require the http <port> command")
+                f.write_str("public reachability options require http <port> or start")
             }
             Self::PublicReachabilityOptionsWithoutOptIn => {
                 f.write_str("public reachability tuning requires --verify-public-reachability")
@@ -1703,6 +2237,23 @@ impl std::fmt::Display for ArgError {
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
         }
     }
+}
+
+fn parse_start_command(args: &[String]) -> Result<ParsedArgs, ArgError> {
+    let mut parsed = parse_args(args)?;
+    if parsed.local_explicit {
+        return Err(ArgError::StartLocalConflict);
+    }
+    if parsed.tunnel_id_explicit {
+        return Err(ArgError::StartTunnelConflict);
+    }
+    if parsed.enroll_only {
+        return Err(ArgError::StartEnrollOnlyConflict);
+    }
+    // A v2 profile is always managed HTTP, including values supplied by the
+    // config after this initial CLI-only validation.
+    parsed.local_explicit = false;
+    Ok(parsed)
 }
 
 fn parse_run_command(args: &[String]) -> Result<(RunMode, ParsedArgs), ArgError> {
@@ -2485,6 +3036,143 @@ mod tests {
         }"#
     }
 
+    fn valid_multi_config_json() -> &'static [u8] {
+        br#"{
+            "version": 2,
+            "edge": {
+                "address": "127.0.0.1:17100",
+                "ca": "edge-ca.pem",
+                "server_name": "edge.test"
+            },
+            "hostname": {
+                "address": "127.0.0.1:17400",
+                "ca": "hostname-ca.pem",
+                "server_name": "control.test"
+            },
+            "identity": {
+                "agent_id": "agent-profile",
+                "client_certificate": "agent.pem",
+                "client_private_key": "agent-key.pem"
+            },
+            "tunnels": [
+                { "tunnel_id": "tunnel-a", "local_port": 3000 },
+                { "tunnel_id": "tunnel-b", "local_port": 3001 }
+            ]
+        }"#
+    }
+
+    #[test]
+    fn multi_config_is_strict_bounded_and_resolves_loopback_tunnels() {
+        let AgentConfigDocument::Multi(config) =
+            parse_agent_config(valid_multi_config_json()).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        let mut parsed = ParsedArgs::default();
+        let config_path = PathBuf::from("profiles").join("config.json");
+        let tunnels = apply_multi_agent_config(&mut parsed, &config_path, config).unwrap();
+        assert_eq!(
+            tunnels,
+            vec![
+                ManagedTunnelSpec {
+                    tunnel_id: TunnelId::new("tunnel-a").unwrap(),
+                    local: "127.0.0.1:3000".parse().unwrap(),
+                },
+                ManagedTunnelSpec {
+                    tunnel_id: TunnelId::new("tunnel-b").unwrap(),
+                    local: "127.0.0.1:3001".parse().unwrap(),
+                },
+            ]
+        );
+        assert_eq!(parsed.agent_id.as_str(), "agent-profile");
+        assert_eq!(parsed.tls_ca, Some(PathBuf::from("profiles/edge-ca.pem")));
+
+        let duplicate = String::from_utf8(valid_multi_config_json().to_vec())
+            .unwrap()
+            .replace("tunnel-b", "tunnel-a");
+        let AgentConfigDocument::Multi(config) = parse_agent_config(duplicate.as_bytes()).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        assert!(matches!(
+            apply_multi_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config),
+            Err(AgentConfigError::DuplicateTunnel)
+        ));
+
+        let zero = String::from_utf8(valid_multi_config_json().to_vec())
+            .unwrap()
+            .replace("\"local_port\": 3000", "\"local_port\": 0");
+        let AgentConfigDocument::Multi(config) = parse_agent_config(zero.as_bytes()).unwrap()
+        else {
+            panic!("expected config v2");
+        };
+        assert!(matches!(
+            apply_multi_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config),
+            Err(AgentConfigError::ZeroLocalPort)
+        ));
+
+        let make_config = |tunnels| MultiAgentConfigFile {
+            version: MULTI_AGENT_CONFIG_VERSION,
+            edge: AgentConfigEdge {
+                address: "127.0.0.1:7100".to_owned(),
+                ca: PathBuf::from("edge-ca.pem"),
+                server_name: "edge.test".to_owned(),
+            },
+            hostname: AgentConfigHostname {
+                address: "127.0.0.1:7400".to_owned(),
+                ca: PathBuf::from("hostname-ca.pem"),
+                server_name: "control.test".to_owned(),
+            },
+            identity: MultiAgentConfigIdentity {
+                agent_id: "agent-profile".to_owned(),
+                client_certificate: PathBuf::from("agent.pem"),
+                client_private_key: PathBuf::from("agent-key.pem"),
+            },
+            tunnels,
+            public_reachability: None,
+        };
+        assert!(matches!(
+            apply_multi_agent_config(
+                &mut ParsedArgs::default(),
+                Path::new("config.json"),
+                make_config(Vec::new()),
+            ),
+            Err(AgentConfigError::EmptyTunnels)
+        ));
+        let too_many = (0..=MAX_MANAGED_HTTP_TUNNELS)
+            .map(|index| AgentConfigTunnel {
+                tunnel_id: format!("tunnel-{index}"),
+                local_port: 3000,
+            })
+            .collect();
+        assert!(matches!(
+            apply_multi_agent_config(
+                &mut ParsedArgs::default(),
+                Path::new("config.json"),
+                make_config(too_many),
+            ),
+            Err(AgentConfigError::TooManyTunnels)
+        ));
+    }
+
+    #[test]
+    fn start_command_reserves_tunnel_shape_for_config_v2() {
+        let parsed = parse_start_command(&args(&["--config", "profile.json"])).unwrap();
+        assert_eq!(parsed.config_path, Some(PathBuf::from("profile.json")));
+        assert!(matches!(
+            parse_start_command(&args(&["--local", "127.0.0.1:3000"])),
+            Err(ArgError::StartLocalConflict)
+        ));
+        assert!(matches!(
+            parse_start_command(&args(&["--tunnel-id", "tunnel-a"])),
+            Err(ArgError::StartTunnelConflict)
+        ));
+        assert!(matches!(
+            parse_start_command(&args(&["--enroll-only"])),
+            Err(ArgError::StartEnrollOnlyConflict)
+        ));
+    }
+
     #[test]
     fn strict_config_layers_relative_paths_below_explicit_cli_values() {
         let config_json = String::from_utf8(valid_config_json().to_vec())
@@ -2493,7 +3181,11 @@ mod tests {
                 "\n            }\n        }",
                 "\n            },\n            \"public_reachability\": {\n                \"enabled\": true,\n                \"ca\": \"probe-ca.pem\",\n                \"timeout_ms\": 9000,\n                \"monitor_interval_ms\": 10000,\n                \"failure_threshold\": 4\n            }\n        }",
             );
-        let config = parse_agent_config(config_json.as_bytes()).unwrap();
+        let AgentConfigDocument::Single(config) =
+            parse_agent_config(config_json.as_bytes()).unwrap()
+        else {
+            panic!("expected config v1");
+        };
         let mut parsed = parse_args(&args(&[
             "--edge",
             "127.0.0.1:27100",
@@ -2570,7 +3262,11 @@ mod tests {
                 "\n            }\n        }",
                 "\n            },\n            \"public_reachability\": {\n                \"enabled\": false,\n                \"monitor_interval_ms\": 10000\n            }\n        }",
             );
-        let config = parse_agent_config(disabled_monitor.as_bytes()).unwrap();
+        let AgentConfigDocument::Single(config) =
+            parse_agent_config(disabled_monitor.as_bytes()).unwrap()
+        else {
+            panic!("expected config v1");
+        };
         assert!(matches!(
             apply_agent_config(&mut ParsedArgs::default(), Path::new("config.json"), config,),
             Err(AgentConfigError::InvalidSchema)

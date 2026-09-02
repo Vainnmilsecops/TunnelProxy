@@ -1190,3 +1190,32 @@ optionally set `--signed-access-reload-interval-ms` (default 1000). Generation
 numbers must be non-zero and strictly increase. After issuers have moved to
 key 2 and the maximum old-token lifetime has elapsed, publish a key-2-only
 ring at generation 3. At most eight keys may overlap.
+
+## 35. Running a bounded multi-tunnel Agent process
+
+Create config v2 as documented in `docs/AGENT_CONFIG.md`. The shared identity
+must be authorized for every listed TunnelId, and Edge must allow at least the
+same number of Agent sessions. Validate the whole profile without network I/O:
+
+```text
+tunnelproxy config validate --config ./config-v2.json
+```
+
+Then start all managed HTTP tunnels:
+
+```text
+tunnelproxy start --config ./config-v2.json
+```
+
+The profile accepts 1â€“16 unique TunnelIds and non-zero local ports. Each entry
+runs the existing reconnecting Agent runtime on its own transport, so no
+Tunnel Protocol change is involved. Shared CLI flags may override shared
+endpoint, identity, TLS, reconnect, operations, and reachability settings;
+`--local`, `--tunnel-id`, and `--enroll-only` are rejected in this mode.
+
+For local validation, run two HTTP servers on the configured loopback ports,
+set Edge `--max-agent-sessions` to at least two, and verify both printed public
+hostnames return their corresponding response bodies. Restart Edge to exercise
+reconnect. `/readyz` must remain false until the full configured set and any
+public proofs are ready; terminal failure of one child drains the process.
+Config v1 remains the rollback path through `tunnelproxy http <port>`.

@@ -1438,3 +1438,30 @@ one-shot users retain their reconnect behavior. Detection and recovery latency
 are bounded by the chosen interval plus one attempt. External alert delivery,
 persistent history, distributed probe locations, DNS/certificate provisioning,
 and multi-edge aggregation remain separate work.
+
+## ADR-053 â€” Multi-tunnel Agent orchestration uses bounded independent transports
+
+**Status:** Accepted (Session 53).
+
+**Context:** Edge routing and certificate authorization already support many
+TunnelIds, but the canonical Agent process accepts exactly one TunnelId and
+local port. Extending Protocol v2 registration to mutate one live transport
+would couple stream routing, authorization, reconnect, and compatibility in a
+single large wire change.
+
+**Decision:** Add strict config v2 with one shared identity and 1â€“16 unique
+managed HTTP tunnel entries. `tunnelproxy start` creates one existing
+`AgentRuntime` and one Protocol v2 registration per entry, sharing only the
+process-level TLS reload, enrollment, operations, and shutdown supervisors.
+Transient failures reconnect per child. Terminal child failure fails closed,
+marks aggregate readiness false, and drains the full set. Aggregate operations
+metrics use counts and sums without identity labels. Config v1 and
+`http <port>` remain unchanged and command/version mismatches are rejected.
+
+**Consequences:** One local process can publish multiple managed URLs without
+a Tunnel Protocol or Edge routing change, and a transient session loss does
+not interrupt sibling transports. The Edge session ceiling and total stream
+capacity must account for every configured tunnel. Hostname allocation remains
+durable on partial failure. Hot add/remove, partial-success terminal policy,
+per-tunnel identities, multiple registrations on one transport, DNS/public
+certificate automation, and multi-edge ownership remain separate work.

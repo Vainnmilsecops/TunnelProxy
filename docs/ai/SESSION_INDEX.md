@@ -1662,3 +1662,28 @@ Out of scope:
 - Persistent health history, external alerts, distributed vantage-point
   probes, DNS/public-certificate provisioning, custom domains, multi-edge
   aggregation/ownership, and Tunnel Protocol changes.
+
+## Session 53 â€” Bounded Multi-Tunnel Managed HTTP Agent â€” complete
+
+- Added strict config v2 and `tunnelproxy start` for 1â€“16 unique managed HTTP
+  TunnelIds with bounded loopback local ports, while retaining config v1 and
+  `tunnelproxy http <port>` compatibility.
+- Added a fail-closed `MultiAgentRuntime` that composes one existing Protocol
+  v2 transport per tunnel. Transient reconnect stays child-local; terminal
+  failure triggers shared shutdown and bounded drain.
+- Kept TLS reload, credential renewal, hostname service, operations, OS
+  shutdown, and process exit under one shared owner. Durable hostname
+  allocations remain explicit and are never rolled back implicitly.
+- Added per-tunnel URL readiness/probing plus aggregate all-tunnels `/readyz`.
+  Metrics expose configured/ready counts, fixed state counts, and summed
+  telemetry without identity dimensions.
+- Added parser, bounds, command/version separation, config-v1 regression,
+  operations aggregation, supervisor lifecycle, and real mTLS/public-TLS E2E
+  coverage routing two hostnames to two distinct local services. The workspace
+  contains 412 explicit tests.
+
+Out of scope:
+
+- Multiple registrations on one Agent transport, hot profile mutation,
+  partial-success terminal policy, per-tunnel identities/policies, automatic
+  DNS/public certificates, custom domains, and multi-edge ownership.

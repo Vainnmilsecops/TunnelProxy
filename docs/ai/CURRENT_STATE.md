@@ -487,6 +487,9 @@
   unknown/duplicate fields and unsupported versions fail closed. Relative
   paths resolve from the config directory, and layering is CLI over config over
   defaults with deterministic explicit/environment/platform path selection.
+- Strict config v2 moves tunnel shape into a bounded 1â€“16 entry list for
+  `tunnelproxy start`; shared identity, endpoints, TLS paths, public
+  reachability policy, and offline validation retain the v1 trust boundary.
 - `tunnelproxy config validate` performs bounded offline schema, runtime, path,
   and dual-TLS validation without network access or durable mutation.
 - The Control Plane may expose an independent bounded mutual-TLS route service
@@ -540,6 +543,26 @@
   real-TLS route-loss/re-registration/recovery coverage. The workspace contains
   405 explicit tests.
 
+## Session 53 delivered
+
+- Added strict config v2 and `tunnelproxy start` for 1â€“16 unique managed HTTP
+  TunnelIds with non-zero loopback local ports. Config v1 and
+  `tunnelproxy http <port>` remain compatible and command/version mismatches
+  fail before network or durable mutation.
+- Added `MultiAgentRuntime`, composing one existing Protocol v2 transport per
+  tunnel. Transient failures retain child-local reconnect; terminal child
+  failure triggers shared bounded drain. TLS reload, enrollment, operations,
+  OS shutdown, and exit remain single process-level owners.
+- Allocates each durable hostname, prints each mapping only after its child is
+  ready, and applies optional startup/continuous reachability independently.
+  Aggregate `/readyz` requires every child; `/healthz` remains process health.
+- Added fixed-cardinality configured/ready tunnel gauges, state counts, and
+  summed connection/reachability/transport telemetry without hostname or
+  identity labels.
+- Added strict parser/bounds/compatibility, supervisor/aggregation, offline
+  config validation, and real-mTLS/public-TLS two-hostname-to-two-local-service
+  coverage. The workspace contains 412 explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -554,7 +577,8 @@
   Session 35 implements bounded process-local frame round-robin scheduling;
   Sessions 36–37 expose saturation/fairness measurements plus their live
   capacity denominator and operator decision guide.
-- Multiple tunnel registrations on one Agent transport.
+- Multiple tunnel registrations on one Agent transport. Session 53 runs
+  multiple managed tunnels over bounded independent transports instead.
 - Automatic account/profile creation, inline secret custody, named profiles,
   and wildcard DNS/public TLS provisioning. The canonical
   `tunnelproxy http <port>` executable, strict path-based local config, and
@@ -581,7 +605,7 @@
 
 ## Next planned session
 
-Session 53 has not been selected. DNS/public-certificate automation and
+Session 54 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

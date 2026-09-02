@@ -75,6 +75,7 @@ fn managed_http_help_and_configuration_errors_preserve_cli_contracts() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     assert!(stdout.contains("tunnelproxy-agent http <port> [OPTIONS]"));
+    assert!(stdout.contains("tunnelproxy-agent start [--config <path>] [OPTIONS]"));
     assert!(stdout.contains("managed hostname remains allocated on exit"));
     assert!(help.stderr.is_empty());
 
@@ -169,6 +170,71 @@ fn canonical_binary_uses_its_own_name_and_validates_config_without_network() {
         hostname.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
     ));
+    let v1_start = Command::new(canonical_binary())
+        .args(["start", "--config"])
+        .arg(&config)
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert_eq!(v1_start.status.code(), Some(2));
+
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+                "version": 2,
+                "edge": {{
+                    "address": "{}",
+                    "ca": "ca.pem",
+                    "server_name": "edge.test"
+                }},
+                "hostname": {{
+                    "address": "{}",
+                    "ca": "ca.pem",
+                    "server_name": "control.test"
+                }},
+                "identity": {{
+                    "agent_id": "agent-profile",
+                    "client_certificate": "agent.pem",
+                    "client_private_key": "agent-key.pem"
+                }},
+                "tunnels": [
+                    {{ "tunnel_id": "tunnel-a", "local_port": 3000 }},
+                    {{ "tunnel_id": "tunnel-b", "local_port": 3001 }}
+                ]
+            }}"#,
+            edge.local_addr().unwrap(),
+            hostname.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let validated_v2 = Command::new(canonical_binary())
+        .args(["config", "validate", "--config"])
+        .arg(&config)
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert!(validated_v2.status.success());
+    assert_eq!(validated_v2.stdout, b"configuration valid\n");
+    assert!(validated_v2.stderr.is_empty());
+    assert!(matches!(
+        edge.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        hostname.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let v2_http = Command::new(canonical_binary())
+        .args(["http", "3000", "--config"])
+        .arg(&config)
+        .env("TUNNELPROXY_LOG_FORMAT", "json")
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert_eq!(v2_http.status.code(), Some(2));
 
     let secret_marker = "INLINE_SECRET_MUST_NOT_BE_LOGGED";
     std::fs::write(&config, format!(r#"{{"secret":"{secret_marker}"}}"#)).unwrap();

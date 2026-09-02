@@ -1206,6 +1206,33 @@ local forwarding semantics are unchanged. Metrics and transition logs contain
 only fixed states/failure classes, never hostnames, identities, challenges, or
 proofs.
 
+### 2.51 Bounded multi-tunnel Agent orchestration (Session 53)
+
+Config v2 separates one shared Agent identity/TLS/service configuration from a
+required list of 1â€“16 unique TunnelIds and loopback local ports.
+`tunnelproxy start` validates the entire set before mutation, then allocates
+each durable managed hostname and creates one normal `AgentRuntime` per entry.
+The transports are independent: Protocol v2 still registers exactly one
+TunnelId on each mTLS connection, so no wire-format or Edge routing change is
+required. The Edge Agent-session limit must be sized for the configured set.
+
+`MultiAgentRuntime` owns every child under one fail-closed supervisor. A
+transient connect/session failure stays inside that child's existing bounded
+reconnect loop. A terminal child error or exhausted reconnect budget triggers
+shared shutdown and bounded drain for the remaining children. TLS generation
+reload, credential renewal, the operations listener, OS shutdown, and process
+exit remain single shared owners rather than one task per tunnel.
+
+Managed hostname readiness runs independently per child. Each URL is printed
+only after that child's registration and optional public proof. Aggregate
+`/readyz` requires all children; `/healthz` remains process liveness. Existing
+connection/reachability/transport metrics are summed, fixed state gauges carry
+counts, and new configured/ready tunnel gauges expose capacity without
+identity labels. Config v1 and `http <port>` preserve their exact single-tunnel
+contract. Hot profile reload, partial-success daemon policy, per-tunnel
+credentials, one-transport multi-registration, DNS/TLS provisioning, and
+multi-edge ownership remain separate work.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

@@ -54,8 +54,8 @@ the separate bounded Enrollment Protocol v1 message codec.
 
 **Current implementation:** Outbound mutual-TLS-or-loopback transport,
 certificate-bound Protocol v2 registration intent, handshake/heartbeat,
-bounded multiplexed local bridging, a runnable reconnecting single-session
-process supervisor/CLI, a bounded loopback operations endpoint with connection
+bounded multiplexed local bridging, runnable reconnecting single-session and
+bounded multi-session process supervisors/CLI, a bounded loopback operations endpoint with connection
 status/metrics, and Agent-owned-key bootstrap/renewal that publishes atomic
 credential manifests. The `http <port>` command composes one authenticated
 managed-hostname allocation with that supervisor and announces the URL after
@@ -67,6 +67,9 @@ credential paths, with offline validation and deterministic layering. Managed
 HTTP can gate stdout on a bounded exact-host public HTTPS proof and optionally
 continue non-overlapping checks that drive fixed-cardinality local readiness
 through pending, degraded, unhealthy, and recovery states.
+Strict config v2 and `tunnelproxy start` compose 1â€“16 managed HTTP tunnels,
+each on an independent transport, while aggregating readiness and
+fixed-cardinality telemetry under one process lifecycle.
 
 **Responsibility (future)**
 
