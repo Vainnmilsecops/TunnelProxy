@@ -67,8 +67,9 @@ correct agent, which in turn proxies them into the local service.
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
   rate limiting.
 - An opt-in loopback-only Agent operations endpoint with bounded admission,
-  session-aware readiness, connection/reconnect metrics, and multiplexed DATA
-  saturation/fairness telemetry including live writer-pipeline capacity.
+  session-aware readiness, a versioned per-tunnel managed HTTP inventory,
+  connection/reconnect metrics, and multiplexed DATA saturation/fairness
+  telemetry including live writer-pipeline capacity.
 - An opt-in loopback-only Control Plane operations endpoint with bounded
   admission, service readiness, and fixed-cardinality snapshot, refresh,
   enrollment, reconciliation, and operations metrics.
@@ -226,6 +227,9 @@ One mapping is printed as each tunnel becomes ready. Aggregate `/readyz` is
 successful only when every configured tunnel is ready. A transient disconnect
 reconnects only its own transport; a terminal child failure drains the set and
 exits non-zero. Edge must allow at least the same number of Agent sessions.
+When `--ops-listen` is enabled, `GET /tunnels` returns the bounded local mapping
+and live state for each managed tunnel; raw tunnel mode intentionally does not
+expose that inventory.
 
 ## Repository structure
 
@@ -325,6 +329,7 @@ and Definition of Done.
 | 51 _(complete)_ | opt-in bounded managed-HTTP public reachability verification |
 | 52 _(complete)_ | continuous public reachability health monitoring and recovery |
 | 53 _(complete)_ | bounded multi-tunnel managed HTTP Agent orchestration |
+| 54 _(complete)_ | bounded loopback per-tunnel managed HTTP operations inventory |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

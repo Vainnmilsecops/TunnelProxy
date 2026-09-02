@@ -1,10 +1,11 @@
 //! Bounded loopback-only Agent health, readiness, and metrics endpoint.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,13 +14,14 @@ use hyper::body::Incoming;
 use hyper::header::{CACHE_CONTROL, CONNECTION, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use tunnelproxy_common::{
-    process_logging_snapshot, MultiplexTelemetrySnapshot, ProcessLoggingSnapshot,
-    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal,
+    process_logging_snapshot, MultiplexTelemetrySnapshot, ProcessLoggingSnapshot, PublicHostname,
+    RuntimeShutdownConfig, RuntimeShutdownOutcome, ShutdownSignal, TunnelId,
 };
 
 use crate::{AgentConnectionState, AgentRuntimeStatus, AgentRuntimeStatusHandle};
@@ -28,6 +30,46 @@ pub const MIN_OPERATIONS_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_OPERATIONS_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_OPERATIONS_HEADERS: usize = 128;
 pub const MAX_OPERATIONS_CONNECTIONS: usize = 1_024;
+pub const MAX_TUNNEL_INVENTORY_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// Cloneable metadata/status entry exposed by the managed HTTP operations inventory.
+#[derive(Debug, Clone)]
+pub struct AgentOperationsTunnel {
+    tunnel_id: TunnelId,
+    local_addr: SocketAddr,
+    public_hostname: Arc<RwLock<Option<PublicHostname>>>,
+    status: AgentRuntimeStatusHandle,
+}
+
+impl AgentOperationsTunnel {
+    pub fn new(
+        tunnel_id: TunnelId,
+        local_addr: SocketAddr,
+        status: AgentRuntimeStatusHandle,
+    ) -> Self {
+        Self {
+            tunnel_id,
+            local_addr,
+            public_hostname: Arc::new(RwLock::new(None)),
+            status,
+        }
+    }
+
+    /// Publishes the durable hostname only after allocation succeeds.
+    pub fn publish_hostname(&self, hostname: PublicHostname) {
+        *self
+            .public_hostname
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hostname);
+    }
+
+    fn public_hostname(&self) -> Option<PublicHostname> {
+        self.public_hostname
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentOperationsConfig {
@@ -88,6 +130,7 @@ pub enum AgentOperationsConfigError {
     NonLoopbackListener,
     EmptyStatusSet,
     TooManyStatuses,
+    DuplicateTunnel,
     InvalidConnectionLimit,
     InvalidHeaderBytes,
     InvalidHeaderCount,
@@ -102,6 +145,7 @@ impl std::fmt::Display for AgentOperationsConfigError {
             Self::NonLoopbackListener => "operations listener must use a loopback address",
             Self::EmptyStatusSet => "operations runtime requires at least one Agent status",
             Self::TooManyStatuses => "operations runtime exceeds the 16-tunnel status limit",
+            Self::DuplicateTunnel => "operations inventory contains a duplicate TunnelId",
             Self::InvalidConnectionLimit => {
                 "operations connection limit must be between 1 and 1024"
             }
@@ -165,6 +209,7 @@ pub struct AgentOperationsRuntime {
     local_addr: SocketAddr,
     config: AgentOperationsConfig,
     statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
+    tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
     counters: Arc<AgentOperationsCounters>,
 }
 
@@ -179,6 +224,43 @@ impl AgentOperationsRuntime {
     pub async fn bind_many(
         config: AgentOperationsConfig,
         statuses: Vec<AgentRuntimeStatusHandle>,
+    ) -> Result<Self, AgentOperationsError> {
+        Self::bind_inner(config, statuses, None).await
+    }
+
+    /// Binds an operations runtime with a bounded, deterministic managed-tunnel inventory.
+    pub async fn bind_tunnels(
+        config: AgentOperationsConfig,
+        mut tunnels: Vec<AgentOperationsTunnel>,
+    ) -> Result<Self, AgentOperationsError> {
+        if tunnels.is_empty() {
+            return Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::EmptyStatusSet,
+            ));
+        }
+        if tunnels.len() > crate::MAX_MANAGED_HTTP_TUNNELS {
+            return Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::TooManyStatuses,
+            ));
+        }
+        let mut seen = HashSet::with_capacity(tunnels.len());
+        if tunnels
+            .iter()
+            .any(|tunnel| !seen.insert(tunnel.tunnel_id.clone()))
+        {
+            return Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::DuplicateTunnel,
+            ));
+        }
+        tunnels.sort_by(|left, right| left.tunnel_id.cmp(&right.tunnel_id));
+        let statuses = tunnels.iter().map(|tunnel| tunnel.status.clone()).collect();
+        Self::bind_inner(config, statuses, Some(tunnels)).await
+    }
+
+    async fn bind_inner(
+        config: AgentOperationsConfig,
+        statuses: Vec<AgentRuntimeStatusHandle>,
+        tunnels: Option<Vec<AgentOperationsTunnel>>,
     ) -> Result<Self, AgentOperationsError> {
         config
             .validate()
@@ -202,6 +284,7 @@ impl AgentOperationsRuntime {
             local_addr,
             config,
             statuses: Arc::new(statuses),
+            tunnels: tunnels.map(Arc::new),
             counters: Arc::new(AgentOperationsCounters::default()),
         })
     }
@@ -245,8 +328,11 @@ impl AgentOperationsRuntime {
                         socket,
                         peer,
                         self.config,
-                        Arc::clone(&self.statuses),
-                        Arc::clone(&self.counters),
+                        AgentOperationsRequestState {
+                            statuses: Arc::clone(&self.statuses),
+                            tunnels: self.tunnels.as_ref().map(Arc::clone),
+                            counters: Arc::clone(&self.counters),
+                        },
                         permit,
                         active,
                     ));
@@ -307,20 +393,28 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+struct AgentOperationsRequestState {
+    statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
+    tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
+    counters: Arc<AgentOperationsCounters>,
+}
+
 async fn run_connection(
     socket: TcpStream,
     peer: SocketAddr,
     config: AgentOperationsConfig,
-    statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
-    counters: Arc<AgentOperationsCounters>,
+    state: AgentOperationsRequestState,
     _permit: OwnedSemaphorePermit,
     _active: ActiveConnectionGuard,
 ) {
-    let service_counters = Arc::clone(&counters);
+    let statuses = Arc::clone(&state.statuses);
+    let tunnels = state.tunnels.as_ref().map(Arc::clone);
+    let service_counters = Arc::clone(&state.counters);
     let service = hyper::service::service_fn(move |request| {
         serve_request(
             request,
             Arc::clone(&statuses),
+            tunnels.as_ref().map(Arc::clone),
             Arc::clone(&service_counters),
         )
     });
@@ -346,6 +440,7 @@ async fn run_connection(
 async fn serve_request(
     request: Request<Incoming>,
     statuses: Arc<Vec<AgentRuntimeStatusHandle>>,
+    tunnels: Option<Arc<Vec<AgentOperationsTunnel>>>,
     counters: Arc<AgentOperationsCounters>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let head = request.method() == Method::HEAD;
@@ -376,6 +471,13 @@ async fn serve_request(
                 ),
                 head,
             ),
+            "/tunnels" => match tunnels {
+                Some(tunnels) => tunnel_inventory_response(&tunnels, head),
+                None => {
+                    counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                    plain_response(StatusCode::NOT_FOUND, "not found\n", head)
+                }
+            },
             _ => {
                 counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 plain_response(StatusCode::NOT_FOUND, "not found\n", head)
@@ -399,6 +501,68 @@ fn metrics_response(body: &str, head: bool) -> Response<Full<Bytes>> {
         StatusCode::OK,
         "text/plain; version=0.0.4; charset=utf-8",
         if head { "" } else { body },
+    )
+}
+
+#[derive(Serialize)]
+struct TunnelInventoryResponse {
+    version: u8,
+    configured: usize,
+    ready: usize,
+    tunnels: Vec<TunnelInventoryEntry>,
+}
+
+#[derive(Serialize)]
+struct TunnelInventoryEntry {
+    tunnel_id: String,
+    local_addr: String,
+    public_url: Option<String>,
+    connection_state: &'static str,
+    reachability_state: &'static str,
+    ready: bool,
+}
+
+fn render_tunnel_inventory(tunnels: &[AgentOperationsTunnel]) -> String {
+    let entries = tunnels
+        .iter()
+        .map(|tunnel| {
+            let status = tunnel.status.snapshot();
+            TunnelInventoryEntry {
+                tunnel_id: tunnel.tunnel_id.to_string(),
+                local_addr: tunnel.local_addr.to_string(),
+                public_url: tunnel
+                    .public_hostname()
+                    .map(|hostname| format!("https://{hostname}")),
+                connection_state: status.state.as_str(),
+                reachability_state: status.public_reachability_state.as_str(),
+                ready: status.is_ready(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let response = TunnelInventoryResponse {
+        version: 1,
+        configured: entries.len(),
+        ready: entries.iter().filter(|entry| entry.ready).count(),
+        tunnels: entries,
+    };
+    let mut output = serde_json::to_string(&response).expect("inventory fields are serializable");
+    output.push('\n');
+    assert!(
+        output.len() <= MAX_TUNNEL_INVENTORY_RESPONSE_BYTES,
+        "bounded tunnel inventory exceeded its response limit"
+    );
+    output
+}
+
+fn tunnel_inventory_response(
+    tunnels: &[AgentOperationsTunnel],
+    head: bool,
+) -> Response<Full<Bytes>> {
+    let body = render_tunnel_inventory(tunnels);
+    response(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        if head { "" } else { &body },
     )
 }
 
@@ -855,6 +1019,80 @@ mod tests {
                 AgentOperationsConfigError::TooManyStatuses
             ))
         ));
+
+        let duplicate = TunnelId::new("duplicate").unwrap();
+        assert!(matches!(
+            AgentOperationsRuntime::bind_tunnels(
+                config,
+                vec![
+                    AgentOperationsTunnel::new(
+                        duplicate.clone(),
+                        "127.0.0.1:3000".parse().unwrap(),
+                        status(),
+                    ),
+                    AgentOperationsTunnel::new(
+                        duplicate,
+                        "127.0.0.1:3001".parse().unwrap(),
+                        status(),
+                    ),
+                ],
+            )
+            .await,
+            Err(AgentOperationsError::InvalidConfig(
+                AgentOperationsConfigError::DuplicateTunnel
+            ))
+        ));
+    }
+
+    #[test]
+    fn tunnel_inventory_is_versioned_bounded_and_secret_safe() {
+        let pending = status();
+        pending.require_public_reachability(true);
+        let tunnel = AgentOperationsTunnel::new(
+            TunnelId::new("api").unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+            pending,
+        );
+        let before = render_tunnel_inventory(std::slice::from_ref(&tunnel));
+        assert_eq!(
+            before,
+            "{\"version\":1,\"configured\":1,\"ready\":0,\"tunnels\":[{\"tunnel_id\":\"api\",\"local_addr\":\"127.0.0.1:3000\",\"public_url\":null,\"connection_state\":\"offline\",\"reachability_state\":\"pending\",\"ready\":false}]}\n"
+        );
+
+        tunnel.publish_hostname(PublicHostname::new("api.example.test").unwrap());
+        let after = render_tunnel_inventory(&[tunnel]);
+        assert!(after.contains("\"public_url\":\"https://api.example.test\""));
+        assert!(after.len() <= MAX_TUNNEL_INVENTORY_RESPONSE_BYTES);
+        assert!(!after.contains("agent-dev"));
+        assert!(!after.contains("certificate"));
+        assert!(!after.contains("credential"));
+    }
+
+    #[test]
+    fn maximum_tunnel_inventory_fits_response_bound() {
+        let hostname = PublicHostname::new(format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        ))
+        .unwrap();
+        let tunnels = (0..crate::MAX_MANAGED_HTTP_TUNNELS)
+            .map(|index| {
+                let tunnel = AgentOperationsTunnel::new(
+                    TunnelId::new(format!("{index:02}{}", "x".repeat(62))).unwrap(),
+                    "[::1]:65535".parse().unwrap(),
+                    status(),
+                );
+                tunnel.publish_hostname(hostname.clone());
+                tunnel
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = render_tunnel_inventory(&tunnels);
+        assert!(rendered.len() <= MAX_TUNNEL_INVENTORY_RESPONSE_BYTES);
+        assert_eq!(rendered.matches("\"tunnel_id\"").count(), 16);
     }
 
     #[test]

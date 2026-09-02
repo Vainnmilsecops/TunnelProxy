@@ -281,6 +281,28 @@ ready; do not depend on config-order output. TLS reload, renewal, operations,
 and shutdown are shared process owners, so one failure in those supervisors
 also drains the set.
 
+For identity-level diagnosis, query the loopback listener from the same host or
+network namespace:
+
+```text
+curl --fail-with-body http://127.0.0.1:9091/tunnels
+```
+
+Managed `http` and `start` commands return a versioned JSON document containing
+the configured and ready counts plus each TunnelId, loopback local address,
+published public URL, connection state, reachability state, and readiness. The
+entries are sorted by TunnelId, capped by the 16-tunnel process limit, and
+updated when hostname allocation completes. A `null` public URL means the
+allocation has not yet been published. `HEAD` is supported; other methods are
+rejected. Raw tunnel mode returns `404` because it does not own a managed HTTP
+mapping.
+
+The inventory is intentionally identity-bearing and therefore stays out of
+Prometheus labels. The unauthenticated operations listener must remain on
+loopback: do not publish, proxy, or port-forward `/tunnels`. Responses use
+`Cache-Control: no-store` and never include AgentId, credential paths,
+certificate material, tokens, peer addresses, or reachability challenges.
+
 ### Hostname TLS and Agent-CA rotation
 
 Use an independent `--hostname-tls-reload-manifest` when the hostname endpoint
