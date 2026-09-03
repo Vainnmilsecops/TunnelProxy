@@ -527,6 +527,16 @@ rate-limit state, plus aggregate multiplexed transport occupancy and live
 capacity. `HEAD` is also accepted; other methods return `405` and unknown paths
 return `404`.
 
+When HTTPS ingress is configured, `--https-request-history-capacity <1..128>`
+enables `GET`/`HEAD /requests`. The newest-first JSON response is capped at
+64 KiB and records only a monotonic process-local request ID, canonical
+hostname, TunnelId, bounded method/path, negotiated HTTP version, response
+status, response-header latency, and a fixed outcome. Query strings, headers,
+bodies, peer addresses, and credentials are never retained. Reachability
+probes, WebSocket/CONNECT traffic, and requests rejected before ordinary HTTP
+admission are excluded. The option requires both `--https-listen` and
+`--ops-listen`; without it `/requests` returns `404`.
+
 The endpoint is disabled unless `--ops-listen` is supplied and rejects every
 non-loopback bind. It has explicit connection/header/time/drain bounds, closes
 after one HTTP/1.1 request, and is intentionally unauthenticated because it is

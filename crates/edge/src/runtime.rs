@@ -17,6 +17,7 @@ use crate::{
     HttpIngressExposurePolicy, HttpIngressOutcome, HttpIngressRuntime, MultiplexedEdgeConfig,
     MultiplexedEdgeConfigError, MultiplexedEdgeRuntime, RawIngressExposurePolicy,
     RawIngressManagerConfig, RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteManager,
+    MAX_REQUEST_HISTORY_ENTRIES,
 };
 
 /// Complete configuration for the runnable single-tunnel Edge process.
@@ -31,6 +32,8 @@ pub struct EdgeRuntimeConfig {
     pub https_ingress: Option<HttpIngressConfig>,
     /// Optional loopback-only health, readiness, and Prometheus endpoint.
     pub operations: Option<EdgeOperationsConfig>,
+    /// Optional bounded redacted HTTPS request history exposed by operations.
+    pub request_history_capacity: Option<usize>,
     pub shutdown: RuntimeShutdownConfig,
 }
 
@@ -48,6 +51,7 @@ impl EdgeRuntimeConfig {
             raw_exposure: RawIngressExposurePolicy::LoopbackOnly,
             https_ingress: None,
             operations: None,
+            request_history_capacity: None,
             shutdown: RuntimeShutdownConfig::default(),
         }
     }
@@ -130,6 +134,17 @@ impl EdgeRuntimeConfig {
                 .validate()
                 .map_err(EdgeRuntimeConfigError::Operations)?;
         }
+        if let Some(capacity) = self.request_history_capacity {
+            if !(1..=MAX_REQUEST_HISTORY_ENTRIES).contains(&capacity) {
+                return Err(EdgeRuntimeConfigError::InvalidRequestHistoryCapacity);
+            }
+            if self.https_ingress.is_none() {
+                return Err(EdgeRuntimeConfigError::RequestHistoryRequiresHttps);
+            }
+            if self.operations.is_none() {
+                return Err(EdgeRuntimeConfigError::RequestHistoryRequiresOperations);
+            }
+        }
         self.shutdown
             .validate()
             .map_err(|_| EdgeRuntimeConfigError::ZeroDrainTimeout)
@@ -153,6 +168,9 @@ pub enum EdgeRuntimeConfigError {
     PublicHttpsRequiresMutualTls,
     PublicHttpsRequiresLiveAuthorization,
     Operations(EdgeOperationsConfigError),
+    InvalidRequestHistoryCapacity,
+    RequestHistoryRequiresHttps,
+    RequestHistoryRequiresOperations,
     RawTunnelNotAuthorized(TunnelId),
     ZeroDrainTimeout,
 }
@@ -195,6 +213,15 @@ impl std::fmt::Display for EdgeRuntimeConfigError {
                 f.write_str("public HTTPS ingress requires dynamic snapshot authorization")
             }
             Self::Operations(error) => write!(f, "invalid operations endpoint: {error}"),
+            Self::InvalidRequestHistoryCapacity => {
+                f.write_str("request history capacity must be between 1 and 128")
+            }
+            Self::RequestHistoryRequiresHttps => {
+                f.write_str("request history requires HTTPS ingress")
+            }
+            Self::RequestHistoryRequiresOperations => {
+                f.write_str("request history requires the operations endpoint")
+            }
             Self::RawTunnelNotAuthorized(tunnel_id) => write!(
                 f,
                 "raw TunnelId {tunnel_id} is absent from the registration policy"
@@ -541,11 +568,16 @@ impl EdgeRuntime {
         https_config.shutdown = shutdown;
         let https_routes = https_config.routes.clone();
         let dynamic_https = https_routes.is_dynamic();
-        let ingress = HttpIngressRuntime::bind(https_config, router.clone())
-            .await
-            .map_err(EdgeRuntimeError::HttpsStartup)?;
+        let ingress = HttpIngressRuntime::bind_with_request_history(
+            https_config,
+            router.clone(),
+            self.config.request_history_capacity,
+        )
+        .await
+        .map_err(EdgeRuntimeError::HttpsStartup)?;
         let https_addr = ingress.local_addr();
         let https_status = ingress.status_handle();
+        let request_history = ingress.request_history();
         let operations_runtime = match self.config.operations {
             Some(mut operations_config) => {
                 operations_config.shutdown = shutdown;
@@ -557,6 +589,7 @@ impl EdgeRuntime {
                         EdgeIngressMetricsSource::Https {
                             status: https_status,
                             routes: https_routes,
+                            request_history,
                         },
                     )
                     .await
@@ -752,6 +785,21 @@ mod tests {
         let config = EdgeRuntimeConfig::dev_defaults();
         assert_eq!(config.multiplex.agent_listener.max_agent_sessions, 1);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn request_history_is_bounded_and_requires_https() {
+        let mut config = EdgeRuntimeConfig::dev_defaults();
+        config.request_history_capacity = Some(0);
+        assert_eq!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::InvalidRequestHistoryCapacity)
+        );
+        config.request_history_capacity = Some(1);
+        assert_eq!(
+            config.validate(),
+            Err(EdgeRuntimeConfigError::RequestHistoryRequiresHttps)
+        );
     }
 
     #[test]

@@ -593,6 +593,9 @@ async fn operations_endpoint_tracks_raw_readiness_metrics_and_lifecycle() {
     assert!(operations_request(operations_addr, "GET", "/missing")
         .await
         .starts_with("HTTP/1.1 404 Not Found"));
+    assert!(operations_request(operations_addr, "GET", "/requests")
+        .await
+        .starts_with("HTTP/1.1 404 Not Found"));
 
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
@@ -1221,6 +1224,7 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
 #[tokio::test]
 async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     let public_pki = test_pki("demo.example.test");
+    let operations_addr = unused_addr().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = local_listener.local_addr().unwrap();
     let (captured_tx, mut captured_rx) = tokio::sync::mpsc::channel(5);
@@ -1267,6 +1271,8 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
 
     let https_addr = unused_addr().await;
     let mut config = edge_config(unused_addr().await);
+    config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
+    config.request_history_capacity = Some(8);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
         routes: HttpHostRoutes::single(
@@ -1463,6 +1469,28 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
         .iter()
         .all(|request| request.contains("host: demo.example.test\r\n")));
 
+    let history = operations_request(operations_addr, "GET", "/requests").await;
+    let history: serde_json::Value =
+        serde_json::from_str(history.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(history["retained"], 6);
+    assert_eq!(history["requests"][0]["path"], "/fallback");
+    assert_eq!(history["requests"][0]["protocol"], "http1");
+    let requests = history["requests"].as_array().unwrap();
+    let slow = requests
+        .iter()
+        .find(|entry| entry["path"] == "/slow")
+        .unwrap();
+    assert_eq!(slow["protocol"], "http2");
+    assert_eq!(slow["response_status"], 504);
+    assert_eq!(slow["outcome"], "timeout");
+    let oversized = requests
+        .iter()
+        .find(|entry| entry["path"] == "/oversized")
+        .unwrap();
+    assert_eq!(oversized["response_status"], 413);
+    assert_eq!(oversized["outcome"], "rejected");
+    assert!(!requests.iter().any(|entry| entry["path"] == "/fronted"));
+
     local_task.await.unwrap();
     agent_trigger.shutdown();
     let _ = agent_task.await.unwrap().unwrap();
@@ -1482,7 +1510,9 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     assert_eq!(https.rejected_requests, 4);
     assert_eq!(https.rejected_connect_sessions, 1);
     assert_eq!(https.request_timeouts, 1);
+    assert!(outcome.operations.is_some());
     wait_until_bindable(https_addr).await;
+    wait_until_bindable(operations_addr).await;
 }
 
 fn websocket_accept_from_request(request: &str) -> String {
@@ -3611,6 +3641,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     let https_addr = unused_addr().await;
     let mut config = edge_config(unused_addr().await);
     config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
+    config.request_history_capacity = Some(4);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
         routes: HttpHostRoutes::single(
@@ -3689,8 +3720,9 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     let first = sender
         .send_request(
             Request::builder()
-                .uri("/limited")
+                .uri("/limited?tp_access=never-store&private=value")
                 .header(HOST, "demo.example.test")
+                .header("authorization", "Bearer never-store")
                 .body(Empty::<Bytes>::new())
                 .unwrap(),
         )
@@ -3714,6 +3746,32 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert_eq!(limited.headers().get("retry-after").unwrap(), "1");
     limited.into_body().collect().await.unwrap();
     connection_task.await.unwrap().unwrap();
+
+    let history = operations_request(operations_addr, "GET", "/requests").await;
+    assert!(history.starts_with("HTTP/1.1 200 OK"));
+    assert!(history.contains("content-type: application/json; charset=utf-8"));
+    assert!(history.contains("cache-control: no-store"));
+    assert!(!history.contains("never-store"));
+    assert!(!history.contains("private=value"));
+    assert!(!history.to_ascii_lowercase().contains("authorization"));
+    let history_body = history.split_once("\r\n\r\n").unwrap().1;
+    let history_json: serde_json::Value = serde_json::from_str(history_body).unwrap();
+    assert_eq!(history_json["version"], 1);
+    assert_eq!(history_json["capacity"], 4);
+    assert_eq!(history_json["retained"], 1);
+    assert_eq!(history_json["requests"][0]["hostname"], "demo.example.test");
+    assert_eq!(history_json["requests"][0]["tunnel_id"], "tunnel-dev");
+    assert_eq!(history_json["requests"][0]["method"], "GET");
+    assert_eq!(history_json["requests"][0]["path"], "/limited");
+    assert_eq!(history_json["requests"][0]["protocol"], "http1");
+    assert_eq!(history_json["requests"][0]["response_status"], 200);
+    assert_eq!(history_json["requests"][0]["outcome"], "forwarded");
+    let head = operations_request(operations_addr, "HEAD", "/requests").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(head.split_once("\r\n\r\n").unwrap().1, "");
+    assert!(operations_request(operations_addr, "POST", "/requests")
+        .await
+        .starts_with("HTTP/1.1 405 Method Not Allowed"));
 
     let request = || {
         let connector = connector.clone();
@@ -3755,6 +3813,11 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert!(metrics.contains("tunnelproxy_edge_https_per_ip_rate_limit_rejections_total 1\n"));
     assert!(metrics.contains("tunnelproxy_edge_https_reused_requests_total 1\n"));
     assert!(metrics.contains("tunnelproxy_edge_https_request_timeouts_total 0\n"));
+    assert!(metrics.contains("tunnelproxy_edge_https_request_history_capacity 4\n"));
+    assert!(metrics.contains("tunnelproxy_edge_https_request_history_retained 1\n"));
+    assert!(metrics.contains(
+        "tunnelproxy_edge_https_request_history_outcomes_total{outcome=\"forwarded\"} 1\n"
+    ));
     assert!(metrics.contains("tunnelproxy_edge_https_tracked_rate_limit_peers 1\n"));
     assert!(!metrics.contains("demo.example.test"));
     assert!(!metrics.contains("tunnel-dev"));

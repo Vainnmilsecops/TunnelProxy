@@ -6,9 +6,9 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -52,6 +52,9 @@ use crate::http_tls::{
     PublicHttpProtocolPolicy, PublicTlsConfig, PUBLIC_HTTP1_ALPN, PUBLIC_HTTP2_ALPN,
 };
 use crate::multiplex::{EdgeSessionRouter, RouteError};
+use crate::request_history::{
+    RequestHistory, RequestHistoryOutcome, RequestHistoryPending, RequestHistoryProtocol,
+};
 
 pub const MIN_HTTP_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_HTTP_HEADER_BYTES: usize = 1024 * 1024;
@@ -952,12 +955,21 @@ pub struct HttpIngressRuntime {
     config: HttpIngressConfig,
     router: EdgeSessionRouter,
     status: HttpIngressStatusHandle,
+    request_history: Option<RequestHistory>,
 }
 
 impl HttpIngressRuntime {
     pub async fn bind(
         config: HttpIngressConfig,
         router: EdgeSessionRouter,
+    ) -> Result<Self, HttpIngressError> {
+        Self::bind_with_request_history(config, router, None).await
+    }
+
+    pub(crate) async fn bind_with_request_history(
+        config: HttpIngressConfig,
+        router: EdgeSessionRouter,
+        request_history_capacity: Option<usize>,
     ) -> Result<Self, HttpIngressError> {
         config.validate().map_err(HttpIngressError::InvalidConfig)?;
         let listener = TcpListener::bind(config.listen_addr)
@@ -972,12 +984,17 @@ impl HttpIngressRuntime {
                 .as_ref()
                 .map(|signed_access| signed_access.key_ring.clone()),
         };
+        let request_history = request_history_capacity.map(|capacity| {
+            RequestHistory::new(capacity)
+                .expect("process runtime validates request history capacity before HTTPS bind")
+        });
         Ok(Self {
             listener,
             local_addr,
             config,
             router,
             status,
+            request_history,
         })
     }
 
@@ -987,6 +1004,10 @@ impl HttpIngressRuntime {
 
     pub fn status_handle(&self) -> HttpIngressStatusHandle {
         self.status.clone()
+    }
+
+    pub(crate) fn request_history(&self) -> Option<RequestHistory> {
+        self.request_history.clone()
     }
 
     pub async fn run_until_shutdown(
@@ -1058,6 +1079,7 @@ impl HttpIngressRuntime {
                         rate_limiter.clone(),
                         websocket_permits.clone(),
                         connect_permits.clone(),
+                        self.request_history.clone(),
                         global_permit,
                         peer_permit,
                         active_connection,
@@ -1167,6 +1189,7 @@ async fn run_connection(
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
     connect_permits: Option<Arc<Semaphore>>,
+    request_history: Option<RequestHistory>,
     _global_permit: OwnedSemaphorePermit,
     _peer_permit: Option<PeerAdmissionPermit>,
     _active_connection: ActiveConnectionGuard,
@@ -1224,6 +1247,7 @@ async fn run_connection(
             rate_limiter.clone(),
             websocket_permits.clone(),
             connect_permits.clone(),
+            request_history.clone(),
             Some(opaque_relay_tx.clone()),
             Arc::clone(&request_count),
             protocol,
@@ -1256,6 +1280,7 @@ async fn handle_ingress_request(
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
     connect_permits: Option<Arc<Semaphore>>,
+    request_history: Option<RequestHistory>,
     opaque_relay_tx: Option<mpsc::Sender<OpaqueRelay>>,
     request_count: Arc<AtomicUsize>,
     protocol: NegotiatedHttpProtocol,
@@ -1285,6 +1310,8 @@ async fn handle_ingress_request(
     let close_after = protocol == NegotiatedHttpProtocol::Http1
         && request_number == config.max_requests_per_connection;
     let deadline = tokio::time::Instant::now() + config.request_timeout;
+    let request_started = Instant::now();
+    let history_observation = Arc::new(Mutex::new(None));
     let response = tokio::time::timeout_at(
         deadline,
         proxy_request(
@@ -1298,6 +1325,10 @@ async fn handle_ingress_request(
                 rate_limiter,
                 websocket_permits,
                 connect_permits,
+                request_history,
+                history_observation: Arc::clone(&history_observation),
+                protocol,
+                request_started,
                 opaque_relay_tx,
             },
             deadline,
@@ -1305,9 +1336,14 @@ async fn handle_ingress_request(
     )
     .await;
     let mut response = match response {
-        Ok(Ok(response)) => response,
+        Ok(Ok(response)) => {
+            finish_request_history(&history_observation, response.status());
+            response
+        }
         Ok(Err(infallible)) => match infallible {},
         Err(_) => {
+            mark_request_history(&history_observation, RequestHistoryOutcome::Timeout);
+            finish_request_history(&history_observation, StatusCode::GATEWAY_TIMEOUT);
             counters.request_timeouts.fetch_add(1, Ordering::Relaxed);
             counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
             warn!(%peer, event = "https_request_timeout");
@@ -1550,7 +1586,34 @@ struct HttpRequestContext {
     rate_limiter: HttpRequestRateLimiter,
     websocket_permits: Option<Arc<Semaphore>>,
     connect_permits: Option<Arc<Semaphore>>,
+    request_history: Option<RequestHistory>,
+    history_observation: Arc<Mutex<Option<RequestHistoryPending>>>,
+    protocol: NegotiatedHttpProtocol,
+    request_started: Instant,
     opaque_relay_tx: Option<mpsc::Sender<OpaqueRelay>>,
+}
+
+fn mark_request_history(
+    observation: &Mutex<Option<RequestHistoryPending>>,
+    outcome: RequestHistoryOutcome,
+) {
+    if let Some(pending) = observation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        pending.set_outcome(outcome);
+    }
+}
+
+fn finish_request_history(observation: &Mutex<Option<RequestHistoryPending>>, status: StatusCode) {
+    let pending = observation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(pending) = pending {
+        pending.finish(status.as_u16());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1570,6 +1633,10 @@ async fn proxy_request(
         rate_limiter,
         websocket_permits,
         connect_permits,
+        request_history,
+        history_observation,
+        protocol,
+        request_started,
         opaque_relay_tx,
     } = context;
     let reachability_intent = request.uri().path() == PUBLIC_REACHABILITY_PATH;
@@ -1722,6 +1789,24 @@ async fn proxy_request(
         warn!(%peer, %hostname, reason = rejection.reason, event = "https_request_rejected");
         return Ok(error_response(rejection.status));
     }
+    if matches!(&kind, PreparedRequestKind::Regular) {
+        if let Some(history) = request_history {
+            let pending = history.begin(
+                hostname.as_str(),
+                tunnel_id.as_str(),
+                request.method().as_str(),
+                request.uri().path(),
+                match protocol {
+                    NegotiatedHttpProtocol::Http1 => RequestHistoryProtocol::Http1,
+                    NegotiatedHttpProtocol::Http2 => RequestHistoryProtocol::Http2,
+                },
+                request_started,
+            );
+            *history_observation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
+        }
+    }
     counters.admitted_requests.fetch_add(1, Ordering::Relaxed);
 
     let websocket_guard = if matches!(&kind, PreparedRequestKind::WebSocket(_)) {
@@ -1790,6 +1875,7 @@ async fn proxy_request(
         .upper()
         .is_some_and(|length| length > config.max_request_body_bytes as u64)
     {
+        mark_request_history(&history_observation, RequestHistoryOutcome::Rejected);
         counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
         return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
     }
@@ -1797,6 +1883,10 @@ async fn proxy_request(
     let routed = match router.open_tunnel_io_tracked(&tunnel_id, tunnel_io).await {
         Ok(stream) => stream,
         Err(error) => {
+            mark_request_history(
+                &history_observation,
+                RequestHistoryOutcome::LocalUnavailable,
+            );
             counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
             if matches!(&kind, PreparedRequestKind::WebSocket(_)) {
                 counters
@@ -1950,6 +2040,10 @@ async fn proxy_request(
     {
         Ok(parts) => parts,
         Err(_) => {
+            mark_request_history(
+                &history_observation,
+                RequestHistoryOutcome::LocalUnavailable,
+            );
             counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(StatusCode::BAD_GATEWAY));
         }
@@ -1966,6 +2060,10 @@ async fn proxy_request(
             let response = match sender.send_request(request).await {
                 Ok(response) => response,
                 Err(_) => {
+                    mark_request_history(
+                        &history_observation,
+                        RequestHistoryOutcome::LocalUnavailable,
+                    );
                     counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
                     return Ok(error_response(StatusCode::BAD_GATEWAY));
                 }

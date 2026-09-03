@@ -206,6 +206,21 @@ async fn wait_for_health(
     .expect("snapshot source health did not change");
 }
 
+async fn wait_for_operations_active(addr: SocketAddr, expected: usize) {
+    let metric = format!("tunnelproxy_control_plane_operations_active_connections {expected}\n");
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let response = operations_request(addr, "GET", "/metrics").await;
+            if response.contains(&metric) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operations connection was not admitted");
+}
+
 #[tokio::test]
 async fn sqlite_authority_bootstraps_pushes_and_recovers_snapshot_stream() {
     let (database, directory) = temp_database();
@@ -357,9 +372,15 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
     wait_for_version(&mut edge_snapshots, 2).await;
 
     let mut drain_probe = TcpStream::connect(operations_addr).await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    // The metrics request itself is active while rendered, so observing two
+    // active connections proves the header-stalled drain probe was accepted.
+    wait_for_operations_active(operations_addr, 2).await;
     server_trigger.shutdown();
-    sleep(Duration::from_millis(10)).await;
+    // Source staleness is the observable acknowledgement that the runtime has
+    // consumed shutdown, marked readiness false, and drained snapshot service
+    // before stopping operations last. A fixed sleep races that scheduling on
+    // loaded CI hosts.
+    wait_for_health(&mut edge_snapshots, SnapshotSourceHealth::Stale).await;
     drain_probe
         .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await
@@ -377,7 +398,6 @@ async fn control_plane_runtime_refreshes_imports_and_survives_process_restart() 
     assert_eq!(outcome.operations_addr, Some(operations_addr));
     assert!(outcome.operations.is_some());
     assert!(TcpStream::connect(operations_addr).await.is_err());
-    wait_for_health(&mut edge_snapshots, SnapshotSourceHealth::Stale).await;
 
     let restarted = ControlPlaneRuntime::bind(ControlPlaneRuntimeConfig {
         database_path: database.clone(),

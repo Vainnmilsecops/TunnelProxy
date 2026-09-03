@@ -13,6 +13,7 @@ use hyper::body::Incoming;
 use hyper::header::{CACHE_CONTROL, CONNECTION, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -26,6 +27,10 @@ use tunnelproxy_control_plane::HttpsRouteSourceHealth;
 use crate::http_ingress::{HttpHostRoutes, HttpIngressStatus, HttpIngressStatusHandle};
 use crate::multiplex::{AuthorizationSourceStatus, EdgeSessionRouter};
 use crate::raw_ingress::{RawIngressRouteId, RawIngressRouteManager, RawIngressRouteStatus};
+use crate::request_history::{
+    RequestHistory, RequestHistoryEntry, RequestHistoryOutcome, RequestHistorySnapshot,
+    MAX_REQUEST_HISTORY_RESPONSE_BYTES,
+};
 
 pub const MIN_OPERATIONS_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_OPERATIONS_HEADER_BYTES: usize = 64 * 1024;
@@ -159,6 +164,7 @@ pub(crate) enum EdgeIngressMetricsSource {
     Https {
         status: HttpIngressStatusHandle,
         routes: HttpHostRoutes,
+        request_history: Option<RequestHistory>,
     },
 }
 
@@ -400,6 +406,17 @@ async fn serve_request(
                     collect_metrics(&router, &tunnel_id, &ingress, &counters, &draining).await;
                 metrics_response(&render_metrics(snapshot), head)
             }
+            "/requests" => match &ingress {
+                EdgeIngressMetricsSource::Https {
+                    request_history: Some(history),
+                    ..
+                } => request_history_response(history, head),
+                EdgeIngressMetricsSource::Raw { .. }
+                | EdgeIngressMetricsSource::Https {
+                    request_history: None,
+                    ..
+                } => plain_response(StatusCode::NOT_FOUND, "not found\n", head),
+            },
             _ => {
                 counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 plain_response(StatusCode::NOT_FOUND, "not found\n", head)
@@ -445,6 +462,64 @@ fn metrics_response(body: &str, head: bool) -> Response<Full<Bytes>> {
     )
 }
 
+fn request_history_response(history: &RequestHistory, head: bool) -> Response<Full<Bytes>> {
+    let body = render_request_history(history.snapshot());
+    response(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        if head { "" } else { &body },
+    )
+}
+
+#[derive(Serialize)]
+struct RequestHistoryDocument<'a> {
+    version: u8,
+    capacity: usize,
+    retained: usize,
+    returned: usize,
+    recorded_total: u64,
+    evicted_total: u64,
+    sequence_exhaustions: u64,
+    truncated: bool,
+    requests: &'a [RequestHistoryEntry],
+}
+
+fn render_request_history(snapshot: RequestHistorySnapshot) -> String {
+    let mut lower = 0;
+    let mut upper = snapshot.entries.len();
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if serialize_request_history(&snapshot, candidate).len()
+            <= MAX_REQUEST_HISTORY_RESPONSE_BYTES
+        {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    let body = serialize_request_history(&snapshot, lower);
+    assert!(body.len() <= MAX_REQUEST_HISTORY_RESPONSE_BYTES);
+    body
+}
+
+fn serialize_request_history(snapshot: &RequestHistorySnapshot, returned: usize) -> String {
+    let document = RequestHistoryDocument {
+        version: 1,
+        capacity: snapshot.capacity,
+        retained: snapshot.entries.len(),
+        returned,
+        recorded_total: snapshot.recorded_total,
+        evicted_total: snapshot.evicted_total,
+        sequence_exhaustions: snapshot.sequence_exhaustions,
+        truncated: returned < snapshot.entries.len(),
+        requests: &snapshot.entries[..returned],
+    };
+    let mut body = serde_json::to_string(&document)
+        .expect("bounded request history contains only serializable values");
+    body.push('\n');
+    body
+}
+
 fn response(status: StatusCode, content_type: &'static str, body: &str) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::copy_from_slice(body.as_bytes())));
     *response.status_mut() = status;
@@ -480,6 +555,7 @@ enum IngressMetricSnapshot {
         route_health: Option<HttpsRouteSourceHealth>,
         route_version: u64,
         route_count: usize,
+        request_history: Option<RequestHistorySnapshot>,
     },
 }
 
@@ -509,11 +585,16 @@ async fn collect_metrics(
         EdgeIngressMetricsSource::Raw { manager, route_id } => {
             IngressMetricSnapshot::Raw(manager.get_route(*route_id).await.ok())
         }
-        EdgeIngressMetricsSource::Https { status, routes } => IngressMetricSnapshot::Https {
+        EdgeIngressMetricsSource::Https {
+            status,
+            routes,
+            request_history,
+        } => IngressMetricSnapshot::Https {
             status: Box::new(status.snapshot()),
             route_health: routes.dynamic_source_health(),
             route_version: routes.dynamic_catalog_version().unwrap_or(0),
             route_count: routes.len(),
+            request_history: request_history.as_ref().map(RequestHistory::snapshot),
         },
     };
     EdgeMetricSnapshot {
@@ -641,12 +722,14 @@ fn render_metrics(snapshot: EdgeMetricSnapshot) -> String {
             route_health,
             route_version,
             route_count,
+            request_history,
         } => render_https_metrics(
             &mut output,
             *status,
             route_health,
             route_version,
             route_count,
+            request_history.as_ref(),
         ),
     }
     output
@@ -813,6 +896,7 @@ fn render_https_metrics(
     route_health: Option<HttpsRouteSourceHealth>,
     route_version: u64,
     route_count: usize,
+    request_history: Option<&RequestHistorySnapshot>,
 ) {
     metric(output, "tunnelproxy_edge_ingress_mode_raw", "gauge", 0);
     metric(output, "tunnelproxy_edge_ingress_mode_https", "gauge", 1);
@@ -844,6 +928,48 @@ fn render_https_metrics(
         "gauge",
         route_count,
     );
+    metric(
+        output,
+        "tunnelproxy_edge_https_request_history_capacity",
+        "gauge",
+        request_history.map_or(0, |history| history.capacity),
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_https_request_history_retained",
+        "gauge",
+        request_history.map_or(0, |history| history.entries.len()),
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_https_request_history_recorded_total",
+        "counter",
+        request_history.map_or(0, |history| history.recorded_total),
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_https_request_history_evicted_total",
+        "counter",
+        request_history.map_or(0, |history| history.evicted_total),
+    );
+    metric(
+        output,
+        "tunnelproxy_edge_https_request_history_sequence_exhaustions_total",
+        "counter",
+        request_history.map_or(0, |history| history.sequence_exhaustions),
+    );
+    let _ = writeln!(
+        output,
+        "# TYPE tunnelproxy_edge_https_request_history_outcomes_total counter"
+    );
+    for outcome in RequestHistoryOutcome::ALL {
+        let value = request_history.map_or(0, |history| history.outcome_count(outcome));
+        let _ = writeln!(
+            output,
+            "tunnelproxy_edge_https_request_history_outcomes_total{{outcome=\"{}\"}} {value}",
+            outcome.as_str()
+        );
+    }
     for (name, kind, value) in [
         (
             "tunnelproxy_edge_https_active_connections",
@@ -1232,6 +1358,7 @@ mod tests {
             None,
             0,
             1,
+            None,
         );
         assert!(https.contains("tunnelproxy_edge_https_http1_connections_total 3\n"));
         assert!(https.contains("tunnelproxy_edge_https_http2_connections_total 2\n"));
@@ -1276,6 +1403,13 @@ mod tests {
         assert!(https.contains("tunnelproxy_edge_https_reachability_probe_requests_total 23\n"));
         assert!(https.contains("tunnelproxy_edge_https_reachability_probe_successes_total 21\n"));
         assert!(https.contains("tunnelproxy_edge_https_reachability_probe_failures_total 2\n"));
+        assert!(https.contains("tunnelproxy_edge_https_request_history_capacity 0\n"));
+        for outcome in RequestHistoryOutcome::ALL {
+            assert!(https.contains(&format!(
+                "tunnelproxy_edge_https_request_history_outcomes_total{{outcome=\"{}\"}} 0",
+                outcome.as_str()
+            )));
+        }
         assert!(!https.contains("hostname"));
     }
 
@@ -1287,6 +1421,40 @@ mod tests {
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
             "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn request_history_json_is_versioned_newest_first_and_response_bounded() {
+        let history = RequestHistory::new(128).unwrap();
+        for index in 0..128 {
+            history
+                .begin(
+                    "demo.example.test",
+                    "tunnel-dev",
+                    "GET",
+                    &format!("/{index}/{}", "x".repeat(2 * 1024)),
+                    crate::request_history::RequestHistoryProtocol::Http1,
+                    std::time::Instant::now(),
+                )
+                .finish(200);
+        }
+        let body = render_request_history(history.snapshot());
+        assert!(body.len() <= MAX_REQUEST_HISTORY_RESPONSE_BYTES);
+        let document: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(document["version"], 1);
+        assert_eq!(document["capacity"], 128);
+        assert_eq!(document["retained"], 128);
+        assert_eq!(document["recorded_total"], 128);
+        assert_eq!(document["truncated"], true);
+        assert_eq!(document["requests"][0]["request_id"], 128);
+
+        let response = request_history_response(&history, false);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
         );
     }
 }

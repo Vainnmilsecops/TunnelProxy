@@ -75,7 +75,7 @@ localhost:<port>
 
 Automated account provisioning, DNS/TLS automation, custom domains, dashboard,
 billing, distributed/shared request-rate
-coordination, request inspection, stream replay, protected issuer custody,
+coordination, request body/header inspection, stream replay, protected issuer custody,
 multi-edge ownership, and cloud deployment are explicitly **not implemented**.
 Sessions 39–42 provide
 durable managed-hostname allocation plus authenticated Agent-facing
@@ -88,6 +88,9 @@ managed HTTP tunnels over independent transports in one bounded process.
 Session 55 lets that config-v2 process opt into atomic digest-manifest local
 port generations: only existing TunnelIds' targets change, new streams use the
 active snapshot, and existing streams/transports remain connected.
+Session 56 adds an opt-in 1-to-128-entry redacted HTTPS request-metadata ring
+at the loopback Edge operations endpoint. It never stores queries, headers,
+bodies, peer IPs, or credentials and does not inspect WebSocket/CONNECT data.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,

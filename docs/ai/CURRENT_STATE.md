@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Atomic Config-v2 Local-Target Generation Reload** (Session 55).
+**Bounded Redacted HTTPS Request History** (Session 56).
 
 ## Completed
 
@@ -606,6 +606,26 @@
   operations, and real-TCP continuity coverage. The workspace contains 423
   explicit tests.
 
+## Session 56 delivered
+
+- Added opt-in `--https-request-history-capacity <1..128>` to the runnable
+  Edge. It requires both HTTPS ingress and the loopback operations listener;
+  disabled and raw-ingress modes return `404` for `/requests`.
+- Added a newest-first bounded process-local ring for admitted ordinary HTTP
+  requests. Capacity eviction is deterministic and request-ID exhaustion
+  fails closed without unbounded allocation.
+- Added versioned `GET`/`HEAD /requests` JSON with no-store responses and a
+  64 KiB serialization ceiling. Entries contain only request ID, canonical
+  hostname, TunnelId, bounded method/path, HTTP version, response status,
+  response-header latency, and a fixed outcome.
+- Never retain query strings, signed-access tokens, headers, bodies, peer IPs,
+  credentials, certificates, or payload bytes. Reachability probes,
+  WebSocket/CONNECT traffic, and pre-admission rejections are excluded.
+- Added fixed-cardinality capacity, retention, eviction, exhaustion, and
+  outcome metrics plus registry, parser/config, operations, redaction,
+  HTTP/1.1, HTTP/2, timeout, rejection, and lifecycle coverage. The workspace
+  contains 429 explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -645,10 +665,13 @@
 - Embedded durable/remote-write telemetry, log rotation/shipping, dashboards,
   and alerting. Collection and retention remain operator-owned (DEBT-010
   resolved by Sessions 37–38).
+- Durable request history, header/body capture, query filtering, public
+  operations access, and request replay. Session 56 implements only bounded
+  redacted process-local metadata for admitted ordinary HTTPS requests.
 
 ## Next planned session
 
-Session 56 has not been selected. DNS/public-certificate automation and
+Session 57 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.
