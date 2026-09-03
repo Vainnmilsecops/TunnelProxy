@@ -53,6 +53,13 @@
 | 47      | Bounded Route-Bound Classic HTTP/2 CONNECT Ingress | complete |
 | 48      | Bounded Route-Bound RFC 8441 WebSocket Ingress | complete |
 | 49      | Bounded Expiring Signed Access URLs for Public HTTPS | complete |
+| 50      | Atomic Signed-Access Public-Key Ring Reload   | complete |
+| 51      | Bounded Managed-HTTP Public Reachability Verification | complete |
+| 52      | Continuous Public Reachability Monitoring    | complete |
+| 53      | Bounded Multi-Tunnel Managed HTTP Agent      | complete |
+| 54      | Bounded Managed HTTP Operations Inventory    | complete |
+| 55      | Atomic Config-v2 Local-Target Generation Reload | complete |
+| 56      | Bounded Redacted HTTPS Request History       | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1741,3 +1748,26 @@ Out of scope:
 - Hot add/remove or rename, shared identity/TLS/endpoint/policy mutation,
   per-tunnel generation independence, transport reconnect-on-reload, public
   config distribution, DNS/public certificates, and multi-edge ownership.
+
+## Session 56 — Bounded Redacted HTTPS Request History — complete
+
+- Added optional Edge `--https-request-history-capacity <1..128>`, requiring
+  HTTPS ingress and the loopback operations listener while preserving disabled
+  compatibility.
+- Added a newest-first bounded in-memory ring with deterministic eviction,
+  monotonic process-local request IDs, response-header latency, HTTP version,
+  response status, and fixed forwarded/local-unavailable/timeout/rejected
+  outcomes.
+- Stored path only with a 2 KiB UTF-8-safe cap and never retained query
+  strings, signed-access tokens, headers, bodies, peer IPs, credentials,
+  certificates, or payload bytes. Probes, WebSocket/CONNECT traffic, and
+  pre-admission rejections remain outside the history.
+- Added versioned no-store `GET`/`HEAD /requests`, a 64 KiB response ceiling,
+  fixed-cardinality metrics, and unit/parser/operations plus real TLS HTTP/1.1
+  and HTTP/2 coverage. The workspace contains 429 explicit tests.
+
+Out of scope:
+
+- Header/body capture, durable storage, filtering/search, replay, WebSocket or
+  CONNECT inspection, public/authenticated operations, dashboards, and
+  multi-edge aggregation.

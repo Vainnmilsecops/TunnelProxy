@@ -1491,3 +1491,31 @@ streams. `/tunnels` follows the active snapshot and fixed-cardinality metrics
 report generation and reload health without identity-bearing labels. Hot
 add/remove, shared profile mutation, remote distribution, and independently
 versioned per-tunnel targets remain out of scope.
+
+## ADR-056 — HTTPS request history is bounded, redacted, and operations-local
+
+**Status:** Accepted (Session 56).
+
+**Context:** Operators need recent request outcomes and response-header
+latency to diagnose a live HTTPS route, but capturing arbitrary traffic would
+retain secrets, create unbounded memory/storage pressure, and turn the Edge
+into a replay or audit system.
+
+**Decision:** Make history explicitly opt-in with a strict 1-to-128-entry
+process-local ring, available only when HTTPS ingress and the loopback
+operations endpoint are both configured. Record only admitted ordinary HTTP
+requests and only a monotonic ID, canonical hostname, TunnelId, bounded
+method/path, HTTP version, status, header latency, and fixed outcome. Use the
+URI path component so queries are never stored; never copy headers, bodies,
+peer addresses, or credentials. Exclude reachability probes, WebSocket,
+CONNECT, and pre-admission rejections. Expose a versioned newest-first
+`GET`/`HEAD /requests` document capped at 64 KiB and identity-free
+fixed-cardinality metrics.
+
+**Consequences:** A local operator gets bounded recent diagnostic context with
+deterministic eviction and no hot-path storage/network dependency. The JSON
+endpoint intentionally contains hostname and TunnelId and therefore remains
+loopback-only and no-store, while metrics retain fixed labels. Restart clears
+history. Durable audit storage, headers/bodies/queries, filtering, replay,
+public operations access, and upgraded-protocol inspection remain out of
+scope.

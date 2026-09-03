@@ -28,7 +28,7 @@ use tunnelproxy_edge::{
     PublicTlsReloadBootstrapError, PublicTlsReloadConfig, PublicTlsReloadRuntime,
     RawIngressExposurePolicy, RuntimeShutdownConfig, SignedAccessIngressConfig,
     SnapshotAwareEdgeRuntime, SnapshotAwareEdgeRuntimeError, SnapshotAwareEdgeRuntimeOutcome,
-    WebSocketIngressConfig,
+    WebSocketIngressConfig, MAX_REQUEST_HISTORY_ENTRIES,
 };
 
 const USAGE: &str = "\
@@ -86,6 +86,7 @@ Options:
   --http-rate-limit-idle-ms <ms> peer bucket TTL (default 300000)
   --http-header-timeout-ms <ms>    header deadline (default 10000)
   --http-request-timeout-ms <ms>   full request deadline (default 60000)
+  --https-request-history-capacity <usize> opt-in redacted request history (max 128)
   --ops-listen <loopback-addr>     enable health/readiness/metrics endpoint
   --max-ops-connections <usize>    operations connection limit (default 8)
   --ops-header-timeout-ms <ms>     operations header deadline (default 2000)
@@ -156,6 +157,7 @@ async fn main() -> ExitCode {
     config.tunnel_id = parsed.tunnel_id.clone();
     config.max_raw_connections = parsed.max_raw_connections;
     config.raw_exposure = raw_exposure;
+    config.request_history_capacity = parsed.request_history_capacity;
     config.shutdown = RuntimeShutdownConfig::new(parsed.drain_timeout);
     config.operations = parsed.ops_listen.map(|listen_addr| {
         let mut operations = EdgeOperationsConfig::loopback(listen_addr);
@@ -482,6 +484,7 @@ struct ParsedArgs {
     http_rate_limit_idle: Duration,
     http_header_timeout: Duration,
     http_request_timeout: Duration,
+    request_history_capacity: Option<usize>,
     ops_listen: Option<SocketAddr>,
     max_ops_connections: usize,
     ops_header_timeout: Duration,
@@ -575,6 +578,7 @@ impl Default for ParsedArgs {
             http_rate_limit_idle: Duration::from_secs(5 * 60),
             http_header_timeout: Duration::from_secs(10),
             http_request_timeout: Duration::from_secs(60),
+            request_history_capacity: None,
             ops_listen: None,
             max_ops_connections: 8,
             ops_header_timeout: Duration::from_secs(2),
@@ -636,6 +640,9 @@ enum ArgError {
     PublicHttpsPerIpLimitRequired,
     PublicHttpsPerIpLimitWithoutOptIn,
     PublicHttpsPerIpLimitInvalid,
+    InvalidRequestHistoryCapacity,
+    RequestHistoryRequiresHttps,
+    RequestHistoryRequiresOperations,
     OperationsOptionsWithoutListener,
     UnknownFlag(String),
 }
@@ -714,6 +721,15 @@ impl std::fmt::Display for ArgError {
             Self::PublicHttpsPerIpLimitInvalid => f.write_str(
                 "--max-http-connections-per-ip must be non-zero and cannot exceed --max-http-connections",
             ),
+            Self::InvalidRequestHistoryCapacity => {
+                f.write_str("--https-request-history-capacity must be between 1 and 128")
+            }
+            Self::RequestHistoryRequiresHttps => {
+                f.write_str("--https-request-history-capacity requires --https-listen")
+            }
+            Self::RequestHistoryRequiresOperations => {
+                f.write_str("--https-request-history-capacity requires --ops-listen")
+            }
             Self::OperationsOptionsWithoutListener => {
                 f.write_str("operations limit/timeout options require --ops-listen")
             }
@@ -1015,6 +1031,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 parsed.https_options_present = true;
                 index += 2;
             }
+            "--https-request-history-capacity" => {
+                parsed.request_history_capacity = Some(parse_number(args, index, flag)?);
+                parsed.https_options_present = true;
+                index += 2;
+            }
             "--ops-listen" => {
                 parsed.ops_listen = Some(parse_addr(args, index, flag)?);
                 index += 2;
@@ -1153,6 +1174,17 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
     }
     if parsed.ops_options_present && parsed.ops_listen.is_none() {
         return Err(ArgError::OperationsOptionsWithoutListener);
+    }
+    if let Some(capacity) = parsed.request_history_capacity {
+        if !(1..=MAX_REQUEST_HISTORY_ENTRIES).contains(&capacity) {
+            return Err(ArgError::InvalidRequestHistoryCapacity);
+        }
+        if parsed.https_listen.is_none() {
+            return Err(ArgError::RequestHistoryRequiresHttps);
+        }
+        if parsed.ops_listen.is_none() {
+            return Err(ArgError::RequestHistoryRequiresOperations);
+        }
     }
     if parsed.https_route_server.is_some() && parsed.https_host.is_some() {
         return Err(ArgError::HttpsRouteHostConflict);
@@ -2135,6 +2167,48 @@ mod tests {
             parse_args(&args(&["--max-ops-connections", "2"])),
             Err(ArgError::OperationsOptionsWithoutListener)
         );
+    }
+
+    #[test]
+    fn request_history_is_explicit_bounded_and_requires_https_operations() {
+        assert_eq!(
+            parse_args(&args(&["--https-request-history-capacity", "0"])),
+            Err(ArgError::InvalidRequestHistoryCapacity)
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--https-request-history-capacity",
+                "129",
+                "--https-listen",
+                "127.0.0.1:7443",
+                "--ops-listen",
+                "127.0.0.1:9090",
+            ])),
+            Err(ArgError::InvalidRequestHistoryCapacity)
+        );
+        assert_eq!(
+            parse_args(&args(&["--https-request-history-capacity", "8"])),
+            Err(ArgError::RequestHistoryRequiresHttps)
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--https-request-history-capacity",
+                "8",
+                "--https-listen",
+                "127.0.0.1:7443",
+            ])),
+            Err(ArgError::RequestHistoryRequiresOperations)
+        );
+        let parsed = parse_args(&args(&[
+            "--https-request-history-capacity",
+            "8",
+            "--https-listen",
+            "127.0.0.1:7443",
+            "--ops-listen",
+            "127.0.0.1:9090",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.request_history_capacity, Some(8));
     }
 
     #[test]

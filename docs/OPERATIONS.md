@@ -146,6 +146,36 @@ live session lock, query SQLite, or perform remote backend I/O. Exported labels
 use bounded enumerations only. Never add tokens, certificates, payloads,
 hostnames, durable IDs, session IDs, stream IDs, or addresses as metric labels.
 
+## Edge HTTPS request history
+
+Edge may opt into a process-local redacted history by setting
+`--https-request-history-capacity <1..128>` together with HTTPS ingress and the
+loopback operations listener. `GET /requests` returns a versioned,
+newest-first JSON snapshot; `HEAD` returns the same status and headers without
+a body. The endpoint returns `404` while disabled, rejects other methods with
+`405`, always sends `Cache-Control: no-store`, and caps serialized output at
+64 KiB. If all retained entries do not fit, `returned` is smaller than
+`retained` and `truncated` is true.
+
+Each admitted ordinary HTTP request retains only its process-local request ID,
+canonical hostname, TunnelId, method (bounded to 32 bytes), path (bounded to
+2 KiB with `path_truncated`), HTTP/1 or HTTP/2, response status,
+response-header latency in milliseconds, and one fixed outcome:
+`forwarded`, `local_unavailable`, `timeout`, or `rejected`. Query strings,
+including signed-access tokens, are discarded before recording. Headers,
+bodies, peer IPs, credentials, certificates, and payload bytes are never
+stored. Reachability probes, WebSocket sessions, CONNECT sessions, and work
+rejected before ordinary-request admission are excluded.
+
+The matching metrics report configured capacity, retained entries, total
+records, evictions, request-ID exhaustion, and four fixed outcome labels under
+`tunnelproxy_edge_https_request_history_*`. Hostnames, TunnelIds, methods,
+paths, and request IDs never become metric labels. The ring and counters reset
+on process restart; this feature is operational context, not durable audit
+storage, traffic capture, filtering, or replay. Keep the operations listener
+loopback-only and grant access as carefully as for other identity-bearing
+diagnostic data.
+
 ## Nonblocking process-log sink
 
 Synchronous stderr is the compatibility default. For long-running processes,

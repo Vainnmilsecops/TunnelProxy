@@ -65,7 +65,9 @@ correct agent, which in turn proxies them into the local service.
 - An opt-in loopback-only Edge operations endpoint with bounded HTTP/1.1
   admission, liveness/readiness probes, and fixed-cardinality Prometheus
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
-  rate limiting.
+  rate limiting. HTTPS mode can additionally expose an opt-in bounded,
+  redacted, process-local history of admitted ordinary requests at
+  `GET`/`HEAD /requests`.
 - An opt-in loopback-only Agent operations endpoint with bounded admission,
   session-aware readiness, a versioned per-tunnel managed HTTP inventory,
   connection/reconnect metrics, and multiplexed DATA saturation/fairness
@@ -135,7 +137,8 @@ The following are **not yet implemented**:
   and DDoS mitigation. Bounded expiring signed URLs are implemented.
 - General administrative/account API and protected issuer-key custody/CA
   rollover.
-- Request inspection, replay, and webhook debugging.
+- Request body/header inspection, replay, and webhook debugging. A bounded
+  redacted HTTPS request-metadata history is implemented.
 - Public/authenticated operations access, metrics persistence/remote write,
   dashboards, and alerts.
 - Multi-tenant or multi-edge runtime.
@@ -338,6 +341,7 @@ and Definition of Done.
 | 53 _(complete)_ | bounded multi-tunnel managed HTTP Agent orchestration |
 | 54 _(complete)_ | bounded loopback per-tunnel managed HTTP operations inventory |
 | 55 _(complete)_ | atomic config-v2 local-target generation reload |
+| 56 _(complete)_ | bounded redacted HTTPS request history |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

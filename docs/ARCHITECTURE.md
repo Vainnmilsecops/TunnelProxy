@@ -1257,6 +1257,29 @@ config v2 remains compatible as disabled generation zero. Hot tunnel
 add/remove, per-tunnel generation control, and shared profile mutation remain
 separate scopes.
 
+### 2.53 Bounded redacted HTTPS request history (Session 56)
+
+The runnable Edge can opt into a 1-to-128-entry process-local ring shared by
+HTTPS ingress and the loopback operations listener. An admitted ordinary HTTP
+request creates a small observation record; finalization happens when response
+headers are available, including local-unavailable, timeout, and bounded local
+rejection outcomes. The mutex is held only for short synchronous snapshot or
+record operations and never across network awaits.
+
+The record deliberately contains only a monotonic process-local ID, canonical
+hostname, TunnelId, bounded method and path, negotiated HTTP version, response
+status, response-header latency, and a fixed outcome. URI queries are removed
+by using the path component only, and headers, bodies, peer addresses, and
+credentials are never copied into the registry. Reachability probes,
+WebSocket/CONNECT traffic, and pre-admission rejection paths are excluded.
+
+`GET`/`HEAD /requests` serializes newest-first JSON with a 64 KiB hard limit,
+truncating the returned prefix when necessary while reporting retained and
+returned counts. Eviction and outcome counters use only fixed-cardinality
+metrics. The feature requires both HTTPS ingress and loopback operations and
+is disabled by default; it adds no persistence, query/filter API, replay,
+public operations access, or Tunnel Protocol change.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

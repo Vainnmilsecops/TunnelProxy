@@ -1180,6 +1180,7 @@ mod http_tls;
 pub mod multiplex;
 mod operations;
 pub mod raw_ingress;
+mod request_history;
 mod runtime;
 mod snapshot_runtime;
 mod tls;
@@ -1217,6 +1218,7 @@ pub use raw_ingress::{
     RawIngressRouteConfig, RawIngressRouteError, RawIngressRouteId, RawIngressRouteManager,
     RawIngressRouteState, RawIngressRouteStatus, RawIngressRouteTarget,
 };
+pub use request_history::{MAX_REQUEST_HISTORY_ENTRIES, MAX_REQUEST_HISTORY_RESPONSE_BYTES};
 pub use runtime::{
     EdgeRuntime, EdgeRuntimeConfig, EdgeRuntimeConfigError, EdgeRuntimeError, EdgeRuntimeOutcome,
 };
