@@ -1519,3 +1519,26 @@ loopback-only and no-store, while metrics retain fixed labels. Restart clears
 history. Durable audit storage, headers/bodies/queries, filtering, replay,
 public operations access, and upgraded-protocol inspection remain out of
 scope.
+
+## ADR-057 — Request-history pagination uses stateless exclusive ID cursors
+
+**Status:** Accepted (Session 57).
+
+**Context:** The Session 56 history and 64 KiB response ceiling bound memory
+and output, but operators need a way to traverse more than one page without
+adding storage, server-side cursor lifetime, or sensitive filtering.
+
+**Decision:** Accept only optional `limit=1..128` and non-zero decimal
+`before=<request_id>` on loopback `GET`/`HEAD /requests`. Select retained IDs
+strictly below `before`, preserve newest-first order, and expose additive
+`eligible`, `has_more`, and `next_before` fields. Treat both the requested
+limit and the 64 KiB ceiling as truncation. Reject unknown, duplicate,
+encoded, malformed, zero, and out-of-range query parameters with `400` while
+preserving disabled `404` and method `405` behavior.
+
+**Consequences:** Clients can continue from the last returned ID without
+duplicates while the retained snapshot is unchanged. Each request observes a
+fresh bounded ring snapshot, so concurrent recording or eviction can produce
+gaps or an empty page for an old cursor; no cursor state is pinned or
+reconstructed. This adds no value-based filtering, persistence, capture,
+replay, public endpoint, dynamic metric labels, CLI, or protocol change.

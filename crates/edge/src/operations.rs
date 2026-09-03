@@ -29,7 +29,7 @@ use crate::multiplex::{AuthorizationSourceStatus, EdgeSessionRouter};
 use crate::raw_ingress::{RawIngressRouteId, RawIngressRouteManager, RawIngressRouteStatus};
 use crate::request_history::{
     RequestHistory, RequestHistoryEntry, RequestHistoryOutcome, RequestHistorySnapshot,
-    MAX_REQUEST_HISTORY_RESPONSE_BYTES,
+    MAX_REQUEST_HISTORY_ENTRIES, MAX_REQUEST_HISTORY_RESPONSE_BYTES,
 };
 
 pub const MIN_OPERATIONS_HEADER_BYTES: usize = 8 * 1024;
@@ -410,7 +410,17 @@ async fn serve_request(
                 EdgeIngressMetricsSource::Https {
                     request_history: Some(history),
                     ..
-                } => request_history_response(history, head),
+                } => match RequestHistoryQuery::parse(request.uri().query()) {
+                    Ok(query) => request_history_response(history, query, head),
+                    Err(_) => {
+                        counters.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                        plain_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid request history query\n",
+                            head,
+                        )
+                    }
+                },
                 EdgeIngressMetricsSource::Raw { .. }
                 | EdgeIngressMetricsSource::Https {
                     request_history: None,
@@ -462,8 +472,12 @@ fn metrics_response(body: &str, head: bool) -> Response<Full<Bytes>> {
     )
 }
 
-fn request_history_response(history: &RequestHistory, head: bool) -> Response<Full<Bytes>> {
-    let body = render_request_history(history.snapshot());
+fn request_history_response(
+    history: &RequestHistory,
+    query: RequestHistoryQuery,
+    head: bool,
+) -> Response<Full<Bytes>> {
+    let body = render_request_history(history.snapshot(), query);
     response(
         StatusCode::OK,
         "application/json; charset=utf-8",
@@ -471,25 +485,85 @@ fn request_history_response(history: &RequestHistory, head: bool) -> Response<Fu
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequestHistoryQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidRequestHistoryQuery;
+
+impl RequestHistoryQuery {
+    fn parse(query: Option<&str>) -> Result<Self, InvalidRequestHistoryQuery> {
+        let Some(query) = query.filter(|query| !query.is_empty()) else {
+            return Ok(Self::default());
+        };
+        let mut parsed = Self::default();
+        for parameter in query.split('&') {
+            let (name, value) = parameter
+                .split_once('=')
+                .ok_or(InvalidRequestHistoryQuery)?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(InvalidRequestHistoryQuery);
+            }
+            match name {
+                "before" if parsed.before.is_none() => {
+                    let before = value
+                        .parse::<u64>()
+                        .map_err(|_| InvalidRequestHistoryQuery)?;
+                    if before == 0 {
+                        return Err(InvalidRequestHistoryQuery);
+                    }
+                    parsed.before = Some(before);
+                }
+                "limit" if parsed.limit.is_none() => {
+                    let limit = value
+                        .parse::<usize>()
+                        .map_err(|_| InvalidRequestHistoryQuery)?;
+                    if !(1..=MAX_REQUEST_HISTORY_ENTRIES).contains(&limit) {
+                        return Err(InvalidRequestHistoryQuery);
+                    }
+                    parsed.limit = Some(limit);
+                }
+                _ => return Err(InvalidRequestHistoryQuery),
+            }
+        }
+        Ok(parsed)
+    }
+}
+
 #[derive(Serialize)]
 struct RequestHistoryDocument<'a> {
     version: u8,
     capacity: usize,
     retained: usize,
+    eligible: usize,
     returned: usize,
     recorded_total: u64,
     evicted_total: u64,
     sequence_exhaustions: u64,
     truncated: bool,
+    has_more: bool,
+    next_before: Option<u64>,
     requests: &'a [RequestHistoryEntry],
 }
 
-fn render_request_history(snapshot: RequestHistorySnapshot) -> String {
+fn render_request_history(snapshot: RequestHistorySnapshot, query: RequestHistoryQuery) -> String {
+    let start = query.before.map_or(0, |before| {
+        snapshot
+            .entries
+            .iter()
+            .position(|entry| entry.request_id < before)
+            .unwrap_or(snapshot.entries.len())
+    });
+    let eligible = snapshot.entries.len() - start;
+    let page_limit = query.limit.unwrap_or(snapshot.capacity).min(eligible);
     let mut lower = 0;
-    let mut upper = snapshot.entries.len();
+    let mut upper = page_limit;
     while lower < upper {
         let candidate = lower + (upper - lower).div_ceil(2);
-        if serialize_request_history(&snapshot, candidate).len()
+        if serialize_request_history(&snapshot, start, eligible, candidate).len()
             <= MAX_REQUEST_HISTORY_RESPONSE_BYTES
         {
             lower = candidate;
@@ -497,22 +571,36 @@ fn render_request_history(snapshot: RequestHistorySnapshot) -> String {
             upper = candidate - 1;
         }
     }
-    let body = serialize_request_history(&snapshot, lower);
+    let body = serialize_request_history(&snapshot, start, eligible, lower);
     assert!(body.len() <= MAX_REQUEST_HISTORY_RESPONSE_BYTES);
     body
 }
 
-fn serialize_request_history(snapshot: &RequestHistorySnapshot, returned: usize) -> String {
+fn serialize_request_history(
+    snapshot: &RequestHistorySnapshot,
+    start: usize,
+    eligible: usize,
+    returned: usize,
+) -> String {
+    let has_more = returned < eligible;
+    let next_before = if has_more && returned > 0 {
+        Some(snapshot.entries[start + returned - 1].request_id)
+    } else {
+        None
+    };
     let document = RequestHistoryDocument {
         version: 1,
         capacity: snapshot.capacity,
         retained: snapshot.entries.len(),
+        eligible,
         returned,
         recorded_total: snapshot.recorded_total,
         evicted_total: snapshot.evicted_total,
         sequence_exhaustions: snapshot.sequence_exhaustions,
-        truncated: returned < snapshot.entries.len(),
-        requests: &snapshot.entries[..returned],
+        truncated: has_more,
+        has_more,
+        next_before,
+        requests: &snapshot.entries[start..start + returned],
     };
     let mut body = serde_json::to_string(&document)
         .expect("bounded request history contains only serializable values");
@@ -1439,22 +1527,140 @@ mod tests {
                 )
                 .finish(200);
         }
-        let body = render_request_history(history.snapshot());
+        let body = render_request_history(history.snapshot(), RequestHistoryQuery::default());
         assert!(body.len() <= MAX_REQUEST_HISTORY_RESPONSE_BYTES);
         let document: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(document["version"], 1);
         assert_eq!(document["capacity"], 128);
         assert_eq!(document["retained"], 128);
+        assert_eq!(document["eligible"], 128);
         assert_eq!(document["recorded_total"], 128);
         assert_eq!(document["truncated"], true);
+        assert_eq!(document["has_more"], true);
+        assert!(document["next_before"].as_u64().is_some());
         assert_eq!(document["requests"][0]["request_id"], 128);
 
-        let response = request_history_response(&history, false);
+        let response = request_history_response(&history, RequestHistoryQuery::default(), false);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
             "application/json; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn request_history_query_is_strict_and_bounded() {
+        assert_eq!(
+            RequestHistoryQuery::parse(None),
+            Ok(RequestHistoryQuery::default())
+        );
+        assert_eq!(
+            RequestHistoryQuery::parse(Some("")),
+            Ok(RequestHistoryQuery::default())
+        );
+        assert_eq!(
+            RequestHistoryQuery::parse(Some("limit=8&before=42")),
+            Ok(RequestHistoryQuery {
+                before: Some(42),
+                limit: Some(8),
+            })
+        );
+        for invalid in [
+            "limit=0",
+            "limit=129",
+            "limit=",
+            "limit=one",
+            "limit=+1",
+            "limit=1&limit=2",
+            "before=0",
+            "before=",
+            "before=one",
+            "before=+1",
+            "before=1&before=2",
+            "unknown=1",
+            "limit",
+            "limit=1&",
+            "limit=%31",
+        ] {
+            assert_eq!(
+                RequestHistoryQuery::parse(Some(invalid)),
+                Err(InvalidRequestHistoryQuery),
+                "query {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn request_history_cursor_pages_are_newest_first_without_duplicates() {
+        let history = RequestHistory::new(5).unwrap();
+        for index in 1..=7 {
+            history
+                .begin(
+                    "demo.example.test",
+                    "tunnel-dev",
+                    "GET",
+                    &format!("/{index}"),
+                    crate::request_history::RequestHistoryProtocol::Http2,
+                    std::time::Instant::now(),
+                )
+                .finish(200);
+        }
+
+        let first: serde_json::Value = serde_json::from_str(&render_request_history(
+            history.snapshot(),
+            RequestHistoryQuery {
+                before: None,
+                limit: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(first["retained"], 5);
+        assert_eq!(first["eligible"], 5);
+        assert_eq!(first["returned"], 2);
+        assert_eq!(first["has_more"], true);
+        assert_eq!(first["next_before"], 6);
+        assert_eq!(first["requests"][0]["request_id"], 7);
+        assert_eq!(first["requests"][1]["request_id"], 6);
+
+        let second: serde_json::Value = serde_json::from_str(&render_request_history(
+            history.snapshot(),
+            RequestHistoryQuery {
+                before: first["next_before"].as_u64(),
+                limit: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(second["eligible"], 3);
+        assert_eq!(second["returned"], 2);
+        assert_eq!(second["next_before"], 4);
+        assert_eq!(second["requests"][0]["request_id"], 5);
+        assert_eq!(second["requests"][1]["request_id"], 4);
+
+        let final_page: serde_json::Value = serde_json::from_str(&render_request_history(
+            history.snapshot(),
+            RequestHistoryQuery {
+                before: second["next_before"].as_u64(),
+                limit: Some(2),
+            },
+        ))
+        .unwrap();
+        assert_eq!(final_page["eligible"], 1);
+        assert_eq!(final_page["returned"], 1);
+        assert_eq!(final_page["has_more"], false);
+        assert_eq!(final_page["next_before"], serde_json::Value::Null);
+        assert_eq!(final_page["requests"][0]["request_id"], 3);
+
+        let evicted_cursor: serde_json::Value = serde_json::from_str(&render_request_history(
+            history.snapshot(),
+            RequestHistoryQuery {
+                before: Some(2),
+                limit: Some(5),
+            },
+        ))
+        .unwrap();
+        assert_eq!(evicted_cursor["eligible"], 0);
+        assert_eq!(evicted_cursor["returned"], 0);
+        assert_eq!(evicted_cursor["has_more"], false);
     }
 }

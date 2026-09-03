@@ -154,8 +154,27 @@ loopback operations listener. `GET /requests` returns a versioned,
 newest-first JSON snapshot; `HEAD` returns the same status and headers without
 a body. The endpoint returns `404` while disabled, rejects other methods with
 `405`, always sends `Cache-Control: no-store`, and caps serialized output at
-64 KiB. If all retained entries do not fit, `returned` is smaller than
-`retained` and `truncated` is true.
+64 KiB.
+
+The endpoint accepts only these optional query parameters:
+
+- `limit=<1..128>` limits the page; it defaults to the configured history
+  capacity.
+- `before=<request_id>` returns entries whose non-zero request ID is strictly
+  less than the cursor.
+
+Parameters may appear in either order, but duplicate, unknown, empty,
+non-decimal, zero, encoded, or out-of-range values return `400`. A cursor is
+stateless and snapshot-relative: concurrent requests or eviction can create
+gaps, and an already-evicted cursor can legitimately return an empty page.
+Entries remain newest-first and never repeat across pages when the retained
+snapshot is unchanged.
+
+The document reports `retained` for the complete current ring and `eligible`
+for entries older than the optional cursor. `returned` is the number emitted.
+`has_more` and `truncated` are true when the requested limit or the 64 KiB
+ceiling leaves eligible entries for a later page; `next_before` is the last
+returned request ID in that case and otherwise is `null`.
 
 Each admitted ordinary HTTP request retains only its process-local request ID,
 canonical hostname, TunnelId, method (bounded to 32 bytes), path (bounded to

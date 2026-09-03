@@ -1280,6 +1280,29 @@ metrics. The feature requires both HTTPS ingress and loopback operations and
 is disabled by default; it adds no persistence, query/filter API, replay,
 public operations access, or Tunnel Protocol change.
 
+### 2.54 Bounded request-history cursor pagination (Session 57)
+
+The loopback `GET`/`HEAD /requests` endpoint accepts strict optional
+`limit=1..128` and non-zero `before=<request_id>` parameters. The cursor is an
+exclusive monotonic request-ID boundary, so each response selects retained
+entries with IDs below it and preserves newest-first order. Unknown,
+duplicate, encoded, malformed, zero, and out-of-range values fail closed with
+`400`; disabled history remains indistinguishable from an absent resource with
+`404`.
+
+Pagination snapshots the existing bounded ring for each request and does not
+pin entries or allocate server-side cursor state. `retained` describes the
+whole ring, `eligible` describes the cursor-selected suffix, and `returned`
+describes the serialized page. `has_more`, `truncated`, and `next_before`
+allow continuation when either the requested limit or the existing 64 KiB
+serialization ceiling cuts the page short. Eviction or concurrent recording
+may create gaps between independent snapshots, including an empty page after
+an old cursor; no data is replayed or reconstructed.
+
+This is ID-based traversal only, not filtering by hostname, TunnelId, method,
+path, status, outcome, or other retained values. It adds no storage, payload
+capture, public operations exposure, protocol change, or dynamic metric label.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

@@ -60,6 +60,7 @@
 | 54      | Bounded Managed HTTP Operations Inventory    | complete |
 | 55      | Atomic Config-v2 Local-Target Generation Reload | complete |
 | 56      | Bounded Redacted HTTPS Request History       | complete |
+| 57      | Bounded Request-History Cursor Pagination    | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1771,3 +1772,25 @@ Out of scope:
 - Header/body capture, durable storage, filtering/search, replay, WebSocket or
   CONNECT inspection, public/authenticated operations, dashboards, and
   multi-edge aggregation.
+
+## Session 57 — Bounded Request-History Cursor Pagination — complete
+
+- Added strict optional `limit=<1..128>` and non-zero decimal
+  `before=<request_id>` parameters to loopback `GET`/`HEAD /requests` while
+  retaining the default Session 56 behavior.
+- Added stateless newest-first exclusive-cursor pages, including safe eviction
+  gaps and no duplicate IDs across an unchanged retained snapshot.
+- Added additive `eligible`, `has_more`, and `next_before` response fields.
+  The requested limit and existing 64 KiB ceiling both drive `truncated`, and
+  continuation always uses the last returned ID.
+- Unknown, duplicate, encoded, malformed, zero, and out-of-range query values
+  return `400`; disabled history remains `404`, non-GET/HEAD methods remain
+  `405`, and successful responses remain no-store.
+- Added strict parser, cursor traversal, eviction-gap, response-bound, and real
+  HTTP/1.1/HTTP/2 coverage. The workspace contains 431 explicit tests.
+
+Out of scope:
+
+- Persistence, server-side cursor state, snapshot pinning, value-based search
+  or filtering, header/body/query capture, public operations exposure, replay,
+  long polling, CLI or Tunnel Protocol changes.
