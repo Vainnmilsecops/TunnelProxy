@@ -537,6 +537,14 @@ probes, WebSocket/CONNECT traffic, and requests rejected before ordinary HTTP
 admission are excluded. The option requires both `--https-listen` and
 `--ops-listen`; without it `/requests` returns `404`.
 
+Use `GET /requests?limit=32` for the first bounded page and, while
+`has_more` is true, request `GET /requests?limit=32&before=<next_before>`.
+Only `limit=1..128` and a non-zero decimal `before` are accepted. Unknown,
+duplicate, encoded, malformed, or out-of-range parameters return `400`.
+Pagination is a stateless view of the current in-memory ring, so concurrent
+recording or eviction may create gaps between requests; it never expands the
+redacted record schema or persists a snapshot.
+
 The endpoint is disabled unless `--ops-listen` is supplied and rejects every
 non-loopback bind. It has explicit connection/header/time/drain bounds, closes
 after one HTTP/1.1 request, and is intentionally unauthenticated because it is

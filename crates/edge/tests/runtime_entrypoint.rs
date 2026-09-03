@@ -596,6 +596,11 @@ async fn operations_endpoint_tracks_raw_readiness_metrics_and_lifecycle() {
     assert!(operations_request(operations_addr, "GET", "/requests")
         .await
         .starts_with("HTTP/1.1 404 Not Found"));
+    assert!(
+        operations_request(operations_addr, "GET", "/requests?limit=1")
+            .await
+            .starts_with("HTTP/1.1 404 Not Found")
+    );
 
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
@@ -1473,6 +1478,10 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     let history: serde_json::Value =
         serde_json::from_str(history.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(history["retained"], 6);
+    assert_eq!(history["eligible"], 6);
+    assert_eq!(history["returned"], 6);
+    assert_eq!(history["has_more"], false);
+    assert_eq!(history["next_before"], serde_json::Value::Null);
     assert_eq!(history["requests"][0]["path"], "/fallback");
     assert_eq!(history["requests"][0]["protocol"], "http1");
     let requests = history["requests"].as_array().unwrap();
@@ -1490,6 +1499,35 @@ async fn http2_multiplexes_bounded_streams_and_rejects_authority_fronting() {
     assert_eq!(oversized["response_status"], 413);
     assert_eq!(oversized["outcome"], "rejected");
     assert!(!requests.iter().any(|entry| entry["path"] == "/fronted"));
+
+    let first_page = operations_request(operations_addr, "GET", "/requests?limit=2").await;
+    let first_page: serde_json::Value =
+        serde_json::from_str(first_page.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(first_page["eligible"], 6);
+    assert_eq!(first_page["returned"], 2);
+    assert_eq!(first_page["has_more"], true);
+    let cursor = first_page["next_before"].as_u64().unwrap();
+    let first_ids = first_page["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["request_id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    let second_page = operations_request(
+        operations_addr,
+        "GET",
+        &format!("/requests?before={cursor}&limit=2"),
+    )
+    .await;
+    let second_page: serde_json::Value =
+        serde_json::from_str(second_page.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(second_page["eligible"], 4);
+    assert_eq!(second_page["returned"], 2);
+    for entry in second_page["requests"].as_array().unwrap() {
+        let request_id = entry["request_id"].as_u64().unwrap();
+        assert!(request_id < cursor);
+        assert!(!first_ids.contains(&request_id));
+    }
 
     local_task.await.unwrap();
     agent_trigger.shutdown();
@@ -3766,9 +3804,20 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert_eq!(history_json["requests"][0]["protocol"], "http1");
     assert_eq!(history_json["requests"][0]["response_status"], 200);
     assert_eq!(history_json["requests"][0]["outcome"], "forwarded");
-    let head = operations_request(operations_addr, "HEAD", "/requests").await;
+    let head = operations_request(operations_addr, "HEAD", "/requests?limit=1").await;
     assert!(head.starts_with("HTTP/1.1 200 OK"));
     assert_eq!(head.split_once("\r\n\r\n").unwrap().1, "");
+    for invalid_query in [
+        "/requests?limit=0",
+        "/requests?limit=129",
+        "/requests?before=0",
+        "/requests?limit=1&limit=2",
+        "/requests?unknown=1",
+    ] {
+        assert!(operations_request(operations_addr, "GET", invalid_query)
+            .await
+            .starts_with("HTTP/1.1 400 Bad Request"));
+    }
     assert!(operations_request(operations_addr, "POST", "/requests")
         .await
         .starts_with("HTTP/1.1 405 Method Not Allowed"));

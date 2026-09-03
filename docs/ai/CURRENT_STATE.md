@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Redacted HTTPS Request History** (Session 56).
+**Bounded Request-History Cursor Pagination** (Session 57).
 
 ## Completed
 
@@ -626,6 +626,24 @@
   HTTP/1.1, HTTP/2, timeout, rejection, and lifecycle coverage. The workspace
   contains 429 explicit tests.
 
+## Session 57 delivered
+
+- Added strict optional `limit=<1..128>` and non-zero decimal
+  `before=<request_id>` pagination to loopback `GET`/`HEAD /requests`.
+  Defaults preserve the Session 56 single-page behavior.
+- Pages remain newest-first and select only retained IDs strictly below the
+  cursor. Pagination is stateless; eviction gaps and an empty page for an old
+  cursor are safe outcomes.
+- Extended the versioned JSON additively with `eligible`, `has_more`, and
+  `next_before`. `truncated` now reports either the caller's page limit or the
+  unchanged 64 KiB serialization ceiling leaving eligible entries.
+- Unknown, duplicate, encoded, malformed, zero, and out-of-range query values
+  fail closed with `400`; disabled history still returns `404`, other methods
+  remain `405`, and all successful responses remain no-store.
+- Added parser, cursor ordering/no-duplicate, eviction-gap, size-bound, and
+  real HTTP/1.1/HTTP/2 pagination coverage. The workspace contains 431
+  explicit tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -665,13 +683,14 @@
 - Embedded durable/remote-write telemetry, log rotation/shipping, dashboards,
   and alerting. Collection and retention remain operator-owned (DEBT-010
   resolved by Sessions 37–38).
-- Durable request history, header/body capture, query filtering, public
-  operations access, and request replay. Session 56 implements only bounded
-  redacted process-local metadata for admitted ordinary HTTPS requests.
+- Durable request history, header/body capture, value-based query filtering or
+  search, public operations access, and request replay. Sessions 56–57
+  implement only bounded redacted process-local metadata and stateless ID
+  cursor traversal for admitted ordinary HTTPS requests.
 
 ## Next planned session
 
-Session 57 has not been selected. DNS/public-certificate automation and
+Session 58 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

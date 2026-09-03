@@ -67,7 +67,8 @@ correct agent, which in turn proxies them into the local service.
   metrics for authorization, multiplexed transport, raw ingress, HTTPS, and
   rate limiting. HTTPS mode can additionally expose an opt-in bounded,
   redacted, process-local history of admitted ordinary requests at
-  `GET`/`HEAD /requests`.
+  `GET`/`HEAD /requests`, with strict bounded `limit`/`before` cursor
+  pagination.
 - An opt-in loopback-only Agent operations endpoint with bounded admission,
   session-aware readiness, a versioned per-tunnel managed HTTP inventory,
   connection/reconnect metrics, and multiplexed DATA saturation/fairness
@@ -342,6 +343,7 @@ and Definition of Done.
 | 54 _(complete)_ | bounded loopback per-tunnel managed HTTP operations inventory |
 | 55 _(complete)_ | atomic config-v2 local-target generation reload |
 | 56 _(complete)_ | bounded redacted HTTPS request history |
+| 57 _(complete)_ | bounded request-history cursor pagination |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

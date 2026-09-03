@@ -137,7 +137,8 @@ An optional loopback-only operations listener reads these in-memory snapshots
 for health/readiness and fixed-cardinality Prometheus output, remains available
 during ingress drain, and performs no Control Plane or storage lookup. It can
 also expose an independently opt-in bounded, redacted, process-local history
-of admitted ordinary HTTPS request metadata; query/header/body/IP data and
+of admitted ordinary HTTPS request metadata with strict stateless
+`limit`/`before` cursor pagination; URI-query/header/body/IP data and
 WebSocket, CONNECT, or reachability-probe traffic never enter that registry.
 
 **Responsibility (future)**

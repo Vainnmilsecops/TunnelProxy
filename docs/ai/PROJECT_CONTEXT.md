@@ -91,6 +91,9 @@ active snapshot, and existing streams/transports remain connected.
 Session 56 adds an opt-in 1-to-128-entry redacted HTTPS request-metadata ring
 at the loopback Edge operations endpoint. It never stores queries, headers,
 bodies, peer IPs, or credentials and does not inspect WebSocket/CONNECT data.
+Session 57 adds strict stateless `limit`/`before` cursor pagination over that
+same bounded ring, preserving newest-first order, the 64 KiB output ceiling,
+and the existing redaction and loopback-only boundaries.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,
