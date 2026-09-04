@@ -1542,3 +1542,27 @@ fresh bounded ring snapshot, so concurrent recording or eviction can produce
 gaps or an empty page for an old cursor; no cursor state is pinned or
 reconstructed. This adds no value-based filtering, persistence, capture,
 replay, public endpoint, dynamic metric labels, CLI, or protocol change.
+
+## ADR-058 — Legacy TCP relay liveness is based on successful byte activity
+
+**Status:** Accepted (Session 58).
+
+**Context:** The preserved echo, relay, and local-forwarder foundations bound
+buffers, connect time, and task drain, but an established silent socket could
+retain its task, peer socket, upstream socket, and forwarder permit forever.
+A total connection deadline would incorrectly terminate healthy long-lived
+traffic.
+
+**Decision:** Use one activity-aware deadline shared by both relay directions.
+Only a completed non-empty write resets it. Drive both directions with fixed
+8 KiB buffers and require writes and half-close shutdowns to complete by the
+same deadline. Default compatibility helpers to 60 seconds; validate the
+development forwarder's configured value from 1 millisecond through 1 hour.
+Return typed relay/forwarder timeout variants and retain RAII task ownership.
+
+**Consequences:** Active connections have no artificial lifetime cap, while
+silent or write-stalled peers release both sockets and forwarder admission in
+finite time without stopping the listener. Existing public helper signatures,
+half-close, byte counts, payload opacity, and Tunnel Protocol remain intact.
+Per-IP legacy admission, upstream pooling, production ingress refactoring, and
+new telemetry surfaces remain separate work.

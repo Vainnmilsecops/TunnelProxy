@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tunnelproxy_edge::{handle_connection, run_listener};
+use tunnelproxy_edge::{handle_connection, handle_connection_with_idle_timeout, run_listener};
 
 /// Bind a `TcpListener` on an ephemeral port and start `run_listener`
 /// in the background. Returns the bound address and the join handle for
@@ -102,6 +102,35 @@ async fn echo_server_returns_empty_for_immediate_close() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn echo_activity_resets_idle_deadline_then_silence_closes_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handler = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        handle_connection_with_idle_timeout(stream, peer, Duration::from_millis(300)).await;
+    });
+    let mut client = TcpStream::connect(addr).await.unwrap();
+
+    for byte in b"live" {
+        client.write_all(&[*byte]).await.unwrap();
+        let mut echoed = [0_u8; 1];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed[0], *byte);
+        if *byte != b'e' {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+    }
+
+    let mut after_idle = [0_u8; 1];
+    let read = timeout(Duration::from_secs(1), client.read(&mut after_idle))
+        .await
+        .expect("silent echo connection should close by its idle deadline")
+        .unwrap();
+    assert_eq!(read, 0);
+    handler.await.unwrap();
 }
 
 /// Smoke test that `run_listener` itself binds successfully. This is

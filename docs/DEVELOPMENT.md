@@ -80,6 +80,26 @@ native Windows build still requires Visual Studio Build Tools with the
 "Desktop development with C++" workload; alternatively run the Linux gates in
 WSL.
 
+### 3.2 Running the legacy local TCP forwarder
+
+The development example retains the Session 04 local forwarder surface:
+
+```bash
+cargo run -p tunnelproxy-edge --example edge_dev -- \
+  --listen 127.0.0.1:7000 \
+  --upstream 127.0.0.1:8000 \
+  --max-connections 100 \
+  --connect-timeout-ms 5000 \
+  --relay-idle-timeout-ms 60000
+```
+
+The relay idle timeout accepts `1..=3600000` milliseconds and defaults to 60
+seconds. It is an inactivity bound, not a connection-lifetime bound: every
+successfully forwarded non-empty write in either direction resets one shared
+deadline. Silent reads, blocked writes, and blocked half-closes terminate the
+connection, release its concurrency permit, and do not stop the listener.
+The TCP echo and Session 03 relay compatibility helpers use the same default.
+
 ## 4. Formatting
 
 - We use the default `rustfmt` configuration. There is no custom

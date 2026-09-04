@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Request-History Cursor Pagination** (Session 57).
+**Bounded Activity-Aware Legacy TCP Relay Idle Timeout** (Session 58).
 
 ## Completed
 
@@ -644,6 +644,26 @@
   real HTTP/1.1/HTTP/2 pagination coverage. The workspace contains 431
   explicit tests.
 
+## Session 58 delivered
+
+- Added a shared activity-aware idle deadline to the preserved Edge TCP echo,
+  relay, and local-forwarder primitives. A successful non-empty write in
+  either direction resets the deadline; silent reads, blocked writes, and
+  blocked half-closes terminate within it.
+- Added a 60-second default and strict 1 ms-to-1 hour
+  `relay_idle_timeout` forwarder bound. The `edge_dev` example exposes
+  `--relay-idle-timeout-ms`; compatibility helpers retain their signatures and
+  use the default.
+- Added typed `RelayError::IdleTimeout` and
+  `ForwardError::RelayIdleTimeout`/`RelayIdleTimeout` lifecycle reporting.
+  Timeout drops both sockets, releases the admission permit through RAII, and
+  leaves the listener usable.
+- Preserved fixed 8 KiB buffers, byte-exact full duplex, byte counters, and TCP
+  half-close behavior without detached copy tasks or payload logging.
+- Added config/category, echo activity, bidirectional relay activity, typed
+  permit-release, and development CLI coverage. The workspace contains 437
+  explicit tests across all targets.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -678,7 +698,6 @@
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
 - Upstream connection pool (DEBT-008 open).
-- Relay-path idle read deadline (DEBT-006 remains open outside Agent heartbeat).
 - Per-IP admission control on the forwarder (DEBT-009 open).
 - Embedded durable/remote-write telemetry, log rotation/shipping, dashboards,
   and alerting. Collection and retention remain operator-owned (DEBT-010
@@ -690,7 +709,7 @@
 
 ## Next planned session
 
-Session 58 has not been selected. DNS/public-certificate automation and
+Session 59 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

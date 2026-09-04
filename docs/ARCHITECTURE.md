@@ -116,8 +116,7 @@ Configured TCP Upstream
 This is **not** the reverse tunnel. It is a generic byte-oriented
 TCP relay: for every accepted downstream connection, the relay dials
 a fresh upstream TCP connection and forwards bytes concurrently in
-both directions using
-[`tokio::io::copy_bidirectional`], which honors TCP half-close. The
+both directions through fixed-size buffers while honoring TCP half-close. The
 relay preserves bounded buffers (no `read_to_end`, no payload
 logging) and isolates per-connection failures so the listener keeps
 running. The relay exists to validate the byte-stream pipeline that
@@ -136,6 +135,7 @@ same byte-stream contract but adds:
    upstream_addr: SocketAddr
    max_connections: usize           # bounded concurrent admission
    connect_timeout:  Duration       # upstream TCP connect deadline
+   relay_idle_timeout: Duration      # shared established-relay idle deadline
 ```
 
 - **Connection identity.** Every accepted downstream connection is
@@ -147,7 +147,7 @@ same byte-stream contract but adds:
   ([`ConnectionLifecycle::Accepted`], `ConnectingUpstream`,
   `Relaying`, `Closed`, plus the failure phases
   `CapacityRejected`, `UpstreamConnectFailed`,
-  `UpstreamConnectTimeout`, `RelayIoFailed`).
+  `UpstreamConnectTimeout`, `RelayIoFailed`, `RelayIdleTimeout`).
 - **Bounded admission.** A `tokio::sync::Semaphore` of size
   `max_connections` is acquired *before* dialing the upstream.
   Accepted connections with no available permit are rejected
@@ -1302,6 +1302,26 @@ an old cursor; no data is replayed or reconstructed.
 This is ID-based traversal only, not filtering by hostname, TunnelId, method,
 path, status, outcome, or other retained values. It adds no storage, payload
 capture, public operations exposure, protocol change, or dynamic metric label.
+
+### 2.55 Activity-aware idle deadlines for legacy TCP paths (Session 58)
+
+The echo, relay, and local-forwarder baselines now share the same bounded
+activity rule: an established socket pair may remain alive indefinitely only
+while a non-empty write completes in either direction before the deadline.
+The default is 60 seconds. The development forwarder accepts a strict
+`relay_idle_timeout` between 1 millisecond and 1 hour; older public helpers
+retain their signatures and use the default.
+
+Each direction owns one fixed 8 KiB buffer. Reads compete with one shared
+deadline; writes and half-close shutdowns must complete by that same deadline.
+A successful write resets it, while EOF half-closes only the opposite writer
+and permits the remaining direction to finish. Timeout drops both sockets,
+returns `RelayError::IdleTimeout` or `ForwardError::RelayIdleTimeout`, releases
+the forwarder's admission permit through RAII, and leaves the listener live.
+
+This hardens only the preserved local TCP baselines and changes no HTTP
+upgrade, public raw-ingress, Agent transport, Tunnel Protocol, per-IP
+admission, or upstream connection-pooling policy.
 
 ## 3. Control plane vs data plane
 

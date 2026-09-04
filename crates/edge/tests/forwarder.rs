@@ -20,8 +20,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tunnelproxy_edge::{
-    forward_handle_connection, ConnectionId, ConnectionIdAllocator, ConnectionLifecycle,
-    ConnectionOutcome, ForwardConfig, ForwardConfigError, ForwardError, Forwarder, RelayStats,
+    forward_handle_connection, forward_handle_connection_with_idle_timeout, ConnectionId,
+    ConnectionIdAllocator, ConnectionLifecycle, ConnectionOutcome, ForwardConfig,
+    ForwardConfigError, ForwardError, Forwarder, RelayStats,
 };
 
 /// Per-connection buffer used by upstream test servers.
@@ -209,6 +210,7 @@ async fn forwarder_capacity_limit_one_rejects_then_releases() {
         upstream_addr,
         max_connections: 1,
         connect_timeout: Duration::from_secs(2),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     let forwarder = Forwarder::new(config).expect("valid config");
     assert_eq!(forwarder.available_permits(), 1);
@@ -267,6 +269,55 @@ async fn forwarder_capacity_limit_one_rejects_then_releases() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn forwarder_idle_timeout_is_typed_and_releases_its_permit() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (_socket, _) = upstream.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream_addr = downstream.local_addr().unwrap();
+    let permits = Arc::new(Semaphore::new(1));
+    let handler_permits = Arc::clone(&permits);
+    let handler = tokio::spawn(async move {
+        let (stream, peer) = downstream.accept().await.unwrap();
+        let permit = handler_permits.try_acquire_owned().unwrap();
+        forward_handle_connection_with_idle_timeout(
+            ConnectionId(2),
+            stream,
+            peer,
+            upstream_addr,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            permit,
+        )
+        .await
+    });
+
+    let mut client = TcpStream::connect(downstream_addr).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(Duration::from_secs(1), client.read(&mut byte))
+        .await
+        .expect("idle forwarder connection should close")
+        .unwrap();
+    assert_eq!(read, 0);
+
+    let outcome = handler.await.unwrap();
+    assert!(matches!(
+        &outcome.outcome,
+        Err(ForwardError::RelayIdleTimeout { idle_timeout })
+            if *idle_timeout == Duration::from_millis(100)
+    ));
+    assert_eq!(outcome.final_phase(), ConnectionLifecycle::RelayIdleTimeout);
+    assert_eq!(permits.available_permits(), 1);
+    let _replacement_permit = permits
+        .try_acquire_owned()
+        .expect("replacement connection can reuse the released permit");
+    upstream_task.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +492,7 @@ async fn forwarder_recoverable_failure_does_not_kill_listener() {
         upstream_addr: unreachable_addr,
         max_connections: 4,
         connect_timeout: Duration::from_millis(300),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     let forwarder = Forwarder::new(cfg).expect("valid config");
     let server = tokio::spawn(forwarder.run());
@@ -469,6 +521,7 @@ fn forwarder_new_rejects_invalid_config() {
         upstream_addr: "127.0.0.1:1".parse().unwrap(),
         max_connections: 0,
         connect_timeout: Duration::from_secs(1),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     assert_eq!(
         Forwarder::new(bad_max).err(),
@@ -480,6 +533,7 @@ fn forwarder_new_rejects_invalid_config() {
         upstream_addr: "127.0.0.1:1".parse().unwrap(),
         max_connections: 16,
         connect_timeout: Duration::ZERO,
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     assert_eq!(
         Forwarder::new(bad_timeout).err(),
@@ -503,6 +557,7 @@ async fn forwarder_failure_then_recovery_via_restart() {
         upstream_addr: unreachable_addr,
         max_connections: 16,
         connect_timeout: Duration::from_millis(300),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     let server_bad = tokio::spawn(Forwarder::new(cfg_bad).unwrap().run());
 
@@ -527,6 +582,7 @@ async fn forwarder_failure_then_recovery_via_restart() {
         upstream_addr,
         max_connections: 16,
         connect_timeout: Duration::from_secs(2),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     let server_good = tokio::spawn(Forwarder::new(cfg_good).unwrap().run());
 

@@ -61,6 +61,7 @@
 | 55      | Atomic Config-v2 Local-Target Generation Reload | complete |
 | 56      | Bounded Redacted HTTPS Request History       | complete |
 | 57      | Bounded Request-History Cursor Pagination    | complete |
+| 58      | Bounded Activity-Aware Legacy TCP Relay Idle Timeout | complete |
 
 ## Session 01 — Foundation — complete
 
@@ -1794,3 +1795,26 @@ Out of scope:
 - Persistence, server-side cursor state, snapshot pinning, value-based search
   or filtering, header/body/query capture, public operations exposure, replay,
   long polling, CLI or Tunnel Protocol changes.
+
+## Session 58 — Bounded Activity-Aware Legacy TCP Relay Idle Timeout — complete
+
+- Added one shared activity-aware deadline to the compatibility TCP echo,
+  relay, and local-forwarder paths. Only a completed non-empty write in either
+  direction resets it; silent reads, blocked writes, and half-close shutdowns
+  are finite.
+- Added a 60-second default plus strict 1 ms-to-1 hour forwarder validation and
+  `edge_dev --relay-idle-timeout-ms` configuration. Existing public helper
+  signatures retain the default behavior.
+- Added `RelayError::IdleTimeout`, `ForwardError::RelayIdleTimeout`, and the
+  fixed `relay_idle_timeout` lifecycle/category. Timeouts drop both sockets,
+  release the forwarder permit through RAII, and do not stop its listener.
+- Preserved fixed 8 KiB buffers, bidirectional byte counts, half-close, and
+  task ownership. Added unit, real-TCP echo/relay/forwarder, permit-release,
+  and example CLI tests. The workspace contains 437 explicit tests across all
+  targets.
+
+Out of scope:
+
+- Per-IP legacy-forwarder admission, upstream pooling, changes to public raw
+  ingress or HTTP upgrades, Agent/Tunnel Protocol changes, new metrics, and
+  payload inspection/logging.

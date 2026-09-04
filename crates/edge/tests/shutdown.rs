@@ -99,6 +99,7 @@ async fn forwarder_forces_a_stalled_relay_and_joins_it() {
         upstream_addr,
         max_connections: 1,
         connect_timeout: Duration::from_secs(1),
+        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     })
     .unwrap();
     let (trigger, signal) = shutdown_channel();

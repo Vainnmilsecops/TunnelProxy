@@ -4,7 +4,7 @@
 //! binds a downstream listener, enforces a bounded concurrency
 //! policy, dials a fresh upstream connection per accepted downstream
 //! under a bounded connect timeout, and forwards raw bytes in both
-//! directions using `tokio::io::copy_bidirectional`.
+//! directions through fixed buffers under an activity-aware idle deadline.
 //!
 //! CLI:
 //!
@@ -13,11 +13,12 @@
 //!   --listen 127.0.0.1:7000 \
 //!   --upstream 127.0.0.1:8000 \
 //!   --max-connections 100 \
-//!   --connect-timeout-ms 5000
+//!   --connect-timeout-ms 5000 \
+//!   --relay-idle-timeout-ms 60000
 //! ```
 //!
 //! Defaults (`127.0.0.1:7000` → `127.0.0.1:8000`, 100 connections,
-//! 5 s connect timeout) apply when a flag is omitted. Use `--help`
+//! 5 s connect timeout, 60 s relay idle timeout) apply when a flag is omitted. Use `--help`
 //! to print usage.
 //!
 //! The binary returns a non-zero exit code on fatal bind errors or
@@ -34,6 +35,7 @@ use tracing::{error, info};
 use tunnelproxy_common::{init_process_logging, ProcessLogFormat};
 use tunnelproxy_edge::{
     ForwardConfig, ForwardConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_RELAY_IDLE_TIMEOUT,
 };
 
 const USAGE: &str = "\
@@ -44,6 +46,7 @@ Options:
   --upstream <addr>           upstream dial address       (default 127.0.0.1:8000)
   --max-connections <usize>   max concurrent relays      (default 100; must be > 0)
   --connect-timeout-ms <ms>   upstream connect timeout   (default 5000; must be > 0)
+  --relay-idle-timeout-ms <ms> established relay idle timeout (default 60000; 1..=3600000)
   --help                      print this help and exit
 ";
 
@@ -80,6 +83,7 @@ async fn main() -> ExitCode {
         upstream_addr: parsed.upstream_addr,
         max_connections: parsed.max_connections,
         connect_timeout: parsed.connect_timeout,
+        relay_idle_timeout: parsed.relay_idle_timeout,
     };
 
     if let Err(err) = config.validate() {
@@ -90,6 +94,12 @@ async fn main() -> ExitCode {
             ForwardConfigError::ZeroConnectTimeout => {
                 error!("--connect-timeout-ms must be greater than zero");
             }
+            ForwardConfigError::RelayIdleTimeoutTooSmall => {
+                error!("--relay-idle-timeout-ms must be at least 1");
+            }
+            ForwardConfigError::RelayIdleTimeoutTooLarge => {
+                error!("--relay-idle-timeout-ms must not exceed 3600000");
+            }
         }
         return ExitCode::from(2);
     }
@@ -99,6 +109,7 @@ async fn main() -> ExitCode {
         upstream = %config.upstream_addr,
         max_connections = config.max_connections,
         connect_timeout_ms = config.connect_timeout.as_millis() as u64,
+        relay_idle_timeout_ms = config.relay_idle_timeout.as_millis() as u64,
         "tunnelproxy-edge: starting TCP forwarder"
     );
 
@@ -128,6 +139,7 @@ struct ParsedArgs {
     upstream_addr: SocketAddr,
     max_connections: usize,
     connect_timeout: Duration,
+    relay_idle_timeout: Duration,
     help: bool,
 }
 
@@ -164,6 +176,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
             .expect("hardcoded default upstream address is valid"),
         max_connections: DEFAULT_MAX_CONNECTIONS,
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        relay_idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
         help: false,
     };
 
@@ -208,6 +221,15 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, ArgError> {
                 out.connect_timeout = Duration::from_millis(ms);
                 i += 2;
             }
+            "--relay-idle-timeout-ms" => {
+                let value = take_value(args, i, "--relay-idle-timeout-ms")?;
+                let ms: u64 = value.parse().map_err(|_| ArgError::InvalidNumber {
+                    flag: "relay-idle-timeout-ms",
+                    value: value.clone(),
+                })?;
+                out.relay_idle_timeout = Duration::from_millis(ms);
+                i += 2;
+            }
             other => return Err(ArgError::UnknownFlag(other.to_string())),
         }
     }
@@ -221,4 +243,45 @@ fn take_value<'a>(
     flag: &'static str,
 ) -> Result<&'a String, ArgError> {
     args.get(i + 1).ok_or(ArgError::MissingValue(flag))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn relay_idle_timeout_defaults_and_parses() {
+        assert_eq!(
+            parse_args(&[]).unwrap().relay_idle_timeout,
+            DEFAULT_RELAY_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            parse_args(&args(&["--relay-idle-timeout-ms", "1250"]))
+                .unwrap()
+                .relay_idle_timeout,
+            Duration::from_millis(1250)
+        );
+        assert!(USAGE.contains("--relay-idle-timeout-ms"));
+    }
+
+    #[test]
+    fn relay_idle_timeout_cli_values_use_forwarder_bounds() {
+        for (milliseconds, expected) in [
+            (0, ForwardConfigError::RelayIdleTimeoutTooSmall),
+            (3_600_001, ForwardConfigError::RelayIdleTimeoutTooLarge),
+        ] {
+            let parsed = parse_args(&args(&[
+                "--relay-idle-timeout-ms",
+                &milliseconds.to_string(),
+            ]))
+            .unwrap();
+            let mut config = ForwardConfig::dev_defaults();
+            config.relay_idle_timeout = parsed.relay_idle_timeout;
+            assert_eq!(config.validate(), Err(expected));
+        }
+    }
 }

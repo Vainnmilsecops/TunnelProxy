@@ -150,7 +150,7 @@
   explicitly aborted and joined after the deadline.
 - **Tracking:** resolved in Session 11.
 
-### DEBT-006 — No connection-level read/write idle timeout
+### DEBT-006 — No connection-level read/write idle timeout — resolved
 
 - **Introduced in:** Session 02
 - **Category:** correctness
@@ -163,11 +163,13 @@
   idle read deadline. Session 08's new single-stream path does have a
   configurable application-data idle deadline; this debt remains for the
   legacy echo/forwarder paths only.
-- **Exit plan:** Wrap `copy_bidirectional` (or its driving
-  half-copies) in a configurable idle deadline that aborts the
-  relay without leaking sockets or the semaphore permit. Document
-  the default in `docs/DEVELOPMENT.md`.
-- **Tracking:** Session 05+ plan, `docs/ai/SESSION_INDEX.md`.
+- **Resolution:** Session 58 replaced the unbounded legacy echo/relay copy
+  loops with fixed-buffer, activity-aware forwarding under one shared idle
+  deadline. Successful writes in either direction reset the deadline; reads,
+  writes, and half-close shutdowns are bounded. The forwarder validates a
+  1 ms-to-1 hour setting, reports a typed timeout, releases its semaphore
+  permit through RAII, and keeps accepting later connections.
+- **Tracking:** resolved in Session 58.
 
 ### DEBT-008 — No upstream connection pool
 

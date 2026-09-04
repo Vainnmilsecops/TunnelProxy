@@ -18,7 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tunnelproxy_edge::{
-    relay_bidirectional, relay_connection, run_relay_listener, RelayError, RelayStats,
+    relay_bidirectional, relay_bidirectional_with_idle_timeout, relay_connection,
+    run_relay_listener, RelayError, RelayStats,
 };
 
 /// Size of the intermediate read buffer used by the upstream echo
@@ -398,6 +399,50 @@ async fn relay_connection_reports_upstream_connect_failure() {
         }
         other => panic!("expected UpstreamConnect, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn relay_activity_in_either_direction_resets_shared_idle_deadline() {
+    let downstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream_addr = downstream_listener.local_addr().unwrap();
+    let mut downstream_client = TcpStream::connect(downstream_addr).await.unwrap();
+    let (downstream_relay, _) = downstream_listener.accept().await.unwrap();
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_relay = TcpStream::connect(upstream_addr).await.unwrap();
+    let (mut upstream_server, _) = upstream_listener.accept().await.unwrap();
+
+    let relay = tokio::spawn(relay_bidirectional_with_idle_timeout(
+        downstream_relay,
+        upstream_relay,
+        Duration::from_millis(300),
+    ));
+
+    downstream_client.write_all(b"a").await.unwrap();
+    let mut byte = [0_u8; 1];
+    upstream_server.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"a");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    upstream_server.write_all(b"b").await.unwrap();
+    downstream_client.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"b");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    downstream_client.write_all(b"c").await.unwrap();
+    upstream_server.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"c");
+
+    let result = timeout(Duration::from_secs(1), relay)
+        .await
+        .expect("silent relay should finish by its idle deadline")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RelayError::IdleTimeout { idle_timeout })
+            if idle_timeout == Duration::from_millis(300)
+    ));
 }
 
 // ---------------------------------------------------------------------------
