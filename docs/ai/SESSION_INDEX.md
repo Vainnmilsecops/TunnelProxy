@@ -1818,3 +1818,26 @@ Out of scope:
 - Per-IP legacy-forwarder admission, upstream pooling, changes to public raw
   ingress or HTTP upgrades, Agent/Tunnel Protocol changes, new metrics, and
   payload inspection/logging.
+
+## Session 59 — Bounded Pre-Spawn Admission for the Legacy TCP Echo Listener — complete
+
+- Added validated `EchoConfig` bounds with 100 active handlers and the
+  Session 58 60-second activity-idle timeout as compatibility defaults.
+- Moved semaphore acquisition into the accept loop before handler task
+  creation. Capacity rejection drops the accepted socket inline, emits the
+  fixed `tcp_connection_rejected_capacity` event, and leaves admitted peers
+  and the listener live.
+- Moved each owned permit into its admitted handler so EOF, I/O failure, idle
+  timeout, graceful completion, and forced shutdown release capacity through
+  RAII. Ready completed tasks are reaped ahead of further accepts.
+- Preserved `run_listener` and `run_listener_until_shutdown`, and added
+  configured plus pre-bound-listener variants for deterministic consumers.
+- Added config-bound, capacity isolation/recovery, and idle-release coverage.
+  The workspace contains 440 explicit tests across all targets and DEBT-004 is
+  resolved.
+
+Out of scope:
+
+- Per-IP legacy-forwarder admission, upstream pooling, public raw/HTTPS
+  ingress changes, rate limiting, metrics, Agent/Tunnel Protocol changes, and
+  payload inspection/logging.

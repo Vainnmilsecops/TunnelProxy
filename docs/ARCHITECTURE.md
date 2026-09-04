@@ -1323,6 +1323,30 @@ This hardens only the preserved local TCP baselines and changes no HTTP
 upgrade, public raw-ingress, Agent transport, Tunnel Protocol, per-IP
 admission, or upstream connection-pooling policy.
 
+### 2.56 Pre-spawn admission for the compatibility echo listener (Session 59)
+
+The compatibility TCP echo listener now owns a semaphore before entering its
+accept loop. Each accepted socket must acquire a permit before the listener
+creates a handler task. When all permits are held, the listener drops the new
+socket inline, emits the fixed `tcp_connection_rejected_capacity` event, and
+continues accepting. Rejected connections therefore consume neither a handler
+task nor a buffer allocation.
+
+`EchoConfig` validates a non-zero global connection limit plus the existing
+1 millisecond-to-1 hour activity-idle range. The compatibility
+`run_listener` and `run_listener_until_shutdown` signatures remain unchanged
+and use 100 connections with the existing 60-second idle default. Explicit
+configured and pre-bound-listener variants support deterministic embedding and
+tests without a bind race.
+
+An admitted handler owns its semaphore permit for its full lifetime. Clean
+EOF, read/write failure, idle timeout, graceful completion, and forced task
+abort all release the permit through RAII. Completed handlers are reaped before
+more sockets are accepted when both branches are ready, preventing the
+supervisor from retaining completed tasks under churn. This closes DEBT-004
+without adding per-IP forwarder admission, rate limiting, metrics, protocol
+changes, or a new production ingress surface.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

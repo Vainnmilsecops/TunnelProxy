@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tunnelproxy_edge::{handle_connection, handle_connection_with_idle_timeout, run_listener};
+use tunnelproxy_edge::{
+    handle_connection_with_idle_timeout, run_listener, serve_listener_with_config, EchoConfig,
+};
 
 /// Bind a `TcpListener` on an ephemeral port and start `run_listener`
 /// in the background. Returns the bound address and the join handle for
@@ -21,27 +23,9 @@ async fn spawn_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        // `run_listener` returns on accept error; for the test we abort
-        // the handle when finished, so any error is acceptable here.
-        let _ = run_listener_on(listener).await;
+        let _ = serve_listener_with_config(listener, EchoConfig::default()).await;
     });
     (addr, handle)
-}
-
-/// Minimal `run_listener`-style loop that takes ownership of a
-/// pre-bound `TcpListener` so tests can assert against an already-bound
-/// ephemeral port. We re-implement the loop here instead of using
-/// `run_listener(SocketAddr)` because `run_listener` would rebind,
-/// potentially racing with another test.
-async fn run_listener_on(listener: TcpListener) -> std::io::Result<()> {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                tokio::spawn(handle_connection(stream, peer));
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 #[tokio::test]
@@ -131,6 +115,79 @@ async fn echo_activity_resets_idle_deadline_then_silence_closes_connection() {
         .unwrap();
     assert_eq!(read, 0);
     handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn echo_capacity_rejects_without_disrupting_the_admitted_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve_listener_with_config(
+            listener,
+            EchoConfig {
+                max_connections: 1,
+                idle_timeout: Duration::from_secs(2),
+            },
+        )
+        .await;
+    });
+
+    let mut client_a = TcpStream::connect(addr).await.unwrap();
+    client_a.write_all(b"a").await.unwrap();
+    let mut byte = [0_u8; 1];
+    client_a.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"a");
+
+    let mut client_b = TcpStream::connect(addr).await.unwrap();
+    let rejected = timeout(Duration::from_secs(1), client_b.read(&mut byte))
+        .await
+        .expect("connection above capacity should be closed promptly")
+        .unwrap();
+    assert_eq!(rejected, 0);
+
+    client_a.write_all(b"z").await.unwrap();
+    client_a.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"z");
+    client_a.shutdown().await.unwrap();
+    assert_eq!(client_a.read(&mut byte).await.unwrap(), 0);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut client_c = TcpStream::connect(addr).await.unwrap();
+    client_c.write_all(b"c").await.unwrap();
+    client_c.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"c");
+    server.abort();
+}
+
+#[tokio::test]
+async fn echo_idle_timeout_releases_capacity_for_the_next_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve_listener_with_config(
+            listener,
+            EchoConfig {
+                max_connections: 1,
+                idle_timeout: Duration::from_millis(100),
+            },
+        )
+        .await;
+    });
+
+    let mut silent = TcpStream::connect(addr).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let closed = timeout(Duration::from_secs(1), silent.read(&mut byte))
+        .await
+        .expect("silent connection should hit its idle deadline")
+        .unwrap();
+    assert_eq!(closed, 0);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut replacement = TcpStream::connect(addr).await.unwrap();
+    replacement.write_all(b"r").await.unwrap();
+    replacement.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"r");
+    server.abort();
 }
 
 /// Smoke test that `run_listener` itself binds successfully. This is

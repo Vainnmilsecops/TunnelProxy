@@ -120,24 +120,18 @@
   forward proxying, non-WebSocket extended CONNECT, and WebSocket extension
   negotiation remain outside the implemented policy as separate surfaces.
 
-### DEBT-004 — Unbounded connection-task spawning on the edge echo listener
+### DEBT-004 — Unbounded connection-task spawning on the edge echo listener — resolved
 
 - **Introduced in:** Session 02
 - **Category:** correctness
 - **Impact:** medium
-- **Rationale:** Session 02 establishes a Tokio `TcpListener` whose
-  accept loop spawns one unbounded task per accepted connection via
-  `tokio::spawn(handle_connection(...))`. There is no semaphore,
-  per-IP rate limit, connection cap, or admission control on the
-  echo baseline. The forwarder that supersedes the production
-  intent (`Forwarder` in Session 04) already enforces a semaphore-
-  bounded admission policy; the unbounded echo listener is kept as
-  a deliberately small, regression-only artifact.
-- **Exit plan:** Either remove the echo listener once the forwarder
-  is the canonical surface, or wrap it in the same `Forwarder`
-  semaphore. Either choice is fine; what is not fine is leaving the
-  unbounded admission in the production surface.
-- **Tracking:** open.
+- **Resolution:** Session 59 added a validated `EchoConfig` and requires each
+  accepted socket to acquire a global semaphore permit before a handler task
+  is spawned. Excess sockets are dropped inline, admitted tasks retain their
+  permit through RAII, and completed tasks are preferentially reaped. The old
+  listener APIs retain their signatures and use a finite default of 100
+  active handlers.
+- **Tracking:** resolved in Session 59.
 
 ### DEBT-005 — No graceful shutdown for the edge listener — resolved
 

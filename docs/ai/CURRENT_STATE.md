@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Activity-Aware Legacy TCP Relay Idle Timeout** (Session 58).
+**Bounded Pre-Spawn Admission for the Legacy TCP Echo Listener** (Session 59).
 
 ## Completed
 
@@ -664,6 +664,25 @@
   permit-release, and development CLI coverage. The workspace contains 437
   explicit tests across all targets.
 
+## Session 59 delivered
+
+- Added `EchoConfig` with a default maximum of 100 active handlers and the
+  existing 60-second activity-idle default. Zero capacity and idle values
+  outside 1 millisecond through 1 hour fail validation before listener use.
+- Moved echo admission ahead of handler task creation. An excess accepted
+  socket is dropped inline with the fixed
+  `tcp_connection_rejected_capacity` event, so rejection allocates no handler
+  task or per-connection read buffer and does not stop the listener.
+- Admitted tasks own their semaphore permits through RAII. EOF, I/O failure,
+  idle timeout, graceful completion, and forced shutdown all release capacity;
+  completed handlers are preferentially reaped before further accepts.
+- Preserved the original `run_listener` and `run_listener_until_shutdown`
+  signatures. Explicit configured and pre-bound-listener variants support
+  deterministic embedding and integration tests.
+- Added strict config, capacity isolation/recovery, and idle-release tests.
+  The workspace contains 440 explicit tests across all targets and DEBT-004 is
+  resolved.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -709,7 +728,7 @@
 
 ## Next planned session
 
-Session 59 has not been selected. DNS/public-certificate automation and
+Session 60 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.
