@@ -28,6 +28,7 @@
 | Agent: verify echoed bytes                | ✅   | —           | —   | Byte-exact equality asserted; structured `RunOutcome::Success` / `Mismatch`.                                                 |
 | Agent: timeout on long operations         | ✅   | —           | —   | `DEFAULT_OPERATION_TIMEOUT` wraps `read_to_end`; mismatched server surfaces as `RunOutcome::Mismatch`.                       |
 | TCP networking (round-trip baseline)      | ✅   | ✅          | —   | Session 02 deliverables.                                                                                                    |
+| Edge: TCP echo pre-spawn admission        | ✅   | ✅          | —   | `EchoConfig` rejects invalid bounds; real TCP proves capacity-one rejection creates no peer disruption and clean/idle completion releases admission for the next connection. |
 | Edge: TCP relay basic round-trip          | ✅   | ✅          | —   | `relay_round_trip_small_payload`; `run_relay_listener` smoke test.                                                          |
 | Edge: TCP relay large (256 KiB) payload   | ✅   | ✅          | —   | `relay_round_trip_large_payload`; deterministic pseudo-random bytes incl. nulls / high values.                              |
 | Edge: TCP relay preserves half-close       | —    | ✅          | —   | `relay_preserves_half_close`; client EOF on write side, upstream responds after draining request, relay forwards response.  |

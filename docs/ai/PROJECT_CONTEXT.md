@@ -97,6 +97,9 @@ and the existing redaction and loopback-only boundaries.
 Session 58 closes the legacy TCP idle-deadline gap with fixed-buffer,
 activity-aware echo/relay/forwarder I/O, typed timeout outcomes, and guaranteed
 forwarder permit release while preserving half-close and public helper APIs.
+Session 59 closes the echo task-admission gap by acquiring a validated global
+permit before handler creation, rejecting excess sockets inline, and retaining
+capacity through RAII while preserving the original listener entry points.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,

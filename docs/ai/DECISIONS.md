@@ -1566,3 +1566,30 @@ finite time without stopping the listener. Existing public helper signatures,
 half-close, byte counts, payload opacity, and Tunnel Protocol remain intact.
 Per-IP legacy admission, upstream pooling, production ingress refactoring, and
 new telemetry surfaces remain separate work.
+
+## ADR-059 — Compatibility echo admission occurs before task creation
+
+**Status:** Accepted (Session 59).
+
+**Context:** Session 58 bounds each echo connection's inactive lifetime, but
+the Session 02 listener still created one Tokio task for every accepted socket
+before applying any admission policy. A connection flood could therefore grow
+the live task set and allocate one fixed read buffer per task even though the
+echo server is only a compatibility and regression surface.
+
+**Decision:** Add a validated `EchoConfig` with a finite global connection
+limit and the existing activity-idle timeout. Acquire an owned semaphore permit
+in the accept loop before spawning a handler. Drop excess sockets inline and
+emit one fixed rejection event. Move the permit into the admitted handler and
+prefer joining completed tasks before accepting another socket when both are
+ready. Keep the original listener function signatures as wrappers around the
+100-connection, 60-second defaults, and expose configured pre-bound-listener
+variants for deterministic callers.
+
+**Consequences:** The number of active echo handlers and their fixed 8 KiB
+buffers is bounded by configuration. Rejections do not create tasks, one
+connection cannot disrupt an admitted peer, and every completion, timeout, or
+abort releases capacity through RAII. The listener remains a loopback-oriented
+compatibility surface; per-IP forwarder admission, upstream pooling, rate
+limiting, metrics, public ingress, Agent, and Tunnel Protocol behavior are
+unchanged.

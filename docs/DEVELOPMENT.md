@@ -100,6 +100,14 @@ deadline. Silent reads, blocked writes, and blocked half-closes terminate the
 connection, release its concurrency permit, and do not stop the listener.
 The TCP echo and Session 03 relay compatibility helpers use the same default.
 
+The compatibility echo listener additionally admits at most 100 active
+handlers by default. `EchoConfig` can lower that bound for an embedded or test
+listener. Admission is checked before task creation: an excess socket is
+closed immediately with `tcp_connection_rejected_capacity`, while accepted
+handlers hold an RAII permit until EOF, failure, idle timeout, or shutdown.
+`serve_listener_with_config` accepts a pre-bound `TcpListener` when a caller
+needs to bind port zero without releasing and rebinding the address.
+
 ## 4. Formatting
 
 - We use the default `rustfmt` configuration. There is no custom

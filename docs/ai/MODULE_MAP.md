@@ -91,8 +91,8 @@ existing streams retain their local sockets.
 
 ## `tunnelproxy-edge`
 
-**Current implementation:** activity-idle-bounded TCP echo/relay baselines,
-bounded local forwarder, Agent transport,
+**Current implementation:** pre-spawn-admission- and activity-idle-bounded TCP
+echo/relay baselines, bounded local forwarder, Agent transport,
 bounded stream multiplexing, lifecycle-managed raw TCP routes, and bounded
 HTTPS ingress with default HTTP/1.1 and opt-in bounded HTTP/2, per-request
 deadlines, protocol-specific keepalive, graceful connection drain, and an

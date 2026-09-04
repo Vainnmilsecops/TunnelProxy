@@ -98,6 +98,12 @@ pub const DEFAULT_UPSTREAM_ADDR: &str = "127.0.0.1:8000";
 /// with [`ConnectionLifecycle::CapacityRejected`]).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
+/// Default maximum number of concurrently running echo handlers.
+///
+/// Echo admission happens before a handler task is spawned, so this also
+/// bounds the listener's live task set under connection floods.
+pub const DEFAULT_ECHO_MAX_CONNECTIONS: usize = 100;
+
 /// Default upstream TCP connect timeout.
 ///
 /// Bound the time a single downstream connection spends waiting to
@@ -129,8 +135,79 @@ pub const MAX_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub const READ_BUFFER_SIZE: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
-// Session 02 — TCP echo baseline (preserved unchanged)
+// Session 02 — TCP echo baseline (preserved compatibility surface)
 // ---------------------------------------------------------------------------
+
+/// Bounded connection policy for the compatibility TCP echo server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoConfig {
+    /// Maximum number of concurrently running connection handlers.
+    pub max_connections: usize,
+    /// Maximum time without a successfully echoed non-empty write.
+    pub idle_timeout: Duration,
+}
+
+impl Default for EchoConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_ECHO_MAX_CONNECTIONS,
+            idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl EchoConfig {
+    /// Validate the echo admission and idle-timeout bounds.
+    pub fn validate(&self) -> Result<(), EchoConfigError> {
+        if self.max_connections == 0 {
+            return Err(EchoConfigError::ZeroMaxConnections);
+        }
+        if self.max_connections > Semaphore::MAX_PERMITS {
+            return Err(EchoConfigError::TooManyConnections);
+        }
+        if self.idle_timeout < MIN_RELAY_IDLE_TIMEOUT {
+            return Err(EchoConfigError::IdleTimeoutTooSmall);
+        }
+        if self.idle_timeout > MAX_RELAY_IDLE_TIMEOUT {
+            return Err(EchoConfigError::IdleTimeoutTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid [`EchoConfig`] values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoConfigError {
+    /// `max_connections` must be strictly greater than zero.
+    ZeroMaxConnections,
+    /// `max_connections` must fit Tokio's semaphore implementation.
+    TooManyConnections,
+    /// `idle_timeout` must be at least one millisecond.
+    IdleTimeoutTooSmall,
+    /// `idle_timeout` must not exceed one hour.
+    IdleTimeoutTooLarge,
+}
+
+impl std::fmt::Display for EchoConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMaxConnections => {
+                f.write_str("echo max_connections must be greater than zero")
+            }
+            Self::TooManyConnections => {
+                f.write_str("echo max_connections exceeds the semaphore limit")
+            }
+            Self::IdleTimeoutTooSmall => {
+                f.write_str("echo idle_timeout must be at least 1 millisecond")
+            }
+            Self::IdleTimeoutTooLarge => {
+                f.write_str("echo idle_timeout must not exceed 3600000 milliseconds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EchoConfigError {}
 
 /// Bind a TCP listener and serve connections forever, echoing every
 /// byte received from each client back to that client until EOF or
@@ -155,28 +232,60 @@ pub const READ_BUFFER_SIZE: usize = 8 * 1024;
 /// process supervisor. Normal per-connection closes are not
 /// propagated upward.
 pub async fn run_listener(bind_addr: SocketAddr) -> std::io::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
-    let local = listener.local_addr()?;
-    info!(addr = %local, event = "tcp_server_started", "TCP server bound");
+    run_listener_with_config(bind_addr, EchoConfig::default()).await
+}
 
+/// Bind and run the echo listener with explicit bounded admission policy.
+pub async fn run_listener_with_config(
+    bind_addr: SocketAddr,
+    config: EchoConfig,
+) -> std::io::Result<()> {
+    validate_echo_config(config)?;
+    let listener = TcpListener::bind(bind_addr).await?;
+    serve_listener_with_config(listener, config).await
+}
+
+/// Serve a pre-bound listener with bounded pre-spawn connection admission.
+///
+/// Accepting a socket does not imply spawning a task: when capacity is full,
+/// the socket is dropped inline and the listener continues. This form is
+/// useful to callers that bind port zero and need to inspect the selected
+/// address before serving.
+pub async fn serve_listener_with_config(
+    listener: TcpListener,
+    config: EchoConfig,
+) -> std::io::Result<()> {
+    validate_echo_config(config)?;
+    let local = listener.local_addr()?;
+    info!(
+        addr = %local,
+        max_connections = config.max_connections,
+        idle_timeout_ms = config.idle_timeout.as_millis() as u64,
+        event = "tcp_server_started",
+        "TCP server bound"
+    );
+
+    let permits = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                info!(
-                    peer = %peer,
-                    event = "tcp_connection_accepted",
-                    "accepted connection"
-                );
-                    tasks.spawn(handle_connection(stream, peer));
+                    admit_echo_connection(
+                        &mut tasks,
+                        stream,
+                        peer,
+                        Arc::clone(&permits),
+                        config,
+                    );
                 }
                 Err(err) => {
                 error!(error = %err, event = "tcp_listener_accept_error", "accept failed");
                 return Err(err);
                 }
             },
-            _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
 }
@@ -187,22 +296,90 @@ pub async fn run_listener_until_shutdown(
     signal: ShutdownSignal,
     shutdown: RuntimeShutdownConfig,
 ) -> std::io::Result<RuntimeShutdownOutcome> {
+    run_listener_until_shutdown_with_config(bind_addr, EchoConfig::default(), signal, shutdown)
+        .await
+}
+
+/// Runs the explicitly configured bounded echo listener until shutdown.
+pub async fn run_listener_until_shutdown_with_config(
+    bind_addr: SocketAddr,
+    config: EchoConfig,
+    signal: ShutdownSignal,
+    shutdown: RuntimeShutdownConfig,
+) -> std::io::Result<RuntimeShutdownOutcome> {
+    validate_echo_config(config)?;
     validate_shutdown(shutdown)?;
     let listener = TcpListener::bind(bind_addr).await?;
+    serve_listener_until_shutdown_with_config(listener, config, signal, shutdown).await
+}
+
+/// Serve a pre-bound echo listener until shutdown under explicit bounds.
+pub async fn serve_listener_until_shutdown_with_config(
+    listener: TcpListener,
+    config: EchoConfig,
+    signal: ShutdownSignal,
+    shutdown: RuntimeShutdownConfig,
+) -> std::io::Result<RuntimeShutdownOutcome> {
+    validate_echo_config(config)?;
+    validate_shutdown(shutdown)?;
+    let permits = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
             biased;
             () = signal.cancelled() => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                tasks.spawn(handle_connection(stream, peer));
+                admit_echo_connection(
+                    &mut tasks,
+                    stream,
+                    peer,
+                    Arc::clone(&permits),
+                    config,
+                );
             }
-            _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
     drop(listener);
     Ok(drain_tasks(tasks, shutdown.drain_timeout).await)
+}
+
+fn validate_echo_config(config: EchoConfig) -> std::io::Result<()> {
+    config
+        .validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+fn admit_echo_connection(
+    tasks: &mut JoinSet<()>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    permits: Arc<Semaphore>,
+    config: EchoConfig,
+) {
+    let permit = match permits.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+            warn!(
+                peer = %peer,
+                max_connections = config.max_connections,
+                event = "tcp_connection_rejected_capacity",
+                "echo capacity unavailable; downstream closed"
+            );
+            drop(stream);
+            return;
+        }
+    };
+    info!(
+        peer = %peer,
+        event = "tcp_connection_accepted",
+        "accepted connection"
+    );
+    tasks.spawn(async move {
+        let _permit = permit;
+        handle_connection_with_idle_timeout(stream, peer, config.idle_timeout).await;
+    });
 }
 
 /// Drive a single accepted TCP connection: read bytes in a fixed
@@ -1484,6 +1661,38 @@ mod tests {
         ForwardConfig::dev_defaults()
             .validate()
             .expect("dev defaults must be valid");
+    }
+
+    /// Echo admission defaults are finite and invalid bounds fail before bind.
+    #[test]
+    fn echo_config_is_strict_and_bounded() {
+        EchoConfig::default()
+            .validate()
+            .expect("echo defaults must be valid");
+
+        let config = EchoConfig {
+            max_connections: 0,
+            ..EchoConfig::default()
+        };
+        assert_eq!(config.validate(), Err(EchoConfigError::ZeroMaxConnections));
+
+        let config = EchoConfig {
+            max_connections: Semaphore::MAX_PERMITS + 1,
+            ..EchoConfig::default()
+        };
+        assert_eq!(config.validate(), Err(EchoConfigError::TooManyConnections));
+
+        let config = EchoConfig {
+            max_connections: 1,
+            idle_timeout: Duration::ZERO,
+        };
+        assert_eq!(config.validate(), Err(EchoConfigError::IdleTimeoutTooSmall));
+
+        let config = EchoConfig {
+            idle_timeout: MAX_RELAY_IDLE_TIMEOUT + Duration::from_millis(1),
+            ..config
+        };
+        assert_eq!(config.validate(), Err(EchoConfigError::IdleTimeoutTooLarge));
     }
 
     /// `ForwardConfig::validate` rejects a zero-capacity forwarder.
