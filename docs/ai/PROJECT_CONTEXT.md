@@ -94,6 +94,9 @@ bodies, peer IPs, or credentials and does not inspect WebSocket/CONNECT data.
 Session 57 adds strict stateless `limit`/`before` cursor pagination over that
 same bounded ring, preserving newest-first order, the 64 KiB output ceiling,
 and the existing redaction and loopback-only boundaries.
+Session 58 closes the legacy TCP idle-deadline gap with fixed-buffer,
+activity-aware echo/relay/forwarder I/O, typed timeout outcomes, and guaranteed
+forwarder permit release while preserving half-close and public helper APIs.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,

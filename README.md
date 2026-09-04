@@ -12,7 +12,8 @@ correct agent, which in turn proxies them into the local service.
 **Early-stage / pre-MVP transport foundation.** This repository currently contains:
 
 - The Cargo workspace layout and component boundaries.
-- Async TCP echo, relay, and bounded local-forwarder primitives.
+- Async TCP echo, relay, and bounded local-forwarder primitives with a shared
+  activity-aware idle deadline and typed forwarder timeout outcome.
 - Tunnel Protocol v2 binary framing with bounded durable registration and a
   64 KiB frame payload limit.
 - Persistent outbound Agent → Edge handshake and Edge-initiated heartbeat.
@@ -344,6 +345,7 @@ and Definition of Done.
 | 55 _(complete)_ | atomic config-v2 local-target generation reload |
 | 56 _(complete)_ | bounded redacted HTTPS request history |
 | 57 _(complete)_ | bounded request-history cursor pagination |
+| 58 _(complete)_ | bounded activity-aware legacy TCP relay idle timeout |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.

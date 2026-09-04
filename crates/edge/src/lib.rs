@@ -14,8 +14,8 @@
 //!   [`RelayStats`], [`RelayError`], [`RelayDirection`]). Binds a TCP
 //!   listener; for every accepted downstream connection it opens a
 //!   fresh upstream TCP connection to a configured address and
-//!   forwards raw bytes concurrently in both directions using
-//!   [`tokio::io::copy_bidirectional`]. The relay preserves TCP
+//!   forwards raw bytes concurrently in both directions under an
+//!   activity-aware idle deadline. The relay preserves TCP
 //!   half-close semantics so that EOF in one direction does not kill
 //!   traffic in the other.
 //!
@@ -25,7 +25,7 @@
 //!   It is the hardened, configurable, lifecycle-aware foundation of
 //!   the relay: explicit forwarding configuration, per-connection
 //!   identity, structured lifecycle phases, bounded upstream connect
-//!   timeouts, explicit max-concurrent-connections policy, and
+//!   and relay-idle timeouts, explicit max-concurrent-connections policy, and
 //!   RAII-managed resource cleanup. The forwarder is built on top of
 //!   the same byte-stream primitive as the Session 03 relay, so the
 //!   underlying full-duplex and half-close semantics are preserved by
@@ -64,9 +64,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
@@ -105,15 +105,27 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 /// enforced inside the relay.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default maximum period without a successfully forwarded byte.
+///
+/// The deadline is shared by both relay directions and resets after a
+/// complete non-empty write. It therefore bounds silent peers and blocked
+/// writes without imposing a maximum lifetime on active connections.
+pub const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Smallest configurable relay idle timeout.
+pub const MIN_RELAY_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Largest configurable relay idle timeout (one hour).
+pub const MAX_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// Size of the per-connection read buffer used by the Session 02 echo
 /// baseline.
 ///
 /// 8 KiB is a reasonable default for the byte-stream baseline. The
 /// invariant in INV-002 (no unbounded buffering) is satisfied because
 /// the buffer is a fixed allocation and is reused across reads; we
-/// never call `read_to_end` on a live socket. The relay / forwarder
-/// does not use this constant directly — `tokio::io::copy_bidirectional`
-/// allocates its own fixed-size intermediate buffer (default 8 KiB).
+/// never call `read_to_end` on a live socket. The relay / forwarder uses this
+/// same bound for one buffer in each direction.
 pub const READ_BUFFER_SIZE: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -205,11 +217,40 @@ pub async fn run_listener_until_shutdown(
 /// errors after the first byte are treated as a normal close. Write
 /// errors are logged and cause the connection to be dropped so the
 /// caller can reclaim the socket.
-pub async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) {
+pub async fn handle_connection(stream: TcpStream, peer: SocketAddr) {
+    handle_connection_with_idle_timeout(stream, peer, DEFAULT_RELAY_IDLE_TIMEOUT).await;
+}
+
+/// Drive the echo baseline with an explicit activity-aware idle deadline.
+///
+/// The deadline resets only after a non-empty read has been written back in
+/// full. A blocked write therefore remains bounded by the same deadline as a
+/// silent read. This explicit variant supports deterministic tests while
+/// [`handle_connection`] preserves the original public signature.
+pub async fn handle_connection_with_idle_timeout(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    idle_timeout: Duration,
+) {
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
 
     loop {
-        match stream.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            () = &mut idle => {
+                debug!(
+                    peer = %peer,
+                    idle_timeout_ms = idle_timeout.as_millis() as u64,
+                    event = "tcp_connection_idle_timeout",
+                    "client connection exceeded its idle deadline"
+                );
+                return;
+            }
+            read = stream.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => {
                 debug!(
                     peer = %peer,
@@ -225,14 +266,28 @@ pub async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) {
                     bytes = n,
                     "received bytes"
                 );
-                if let Err(err) = stream.write_all(&buf[..n]).await {
-                    warn!(
-                        peer = %peer,
-                        error = %err,
-                        event = "tcp_connection_error",
-                        "write failed; dropping connection"
-                    );
-                    return;
+                match tokio::time::timeout_at(idle.deadline(), stream.write_all(&buf[..n])).await {
+                    Ok(Ok(())) => idle
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout),
+                    Ok(Err(err)) => {
+                        warn!(
+                            peer = %peer,
+                            error = %err,
+                            event = "tcp_connection_error",
+                            "write failed; dropping connection"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(
+                            peer = %peer,
+                            idle_timeout_ms = idle_timeout.as_millis() as u64,
+                            event = "tcp_connection_idle_timeout",
+                            "client write exceeded its idle deadline"
+                        );
+                        return;
+                    }
                 }
             }
             Err(err) => {
@@ -292,6 +347,9 @@ pub enum RelayError {
         to: RelayDirection,
         source: std::io::Error,
     },
+    /// Neither direction completed a non-empty write before the shared idle
+    /// deadline, or a write/half-close could not finish by that deadline.
+    IdleTimeout { idle_timeout: Duration },
 }
 
 /// Identifies which side of the relay a byte copy involves.
@@ -319,6 +377,11 @@ impl std::fmt::Display for RelayError {
             RelayError::Copy { from, to, source } => {
                 write!(f, "copy {from} -> {to} failed: {source}")
             }
+            RelayError::IdleTimeout { idle_timeout } => write!(
+                f,
+                "relay idle timeout after {} ms",
+                idle_timeout.as_millis()
+            ),
         }
     }
 }
@@ -328,6 +391,7 @@ impl std::error::Error for RelayError {
         match self {
             RelayError::UpstreamConnect { source, .. } => Some(source),
             RelayError::Copy { source, .. } => Some(source),
+            RelayError::IdleTimeout { .. } => None,
         }
     }
 }
@@ -338,32 +402,125 @@ impl std::error::Error for RelayError {
 ///
 /// The relay is **byte-oriented**: it never inspects, parses, or
 /// rewrites payload bytes. Each direction is forwarded independently
-/// using [`tokio::io::copy_bidirectional`], which already honours TCP
-/// half-close semantics: when one direction finishes, the matching
-/// write half on the other side is shut down so the remote peer
+/// using two fixed-buffer read/write branches. When one direction finishes,
+/// the matching write half on the other side is shut down so the remote peer
 /// observes EOF.
 ///
 /// Returns the total byte counts forwarded in each direction.
 ///
 /// INV-002 (no unbounded buffering) is structurally satisfied because
-/// `copy_bidirectional` allocates its own fixed-size intermediate
-/// buffer (default 8 KiB) and propagates backpressure naturally.
+/// Each direction owns one fixed 8 KiB intermediate buffer and awaits writes
+/// to propagate backpressure naturally.
 pub async fn relay_bidirectional(
+    downstream: TcpStream,
+    upstream: TcpStream,
+) -> Result<RelayStats, RelayError> {
+    relay_bidirectional_with_idle_timeout(downstream, upstream, DEFAULT_RELAY_IDLE_TIMEOUT).await
+}
+
+/// Forward bytes in both directions under one activity-aware idle deadline.
+///
+/// Each direction uses a fixed-size buffer. A successful non-empty write in
+/// either direction resets the shared deadline. EOF half-closes the opposite
+/// writer and leaves the remaining direction active. Silent reads, blocked
+/// writes, and blocked half-closes all fail with [`RelayError::IdleTimeout`].
+pub async fn relay_bidirectional_with_idle_timeout(
     mut downstream: TcpStream,
     mut upstream: TcpStream,
+    idle_timeout: Duration,
 ) -> Result<RelayStats, RelayError> {
-    let (dn_to_up, up_to_dn) = copy_bidirectional(&mut downstream, &mut upstream)
-        .await
-        .map_err(|source| RelayError::Copy {
-            from: RelayDirection::Downstream, // either direction; tests assert
-            to: RelayDirection::Upstream,     // by byte counts, not by error variant
-            source,
-        })?;
+    let (mut downstream_read, mut downstream_write) = downstream.split();
+    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let started = tokio::time::Instant::now();
+    let (activity_tx, mut activity_rx) = watch::channel(started);
+    let downstream_to_upstream = copy_relay_direction(
+        &mut downstream_read,
+        &mut upstream_write,
+        RelayDirection::Downstream,
+        RelayDirection::Upstream,
+        activity_tx.clone(),
+    );
+    let upstream_to_downstream = copy_relay_direction(
+        &mut upstream_read,
+        &mut downstream_write,
+        RelayDirection::Upstream,
+        RelayDirection::Downstream,
+        activity_tx,
+    );
+    tokio::pin!(downstream_to_upstream);
+    tokio::pin!(upstream_to_downstream);
+
+    let mut downstream_bytes = None;
+    let mut upstream_bytes = None;
+    let mut activity_open = true;
+    let mut deadline = started + idle_timeout;
+    let idle = tokio::time::sleep_until(deadline);
+    tokio::pin!(idle);
+
+    while downstream_bytes.is_none() || upstream_bytes.is_none() {
+        tokio::select! {
+            biased;
+            changed = activity_rx.changed(), if activity_open => {
+                match changed {
+                    Ok(()) => {
+                        let progress_at = *activity_rx.borrow_and_update();
+                        if progress_at > deadline {
+                            return Err(RelayError::IdleTimeout { idle_timeout });
+                        }
+                        deadline = progress_at + idle_timeout;
+                        idle.as_mut().reset(deadline);
+                    }
+                    Err(_) => activity_open = false,
+                }
+            }
+            () = &mut idle => return Err(RelayError::IdleTimeout { idle_timeout }),
+            result = &mut downstream_to_upstream, if downstream_bytes.is_none() => {
+                downstream_bytes = Some(result?);
+            }
+            result = &mut upstream_to_downstream, if upstream_bytes.is_none() => {
+                upstream_bytes = Some(result?);
+            }
+        }
+    }
 
     Ok(RelayStats {
-        bytes_downstream_to_upstream: dn_to_up,
-        bytes_upstream_to_downstream: up_to_dn,
+        bytes_downstream_to_upstream: downstream_bytes.unwrap_or_default(),
+        bytes_upstream_to_downstream: upstream_bytes.unwrap_or_default(),
     })
+}
+
+async fn copy_relay_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    from: RelayDirection,
+    to: RelayDirection,
+    activity: watch::Sender<tokio::time::Instant>,
+) -> Result<u64, RelayError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; READ_BUFFER_SIZE];
+    let mut transferred = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|source| RelayError::Copy { from, to, source })?;
+        if read == 0 {
+            writer
+                .shutdown()
+                .await
+                .map_err(|source| RelayError::Copy { from, to, source })?;
+            return Ok(transferred);
+        }
+        writer
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|source| RelayError::Copy { from, to, source })?;
+        transferred = transferred.saturating_add(read as u64);
+        activity.send_replace(tokio::time::Instant::now());
+    }
 }
 
 /// Accept a downstream `TcpStream`, open a fresh upstream connection
@@ -569,12 +726,15 @@ pub struct ForwardConfig {
     /// Per-connection timeout for `TcpStream::connect(upstream_addr)`.
     /// Must be non-zero.
     pub connect_timeout: Duration,
+    /// Shared activity-aware idle timeout for the established relay. Must be
+    /// between [`MIN_RELAY_IDLE_TIMEOUT`] and [`MAX_RELAY_IDLE_TIMEOUT`].
+    pub relay_idle_timeout: Duration,
 }
 
 impl ForwardConfig {
     /// Local-development defaults: `127.0.0.1:7000` →
     /// `127.0.0.1:8000`, 100 concurrent connections, 5 s connect
-    /// timeout.
+    /// timeout, and 60 s relay idle timeout.
     pub fn dev_defaults() -> Self {
         Self {
             listen_addr: DEFAULT_BIND_ADDR
@@ -585,6 +745,7 @@ impl ForwardConfig {
                 .expect("hardcoded default upstream address is valid"),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            relay_idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
         }
     }
 
@@ -597,6 +758,12 @@ impl ForwardConfig {
         if self.connect_timeout.is_zero() {
             return Err(ForwardConfigError::ZeroConnectTimeout);
         }
+        if self.relay_idle_timeout < MIN_RELAY_IDLE_TIMEOUT {
+            return Err(ForwardConfigError::RelayIdleTimeoutTooSmall);
+        }
+        if self.relay_idle_timeout > MAX_RELAY_IDLE_TIMEOUT {
+            return Err(ForwardConfigError::RelayIdleTimeoutTooLarge);
+        }
         Ok(())
     }
 }
@@ -608,6 +775,10 @@ pub enum ForwardConfigError {
     ZeroMaxConnections,
     /// `connect_timeout` must be a positive [`Duration`].
     ZeroConnectTimeout,
+    /// `relay_idle_timeout` must be at least one millisecond.
+    RelayIdleTimeoutTooSmall,
+    /// `relay_idle_timeout` must not exceed one hour.
+    RelayIdleTimeoutTooLarge,
 }
 
 impl std::fmt::Display for ForwardConfigError {
@@ -618,6 +789,12 @@ impl std::fmt::Display for ForwardConfigError {
             }
             ForwardConfigError::ZeroConnectTimeout => {
                 f.write_str("connect_timeout must be greater than zero")
+            }
+            ForwardConfigError::RelayIdleTimeoutTooSmall => {
+                f.write_str("relay_idle_timeout must be at least 1 millisecond")
+            }
+            ForwardConfigError::RelayIdleTimeoutTooLarge => {
+                f.write_str("relay_idle_timeout must not exceed 3600000 milliseconds")
             }
         }
     }
@@ -651,11 +828,13 @@ pub enum ConnectionLifecycle {
     /// [`ForwardConfig::connect_timeout`]. The downstream socket was
     /// shut down and the listener kept accepting.
     UpstreamConnectTimeout,
-    /// Both sockets are open and [`copy_bidirectional`] is running.
+    /// Both sockets are open and bounded bidirectional forwarding is running.
     Relaying,
-    /// `copy_bidirectional` returned an I/O error before either side
-    /// cleanly closed.
+    /// Bounded bidirectional forwarding returned an I/O error before either
+    /// side cleanly closed.
     RelayIoFailed,
+    /// Neither direction completed a write before the relay idle deadline.
+    RelayIdleTimeout,
     /// Either side closed cleanly and the relay returned
     /// [`RelayStats`].
     Closed,
@@ -672,6 +851,7 @@ impl ConnectionLifecycle {
             ConnectionLifecycle::UpstreamConnectTimeout => "upstream_connect_timeout",
             ConnectionLifecycle::Relaying => "relaying",
             ConnectionLifecycle::RelayIoFailed => "relay_io_failed",
+            ConnectionLifecycle::RelayIdleTimeout => "relay_idle_timeout",
             ConnectionLifecycle::Closed => "closed",
         }
     }
@@ -695,13 +875,16 @@ pub enum ForwardError {
     /// `ForwardConfig::connect_timeout`. The downstream was shut
     /// down.
     UpstreamConnectTimeout,
-    /// `copy_bidirectional` returned an I/O error after both sockets
-    /// were established.
+    /// Bounded bidirectional forwarding returned an I/O error after both
+    /// sockets were established.
     RelayIo {
         from: RelayDirection,
         to: RelayDirection,
         source: std::io::Error,
     },
+    /// The established relay made no successful transfer before its shared
+    /// activity deadline.
+    RelayIdleTimeout { idle_timeout: Duration },
 }
 
 impl ForwardError {
@@ -713,6 +896,7 @@ impl ForwardError {
             ForwardError::UpstreamConnect { .. } => "upstream_connect_failed",
             ForwardError::UpstreamConnectTimeout => "upstream_connect_timeout",
             ForwardError::RelayIo { .. } => "relay_io_failed",
+            ForwardError::RelayIdleTimeout { .. } => "relay_idle_timeout",
         }
     }
 
@@ -723,6 +907,7 @@ impl ForwardError {
             ForwardError::UpstreamConnect { .. } => ConnectionLifecycle::UpstreamConnectFailed,
             ForwardError::UpstreamConnectTimeout => ConnectionLifecycle::UpstreamConnectTimeout,
             ForwardError::RelayIo { .. } => ConnectionLifecycle::RelayIoFailed,
+            ForwardError::RelayIdleTimeout { .. } => ConnectionLifecycle::RelayIdleTimeout,
         }
     }
 }
@@ -740,6 +925,11 @@ impl std::fmt::Display for ForwardError {
             ForwardError::RelayIo { from, to, source } => {
                 write!(f, "relay I/O failed ({from} -> {to}): {source}")
             }
+            ForwardError::RelayIdleTimeout { idle_timeout } => write!(
+                f,
+                "relay idle timeout after {} ms",
+                idle_timeout.as_millis()
+            ),
         }
     }
 }
@@ -751,6 +941,7 @@ impl std::error::Error for ForwardError {
             ForwardError::UpstreamConnect { source } => Some(source),
             ForwardError::UpstreamConnectTimeout => None,
             ForwardError::RelayIo { source, .. } => Some(source),
+            ForwardError::RelayIdleTimeout { .. } => None,
         }
     }
 }
@@ -798,8 +989,8 @@ impl ConnectionOutcome {
 ///    I/O errors are distinguished and surface as
 ///    [`ForwardError::UpstreamConnectTimeout`] or
 ///    [`ForwardError::UpstreamConnect`];
-/// 4. forward raw bytes in both directions via
-///    [`tokio::io::copy_bidirectional`];
+/// 4. forward raw bytes in both directions through fixed buffers under the
+///    shared activity-aware idle deadline;
 /// 5. release the semaphore permit (RAII via
 ///    [`OwnedSemaphorePermit`]).
 ///
@@ -845,6 +1036,7 @@ impl Forwarder {
             upstream = %self.config.upstream_addr,
             max_connections = self.config.max_connections,
             connect_timeout_ms = self.config.connect_timeout.as_millis() as u64,
+            relay_idle_timeout_ms = self.config.relay_idle_timeout.as_millis() as u64,
             event = "forwarder_started",
             "forwarder bound"
         );
@@ -852,7 +1044,10 @@ impl Forwarder {
         let semaphore = self.semaphore;
         let ids = self.ids;
         let upstream_addr = self.config.upstream_addr;
-        let connect_timeout = self.config.connect_timeout;
+        let timeouts = ForwardConnectionTimeouts {
+            connect: self.config.connect_timeout,
+            relay_idle: self.config.relay_idle_timeout,
+        };
 
         let mut tasks = JoinSet::new();
         loop {
@@ -866,7 +1061,7 @@ impl Forwarder {
                         Arc::clone(&semaphore),
                         Arc::clone(&ids),
                         upstream_addr,
-                        connect_timeout,
+                        timeouts,
                     );
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -885,7 +1080,10 @@ impl Forwarder {
         let semaphore = self.semaphore;
         let ids = self.ids;
         let upstream_addr = self.config.upstream_addr;
-        let connect_timeout = self.config.connect_timeout;
+        let timeouts = ForwardConnectionTimeouts {
+            connect: self.config.connect_timeout,
+            relay_idle: self.config.relay_idle_timeout,
+        };
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
@@ -900,7 +1098,7 @@ impl Forwarder {
                         Arc::clone(&semaphore),
                         Arc::clone(&ids),
                         upstream_addr,
-                        connect_timeout,
+                        timeouts,
                     );
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -911,6 +1109,12 @@ impl Forwarder {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ForwardConnectionTimeouts {
+    connect: Duration,
+    relay_idle: Duration,
+}
+
 fn spawn_forwarder_task(
     tasks: &mut JoinSet<()>,
     mut stream: TcpStream,
@@ -918,7 +1122,7 @@ fn spawn_forwarder_task(
     semaphore: Arc<Semaphore>,
     ids: Arc<ConnectionIdAllocator>,
     upstream_addr: SocketAddr,
-    connect_timeout: Duration,
+    timeouts: ForwardConnectionTimeouts,
 ) {
     tasks.spawn(async move {
         let id = ids.next_id();
@@ -936,9 +1140,16 @@ fn spawn_forwarder_task(
                 return;
             }
         };
-        let outcome =
-            forward_handle_connection(id, stream, peer, upstream_addr, connect_timeout, permit)
-                .await;
+        let outcome = forward_handle_connection_with_idle_timeout(
+            id,
+            stream,
+            peer,
+            upstream_addr,
+            timeouts.connect,
+            timeouts.relay_idle,
+            permit,
+        )
+        .await;
         log_outcome(&outcome, upstream_addr);
     });
 }
@@ -951,10 +1162,33 @@ fn spawn_forwarder_task(
 /// `permit`: dropping the function releases it.
 pub async fn forward_handle_connection(
     connection_id: ConnectionId,
+    downstream: TcpStream,
+    peer: SocketAddr,
+    upstream_addr: SocketAddr,
+    connect_timeout: Duration,
+    permit: OwnedSemaphorePermit,
+) -> ConnectionOutcome {
+    forward_handle_connection_with_idle_timeout(
+        connection_id,
+        downstream,
+        peer,
+        upstream_addr,
+        connect_timeout,
+        DEFAULT_RELAY_IDLE_TIMEOUT,
+        permit,
+    )
+    .await
+}
+
+/// Drive one forwarder connection with an explicit established-relay idle
+/// timeout while retaining the original [`forward_handle_connection`] API.
+pub async fn forward_handle_connection_with_idle_timeout(
+    connection_id: ConnectionId,
     mut downstream: TcpStream,
     peer: SocketAddr,
     upstream_addr: SocketAddr,
     connect_timeout: Duration,
+    relay_idle_timeout: Duration,
     permit: OwnedSemaphorePermit,
 ) -> ConnectionOutcome {
     let started = Instant::now();
@@ -1028,7 +1262,8 @@ pub async fn forward_handle_connection(
         "starting bidirectional copy"
     );
 
-    let relay_result = relay_bidirectional_with_id(connection_id, downstream, upstream).await;
+    let relay_result =
+        relay_bidirectional_with_id(connection_id, downstream, upstream, relay_idle_timeout).await;
     let outcome = match relay_result {
         Ok(stats) => {
             info!(
@@ -1066,32 +1301,25 @@ pub async fn forward_handle_connection(
     }
 }
 
-/// Same body as [`relay_bidirectional`] but logs progress with the
-/// connection ID, then maps a [`RelayError::Copy`] into the matching
-/// [`ForwardError::RelayIo`].
+/// Runs the bounded relay body and attaches the connection ID to failure logs.
+/// Conversion into [`ForwardError`] happens at the connection-lifecycle boundary.
 async fn relay_bidirectional_with_id(
     connection_id: ConnectionId,
-    mut downstream: TcpStream,
-    mut upstream: TcpStream,
+    downstream: TcpStream,
+    upstream: TcpStream,
+    idle_timeout: Duration,
 ) -> Result<RelayStats, RelayError> {
-    let res = copy_bidirectional(&mut downstream, &mut upstream).await;
+    let res = relay_bidirectional_with_idle_timeout(downstream, upstream, idle_timeout).await;
     match res {
-        Ok((dn_to_up, up_to_dn)) => Ok(RelayStats {
-            bytes_downstream_to_upstream: dn_to_up,
-            bytes_upstream_to_downstream: up_to_dn,
-        }),
-        Err(source) => {
+        Ok(stats) => Ok(stats),
+        Err(error) => {
             trace!(
                 connection_id = %connection_id,
-                error = %source,
+                error = %error,
                 event = "relay_io_error",
-                "copy_bidirectional returned an I/O error"
+                "bounded bidirectional relay failed"
             );
-            Err(RelayError::Copy {
-                from: RelayDirection::Downstream,
-                to: RelayDirection::Upstream,
-                source,
-            })
+            Err(error)
         }
     }
 }
@@ -1101,6 +1329,7 @@ fn forward_from_relay(err: RelayError) -> ForwardError {
     match err {
         RelayError::UpstreamConnect { source, .. } => ForwardError::UpstreamConnect { source },
         RelayError::Copy { from, to, source } => ForwardError::RelayIo { from, to, source },
+        RelayError::IdleTimeout { idle_timeout } => ForwardError::RelayIdleTimeout { idle_timeout },
     }
 }
 
@@ -1265,6 +1494,7 @@ mod tests {
             upstream_addr: "127.0.0.1:1".parse().unwrap(),
             max_connections: 0,
             connect_timeout: Duration::from_secs(5),
+            relay_idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
         };
         assert_eq!(cfg.validate(), Err(ForwardConfigError::ZeroMaxConnections));
     }
@@ -1277,8 +1507,26 @@ mod tests {
             upstream_addr: "127.0.0.1:1".parse().unwrap(),
             max_connections: 16,
             connect_timeout: Duration::ZERO,
+            relay_idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
         };
         assert_eq!(cfg.validate(), Err(ForwardConfigError::ZeroConnectTimeout));
+    }
+
+    /// `ForwardConfig::validate` enforces the documented idle-timeout range.
+    #[test]
+    fn validate_rejects_relay_idle_timeout_outside_bounds() {
+        let mut cfg = ForwardConfig::dev_defaults();
+        cfg.relay_idle_timeout = Duration::ZERO;
+        assert_eq!(
+            cfg.validate(),
+            Err(ForwardConfigError::RelayIdleTimeoutTooSmall)
+        );
+
+        cfg.relay_idle_timeout = MAX_RELAY_IDLE_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(
+            cfg.validate(),
+            Err(ForwardConfigError::RelayIdleTimeoutTooLarge)
+        );
     }
 
     /// `ForwardError::category` and `phase` cover all variants.
@@ -1304,6 +1552,12 @@ mod tests {
         };
         assert_eq!(relay.category(), "relay_io_failed");
         assert_eq!(relay.phase(), ConnectionLifecycle::RelayIoFailed);
+
+        let idle = ForwardError::RelayIdleTimeout {
+            idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
+        };
+        assert_eq!(idle.category(), "relay_idle_timeout");
+        assert_eq!(idle.phase(), ConnectionLifecycle::RelayIdleTimeout);
     }
 
     /// Session 03 `RelayStats` default is still zero.
