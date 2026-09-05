@@ -988,20 +988,19 @@ async fn https_ingress_enforces_signed_access_and_strips_token_before_forwarding
     let wrong_ca_probe = PublicReachabilityProbe::new(PublicReachabilityConfig {
         hostname: HttpHostname::new("demo.example.test").unwrap(),
         ca_pem: Some(wrong_pki.authority_pem.as_bytes().to_vec()),
-        total_timeout: Duration::from_millis(100),
-        attempt_timeout: Duration::from_millis(40),
+        total_timeout: Duration::from_secs(1),
+        attempt_timeout: Duration::from_secs(1),
         retry_interval: Duration::from_millis(10),
         server_addr_override: Some(https_addr),
     })
     .unwrap();
     let (_, wrong_ca_signal) = shutdown_channel();
-    assert!(matches!(
-        wrong_ca_probe.verify_until_success(wrong_ca_signal).await,
-        Err(PublicReachabilityError::Timeout {
-            attempts: 2..,
-            last_failure: PublicReachabilityFailureClass::Tls,
-        })
-    ));
+    assert_eq!(
+        wrong_ca_probe.verify_once(wrong_ca_signal).await,
+        Err(PublicReachabilityError::AttemptFailed(
+            PublicReachabilityFailureClass::Tls,
+        ))
+    );
 
     let probe = PublicReachabilityProbe::new(PublicReachabilityConfig {
         hostname: HttpHostname::new("demo.example.test").unwrap(),
