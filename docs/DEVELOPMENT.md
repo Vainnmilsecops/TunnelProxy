@@ -89,6 +89,7 @@ cargo run -p tunnelproxy-edge --example edge_dev -- \
   --listen 127.0.0.1:7000 \
   --upstream 127.0.0.1:8000 \
   --max-connections 100 \
+  --max-connections-per-ip 25 \
   --connect-timeout-ms 5000 \
   --relay-idle-timeout-ms 60000
 ```
@@ -99,6 +100,14 @@ successfully forwarded non-empty write in either direction resets one shared
 deadline. Silent reads, blocked writes, and blocked half-closes terminate the
 connection, release its concurrency permit, and do not stop the listener.
 The TCP echo and Session 03 relay compatibility helpers use the same default.
+
+The Forwarder applies both limits before task creation or upstream dialing.
+Without the per-IP flag, its effective value is `min(25, max-connections)`;
+an explicit value must be within `1..=max-connections`. A global rejection
+emits `connection_rejected_capacity`; a same-source rejection emits
+`connection_rejected_peer_capacity`. Admitted tasks hold both permits through
+RAII, so clean close, connect/relay failure, idle timeout, and shutdown release
+the source bucket for a later connection.
 
 The compatibility echo listener additionally admits at most 100 active
 handlers by default. `EchoConfig` can lower that bound for an embedded or test

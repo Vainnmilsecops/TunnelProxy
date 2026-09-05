@@ -1841,3 +1841,28 @@ Out of scope:
 - Per-IP legacy-forwarder admission, upstream pooling, public raw/HTTPS
   ingress changes, rate limiting, metrics, Agent/Tunnel Protocol changes, and
   payload inspection/logging.
+
+## Session 60 — Source-Aware Pre-Spawn Admission for the Legacy Forwarder — complete
+
+- Added always-on per-source-IP admission to the compatibility Forwarder.
+  `Forwarder::new` retains its signature and uses `min(25, global)`;
+  `new_with_per_ip_limit` validates explicit values within `1..=global`
+  without changing the public `ForwardConfig` fields.
+- Moved global and peer permit acquisition ahead of handler task creation and
+  upstream dialing. Rejections close inline with distinct fixed global and
+  peer-capacity events while leaving admitted connections and the listener
+  live.
+- Moved both permits into the admitted task so clean close, connect/relay
+  failure, idle timeout, graceful drain, and forced abort release capacity
+  through RAII. Global-first ordering bounds the active peer map, and completed
+  tasks are preferentially reaped.
+- Added `edge_dev --max-connections-per-ip`, effective startup logging,
+  constructor/CLI bounds, peer-bucket isolation and reclamation tests, and a
+  real-TCP no-upstream-dial/rejection/idle-release scenario. The workspace
+  contains 445 explicit tests across all targets and DEBT-009 is resolved.
+
+Out of scope:
+
+- Upstream pooling, distributed/shared admission, rate limiting, IP-valued
+  metrics, changes to public raw/HTTPS ingress, Agent/Tunnel Protocol changes,
+  and relay payload or half-close changes.

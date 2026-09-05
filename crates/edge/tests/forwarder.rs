@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 use tunnelproxy_edge::{
     forward_handle_connection, forward_handle_connection_with_idle_timeout, ConnectionId,
@@ -272,6 +272,83 @@ async fn forwarder_capacity_limit_one_rejects_then_releases() {
 }
 
 #[tokio::test]
+async fn forwarder_per_ip_limit_rejects_before_upstream_dial_and_releases() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+    let upstream_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let _ = accepted_tx.send(());
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; TEST_BUFFER_SIZE];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) if stream.write_all(&buffer[..read]).await.is_err() => return,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let listen_addr = fresh_addr();
+    let config = ForwardConfig {
+        listen_addr,
+        upstream_addr,
+        max_connections: 2,
+        connect_timeout: Duration::from_secs(1),
+        relay_idle_timeout: Duration::from_millis(300),
+    };
+    let forwarder = Forwarder::new_with_per_ip_limit(config, 1).unwrap();
+    let server = tokio::spawn(forwarder.run());
+
+    let mut client_a = connect_eventually(listen_addr).await;
+    client_a.write_all(b"a").await.unwrap();
+    let mut byte = [0_u8; 1];
+    client_a.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"a");
+    timeout(Duration::from_secs(1), accepted_rx.recv())
+        .await
+        .expect("client A should dial upstream")
+        .expect("upstream observer should remain live");
+
+    let mut client_b = TcpStream::connect(listen_addr).await.unwrap();
+    let rejected = timeout(Duration::from_secs(1), client_b.read(&mut byte))
+        .await
+        .expect("same-IP connection above capacity should close")
+        .unwrap();
+    assert_eq!(rejected, 0);
+    assert!(
+        timeout(Duration::from_millis(150), accepted_rx.recv())
+            .await
+            .is_err(),
+        "per-IP rejection must happen before an upstream dial"
+    );
+
+    client_a.write_all(b"z").await.unwrap();
+    client_a.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"z");
+    let closed = timeout(Duration::from_secs(1), client_a.read(&mut byte))
+        .await
+        .expect("client A should close after its idle deadline")
+        .unwrap();
+    assert_eq!(closed, 0);
+
+    let mut client_c = TcpStream::connect(listen_addr).await.unwrap();
+    client_c.write_all(b"c").await.unwrap();
+    client_c.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"c");
+    timeout(Duration::from_secs(1), accepted_rx.recv())
+        .await
+        .expect("released per-IP slot should permit client C's upstream dial")
+        .expect("upstream observer should remain live");
+
+    server.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
 async fn forwarder_idle_timeout_is_typed_and_releases_its_permit() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
@@ -494,7 +571,7 @@ async fn forwarder_recoverable_failure_does_not_kill_listener() {
         connect_timeout: Duration::from_millis(300),
         relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
-    let forwarder = Forwarder::new(cfg).expect("valid config");
+    let forwarder = Forwarder::new_with_per_ip_limit(cfg, 1).expect("valid per-IP configuration");
     let server = tokio::spawn(forwarder.run());
 
     for _ in 0..2 {

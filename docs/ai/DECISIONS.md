@@ -1593,3 +1593,30 @@ abort releases capacity through RAII. The listener remains a loopback-oriented
 compatibility surface; per-IP forwarder admission, upstream pooling, rate
 limiting, metrics, public ingress, Agent, and Tunnel Protocol behavior are
 unchanged.
+
+## ADR-060 — Legacy Forwarder admission is global, then source-aware, then spawned
+
+**Status:** Accepted (Session 60).
+
+**Context:** The Forwarder had a global relay semaphore, but acquired it inside
+an already spawned task and had no per-source policy. A single IP could consume
+the full pool, rejected connections still briefly created tasks, and a peer
+counter added without an outer bound could itself become unbounded. Adding a
+field to the public `ForwardConfig` would also break existing struct literals.
+
+**Decision:** Require global admission first, per-source-IP admission second,
+and task creation/upstream dialing last. The global permit bounds both active
+tasks and the number of peer-map entries. Move both owned permits into the
+admitted task and drop the socket inline if either acquisition fails. Preserve
+`ForwardConfig` and `Forwarder::new`; the compatibility constructor applies
+`min(25, max_connections)`. Add `new_with_per_ip_limit` for a strict non-zero
+value no greater than global capacity, expose the effective limit, and wire the
+development CLI to that constructor when explicitly configured.
+
+**Consequences:** One source cannot monopolize the default pool, rejection
+does not create a task or dial upstream, and all clean, failure, timeout, drain,
+and abort paths reclaim both permits through RAII. Existing constructor and
+config source compatibility, connection IDs, relay bytes, half-close, and idle
+semantics remain intact. No IP-valued metrics, distributed quota, production
+raw/HTTPS policy change, upstream pooling, Agent change, or Tunnel Protocol
+change is introduced.
