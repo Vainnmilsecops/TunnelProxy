@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Pre-Spawn Admission for the Legacy TCP Echo Listener** (Session 59).
+**Source-Aware Pre-Spawn Admission for the Legacy TCP Forwarder** (Session 60).
 
 ## Completed
 
@@ -683,6 +683,26 @@
   The workspace contains 440 explicit tests across all targets and DEBT-004 is
   resolved.
 
+## Session 60 delivered
+
+- Added an always-on per-source-IP admission policy to the legacy Forwarder.
+  `Forwarder::new` preserves its signature and derives `min(25, global)`;
+  `new_with_per_ip_limit` validates an explicit `1..=global` value without
+  adding a field to `ForwardConfig`.
+- Moved global and peer admission before task creation and upstream dialing.
+  Global rejection retains `connection_rejected_capacity`; per-IP rejection
+  uses the fixed `connection_rejected_peer_capacity` event and immediately
+  returns the acquired global permit.
+- Admitted handlers own both permits through RAII. Clean close, upstream
+  connect failure/timeout, relay failure, idle timeout, graceful drain, and
+  forced abort release both capacities. Global-first admission bounds the
+  active peer map, and completed tasks are preferentially reaped.
+- Added `edge_dev --max-connections-per-ip`, effective-policy startup logging,
+  strict constructor/CLI validation, peer isolation/reclamation coverage, and
+  real-TCP proof that same-IP rejection occurs before upstream dial and
+  recovers after idle timeout. The workspace contains 445 explicit tests
+  across all targets and DEBT-009 is resolved.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -717,7 +737,6 @@
   request-rate coordination, and DDoS mitigation.
 - Multi-edge ownership/failover for durable tunnel identity.
 - Upstream connection pool (DEBT-008 open).
-- Per-IP admission control on the forwarder (DEBT-009 open).
 - Embedded durable/remote-write telemetry, log rotation/shipping, dashboards,
   and alerting. Collection and retention remain operator-owned (DEBT-010
   resolved by Sessions 37–38).
@@ -728,7 +747,7 @@
 
 ## Next planned session
 
-Session 60 has not been selected. DNS/public-certificate automation and
+Session 61 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

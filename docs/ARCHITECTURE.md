@@ -1347,6 +1347,31 @@ supervisor from retaining completed tasks under churn. This closes DEBT-004
 without adding per-IP forwarder admission, rate limiting, metrics, protocol
 changes, or a new production ingress surface.
 
+### 2.57 Source-aware pre-spawn admission for the local forwarder (Session 60)
+
+The compatibility local TCP forwarder now requires both a global permit and a
+per-source-IP permit before it creates a connection task or dials the upstream.
+Global admission is evaluated first, which bounds the peer-admission map by the
+existing global connection limit. Per-IP rejection immediately releases the
+global permit, drops the downstream socket, emits the fixed
+`connection_rejected_peer_capacity` event, and leaves active connections and
+the listener live.
+
+`Forwarder::new` preserves its signature and derives an effective per-IP limit
+as `min(25, max_connections)`. `Forwarder::new_with_per_ip_limit` accepts an
+explicit non-zero value no greater than the global limit, while
+`max_connections_per_ip` exposes the effective policy. The development CLI
+adds `--max-connections-per-ip` under the same validation rule without adding a
+field to the public `ForwardConfig` struct.
+
+Admitted tasks own both permits through RAII. Clean close, upstream connect
+failure or timeout, relay I/O failure, activity idle timeout, graceful drain,
+and forced abort release both capacities. Completed tasks are preferentially
+reaped before new accepts when both are ready. This closes DEBT-009 only for
+the legacy Forwarder; it does not change the already bounded raw/HTTPS ingress,
+introduce distributed quotas, add IP metric labels, pool upstream sockets, or
+alter byte relay and Tunnel Protocol semantics.
+
 ## 3. Control plane vs data plane
 
 | Concern                | Control Plane | Data Plane |

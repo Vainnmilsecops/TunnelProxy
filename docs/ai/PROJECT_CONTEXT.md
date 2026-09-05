@@ -100,6 +100,9 @@ forwarder permit release while preserving half-close and public helper APIs.
 Session 59 closes the echo task-admission gap by acquiring a validated global
 permit before handler creation, rejecting excess sockets inline, and retaining
 capacity through RAII while preserving the original listener entry points.
+Session 60 closes the legacy Forwarder's source-monopoly gap with ordered
+global/per-IP pre-spawn admission, default-compatible construction, explicit
+CLI policy, and RAII release before any later same-IP upstream dial.
 Session 44 adds opt-in bounded HTTP/2 termination at Edge with
 HTTP/1.1 fallback and local translation. Session 45 adds separately opt-in
 bounded HTTP/1.1 WebSocket upgrade with strict client/local handshake checks,

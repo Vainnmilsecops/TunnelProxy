@@ -184,23 +184,20 @@
   mapping and document the cost in `docs/DEVELOPMENT.md`.
 - **Tracking:** open.
 
-### DEBT-009 — No per-IP admission control
+### DEBT-009 — No per-IP admission control — resolved
 
 - **Introduced in:** Session 04
 - **Category:** correctness
 - **Impact:** medium
-- **Rationale:** `Forwarder` bounds the total number of in-flight
-  relays but does not bound per-source-address concurrency. A
-  single noisy peer can still consume a significant share of the
-  permit pool. The capacity-exhaustion policy is global, not
-  per-IP.
-- **Exit plan:** Either track a per-peer counter inside
-  `Forwarder` and reject connections that exceed a per-IP cap, or
-  layer a per-IP semaphore in front of the global one. Document
-  the chosen policy before implementing it.
-- **Tracking:** Session 23 adds bounded per-IP RAII admission to the explicit
-  public raw-ingress production path. This debt remains open only for the
-  legacy standalone `Forwarder`, which is not used by that public route.
+- **Resolution:** Session 60 added source-IP admission to the legacy
+  standalone `Forwarder`. Global and peer permits are acquired before task
+  creation or upstream dialing; rejected sockets are dropped inline. The
+  compatibility constructor uses `min(25, global)` while an explicit
+  constructor and development CLI accept `1..=global`. Both permits release
+  through RAII on every connection exit, and the active peer map remains
+  bounded by global admission. Session 23's public raw-ingress policy is
+  unchanged.
+- **Tracking:** resolved in Session 60.
 
 ### DEBT-010 — Production telemetry is non-durable — resolved
 

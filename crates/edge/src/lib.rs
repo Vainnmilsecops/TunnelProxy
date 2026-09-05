@@ -25,8 +25,8 @@
 //!   It is the hardened, configurable, lifecycle-aware foundation of
 //!   the relay: explicit forwarding configuration, per-connection
 //!   identity, structured lifecycle phases, bounded upstream connect
-//!   and relay-idle timeouts, explicit max-concurrent-connections policy, and
-//!   RAII-managed resource cleanup. The forwarder is built on top of
+//!   and relay-idle timeouts, pre-spawn global/per-IP connection admission,
+//!   and RAII-managed resource cleanup. The forwarder is built on top of
 //!   the same byte-stream primitive as the Session 03 relay, so the
 //!   underlying full-duplex and half-close semantics are preserved by
 //!   construction.
@@ -70,6 +70,8 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
+use admission::PeerAdmission;
+
 pub use tunnelproxy_common::{
     shutdown_channel, RuntimeShutdownConfig, RuntimeShutdownConfigError, RuntimeShutdownOutcome,
     ShutdownSignal, ShutdownTrigger,
@@ -97,6 +99,12 @@ pub const DEFAULT_UPSTREAM_ADDR: &str = "127.0.0.1:8000";
 /// (the downstream socket is shut down and the connection is logged
 /// with [`ConnectionLifecycle::CapacityRejected`]).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+/// Default maximum concurrent forwarder connections from one source IP.
+///
+/// [`Forwarder::new`] clamps this value to the configured global connection
+/// limit, so the compatibility constructor remains valid for smaller pools.
+pub const DEFAULT_FORWARD_MAX_CONNECTIONS_PER_IP: usize = 25;
 
 /// Default maximum number of concurrently running echo handlers.
 ///
@@ -945,7 +953,8 @@ impl ForwardConfig {
     }
 }
 
-/// Errors produced by [`ForwardConfig::validate`].
+/// Errors produced while validating [`ForwardConfig`] or explicit Forwarder
+/// admission policy.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ForwardConfigError {
     /// `max_connections` must be strictly greater than zero.
@@ -956,6 +965,10 @@ pub enum ForwardConfigError {
     RelayIdleTimeoutTooSmall,
     /// `relay_idle_timeout` must not exceed one hour.
     RelayIdleTimeoutTooLarge,
+    /// The explicit per-IP forwarder connection limit must be non-zero.
+    ZeroMaxConnectionsPerIp,
+    /// The explicit per-IP limit cannot exceed the global connection limit.
+    PerIpLimitExceedsGlobal,
 }
 
 impl std::fmt::Display for ForwardConfigError {
@@ -972,6 +985,12 @@ impl std::fmt::Display for ForwardConfigError {
             }
             ForwardConfigError::RelayIdleTimeoutTooLarge => {
                 f.write_str("relay_idle_timeout must not exceed 3600000 milliseconds")
+            }
+            ForwardConfigError::ZeroMaxConnectionsPerIp => {
+                f.write_str("max_connections_per_ip must be greater than zero")
+            }
+            ForwardConfigError::PerIpLimitExceedsGlobal => {
+                f.write_str("max_connections_per_ip cannot exceed max_connections")
             }
         }
     }
@@ -1158,10 +1177,9 @@ impl ConnectionOutcome {
 /// every accepted downstream connection:
 ///
 /// 1. allocate a [`ConnectionId`];
-/// 2. try to acquire a permit from an [`Arc<Semaphore>`] sized to
-///    `config.max_connections`. If no permit is available the
-///    downstream is shut down and the listener continues. This is
-///    the documented capacity-exhaustion policy;
+/// 2. acquire global and per-source-IP permits before creating a handler task.
+///    If either limit is exhausted, the downstream is closed inline and the
+///    listener continues without dialing upstream;
 /// 3. dial the upstream under `config.connect_timeout`. Timeouts and
 ///    I/O errors are distinguished and surface as
 ///    [`ForwardError::UpstreamConnectTimeout`] or
@@ -1177,16 +1195,37 @@ impl ConnectionOutcome {
 pub struct Forwarder {
     config: ForwardConfig,
     semaphore: Arc<Semaphore>,
+    peer_admission: Arc<PeerAdmission>,
+    max_connections_per_ip: usize,
     ids: Arc<ConnectionIdAllocator>,
 }
 
 impl Forwarder {
     /// Construct a forwarder. Returns an error if `config` is not
-    /// valid; the listener is not yet bound.
+    /// valid; the listener is not yet bound. The per-IP connection limit is
+    /// `min(25, config.max_connections)`.
     pub fn new(config: ForwardConfig) -> Result<Self, ForwardConfigError> {
+        let max_connections_per_ip =
+            DEFAULT_FORWARD_MAX_CONNECTIONS_PER_IP.min(config.max_connections);
+        Self::new_with_per_ip_limit(config, max_connections_per_ip)
+    }
+
+    /// Construct a forwarder with an explicit per-source-IP connection limit.
+    pub fn new_with_per_ip_limit(
+        config: ForwardConfig,
+        max_connections_per_ip: usize,
+    ) -> Result<Self, ForwardConfigError> {
         config.validate()?;
+        if max_connections_per_ip == 0 {
+            return Err(ForwardConfigError::ZeroMaxConnectionsPerIp);
+        }
+        if max_connections_per_ip > config.max_connections {
+            return Err(ForwardConfigError::PerIpLimitExceedsGlobal);
+        }
         Ok(Self {
             semaphore: Arc::new(Semaphore::new(config.max_connections)),
+            peer_admission: Arc::new(PeerAdmission::new(max_connections_per_ip)),
+            max_connections_per_ip,
             ids: Arc::new(ConnectionIdAllocator::new()),
             config,
         })
@@ -1203,6 +1242,11 @@ impl Forwarder {
         self.semaphore.available_permits()
     }
 
+    /// Effective maximum number of active connections from one source IP.
+    pub fn max_connections_per_ip(&self) -> usize {
+        self.max_connections_per_ip
+    }
+
     /// Bind the listener and run the forwarder until
     /// [`TcpListener::accept`] itself fails.
     pub async fn run(self) -> std::io::Result<()> {
@@ -1212,36 +1256,38 @@ impl Forwarder {
             addr = %local,
             upstream = %self.config.upstream_addr,
             max_connections = self.config.max_connections,
+            max_connections_per_ip = self.max_connections_per_ip,
             connect_timeout_ms = self.config.connect_timeout.as_millis() as u64,
             relay_idle_timeout_ms = self.config.relay_idle_timeout.as_millis() as u64,
             event = "forwarder_started",
             "forwarder bound"
         );
 
-        let semaphore = self.semaphore;
-        let ids = self.ids;
-        let upstream_addr = self.config.upstream_addr;
-        let timeouts = ForwardConnectionTimeouts {
-            connect: self.config.connect_timeout,
-            relay_idle: self.config.relay_idle_timeout,
+        let listener_state = ForwardListenerState {
+            semaphore: self.semaphore,
+            peer_admission: self.peer_admission,
+            ids: self.ids,
+            upstream_addr: self.config.upstream_addr,
+            timeouts: ForwardConnectionTimeouts {
+                connect: self.config.connect_timeout,
+                relay_idle: self.config.relay_idle_timeout,
+            },
         };
 
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted?;
-                    spawn_forwarder_task(
+                    admit_forwarder_connection(
                         &mut tasks,
                         stream,
                         peer,
-                        Arc::clone(&semaphore),
-                        Arc::clone(&ids),
-                        upstream_addr,
-                        timeouts,
+                        &listener_state,
                     );
                 }
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
     }
@@ -1254,31 +1300,31 @@ impl Forwarder {
     ) -> std::io::Result<RuntimeShutdownOutcome> {
         validate_shutdown(shutdown)?;
         let listener = TcpListener::bind(self.config.listen_addr).await?;
-        let semaphore = self.semaphore;
-        let ids = self.ids;
-        let upstream_addr = self.config.upstream_addr;
-        let timeouts = ForwardConnectionTimeouts {
-            connect: self.config.connect_timeout,
-            relay_idle: self.config.relay_idle_timeout,
+        let listener_state = ForwardListenerState {
+            semaphore: self.semaphore,
+            peer_admission: self.peer_admission,
+            ids: self.ids,
+            upstream_addr: self.config.upstream_addr,
+            timeouts: ForwardConnectionTimeouts {
+                connect: self.config.connect_timeout,
+                relay_idle: self.config.relay_idle_timeout,
+            },
         };
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
                 () = signal.cancelled() => break,
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted?;
-                    spawn_forwarder_task(
+                    admit_forwarder_connection(
                         &mut tasks,
                         stream,
                         peer,
-                        Arc::clone(&semaphore),
-                        Arc::clone(&ids),
-                        upstream_addr,
-                        timeouts,
+                        &listener_state,
                     );
                 }
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
         drop(listener);
@@ -1292,31 +1338,54 @@ struct ForwardConnectionTimeouts {
     relay_idle: Duration,
 }
 
-fn spawn_forwarder_task(
-    tasks: &mut JoinSet<()>,
-    mut stream: TcpStream,
-    peer: SocketAddr,
+struct ForwardListenerState {
     semaphore: Arc<Semaphore>,
+    peer_admission: Arc<PeerAdmission>,
     ids: Arc<ConnectionIdAllocator>,
     upstream_addr: SocketAddr,
     timeouts: ForwardConnectionTimeouts,
+}
+
+fn admit_forwarder_connection(
+    tasks: &mut JoinSet<()>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: &ForwardListenerState,
 ) {
+    let id = state.ids.next_id();
+    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+            error!(
+                connection_id = %id,
+                peer = %peer,
+                upstream = %state.upstream_addr,
+                event = "connection_rejected_capacity",
+                "forwarder capacity unavailable; downstream closed"
+            );
+            drop(stream);
+            return;
+        }
+    };
+    let peer_permit = match state.peer_admission.try_acquire(peer.ip()) {
+        Some(permit) => permit,
+        None => {
+            error!(
+                connection_id = %id,
+                peer = %peer,
+                upstream = %state.upstream_addr,
+                event = "connection_rejected_peer_capacity",
+                "forwarder per-IP capacity unavailable; downstream closed"
+            );
+            drop(permit);
+            drop(stream);
+            return;
+        }
+    };
+    let upstream_addr = state.upstream_addr;
+    let timeouts = state.timeouts;
     tasks.spawn(async move {
-        let id = ids.next_id();
-        let permit = match semaphore.try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
-                let _ = stream.shutdown().await;
-                error!(
-                    connection_id = %id,
-                    peer = %peer,
-                    upstream = %upstream_addr,
-                    event = "connection_rejected_capacity",
-                    "forwarder capacity unavailable; downstream closed"
-                );
-                return;
-            }
-        };
+        let _peer_permit = peer_permit;
         let outcome = forward_handle_connection_with_idle_timeout(
             id,
             stream,
@@ -1735,6 +1804,32 @@ mod tests {
         assert_eq!(
             cfg.validate(),
             Err(ForwardConfigError::RelayIdleTimeoutTooLarge)
+        );
+    }
+
+    /// Forwarder per-IP defaults clamp to global capacity and explicit bounds
+    /// fail before the listener is bound.
+    #[test]
+    fn forwarder_per_ip_admission_is_strict_and_bounded() {
+        let config = ForwardConfig::dev_defaults();
+        let forwarder = Forwarder::new(config.clone()).expect("default policy is valid");
+        assert_eq!(
+            forwarder.max_connections_per_ip(),
+            DEFAULT_FORWARD_MAX_CONNECTIONS_PER_IP
+        );
+
+        let mut small = config.clone();
+        small.max_connections = 4;
+        let forwarder = Forwarder::new(small).expect("default policy clamps to global capacity");
+        assert_eq!(forwarder.max_connections_per_ip(), 4);
+
+        assert_eq!(
+            Forwarder::new_with_per_ip_limit(config.clone(), 0).err(),
+            Some(ForwardConfigError::ZeroMaxConnectionsPerIp)
+        );
+        assert_eq!(
+            Forwarder::new_with_per_ip_limit(config, DEFAULT_MAX_CONNECTIONS + 1).err(),
+            Some(ForwardConfigError::PerIpLimitExceedsGlobal)
         );
     }
 

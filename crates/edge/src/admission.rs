@@ -56,3 +56,34 @@ impl Drop for PeerAdmissionPermit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_ip_limits_are_isolated_and_raii_reclaimed() {
+        let admission = Arc::new(PeerAdmission::new(1));
+        let first_ip = IpAddr::from([127, 0, 0, 1]);
+        let second_ip = IpAddr::from([127, 0, 0, 2]);
+
+        let first = admission
+            .try_acquire(first_ip)
+            .expect("first source should be admitted");
+        assert!(admission.try_acquire(first_ip).is_none());
+        let second = admission
+            .try_acquire(second_ip)
+            .expect("a distinct source should have an independent bucket");
+        assert_eq!(admission.active.lock().unwrap().len(), 2);
+
+        drop(first);
+        assert_eq!(admission.active.lock().unwrap().len(), 1);
+        let replacement = admission
+            .try_acquire(first_ip)
+            .expect("dropping a permit should release its source bucket");
+
+        drop(replacement);
+        drop(second);
+        assert!(admission.active.lock().unwrap().is_empty());
+    }
+}
