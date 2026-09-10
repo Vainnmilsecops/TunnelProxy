@@ -1274,3 +1274,15 @@ hostnames return their corresponding response bodies. Restart Edge to exercise
 reconnect. `/readyz` must remain false until the full configured set and any
 public proofs are ready; terminal failure of one child drains the process.
 Config v1 remains the rollback path through `tunnelproxy http <port>`.
+
+### Pre-bound forwarder tests (Session 61)
+
+Bind a Tokio `TcpListener` to `127.0.0.1:0`, read `local_addr()`, then move it
+into `Forwarder::run_with_listener` or `run_with_listener_until_shutdown`.
+The listener address overrides `ForwardConfig.listen_addr`. Keep the listener
+open until transfer; do not reserve, release and rebind a test port.
+Use byte handshakes/channels for readiness and EOF for completion. Bound waits
+and join fixture tasks. Deliberate idle deadlines still use real time.
+
+CI validation runs `cargo test --workspace --all-targets --locked` followed by
+`cargo test --workspace --doc --locked` on both supported OS runners.

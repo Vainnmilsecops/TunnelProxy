@@ -1251,6 +1251,12 @@ impl Forwarder {
     /// [`TcpListener::accept`] itself fails.
     pub async fn run(self) -> std::io::Result<()> {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// Serve an owned, already-bound listener. Its actual address takes
+    /// precedence over `config.listen_addr`; all admission limits still apply.
+    pub async fn run_with_listener(self, listener: TcpListener) -> std::io::Result<()> {
         let local = listener.local_addr()?;
         info!(
             addr = %local,
@@ -1300,6 +1306,19 @@ impl Forwarder {
     ) -> std::io::Result<RuntimeShutdownOutcome> {
         validate_shutdown(shutdown)?;
         let listener = TcpListener::bind(self.config.listen_addr).await?;
+        self.run_with_listener_until_shutdown(listener, signal, shutdown)
+            .await
+    }
+
+    /// Serve an owned listener, then stop accepting and drain on shutdown.
+    /// The supplied listener determines the address, as in `run_with_listener`.
+    pub async fn run_with_listener_until_shutdown(
+        self,
+        listener: TcpListener,
+        signal: ShutdownSignal,
+        shutdown: RuntimeShutdownConfig,
+    ) -> std::io::Result<RuntimeShutdownOutcome> {
+        validate_shutdown(shutdown)?;
         let listener_state = ForwardListenerState {
             semaphore: self.semaphore,
             peer_admission: self.peer_admission,

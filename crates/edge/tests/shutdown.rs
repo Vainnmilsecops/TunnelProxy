@@ -93,7 +93,8 @@ async fn forwarder_forces_a_stalled_relay_and_joins_it() {
         std::future::pending::<()>().await;
         drop(socket);
     });
-    let listen_addr = unused_loopback_addr().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
     let forwarder = Forwarder::new(ForwardConfig {
         listen_addr,
         upstream_addr,
@@ -103,12 +104,16 @@ async fn forwarder_forces_a_stalled_relay_and_joins_it() {
     })
     .unwrap();
     let (trigger, signal) = shutdown_channel();
-    let runtime = tokio::spawn(forwarder.run_until_shutdown(
+    let runtime = tokio::spawn(forwarder.run_with_listener_until_shutdown(
+        listener,
         signal,
         RuntimeShutdownConfig::new(Duration::from_millis(20)),
     ));
-    let _client = connect_eventually(listen_addr).await;
-    accepted_rx.await.unwrap();
+    let _client = TcpStream::connect(listen_addr).await.unwrap();
+    timeout(Duration::from_secs(3), accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
     trigger.shutdown();
 
     assert_eq!(
@@ -119,6 +124,75 @@ async fn forwarder_forces_a_stalled_relay_and_joins_it() {
         }
     );
     upstream_task.abort();
+    assert!(upstream_task.await.unwrap_err().is_cancelled());
+    TcpListener::bind(listen_addr)
+        .await
+        .expect("forwarder releases listener");
+}
+
+#[tokio::test]
+async fn prebound_forwarder_honors_shutdown_before_accept() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (trigger, signal) = shutdown_channel();
+    trigger.shutdown();
+    // A queued client must not be admitted after shutdown was requested.
+    let _client = TcpStream::connect(addr).await.unwrap();
+    let result = Forwarder::new(ForwardConfig::dev_defaults())
+        .unwrap()
+        .run_with_listener_until_shutdown(
+            listener,
+            signal,
+            RuntimeShutdownConfig::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RuntimeShutdownOutcome::Drained { completed_tasks: 0 }
+    );
+    TcpListener::bind(addr).await.unwrap();
+}
+
+#[tokio::test]
+async fn prebound_forwarder_drains_an_admitted_relay() {
+    timeout(Duration::from_secs(5), async {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = ForwardConfig::dev_defaults();
+        config.upstream_addr = upstream.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, signal) = shutdown_channel();
+        let runtime = tokio::spawn(
+            Forwarder::new(config)
+                .unwrap()
+                .run_with_listener_until_shutdown(
+                    listener,
+                    signal,
+                    RuntimeShutdownConfig::new(Duration::from_secs(3)),
+                ),
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (mut upstream_socket, _) = upstream.accept().await.unwrap();
+        trigger.shutdown();
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        upstream_socket.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"x");
+        upstream_socket.write_all(b"y").await.unwrap();
+        upstream_socket.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"y");
+        assert!(matches!(
+            runtime.await.unwrap().unwrap(),
+            RuntimeShutdownOutcome::Drained { .. }
+        ));
+        TcpListener::bind(addr).await.unwrap();
+    })
+    .await
+    .expect("graceful relay drain exceeded deadline");
 }
 
 #[tokio::test]

@@ -173,3 +173,9 @@
 | Continuous public reachability health     | ✅   | ✅          | —   | Unit tests cover bounded monitor config, non-overlapping fixed-delay scheduling, threshold/readiness transitions, recovery, cancellation, and one-shot reconnect compatibility; real TLS covers live route loss, typed unavailable result, Agent re-registration, and proof recovery. |
 | Multi-tunnel managed HTTP Agent           | ✅   | ✅          | —   | Unit/subprocess tests cover strict config v2, 1â€“16 bounds, duplicate IDs, command/version separation, config-v1 compatibility, aggregate metrics, and supervisor drain; real mTLS/public TLS routes two durable hostnames over independent Agent transports to distinct local services. |
 | Config-v2 local-target generation reload  | ✅   | ✅          | —   | Unit tests cover atomic map publication, monotonic/digest-bound bootstrap, strict mutation limits, last-known-good retention, metrics, and cancellation; real TCP proves active streams retain their local socket while new streams use the new target on the unchanged Agent transport session. |
+
+Session 61 adds owned-listener startup coverage through the forwarder integration
+suite, `prebound_forwarder_honors_shutdown_before_accept`, and
+`prebound_forwarder_drains_an_admitted_relay`. Global and per-IP capacity tests
+observe upstream admission, byte continuity, idle release and subsequent reuse.
+CI executes example unit tests as well as workspace and documentation tests.

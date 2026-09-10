@@ -349,6 +349,7 @@ and Definition of Done.
 | 58 _(complete)_ | bounded activity-aware legacy TCP relay idle timeout |
 | 59 _(complete)_ | bounded pre-spawn admission for the legacy TCP echo listener |
 | 60 _(complete)_ | source-aware pre-spawn admission for the legacy TCP forwarder |
+| 61 _(complete)_ | pre-bound forwarder listeners, synchronized TCP tests, and all-target CI |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
