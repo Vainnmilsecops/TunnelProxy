@@ -1620,3 +1620,17 @@ config source compatibility, connection IDs, relay bytes, half-close, and idle
 semantics remain intact. No IP-valued metrics, distributed quota, production
 raw/HTTPS policy change, upstream pooling, Agent change, or Tunnel Protocol
 change is introduced.
+
+## ADR-061 — Forwarder accepts owned pre-bound listeners
+
+**Status:** Accepted (Session 61).
+
+**Decision:** Add `run_with_listener` and `run_with_listener_until_shutdown`.
+The supplied Tokio listener determines the serving address and transfers ownership
+into the runtime; configuration continues to determine upstream, admission and
+idle limits. Existing methods bind their configured address and delegate.
+
+**Rationale:** Keeping a port bound eliminates the release/rebind race in tests
+and enables embedding with OS-assigned ports. Tests observe admission through
+real byte exchange and bounded channels, and retain ownership of fixture tasks.
+CI executes example tests via `--all-targets` and preserves doc tests separately.

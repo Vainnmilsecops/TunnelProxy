@@ -29,119 +29,55 @@ use tunnelproxy_edge::{
 const TEST_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Spawn a tiny echo upstream bound on an ephemeral port.
-async fn spawn_echo_upstream() -> SocketAddr {
+async fn spawn_echo_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; TEST_BUFFER_SIZE];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; TEST_BUFFER_SIZE];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        return;
                     }
                 }
-            });
+                Err(_) => return,
+            }
         }
     });
-    addr
+    (addr, task)
 }
 
 /// Spawn an upstream that, for each accepted connection, reads until
 /// EOF and then writes a deterministic response.
-async fn spawn_request_then_reply_upstream(response: Vec<u8>) -> SocketAddr {
+async fn spawn_request_then_reply_upstream(
+    response: Vec<u8>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            let response = response.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; TEST_BUFFER_SIZE];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(_) => return,
-                    }
-                }
-                let _ = stream.write_all(&response).await;
-            });
-        }
-    });
-    addr
-}
-
-/// Spawn an upstream that holds its response for `hold` and then
-/// replies with `late-reply`. Used by the capacity-limit test to keep
-/// a relay in-flight deterministically.
-async fn spawn_holding_upstream(hold: Duration) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; TEST_BUFFER_SIZE];
-                let _ = stream.read(&mut buf).await; // first read
-                tokio::time::sleep(hold).await;
-                let _ = stream.write_all(b"late-reply").await;
-            });
-        }
-    });
-    addr
-}
-
-/// Reserve an ephemeral port, close it, and return its address as a
-/// guaranteed-unreachable upstream target.
-fn reserve_unreachable_addr() -> SocketAddr {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
-}
-
-/// Reserve an ephemeral port and return its address.
-fn fresh_addr() -> SocketAddr {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
-}
-
-/// Connect after a spawned `Forwarder::run` has completed its asynchronous
-/// bind. Reserving and releasing an ephemeral port does not guarantee the
-/// listener task will be polled before the client on every Tokio/OS scheduler.
-async fn connect_eventually(addr: SocketAddr) -> TcpStream {
-    timeout(Duration::from_secs(2), async {
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; TEST_BUFFER_SIZE];
         loop {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => panic!("unexpected forwarder connect error: {error}"),
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => return,
             }
         }
-    })
-    .await
-    .expect("forwarder listener did not bind before the deadline")
+        let _ = stream.write_all(&response).await;
+    });
+    (addr, task)
 }
 
-/// Drain a `ReadHalf<TcpStream>` until EOF. Used to keep the read
-/// side alive across the lifetime of a relay under test.
-async fn drain_until_eof(mut stream: tokio::io::ReadHalf<TcpStream>) {
-    let mut buf = vec![0u8; TEST_BUFFER_SIZE];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => continue,
-        }
-    }
+/// Keep an ephemeral port bound without listening throughout the failure test.
+fn reserve_unreachable_addr() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +87,7 @@ async fn drain_until_eof(mut stream: tokio::io::ReadHalf<TcpStream>) {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forwarder_golden_path_round_trip() {
-    let upstream_addr = spawn_echo_upstream().await;
+    let (upstream_addr, echo_task) = spawn_echo_upstream().await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
@@ -184,6 +120,7 @@ async fn forwarder_golden_path_round_trip() {
     assert_eq!(received, payload);
 
     let outcome: ConnectionOutcome = handler.await.unwrap();
+    echo_task.await.unwrap();
     let outcome_ref = &outcome;
     let stats = outcome_ref
         .outcome
@@ -196,117 +133,64 @@ async fn forwarder_golden_path_round_trip() {
 
 // ---------------------------------------------------------------------------
 // TEST 2 — Capacity limit. Real `Forwarder` with `max_connections=1`,
-// a slow upstream that holds the relay in-flight. While A is in
+// an echo handshake that proves admission. While A is in
 // flight, B must be capacity-rejected. After A closes, C must
 // succeed.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forwarder_capacity_limit_one_rejects_then_releases() {
-    let upstream_addr = spawn_holding_upstream(Duration::from_millis(500)).await;
-    let listen_addr = fresh_addr();
-
-    let config = ForwardConfig {
-        listen_addr,
-        upstream_addr,
-        max_connections: 1,
-        connect_timeout: Duration::from_secs(2),
-        relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
-    };
-    let forwarder = Forwarder::new(config).expect("valid config");
-    assert_eq!(forwarder.available_permits(), 1);
-    let server = tokio::spawn(forwarder.run());
-
-    // Connection A: open + write + keep reader alive (drains the echo
-    // stream from upstream). We deliberately do NOT shut down for
-    // ~500 ms so the relay holds the permit across B's attempt.
-    let stream_a = connect_eventually(listen_addr).await;
-    let (read_a, mut write_a) = tokio::io::split(stream_a);
-    let writer_task = tokio::spawn(async move {
-        write_a.write_all(b"A-payload").await.unwrap();
-        // Hold the write side open so the relay copy has traffic to
-        // push for a while. We sleep long enough that B is rejected
-        // while A is still in flight.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        // Then shut down so A completes and the permit is released.
-        write_a.shutdown().await.unwrap();
-    });
-    let drain_a = tokio::spawn(drain_until_eof(read_a));
-
-    // Give the forwarder time to accept A and acquire the permit.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    // Connection B: should observe an immediate close because the
-    // only permit is held by A.
-    {
-        let mut client_b = TcpStream::connect(listen_addr).await.unwrap();
-        let mut buf = [0u8; 16];
-        let r = timeout(Duration::from_secs(2), client_b.read(&mut buf))
-            .await
-            .expect("client B should observe close");
-        assert_eq!(r.unwrap(), 0, "client B must be closed by capacity policy");
-        drop(client_b);
-    }
-
-    // Wait for A's writer to shut down + relay to finish + permit
-    // release. We poll the available permits through a small proxy:
-    // if C succeeds with full payload exchange, the permit is back.
-    let _ = writer_task.await;
-    let _ = drain_a.await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Connection C: must succeed after A released the permit.
-    let mut client_c = TcpStream::connect(listen_addr).await.unwrap();
-    client_c.write_all(b"C-payload").await.unwrap();
-    client_c.shutdown().await.unwrap();
-    let mut got = Vec::new();
-    timeout(Duration::from_secs(3), client_c.read_to_end(&mut got))
-        .await
-        .expect("client C should observe a response")
-        .unwrap();
-    assert!(
-        !got.is_empty(),
-        "client C should observe a response (got empty bytes)"
-    );
-
-    server.abort();
+    admission_rejects_before_dial_and_releases(1).await;
 }
 
 #[tokio::test]
 async fn forwarder_per_ip_limit_rejects_before_upstream_dial_and_releases() {
+    admission_rejects_before_dial_and_releases(2).await;
+}
+
+async fn admission_rejects_before_dial_and_releases(global_limit: usize) {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
-    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let upstream_task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = upstream.accept().await {
-            let _ = accepted_tx.send(());
-            tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            accepted_tx.send(()).await.unwrap();
+            tasks.spawn(async move {
                 let mut buffer = [0_u8; TEST_BUFFER_SIZE];
                 loop {
                     match stream.read(&mut buffer).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) if stream.write_all(&buffer[..read]).await.is_err() => return,
+                        Ok(0) | Err(_) => break,
+                        Ok(read) if stream.write_all(&buffer[..read]).await.is_err() => break,
                         Ok(_) => {}
                     }
                 }
             });
         }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     });
 
-    let listen_addr = fresh_addr();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
     let config = ForwardConfig {
         listen_addr,
         upstream_addr,
-        max_connections: 2,
+        max_connections: global_limit,
         connect_timeout: Duration::from_secs(1),
-        relay_idle_timeout: Duration::from_millis(300),
+        relay_idle_timeout: Duration::from_secs(1),
     };
     let forwarder = Forwarder::new_with_per_ip_limit(config, 1).unwrap();
-    let server = tokio::spawn(forwarder.run());
+    let server = tokio::spawn(forwarder.run_with_listener(listener));
 
-    let mut client_a = connect_eventually(listen_addr).await;
+    let mut client_a = TcpStream::connect(listen_addr).await.unwrap();
     client_a.write_all(b"a").await.unwrap();
     let mut byte = [0_u8; 1];
-    client_a.read_exact(&mut byte).await.unwrap();
+    timeout(Duration::from_secs(3), client_a.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&byte, b"a");
     timeout(Duration::from_secs(1), accepted_rx.recv())
         .await
@@ -320,32 +204,53 @@ async fn forwarder_per_ip_limit_rejects_before_upstream_dial_and_releases() {
         .unwrap();
     assert_eq!(rejected, 0);
     assert!(
-        timeout(Duration::from_millis(150), accepted_rx.recv())
-            .await
-            .is_err(),
-        "per-IP rejection must happen before an upstream dial"
+        accepted_rx.try_recv().is_err(),
+        "rejection must not dial upstream"
     );
 
     client_a.write_all(b"z").await.unwrap();
-    client_a.read_exact(&mut byte).await.unwrap();
-    assert_eq!(&byte, b"z");
-    let closed = timeout(Duration::from_secs(1), client_a.read(&mut byte))
+    timeout(Duration::from_secs(3), client_a.read_exact(&mut byte))
         .await
-        .expect("client A should close after its idle deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&byte, b"z");
+    // Exercise clean-close recovery for the global limit and idle recovery
+    // for the per-IP limit, without using sleeps to arrange either case.
+    if global_limit == 1 {
+        client_a.shutdown().await.unwrap();
+    }
+    let closed = timeout(Duration::from_secs(3), client_a.read(&mut byte))
+        .await
+        .expect("client A should close and release admission")
         .unwrap();
     assert_eq!(closed, 0);
 
     let mut client_c = TcpStream::connect(listen_addr).await.unwrap();
     client_c.write_all(b"c").await.unwrap();
-    client_c.read_exact(&mut byte).await.unwrap();
+    timeout(Duration::from_secs(3), client_c.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&byte, b"c");
     timeout(Duration::from_secs(1), accepted_rx.recv())
         .await
         .expect("released per-IP slot should permit client C's upstream dial")
         .expect("upstream observer should remain live");
 
+    client_c.shutdown().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), client_c.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    timeout(Duration::from_secs(3), upstream_task)
+        .await
+        .unwrap()
+        .unwrap();
     server.abort();
-    upstream_task.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
@@ -395,6 +300,7 @@ async fn forwarder_idle_timeout_is_typed_and_releases_its_permit() {
         .try_acquire_owned()
         .expect("replacement connection can reuse the released permit");
     upstream_task.abort();
+    assert!(upstream_task.await.unwrap_err().is_cancelled());
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +309,7 @@ async fn forwarder_idle_timeout_is_typed_and_releases_its_permit() {
 #[tokio::test]
 async fn forwarder_preserves_half_close() {
     let response: Vec<u8> = b"upstream reply after client EOF".to_vec();
-    let upstream_addr = spawn_request_then_reply_upstream(response.clone()).await;
+    let (upstream_addr, reply_task) = spawn_request_then_reply_upstream(response.clone()).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
@@ -435,6 +341,7 @@ async fn forwarder_preserves_half_close() {
 
     let outcome = handler.await.unwrap();
     assert_eq!(outcome.final_phase(), ConnectionLifecycle::Closed);
+    reply_task.await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +350,7 @@ async fn forwarder_preserves_half_close() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forwarder_large_payload_round_trip() {
-    let upstream_addr = spawn_echo_upstream().await;
+    let (upstream_addr, echo_task) = spawn_echo_upstream().await;
 
     const SIZE: usize = 256 * 1024;
     let mut payload = Vec::with_capacity(SIZE);
@@ -491,6 +398,7 @@ async fn forwarder_large_payload_round_trip() {
     assert_eq!(received, payload);
 
     let outcome = handler.await.unwrap();
+    echo_task.await.unwrap();
     let stats = outcome.outcome.expect("large payload relay completed");
     assert_eq!(
         stats,
@@ -507,7 +415,7 @@ async fn forwarder_large_payload_round_trip() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forwarder_unreachable_upstream_surfaces_upstream_connect_failure() {
-    let unreachable_addr = reserve_unreachable_addr();
+    let (_reserved_upstream, unreachable_addr) = reserve_unreachable_addr();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
 
@@ -561,8 +469,9 @@ async fn forwarder_unreachable_upstream_surfaces_upstream_connect_failure() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forwarder_recoverable_failure_does_not_kill_listener() {
-    let unreachable_addr = reserve_unreachable_addr();
-    let listen_addr = fresh_addr();
+    let (_reserved_upstream, unreachable_addr) = reserve_unreachable_addr();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
 
     let cfg = ForwardConfig {
         listen_addr,
@@ -572,10 +481,10 @@ async fn forwarder_recoverable_failure_does_not_kill_listener() {
         relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
     let forwarder = Forwarder::new_with_per_ip_limit(cfg, 1).expect("valid per-IP configuration");
-    let server = tokio::spawn(forwarder.run());
+    let server = tokio::spawn(forwarder.run_with_listener(listener));
 
     for _ in 0..2 {
-        let mut c = connect_eventually(listen_addr).await;
+        let mut c = TcpStream::connect(listen_addr).await.unwrap();
         let mut buf = [0u8; 16];
         let r = timeout(Duration::from_secs(3), c.read(&mut buf))
             .await
@@ -586,6 +495,7 @@ async fn forwarder_recoverable_failure_does_not_kill_listener() {
     }
 
     server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 // ---------------------------------------------------------------------------
@@ -627,8 +537,9 @@ fn forwarder_new_rejects_invalid_config() {
 #[tokio::test]
 async fn forwarder_failure_then_recovery_via_restart() {
     // Stage 1: forwarder pointed at an unreachable upstream.
-    let unreachable_addr = reserve_unreachable_addr();
-    let listen_addr_bad = fresh_addr();
+    let (_reserved_upstream, unreachable_addr) = reserve_unreachable_addr();
+    let listener_bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr_bad = listener_bad.local_addr().unwrap();
     let cfg_bad = ForwardConfig {
         listen_addr: listen_addr_bad,
         upstream_addr: unreachable_addr,
@@ -636,10 +547,14 @@ async fn forwarder_failure_then_recovery_via_restart() {
         connect_timeout: Duration::from_millis(300),
         relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
-    let server_bad = tokio::spawn(Forwarder::new(cfg_bad).unwrap().run());
+    let server_bad = tokio::spawn(
+        Forwarder::new(cfg_bad)
+            .unwrap()
+            .run_with_listener(listener_bad),
+    );
 
     {
-        let mut c = connect_eventually(listen_addr_bad).await;
+        let mut c = TcpStream::connect(listen_addr_bad).await.unwrap();
         let mut buf = [0u8; 16];
         let r = timeout(Duration::from_secs(3), c.read(&mut buf))
             .await
@@ -648,12 +563,14 @@ async fn forwarder_failure_then_recovery_via_restart() {
         assert_eq!(r, 0);
     }
     server_bad.abort();
+    assert!(server_bad.await.unwrap_err().is_cancelled());
 
     // Stage 2: pick a fresh listen address to avoid any port-reuse
     // timing races, then point the new forwarder at a healthy
     // upstream.
-    let listen_addr_good = fresh_addr();
-    let upstream_addr = spawn_echo_upstream().await;
+    let listener_good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr_good = listener_good.local_addr().unwrap();
+    let (upstream_addr, echo_task) = spawn_echo_upstream().await;
     let cfg_good = ForwardConfig {
         listen_addr: listen_addr_good,
         upstream_addr,
@@ -661,9 +578,13 @@ async fn forwarder_failure_then_recovery_via_restart() {
         connect_timeout: Duration::from_secs(2),
         relay_idle_timeout: tunnelproxy_edge::DEFAULT_RELAY_IDLE_TIMEOUT,
     };
-    let server_good = tokio::spawn(Forwarder::new(cfg_good).unwrap().run());
+    let server_good = tokio::spawn(
+        Forwarder::new(cfg_good)
+            .unwrap()
+            .run_with_listener(listener_good),
+    );
 
-    let mut client = connect_eventually(listen_addr_good).await;
+    let mut client = TcpStream::connect(listen_addr_good).await.unwrap();
     client.write_all(b"recovery hello").await.unwrap();
     client.shutdown().await.unwrap();
     let mut got = Vec::new();
@@ -672,8 +593,10 @@ async fn forwarder_failure_then_recovery_via_restart() {
         .expect("recovery read timed out")
         .unwrap();
     assert_eq!(got, b"recovery hello");
+    echo_task.await.unwrap();
 
     server_good.abort();
+    assert!(server_good.await.unwrap_err().is_cancelled());
 }
 
 // ---------------------------------------------------------------------------

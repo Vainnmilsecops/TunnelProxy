@@ -1866,3 +1866,18 @@ Out of scope:
 - Upstream pooling, distributed/shared admission, rate limiting, IP-valued
   metrics, changes to public raw/HTTPS ingress, Agent/Tunnel Protocol changes,
   and relay payload or half-close changes.
+
+## Session 61 — Pre-bound Forwarder Listeners and Reliable TCP Tests — complete
+
+- Added owned-listener Forwarder APIs for ordinary serving and graceful shutdown;
+  existing bind-and-run entry points delegate to them. The supplied listener's
+  address takes precedence over the configured bind address.
+- Forwarder fixtures retain their ephemeral listener until ownership transfer.
+  Failure fixtures retain a bound, non-listening socket rather than releasing a port.
+- Capacity scenarios synchronize on echoed bytes, bounded upstream notifications,
+  and EOF. Upstream fixture tasks are owned and joined; startup polling and
+  synchronization sleeps are removed from forwarder tests.
+- Added pre-requested shutdown and graceful half-close drain coverage; forced
+  shutdown verifies listener release. Workspace all-target inventory: 447 tests.
+- CI now runs all targets (including example tests) and documentation tests
+  separately on Windows and Ubuntu.

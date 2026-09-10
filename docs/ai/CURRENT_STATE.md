@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Source-Aware Pre-Spawn Admission for the Legacy TCP Forwarder** (Session 60).
+**Pre-bound Forwarder Listeners and Reliable TCP Tests** (Session 61).
 
 ## Completed
 
@@ -703,6 +703,14 @@
   recovers after idle timeout. The workspace contains 445 explicit tests
   across all targets and DEBT-009 is resolved.
 
+## Session 61 delivered
+
+Owned pre-bound Forwarder APIs eliminate test listener release/rebind races.
+Forwarder capacity tests use byte handshakes, bounded notifications and EOF;
+negative upstream fixtures retain a bound non-listening port. Added graceful and
+pre-requested shutdown tests and explicit fixture task joins. CI executes
+all-target tests and doc tests separately. Workspace inventory: 447 tests.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -747,7 +755,7 @@
 
 ## Next planned session
 
-Session 61 has not been selected. DNS/public-certificate automation and
+Session 62 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

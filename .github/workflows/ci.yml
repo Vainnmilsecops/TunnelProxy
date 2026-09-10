@@ -61,7 +61,10 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run documentation tests
+        run: cargo test --workspace --doc --locked
 
       - name: Build workspace
         run: cargo build --workspace --locked
