@@ -422,7 +422,7 @@ impl EdgeRuntime {
         signal: ShutdownSignal,
     ) -> Result<EdgeRuntimeOutcome, EdgeRuntimeError> {
         if let Some(https) = self.config.https_ingress.clone() {
-            return self.run_https_until_shutdown(https, signal).await;
+            return self.run_https_until_shutdown(https, signal, None).await;
         }
         let router = self.transport.router();
         let manager =
@@ -558,10 +558,33 @@ impl EdgeRuntime {
         }
     }
 
+    /// Run with a one-shot notification containing the actual HTTPS bind address.
+    /// Sent only after HTTPS and optional operations listeners have bound and
+    /// their supervised tasks have started. This is listener readiness, not
+    /// Agent/tunnel readiness. No probe connection is needed for port-zero binds.
+    /// Startup errors, raw-only mode, or shutdown already requested at startup
+    /// close the channel without a value; inspect the runtime result for errors.
+    /// Dropping the receiver does not stop the runtime. Existing bind timing is
+    /// unchanged, and a notification is not a guarantee against later shutdown.
+    pub async fn run_until_shutdown_with_https_startup(
+        self,
+        signal: ShutdownSignal,
+        startup: tokio::sync::oneshot::Sender<SocketAddr>,
+    ) -> Result<EdgeRuntimeOutcome, EdgeRuntimeError> {
+        if let Some(https) = self.config.https_ingress.clone() {
+            self.run_https_until_shutdown(https, signal, Some(startup))
+                .await
+        } else {
+            drop(startup);
+            self.run_until_shutdown(signal).await
+        }
+    }
+
     async fn run_https_until_shutdown(
         self,
         mut https_config: HttpIngressConfig,
         signal: ShutdownSignal,
+        startup: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     ) -> Result<EdgeRuntimeOutcome, EdgeRuntimeError> {
         let router = self.transport.router();
         let shutdown = self.config.shutdown;
@@ -610,6 +633,11 @@ impl EdgeRuntime {
         let mut current_sessions = HashSet::new();
         let mut sessions_seen = 0_u64;
         info!(%https_addr, tunnel_id = %self.config.tunnel_id, event = "https_ingress_bound");
+        if let Some(startup) = startup {
+            if !signal.is_shutdown() {
+                let _ = startup.send(https_addr);
+            }
+        }
 
         loop {
             tokio::select! {

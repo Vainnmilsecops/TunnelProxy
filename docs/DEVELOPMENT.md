@@ -1305,3 +1305,17 @@ a second accept loop. Negative upstream fixtures keep a bound non-listening
 source addresses 127.0.0.1 through 127.0.0.5 to distinguish global and IP limits.
 ForwardConfig capacities above `Semaphore::MAX_PERMITS` now return
 `ForwardConfigError::MaxConnectionsTooLarge`, rather than panicking at construction.
+
+### HTTPS runtime startup address (Session 63)
+
+Set `config.https_ingress.listen_addr` to `127.0.0.1:0`, create a Tokio oneshot
+channel, then spawn `edge.run_until_shutdown_with_https_startup(signal, sender)`.
+Await the receiver under a deadline to obtain the actual SocketAddr; connect to
+that address directly. Do not reserve/drop/rebind a port or open a probe connection
+to count readiness. A successful notification means HTTPS and optional operations
+listeners have bound, not that an Agent is online; use router state for that.
+
+The runtime result carries startup errors. The channel closes without an address
+on startup failure, raw-only mode or shutdown already requested during startup.
+Dropping the receiver does not stop serving. Existing `run_until_shutdown` keeps
+its behavior and bind timing. The new notification does not replace health checks.

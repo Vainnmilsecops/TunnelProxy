@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Bounded Legacy Relay Listeners** (Session 62).
+**HTTPS Runtime Startup Notification and Test Reliability** (Session 63).
 
 ## Completed
 
@@ -729,6 +729,34 @@ The first Windows full-suite run failed two unrelated HTTPS runtime tests
 count 2 vs 1). An unchanged full-suite rerun passed; their root cause remains
 unresolved and no HTTPS runtime/test changes are included in this session.
 
+## Session 63 delivered
+
+`EdgeRuntime::run_until_shutdown_with_https_startup` optionally reports the
+actual HTTPS listener address through a one-shot channel after HTTPS and optional
+operations startup succeeds. Existing bind/run timing is unchanged. Startup
+failure, raw-only mode and pre-requested shutdown close the channel without a
+value; detailed errors remain in the runtime result. This is listener readiness,
+not tunnel or public reachability readiness.
+
+Six HTTP/1.1 tests (keep-alive, deadlines, shutdown, rate limiting and host-fronting)
+now bind port zero and connect directly to the reported address without readiness
+probes or TLS retries. Four regressions cover simultaneous independently signed
+TLS listeners, HTTPS bind failure, operations bind failure and pre-requested
+shutdown. Session 62's two HTTPS failures did not reproduce in the initial
+baseline run; port release/rebind is a confirmed fixture hazard, not a proven
+sole root cause of those failures. Remaining runtime fixtures are outside this
+session and still include reserved-port/polling helpers.
+
+Validation: 459 all-target tests pass on Windows and Linux/WSL, along with
+workspace builds and doc tests; fmt, Clippy and Rust 1.75 all-target check pass.
+An initial repeated HTTPS run overlapping full-suite/build activity failed in
+signed-access on Windows (iteration 19) and rate-limit refill on Linux; both
+reported a non-200 response without its status. No TLS/security assertion was
+relaxed. The refill assertion now includes only the status line for diagnosis.
+The cause of these load-associated failures has not been established.
+After full-suite activity completed, the 14-test HTTPS group passed 20 consecutive
+iterations on each OS (280 test executions per OS), using default test concurrency.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -773,7 +801,7 @@ unresolved and no HTTPS runtime/test changes are included in this session.
 
 ## Next planned session
 
-Session 63 has not been selected. DNS/public-certificate automation and
+Session 64 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

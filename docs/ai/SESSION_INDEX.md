@@ -1897,3 +1897,18 @@ Out of scope:
 - Workspace inventory is 455 all-target tests. Windows full-suite rerun and
   Linux/WSL full suite pass; the initial Windows run had two non-reproduced
   HTTPS runtime failures recorded in CURRENT_STATE.
+
+## Session 63 — HTTPS Runtime Startup Notification and Test Reliability — complete
+
+- Added an optional one-shot HTTPS startup address notification after listener
+  startup; retained existing bind/run timing and supervision semantics.
+- Migrated six HTTP/1.1 runtime tests to port-zero binds and direct connections.
+- Added four tests for isolated concurrent TLS listeners, HTTPS/operations bind
+  failures and pre-requested shutdown. Existing security assertions remain intact.
+- Earlier HTTPS failures were not reproduced in the initial baseline; the known
+  port release/rebind hazard is removed from the migrated fixtures, not declared
+  the proven sole cause of all prior flakes.
+- Validation: 459 all-target tests pass on Windows/Linux; the 14-test HTTPS group
+  passes 20 consecutive iterations per OS after overlapping full-suite activity
+  finishes. Earlier stress-run failures remain documented in CURRENT_STATE.
+- Workspace build/doc tests, fmt, Clippy and MSRV 1.75 checks pass.

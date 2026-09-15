@@ -1656,3 +1656,26 @@ Forwarder. The new public validation error variant may require updates to
 exhaustive matches. Low-level relay primitives, half-close payload semantics,
 wire protocol, and production ingress policy are unchanged. Shutdown prioritizes
 cancellation over accept and aborts/joins tasks after the configured drain deadline.
+
+## ADR-063 — HTTPS listener readiness reports its actual bound address
+
+**Status:** Accepted (Session 63).
+
+**Context:** HTTPS runtime tests reserved and released ephemeral ports before
+runtime startup. Another parallel fixture could reuse that port; successful TCP
+connect alone cannot identify the intended TLS listener. Two Session 62 failures
+were consistent with this hazard but their precise cause was not reproduced.
+
+**Decision:** Add `run_until_shutdown_with_https_startup`, accepting a one-shot
+address sender. Publish after HTTPS and optional operations listeners bind and
+supervised tasks are spawned. Port-zero callers use the reported SocketAddr;
+they do not probe connections for readiness. Preserve the old bind/run API and
+startup timing. A closed channel means no startup address was published; callers
+must inspect the runtime result to distinguish startup failure from shutdown or
+raw-only mode. Receiver cancellation does not cancel the runtime.
+
+**Consequences:** Listener readiness remains distinct from tunnel authorization,
+Agent registration and public reachability. Shutdown may occur after notification;
+the notification is not a durable health signal. Six HTTP/1.1 tests adopt this
+path without relaxing TLS verification, timeout behavior or connection counts.
+No TLS policy, wire protocol, or general runtime-fixture refactor is included.
