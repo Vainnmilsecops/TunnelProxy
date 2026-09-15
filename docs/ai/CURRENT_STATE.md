@@ -6,7 +6,7 @@
 
 ## Current milestone
 
-**Pre-bound Forwarder Listeners and Reliable TCP Tests** (Session 61).
+**Bounded Legacy Relay Listeners** (Session 62).
 
 ## Completed
 
@@ -711,6 +711,24 @@ negative upstream fixtures retain a bound non-listening port. Added graceful and
 pre-requested shutdown tests and explicit fixture task joins. CI executes
 all-target tests and doc tests separately. Workspace inventory: 447 tests.
 
+## Session 62 delivered
+
+Legacy `run_relay_listener` and its shutdown variant now delegate to Forwarder:
+100 global connections, 25/source IP, 5-second connect timeout and 60-second
+activity-aware relay idle timeout. Owned pre-bound listener variants share the
+same implementation. Lifecycle logging uses Forwarder events; low-level relay
+primitives remain unchanged. ForwardConfig rejects capacities above
+`Semaphore::MAX_PERMITS` before construction. Relay tests use production APIs,
+owned/joined fixtures, retained negative-test ports, and observable completion
+instead of startup sleeps. Wrapper tests cover global/peer rejection before
+dial, capacity recovery, pre-requested shutdown, graceful drain and forced abort.
+Workspace all-target inventory: 455 tests, passing on Windows and Linux/WSL.
+The first Windows full-suite run failed two unrelated HTTPS runtime tests
+(`https_ingress_rejects_host_fronting_and_fails_closed_while_offline`: BadSignature;
+`https_keep_alive_reuses_one_tls_connection_until_the_request_cap`: connection
+count 2 vs 1). An unchanged full-suite rerun passed; their root cause remains
+unresolved and no HTTPS runtime/test changes are included in this session.
+
 ## Not implemented
 
 - Protected issuer key custody, CA rollover, multi-CA overlap, and CRL/OCSP at
@@ -755,7 +773,7 @@ all-target tests and doc tests separately. Workspace inventory: 447 tests.
 
 ## Next planned session
 
-Session 62 has not been selected. DNS/public-certificate automation and
+Session 63 has not been selected. DNS/public-certificate automation and
 multi-edge ownership remain separate scopes. Collect
 workload evidence using the Session 37 runbook
 before proposing peer-negotiated transport flow control.

@@ -1881,3 +1881,19 @@ Out of scope:
   shutdown verifies listener release. Workspace all-target inventory: 447 tests.
 - CI now runs all targets (including example tests) and documentation tests
   separately on Windows and Ubuntu.
+
+## Session 62 — Bounded Legacy Relay Listeners — complete
+
+- Existing relay listener wrappers now share Forwarder admission, connect/idle
+  deadlines, lifecycle events and task supervision, with unchanged signatures.
+- Added owned pre-bound serving and shutdown entrypoints, defaulting to
+  100 global connections, 25/IP, connect 5 s and idle 60 s.
+- Added structured validation for capacities above Semaphore::MAX_PERMITS.
+- Removed relay tests' substitute accept loop and startup/rebind sleeps;
+  fixtures retain socket ownership and join tasks explicitly.
+- Added wrapper-level global/per-IP rejection-before-dial and recovery tests,
+  pre-requested/invalid shutdown, half-close drain, and forced-abort coverage.
+- No low-level relay primitive, wire protocol, pooling or multi-edge changes.
+- Workspace inventory is 455 all-target tests. Windows full-suite rerun and
+  Linux/WSL full suite pass; the initial Windows run had two non-reproduced
+  HTTPS runtime failures recorded in CURRENT_STATE.

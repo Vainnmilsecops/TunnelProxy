@@ -783,42 +783,42 @@ pub async fn relay_connection(
 /// connection, open a fresh upstream TCP connection to `upstream_addr`
 /// and forward bytes bidirectionally until either side closes.
 ///
-/// Session 03 kept admission unbounded. Session 04 supersedes this
-/// default with [`Forwarder`] (bounded concurrency, connect timeout,
-/// structured lifecycle). For new code prefer the [`Forwarder`].
+/// Uses [`Forwarder`] defaults: 100 global connections, 25 per source IP,
+/// a 5-second connect timeout and a 60-second activity-aware idle timeout.
+/// Unlike the original Session 03 API, admission is bounded. Use [`Forwarder`]
+/// directly to customize these limits. Lifecycle events are Forwarder events.
 pub async fn run_relay_listener(
     bind_addr: SocketAddr,
     upstream_addr: SocketAddr,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
-    let local = listener.local_addr()?;
-    info!(
-        addr = %local,
-        upstream = %upstream_addr,
-        event = "relay_server_started",
-        "relay server bound"
-    );
-
-    let mut tasks = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => {
-                    tasks.spawn(async move {
-                        let _ = relay_connection(stream, peer, upstream_addr).await;
-                    });
-                }
-                Err(err) => {
-                    error!(error = %err, event = "relay_listener_accept_error", "accept failed");
-                    return Err(err);
-                }
-            },
-            _ = tasks.join_next(), if !tasks.is_empty() => {}
-        }
-    }
+    run_relay_listener_with_listener(listener, upstream_addr).await
 }
 
-/// Runs the relay listener until shutdown and drains supervised relays.
+/// Serve an owned pre-bound listener with the defaults of [`run_relay_listener`].
+pub async fn run_relay_listener_with_listener(
+    listener: TcpListener,
+    upstream_addr: SocketAddr,
+) -> std::io::Result<()> {
+    default_relay_forwarder(listener.local_addr()?, upstream_addr)?
+        .run_with_listener(listener)
+        .await
+}
+
+fn default_relay_forwarder(
+    listen_addr: SocketAddr,
+    upstream_addr: SocketAddr,
+) -> std::io::Result<Forwarder> {
+    let config = ForwardConfig {
+        listen_addr,
+        upstream_addr,
+        ..ForwardConfig::dev_defaults()
+    };
+    Forwarder::new(config).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+}
+
+/// Runs the bounded relay listener until shutdown and drains supervised relays.
+/// Uses the same limits and lifecycle events as [`run_relay_listener`].
 pub async fn run_relay_listener_until_shutdown(
     bind_addr: SocketAddr,
     upstream_addr: SocketAddr,
@@ -827,22 +827,21 @@ pub async fn run_relay_listener_until_shutdown(
 ) -> std::io::Result<RuntimeShutdownOutcome> {
     validate_shutdown(shutdown)?;
     let listener = TcpListener::bind(bind_addr).await?;
-    let mut tasks = JoinSet::new();
-    loop {
-        tokio::select! {
-            biased;
-            () = signal.cancelled() => break,
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
-                tasks.spawn(async move {
-                    let _ = relay_connection(stream, peer, upstream_addr).await;
-                });
-            }
-            _ = tasks.join_next(), if !tasks.is_empty() => {}
-        }
-    }
-    drop(listener);
-    Ok(drain_tasks(tasks, shutdown.drain_timeout).await)
+    run_relay_listener_with_listener_until_shutdown(listener, upstream_addr, signal, shutdown).await
+}
+
+/// Serve an owned listener with bounded admission, then stop accepting and drain.
+/// Defaults match [`run_relay_listener`]; an already-requested shutdown wins over accept.
+pub async fn run_relay_listener_with_listener_until_shutdown(
+    listener: TcpListener,
+    upstream_addr: SocketAddr,
+    signal: ShutdownSignal,
+    shutdown: RuntimeShutdownConfig,
+) -> std::io::Result<RuntimeShutdownOutcome> {
+    validate_shutdown(shutdown)?;
+    default_relay_forwarder(listener.local_addr()?, upstream_addr)?
+        .run_with_listener_until_shutdown(listener, signal, shutdown)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -906,7 +905,7 @@ pub struct ForwardConfig {
     pub listen_addr: SocketAddr,
     /// Upstream service address (what the forwarder dials).
     pub upstream_addr: SocketAddr,
-    /// Maximum concurrent in-flight relays. Must be `> 0`.
+    /// Maximum concurrent in-flight relays. Must be in `1..=Semaphore::MAX_PERMITS`.
     pub max_connections: usize,
     /// Per-connection timeout for `TcpStream::connect(upstream_addr)`.
     /// Must be non-zero.
@@ -940,6 +939,9 @@ impl ForwardConfig {
         if self.max_connections == 0 {
             return Err(ForwardConfigError::ZeroMaxConnections);
         }
+        if self.max_connections > Semaphore::MAX_PERMITS {
+            return Err(ForwardConfigError::MaxConnectionsTooLarge);
+        }
         if self.connect_timeout.is_zero() {
             return Err(ForwardConfigError::ZeroConnectTimeout);
         }
@@ -957,6 +959,8 @@ impl ForwardConfig {
 /// admission policy.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ForwardConfigError {
+    /// `max_connections` exceeds the semaphore's supported capacity.
+    MaxConnectionsTooLarge,
     /// `max_connections` must be strictly greater than zero.
     ZeroMaxConnections,
     /// `connect_timeout` must be a positive [`Duration`].
@@ -974,6 +978,9 @@ pub enum ForwardConfigError {
 impl std::fmt::Display for ForwardConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ForwardConfigError::MaxConnectionsTooLarge => {
+                f.write_str("max_connections exceeds Semaphore::MAX_PERMITS")
+            }
             ForwardConfigError::ZeroMaxConnections => {
                 f.write_str("max_connections must be greater than zero")
             }

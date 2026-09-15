@@ -1634,3 +1634,25 @@ idle limits. Existing methods bind their configured address and delegate.
 and enables embedding with OS-assigned ports. Tests observe admission through
 real byte exchange and bounded channels, and retain ownership of fixture tasks.
 CI executes example tests via `--all-targets` and preserves doc tests separately.
+
+## ADR-062 — Legacy relay listeners delegate to bounded Forwarder
+
+**Status:** Accepted (Session 62).
+
+**Context:** Session 03 listener wrappers still spawned unbounded tasks even
+after Forwarder admission was hardened. Most relay integration tests exercised
+a test-only accept loop, and the bind smoke test depended on a 50 ms sleep.
+
+**Decision:** Preserve existing wrapper signatures and delegate through owned
+pre-bound entrypoints to Forwarder with its development defaults (100 global,
+25/IP, connect 5 s, idle 60 s). Reuse admission, task supervision, and graceful
+shutdown rather than maintain another implementation. Reject semaphore capacity
+overflow in ForwardConfig validation. Tests exercise production entrypoints with
+owned fixtures, retained port reservations, and byte/EOF synchronization.
+
+**Consequences:** Legacy listener behavior becomes bounded and lifecycle events
+change to Forwarder events. Existing callers requiring other limits must use
+Forwarder. The new public validation error variant may require updates to
+exhaustive matches. Low-level relay primitives, half-close payload semantics,
+wire protocol, and production ingress policy are unchanged. Shutdown prioritizes
+cancellation over accept and aborts/joins tasks after the configured drain deadline.
