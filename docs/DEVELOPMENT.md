@@ -1286,3 +1286,22 @@ and join fixture tasks. Deliberate idle deadlines still use real time.
 
 CI validation runs `cargo test --workspace --all-targets --locked` followed by
 `cargo test --workspace --doc --locked` on both supported OS runners.
+
+### Bounded legacy relay listeners (Session 62)
+
+`run_relay_listener` and `run_relay_listener_until_shutdown` retain their
+signatures but now use Forwarder defaults: 100 global connections, 25 per source
+IP, 5-second upstream connect timeout, and 60-second shared activity-aware idle
+timeout. Excess clients close before handler creation or upstream dialing.
+Lifecycle logs now use Forwarder event names instead of the original relay
+listener events. Use `Forwarder` for custom limits; low-level `relay_connection`
+and `relay_bidirectional` retain their existing contracts.
+
+For externally bound sockets and tests, use `run_relay_listener_with_listener`
+or `run_relay_listener_with_listener_until_shutdown`; both take ownership of the
+listener. Relay tests must exercise these production APIs rather than implement
+a second accept loop. Negative upstream fixtures keep a bound non-listening
+`TcpSocket` alive, and fixture tasks are joined. Admission tests use loopback
+source addresses 127.0.0.1 through 127.0.0.5 to distinguish global and IP limits.
+ForwardConfig capacities above `Semaphore::MAX_PERMITS` now return
+`ForwardConfigError::MaxConnectionsTooLarge`, rather than panicking at construction.

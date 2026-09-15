@@ -1,5 +1,12 @@
 # TunnelProxy — Test Matrix
 
+Session 62 adds `crates/edge/tests/relay_listener.rs`: both legacy pre-bound
+wrappers enforce global/peer capacity before dialing and recover capacity;
+shutdown covers pre-requested cancellation, invalid config, half-close drain,
+forced abort and listener release. Constructor boundary tests cover
+`Semaphore::MAX_PERMITS` and overflow. `relay_tcp.rs` now exercises production
+listeners with owned fixtures; bind failure replaces the timing-based smoke test.
+
 > Canonical list of capabilities and their test status. **Do not mark a
 > capability as tested unless the test actually exists in the
 > repository.** Status meanings:

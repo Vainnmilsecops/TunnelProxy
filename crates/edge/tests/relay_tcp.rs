@@ -15,11 +15,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tunnelproxy_edge::{
     relay_bidirectional, relay_bidirectional_with_idle_timeout, relay_connection,
-    run_relay_listener, RelayError, RelayStats,
+    run_relay_listener, run_relay_listener_with_listener, RelayError, RelayStats,
 };
 
 /// Size of the intermediate read buffer used by the upstream echo
@@ -27,90 +28,70 @@ use tunnelproxy_edge::{
 /// exercise multi-read traffic.
 const UPSTREAM_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Spawn a Tokio TCP listener on an ephemeral port and forward every
-/// byte back to the connected peer (a tiny "echo" upstream). Returns
-/// the bound address. The listener task runs until the test ends or
-/// the process exits; `tokio::test` cleans it up automatically.
-async fn spawn_echo_upstream() -> SocketAddr {
+/// One-connection fixture with an explicitly owned task.
+async fn spawn_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; UPSTREAM_BUFFER_SIZE];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; UPSTREAM_BUFFER_SIZE];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        return;
                     }
                 }
-            });
+                Err(_) => return,
+            }
         }
     });
-    addr
+    (addr, task)
 }
 
-/// Spawn `run_relay_listener` against a real upstream echo listener
-/// and return the relay's bound address plus the upstream's bound
-/// address. The relay task runs until the test ends.
-async fn spawn_relay_against_upstream() -> (SocketAddr, SocketAddr) {
-    let upstream_addr = spawn_echo_upstream().await;
+/// Serve a pre-bound production relay and return its address and owned tasks.
+async fn spawn_relay_against_upstream(
+) -> (SocketAddr, JoinHandle<()>, JoinHandle<std::io::Result<()>>) {
+    let (upstream_addr, upstream_task) = spawn_echo_upstream().await;
 
     let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = relay_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = run_relay_listener_on(relay_listener, upstream_addr).await;
-    });
-    (relay_addr, upstream_addr)
+    let server = tokio::spawn(run_relay_listener_with_listener(
+        relay_listener,
+        upstream_addr,
+    ));
+    (relay_addr, upstream_task, server)
 }
 
-/// Drop-in replacement for `run_relay_listener` that accepts a
-/// pre-bound listener, so tests do not race against
-/// `TcpListener::bind` rebinding.
-async fn run_relay_listener_on(
-    listener: TcpListener,
-    upstream_addr: SocketAddr,
-) -> std::io::Result<()> {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                tokio::spawn(async move {
-                    let _ = relay_connection(stream, peer, upstream_addr).await;
-                });
-            }
-            Err(err) => return Err(err),
-        }
-    }
+async fn finish_fixture(upstream: JoinHandle<()>, server: JoinHandle<std::io::Result<()>>) {
+    timeout(Duration::from_secs(3), upstream)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
-/// Spawn a Tokio TCP listener that, for each accepted connection,
+/// Spawn a one-connection Tokio TCP listener that
 /// reads until EOF, then writes a deterministic response and closes.
 /// Used for half-close coverage (TEST 3).
-async fn spawn_request_then_reply_upstream(response: Vec<u8>) -> SocketAddr {
+async fn spawn_request_then_reply_upstream(response: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            let response = response.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; UPSTREAM_BUFFER_SIZE];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(_) => return,
-                    }
-                }
-                let _ = stream.write_all(&response).await;
-            });
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; UPSTREAM_BUFFER_SIZE];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => return,
+            }
         }
+        let _ = stream.write_all(&response).await;
     });
-    addr
+    (addr, task)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +99,7 @@ async fn spawn_request_then_reply_upstream(response: Vec<u8>) -> SocketAddr {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn relay_round_trip_small_payload() {
-    let (relay_addr, _upstream_addr) = spawn_relay_against_upstream().await;
+    let (relay_addr, upstream, server) = spawn_relay_against_upstream().await;
 
     let mut client = TcpStream::connect(relay_addr).await.unwrap();
     let payload: &[u8] = b"hello tunnelproxy relay";
@@ -135,6 +116,7 @@ async fn relay_round_trip_small_payload() {
         payload,
         "echo through relay should be byte-exact"
     );
+    finish_fixture(upstream, server).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +124,7 @@ async fn relay_round_trip_small_payload() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn relay_round_trip_large_payload() {
-    let (relay_addr, _upstream_addr) = spawn_relay_against_upstream().await;
+    let (relay_addr, upstream, server) = spawn_relay_against_upstream().await;
 
     // 256 KiB deterministic pseudo-random bytes. Using a fixed seed
     // keeps the test deterministic; the bytes intentionally include
@@ -185,6 +167,7 @@ async fn relay_round_trip_large_payload() {
         "relay truncated large payload"
     );
     assert_eq!(received, payload, "relay corrupted large payload");
+    finish_fixture(upstream, server).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,13 +177,14 @@ async fn relay_round_trip_large_payload() {
 #[tokio::test]
 async fn relay_preserves_half_close() {
     let response: Vec<u8> = b"upstream response after client EOF".to_vec();
-    let upstream_addr = spawn_request_then_reply_upstream(response.clone()).await;
+    let (upstream_addr, upstream) = spawn_request_then_reply_upstream(response.clone()).await;
 
     let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = relay_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = run_relay_listener_on(relay_listener, upstream_addr).await;
-    });
+    let server = tokio::spawn(run_relay_listener_with_listener(
+        relay_listener,
+        upstream_addr,
+    ));
 
     let mut client = TcpStream::connect(relay_addr).await.unwrap();
     client.write_all(b"request body").await.unwrap();
@@ -216,80 +200,40 @@ async fn relay_preserves_half_close() {
         received, response,
         "relay should forward upstream response even after client EOF"
     );
+    finish_fixture(upstream, server).await;
 }
 
 // ---------------------------------------------------------------------------
 // TEST 4 — Connection isolation: a relay task whose upstream is
-// unavailable must not kill the listener; a later valid connection
-// must still be served.
+// unavailable must not kill the listener; another client is accepted and
+// independently closed after its own upstream failure.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn relay_listener_survives_unreachable_upstream() {
-    // Reserve an ephemeral port, close the probe, then use it as an
-    // "unreachable upstream" — connecting to it will fail with
-    // ConnectionRefused on Windows / ECONNREFUSED on Unix.
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unreachable_addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    // Spawn an echo upstream on a *separate* ephemeral port. We'll
-    // route the relay to the unreachable address first, then re-spawn
-    // the relay pointing at the real echo upstream.
-    let real_upstream_addr = spawn_echo_upstream().await;
-
-    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = relay_listener.local_addr().unwrap();
-
-    // Stage 1: relay points at the unreachable upstream. The listener
-    // task should keep accepting connections even though each one
-    // fails upstream.
-    let stage1 = tokio::spawn(async move {
-        let _ = run_relay_listener_on(relay_listener, unreachable_addr).await;
-    });
-
-    // A client connecting now will be dropped because upstream is
-    // unreachable. We assert that the connect itself succeeds and the
-    // subsequent read returns EOF (server closed downstream after
-    // upstream connect failed).
-    {
-        let mut bad_client = TcpStream::connect(relay_addr).await.unwrap();
-        let mut received = Vec::new();
-        let _ = timeout(
-            Duration::from_secs(2),
-            bad_client.read_to_end(&mut received),
-        )
-        .await;
-        // Whatever happens — EOF or empty — we do not care about the
-        // bytes. The point is that the *listener* survived.
-        drop(bad_client);
+    // Retain a bound, non-listening socket so another test cannot steal the port.
+    let reserved = TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let unreachable_addr = reserved.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(run_relay_listener_with_listener(listener, unreachable_addr));
+    // Both connections must be closed: failure does not stop the accept loop.
+    for _ in 0..2 {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(4), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
-
-    // Stage 2: stop stage-1 listener, start a fresh one pointed at
-    // the real echo upstream on the same address (the address is held
-    // by us; stage 1's listener owned the socket and was aborted).
-    stage1.abort();
-    // Yield once so the OS releases the port before we rebind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let relay_listener2 = TcpListener::bind(relay_addr).await.unwrap();
-    tokio::spawn(async move {
-        let _ = run_relay_listener_on(relay_listener2, real_upstream_addr).await;
-    });
-
-    let mut good_client = TcpStream::connect(relay_addr).await.unwrap();
-    let payload: &[u8] = b"after failure, still working";
-    good_client.write_all(payload).await.unwrap();
-    good_client.shutdown().await.unwrap();
-
-    let mut received = Vec::new();
-    timeout(
-        Duration::from_secs(3),
-        good_client.read_to_end(&mut received),
-    )
-    .await
-    .expect("second-stage relay did not respond")
-    .unwrap();
-    assert_eq!(received, payload);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    TcpListener::bind(addr)
+        .await
+        .expect("listener released after joined abort");
 }
 
 // ---------------------------------------------------------------------------
@@ -321,10 +265,14 @@ async fn relay_bidirectional_returns_byte_counts() {
     let downstream_payload_for_task = downstream_payload.clone();
     let downstream_peer = tokio::spawn(async move {
         if let Ok((mut s, _)) = downstream_listener.accept().await {
-            let _ = s.write_all(&downstream_payload_for_task).await;
-            let _ = s.shutdown().await;
-            // Hold the socket open long enough for the relay to drain.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            s.write_all(&downstream_payload_for_task).await.unwrap();
+            s.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(3), s.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, b"PONG");
         }
     });
 
@@ -335,14 +283,17 @@ async fn relay_bidirectional_returns_byte_counts() {
     let upstream_peer = tokio::spawn(async move {
         if let Ok((mut s, _)) = upstream_listener.accept().await {
             let mut buf = Vec::new();
-            let _ = timeout(Duration::from_secs(2), s.read_to_end(&mut buf)).await;
+            timeout(Duration::from_secs(3), s.read_to_end(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 buf.len(),
                 downstream_payload_len,
                 "upstream should have received exactly the downstream payload"
             );
-            let _ = s.write_all(&upstream_response).await;
-            let _ = s.shutdown().await;
+            s.write_all(&upstream_response).await.unwrap();
+            s.shutdown().await.unwrap();
         }
     });
 
@@ -350,9 +301,13 @@ async fn relay_bidirectional_returns_byte_counts() {
     let downstream = TcpStream::connect(downstream_addr).await.unwrap();
     let upstream = TcpStream::connect(upstream_addr).await.unwrap();
 
-    let stats = relay_bidirectional(downstream, upstream)
-        .await
-        .expect("relay_bidirectional should succeed");
+    let stats = timeout(
+        Duration::from_secs(5),
+        relay_bidirectional(downstream, upstream),
+    )
+    .await
+    .unwrap()
+    .expect("relay_bidirectional should succeed");
     assert_eq!(
         stats,
         RelayStats {
@@ -361,8 +316,14 @@ async fn relay_bidirectional_returns_byte_counts() {
         }
     );
 
-    downstream_peer.abort();
-    upstream_peer.abort();
+    timeout(Duration::from_secs(3), downstream_peer)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(3), upstream_peer)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -371,9 +332,9 @@ async fn relay_bidirectional_returns_byte_counts() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn relay_connection_reports_upstream_connect_failure() {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe = TcpSocket::new_v4().unwrap();
+    probe.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let unreachable_addr = probe.local_addr().unwrap();
-    drop(probe);
 
     // Open a real downstream side by binding a listener, accepting one
     // connection, and then handing the accepted stream to
@@ -381,18 +342,14 @@ async fn relay_connection_reports_upstream_connect_failure() {
     // relay must close it after a failed upstream connect.
     let downstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let downstream_addr = downstream_listener.local_addr().unwrap();
-    let acceptor = tokio::spawn(async move {
-        if let Ok((stream, _peer)) = downstream_listener.accept().await {
-            // Hold the downstream stream alive for the duration of the
-            // test by parking it in a long sleep.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let _ = stream;
-        }
-    });
-
     let downstream = TcpStream::connect(downstream_addr).await.unwrap();
-    let result = relay_connection(downstream, downstream_addr, unreachable_addr).await;
-    acceptor.abort();
+    let (_peer, _) = downstream_listener.accept().await.unwrap();
+    let result = timeout(
+        Duration::from_secs(4),
+        relay_connection(downstream, downstream_addr, unreachable_addr),
+    )
+    .await
+    .unwrap();
     match result {
         Err(RelayError::UpstreamConnect { upstream, .. }) => {
             assert_eq!(upstream, unreachable_addr);
@@ -445,38 +402,11 @@ async fn relay_activity_in_either_direction_resets_shared_idle_deadline() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Smoke: `run_relay_listener` itself binds successfully against a real
-// upstream address, mirroring the smoke-test style used for the echo
-// baseline in `tests/edge_tcp.rs`.
-// ---------------------------------------------------------------------------
+// Bind-only API reports collisions without a reserve/drop/rebind readiness race.
 #[tokio::test]
-async fn run_relay_listener_binds_and_serves_one_connection() {
-    let upstream_addr = spawn_echo_upstream().await;
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let server = tokio::spawn(async move {
-        let _ = run_relay_listener(relay_addr, upstream_addr).await;
-    });
-
-    // Give the listener a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut client = TcpStream::connect(relay_addr).await.unwrap();
-    client
-        .write_all(b"hello via run_relay_listener")
-        .await
-        .unwrap();
-    client.shutdown().await.unwrap();
-
-    let mut received = Vec::new();
-    timeout(Duration::from_secs(3), client.read_to_end(&mut received))
-        .await
-        .expect("relay did not respond")
-        .unwrap();
-    assert_eq!(received, b"hello via run_relay_listener");
-
-    server.abort();
+async fn run_relay_listener_reports_bind_failure() {
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let error = run_relay_listener(addr, addr).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 }

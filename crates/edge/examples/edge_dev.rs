@@ -96,6 +96,9 @@ async fn main() -> ExitCode {
         Ok(forwarder) => forwarder,
         Err(err) => {
             match err {
+                ForwardConfigError::MaxConnectionsTooLarge => {
+                    error!("--max-connections exceeds Semaphore::MAX_PERMITS");
+                }
                 ForwardConfigError::ZeroMaxConnections => {
                     error!("--max-connections must be greater than zero");
                 }
