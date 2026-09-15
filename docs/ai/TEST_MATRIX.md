@@ -1,5 +1,10 @@
 # TunnelProxy — Test Matrix
 
+Session 63 adds four HTTPS startup regressions in `runtime_entrypoint.rs`:
+distinct PKI/listener isolation with exact connection counts, HTTPS bind failure,
+operations bind failure, and pre-requested shutdown. Six HTTP/1.1 runtime tests
+use reported ephemeral addresses with no readiness connections or TLS retries.
+
 Session 62 adds `crates/edge/tests/relay_listener.rs`: both legacy pre-bound
 wrappers enforce global/peer capacity before dialing and recover capacity;
 shutdown covers pre-requested cancellation, invalid config, half-close drain,

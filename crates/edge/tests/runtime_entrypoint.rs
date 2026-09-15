@@ -65,6 +65,157 @@ use tunnelproxy_protocol::{
     RegistrationRequest, ROLE_AGENT,
 };
 
+fn startup_https_config(public_pki: &TestPki, https_addr: SocketAddr) -> EdgeRuntimeConfig {
+    let mut config = edge_config("127.0.0.1:0".parse().unwrap());
+    config.https_ingress = Some(HttpIngressConfig {
+        listen_addr: https_addr,
+        routes: HttpHostRoutes::single(
+            HttpHostname::new("demo.example.test").unwrap(),
+            TunnelId::new("tunnel-dev").unwrap(),
+        ),
+        tls: PublicTlsConfig::from_pem(
+            public_pki.server.certificate_pem.as_bytes(),
+            public_pki.server.private_key_pem.as_bytes(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        exposure: HttpIngressExposurePolicy::LoopbackOnly,
+        max_concurrent_connections: 4,
+        max_header_bytes: 16 * 1024,
+        max_headers: 32,
+        max_request_body_bytes: 1024,
+        max_requests_per_connection: 1,
+        http2: None,
+        websocket: None,
+        connect: None,
+        signed_access: None,
+        request_rate_limit: HttpRequestRateLimitConfig::default(),
+        header_read_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(2),
+        duplex_capacity: 16 * 1024,
+        shutdown: RuntimeShutdownConfig::new(Duration::from_secs(1)),
+    });
+    config
+}
+
+#[tokio::test]
+async fn https_startup_reports_isolated_ephemeral_listeners_with_distinct_pki() {
+    timeout(Duration::from_secs(10), async {
+        let mut runtimes = Vec::new();
+        for _ in 0..4 {
+            let pki = test_pki("demo.example.test");
+            let edge =
+                EdgeRuntime::bind(startup_https_config(&pki, "127.0.0.1:0".parse().unwrap()))
+                    .await
+                    .unwrap();
+            let agent_addr = edge.agent_addr();
+            let (trigger, signal) = shutdown_channel();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(edge.run_until_shutdown_with_https_startup(signal, tx));
+            let addr = rx.await.unwrap();
+            assert_ne!(addr.port(), 0);
+            assert!(runtimes.iter().all(|(other, _, _, _, _)| *other != addr));
+            runtimes.push((addr, agent_addr, pki, trigger, task));
+        }
+        for (addr, agent_addr, pki, trigger, task) in runtimes {
+            let connector =
+                TlsConnector::from(raw_tls_client_config(&pki.authority_pem, None, false));
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut tls = connector
+                .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
+                .await
+                .unwrap();
+            tls.write_all(b"GET / HTTP/1.1\r\nHost: demo.example.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 503"));
+            trigger.shutdown();
+            let https = task.await.unwrap().unwrap().https_ingress.unwrap();
+            // Startup notification itself must never create a probe connection.
+            assert_eq!(https.accepted_connections, 1);
+            TcpListener::bind(addr).await.unwrap();
+            TcpListener::bind(agent_addr).await.unwrap();
+        }
+    })
+    .await
+    .expect("isolated HTTPS startup timed out");
+}
+
+#[tokio::test]
+async fn https_startup_failure_closes_notification_and_releases_transport() {
+    timeout(Duration::from_secs(5), async {
+        let pki = test_pki("demo.example.test");
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let edge = EdgeRuntime::bind(startup_https_config(&pki, addr))
+            .await
+            .unwrap();
+        let agent_addr = edge.agent_addr();
+        let (_trigger, signal) = shutdown_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(edge.run_until_shutdown_with_https_startup(signal, tx));
+        assert!(rx.await.is_err());
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(EdgeRuntimeError::HttpsStartup(_))
+        ));
+        TcpListener::bind(agent_addr).await.unwrap();
+        // The collision belongs to the fixture; runtime must not consume it.
+        assert_eq!(occupied.local_addr().unwrap(), addr);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn https_startup_operations_failure_does_not_report_ready() {
+    timeout(Duration::from_secs(5), async {
+        let pki = test_pki("demo.example.test");
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = startup_https_config(&pki, "127.0.0.1:0".parse().unwrap());
+        let operations = EdgeOperationsConfig::loopback(occupied.local_addr().unwrap());
+        config.operations = Some(operations);
+        let edge = EdgeRuntime::bind(config).await.unwrap();
+        let agent_addr = edge.agent_addr();
+        let (_trigger, signal) = shutdown_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(edge.run_until_shutdown_with_https_startup(signal, tx));
+        assert!(rx.await.is_err());
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(EdgeRuntimeError::OperationsStartup(_))
+        ));
+        TcpListener::bind(agent_addr).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn https_startup_pre_requested_shutdown_suppresses_notification() {
+    timeout(Duration::from_secs(5), async {
+        let pki = test_pki("demo.example.test");
+        let edge = EdgeRuntime::bind(startup_https_config(&pki, "127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let agent_addr = edge.agent_addr();
+        let (trigger, signal) = shutdown_channel();
+        trigger.shutdown();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(edge.run_until_shutdown_with_https_startup(signal, tx));
+        assert!(rx.await.is_err());
+        let https = task.await.unwrap().unwrap().https_ingress.unwrap();
+        assert_eq!(https.accepted_connections, 0);
+        TcpListener::bind(agent_addr).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 struct TestIdentity {
     certificate_pem: String,
     private_key_pem: String,
@@ -3231,7 +3382,7 @@ async fn https_keep_alive_reuses_one_tls_connection_until_the_request_cap() {
         }
     });
 
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
@@ -3265,7 +3416,13 @@ async fn https_keep_alive_reuses_one_tls_connection_until_the_request_cap() {
     let edge_addr = edge.agent_addr();
     let router = edge.router();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
@@ -3279,7 +3436,10 @@ async fn https_keep_alive_reuses_one_tls_connection_until_the_request_cap() {
     let tls = connector
         .connect(
             ServerName::try_from("demo.example.test").unwrap(),
-            connect_eventually(https_addr).await,
+            timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3346,7 +3506,7 @@ async fn https_request_deadline_returns_504_and_closes_the_reused_connection() {
         tokio::time::sleep(Duration::from_millis(400)).await;
     });
 
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
@@ -3380,7 +3540,13 @@ async fn https_request_deadline_returns_504_and_closes_the_reused_connection() {
     let edge_addr = edge.agent_addr();
     let router = edge.router();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
@@ -3394,7 +3560,10 @@ async fn https_request_deadline_returns_504_and_closes_the_reused_connection() {
     let tls = connector
         .connect(
             ServerName::try_from("demo.example.test").unwrap(),
-            connect_eventually(https_addr).await,
+            timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3447,7 +3616,7 @@ async fn https_shutdown_gracefully_closes_an_idle_keep_alive_connection() {
             .unwrap();
     });
 
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
@@ -3481,7 +3650,13 @@ async fn https_shutdown_gracefully_closes_an_idle_keep_alive_connection() {
     let edge_addr = edge.agent_addr();
     let router = edge.router();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
@@ -3495,7 +3670,10 @@ async fn https_shutdown_gracefully_closes_an_idle_keep_alive_connection() {
     let tls = connector
         .connect(
             ServerName::try_from("demo.example.test").unwrap(),
-            connect_eventually(https_addr).await,
+            timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3549,7 +3727,7 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
         tokio::time::sleep(Duration::from_secs(2)).await;
     });
 
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.shutdown = RuntimeShutdownConfig::new(Duration::from_millis(50));
     config.https_ingress = Some(HttpIngressConfig {
@@ -3584,7 +3762,13 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
     let edge_addr = edge.agent_addr();
     let router = edge.router();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
@@ -3598,7 +3782,10 @@ async fn https_shutdown_forces_an_active_keep_alive_request_after_the_deadline()
     let tls = connector
         .connect(
             ServerName::try_from("demo.example.test").unwrap(),
-            connect_eventually(https_addr).await,
+            timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3675,7 +3862,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
         }
     });
 
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.operations = Some(EdgeOperationsConfig::loopback(operations_addr));
     config.request_history_capacity = Some(4);
@@ -3718,7 +3905,13 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     let edge_addr = edge.agent_addr();
     let router = edge.router();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let (agent_trigger, agent_signal) = shutdown_channel();
     let agent_task =
         tokio::spawn(agent_runtime(edge_addr, local_addr).run_until_shutdown(agent_signal));
@@ -3745,7 +3938,10 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     let tls = connector
         .connect(
             ServerName::try_from("demo.example.test").unwrap(),
-            connect_eventually(https_addr).await,
+            timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3824,7 +4020,10 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     let request = || {
         let connector = connector.clone();
         async move {
-            let tcp = connect_eventually(https_addr).await;
+            let tcp = timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap();
             let mut tls = connector
                 .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
                 .await
@@ -3842,7 +4041,10 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
 
     assert_eq!(local_requests.load(Ordering::Relaxed), 1);
 
-    let mut invalid_tls = connect_eventually(https_addr).await;
+    let mut invalid_tls = timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+        .await
+        .unwrap()
+        .unwrap();
     invalid_tls.write_all(b"not tls").await.unwrap();
     invalid_tls.shutdown().await.unwrap();
     let metrics = timeout(Duration::from_secs(2), async {
@@ -3871,7 +4073,12 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
     assert!(!metrics.contains("tunnel-dev"));
 
     tokio::time::sleep(Duration::from_millis(1_050)).await;
-    assert!(request().await.starts_with("HTTP/1.1 200 OK"));
+    let refilled_response = request().await;
+    assert!(
+        refilled_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected refill status: {:?}",
+        refilled_response.lines().next()
+    );
 
     agent_trigger.shutdown();
     agent_task.await.unwrap().unwrap();
@@ -3896,7 +4103,7 @@ async fn https_request_rate_limit_returns_429_before_local_service_and_refills()
 #[tokio::test]
 async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
     let public_pki = test_pki("demo.example.test");
-    let https_addr = unused_addr().await;
+    let https_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = edge_config(unused_addr().await);
     config.https_ingress = Some(HttpIngressConfig {
         listen_addr: https_addr,
@@ -3928,7 +4135,13 @@ async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
     });
     let edge = EdgeRuntime::bind(config).await.unwrap();
     let (edge_trigger, edge_signal) = shutdown_channel();
-    let edge_task = tokio::spawn(edge.run_until_shutdown(edge_signal));
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let edge_task =
+        tokio::spawn(edge.run_until_shutdown_with_https_startup(edge_signal, startup_tx));
+    let https_addr = timeout(Duration::from_secs(5), startup_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let connector = TlsConnector::from(raw_tls_client_config(
         &public_pki.authority_pem,
         None,
@@ -3938,7 +4151,10 @@ async fn https_ingress_rejects_host_fronting_and_fails_closed_while_offline() {
     let send = |host: &'static str| {
         let connector = connector.clone();
         async move {
-            let tcp = connect_eventually(https_addr).await;
+            let tcp = timeout(Duration::from_secs(3), TcpStream::connect(https_addr))
+                .await
+                .unwrap()
+                .unwrap();
             let mut tls = connector
                 .connect(ServerName::try_from("demo.example.test").unwrap(), tcp)
                 .await

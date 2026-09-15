@@ -351,6 +351,7 @@ and Definition of Done.
 | 60 _(complete)_ | source-aware pre-spawn admission for the legacy TCP forwarder |
 | 61 _(complete)_ | pre-bound forwarder listeners, synchronized TCP tests, and all-target CI |
 | 62 _(complete)_ | bounded legacy relay wrappers, production-path tests, and semaphore capacity validation |
+| 63 _(complete)_ | HTTPS startup address notification and isolated runtime tests |
 
 See [`docs/ai/SESSION_INDEX.md`](docs/ai/SESSION_INDEX.md) for the running
 session log.
